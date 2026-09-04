@@ -3212,7 +3212,13 @@ mod tests {
         assert_eq!(preset_to_num_ctx("model default"), None);
         assert_eq!(preset_to_num_ctx("64K"), Some(65_536));
         assert_eq!(num_ctx_to_preset(131_072), "128K");
-        assert_eq!(num_ctx_to_preset(65_537), "64K (custom)");
+        // Custom values render as the raw token count (never a K
+        // approximation) and round-trip back through label_to_num_ctx.
+        assert_eq!(num_ctx_to_preset(65_537), "65537 (custom)");
+        assert_eq!(
+            oo::label_to_num_ctx(&num_ctx_to_preset(65_537)),
+            Some(65_537)
+        );
     }
 
     #[test]

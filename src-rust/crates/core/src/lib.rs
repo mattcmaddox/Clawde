@@ -2472,9 +2472,13 @@ pub mod config {
     impl Config {
         /// Resolve the Ollama connectivity mode from settings.
         ///
-        /// Reads `providers.ollama.options.mode` — `"online"` (the default)
-        /// or `"isolated"`. Ollama is never part of free-model routing and
-        /// always requires explicit provider selection.
+        /// Reads `provider_configs.ollama.options.mode` — `"online"` (the
+        /// default) or `"isolated"`. On an effective config (see
+        /// [`Settings::effective_config`]) a top-level
+        /// `providers.ollama.options.mode` is folded in when the nested key
+        /// is absent, so legacy hand-written settings keep working. Ollama is
+        /// never part of free-model routing and always requires explicit
+        /// provider selection.
         pub fn resolve_ollama_mode(&self) -> OllamaMode {
             self.provider_configs
                 .get("ollama")
@@ -3106,6 +3110,36 @@ pub mod config {
                 config.file_injection_max_size = self.file_injection_max_size;
             }
             config
+        }
+
+        /// Persist the Ollama connectivity mode to settings.
+        ///
+        /// The nested `config.provider_configs.ollama.options.mode` is the
+        /// canonical write target: every reader (CLI startup, ACP runtime,
+        /// tool policy) resolves the mode from the *effective* config, where
+        /// a nested key wins per-key over the top-level `providers` merge in
+        /// [`Settings::effective_config`]. Writing only the top-level key —
+        /// the historical behavior — was silently overridden on restart by a
+        /// stale nested `mode` from an older persist path or a hand edit, so
+        /// this setter also removes any stale top-level key to keep the two
+        /// locations from drifting.
+        pub fn set_ollama_mode(&mut self, mode: OllamaMode) {
+            let mode_val = match mode {
+                OllamaMode::Online => "online",
+                OllamaMode::Isolated => "isolated",
+            };
+            self.config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert(
+                    "mode".to_string(),
+                    serde_json::Value::String(mode_val.to_string()),
+                );
+            if let Some(top_level) = self.providers.get_mut("ollama") {
+                top_level.options.remove("mode");
+            }
         }
 
         /// Load settings from all config levels and merge them.
@@ -3751,6 +3785,80 @@ pub mod config {
                     .get("keep_alive")
                     .and_then(|value| value.as_i64()),
                 Some(0)
+            );
+        }
+
+        #[test]
+        fn set_ollama_mode_persists_to_nested_and_clears_stale_top_level() {
+            let mut settings = Settings::default();
+            // A stale top-level `mode` from an older persist path must not
+            // survive a write: it would win the effective-config merge over
+            // every future top-level write and silently revert the user's
+            // choice after restart.
+            settings
+                .providers
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert("mode".to_string(), serde_json::json!("isolated"));
+
+            settings.set_ollama_mode(OllamaMode::Online);
+
+            let nested = settings
+                .config
+                .provider_configs
+                .get("ollama")
+                .and_then(|c| c.options.get("mode"))
+                .and_then(|v| v.as_str().map(str::to_owned));
+            assert_eq!(nested.as_deref(), Some("online"));
+            assert!(settings
+                .providers
+                .get("ollama")
+                .and_then(|c| c.options.get("mode"))
+                .is_none());
+            assert_eq!(
+                settings.effective_config().resolve_ollama_mode(),
+                OllamaMode::Online
+            );
+        }
+
+        #[test]
+        fn stale_nested_mode_no_longer_reverts_a_new_top_level_write() {
+            // The P2 regression: an old nested `mode` must not shadow the
+            // value the user just persisted.
+            let mut settings = Settings::default();
+            settings
+                .config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert("mode".to_string(), serde_json::json!("isolated"));
+
+            settings.set_ollama_mode(OllamaMode::Online);
+
+            assert_eq!(
+                settings.effective_config().resolve_ollama_mode(),
+                OllamaMode::Online
+            );
+        }
+
+        #[test]
+        fn legacy_top_level_mode_still_resolves_via_effective_config() {
+            // Hand-written legacy settings keep working: effective_config
+            // folds the top-level `mode` into the nested map when the nested
+            // key is absent.
+            let mut settings = Settings::default();
+            settings
+                .providers
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert("mode".to_string(), serde_json::json!("isolated"));
+
+            assert_eq!(
+                settings.effective_config().resolve_ollama_mode(),
+                OllamaMode::Isolated
             );
         }
 

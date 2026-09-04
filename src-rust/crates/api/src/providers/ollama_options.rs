@@ -100,6 +100,64 @@ pub const OLLAMA_OPTION_KEYS: &[&str] = &[
 // ---------------------------------------------------------------------------
 // Preset conversion helpers (display string <-> raw value)
 // ---------------------------------------------------------------------------
+// Round-trip rule: `*_to_label` output must always parse back through the
+// matching `label_to_*`. Non-preset values render as `"<raw> (custom)"` and
+// every parser strips that suffix, so a hand-set value survives a
+// display-label round-trip instead of being treated as unset.
+
+/// The five common options the `/ollama` screen edits, in display order
+/// (mirrored by the TUI dialog's `OPTION_KEYS_ORDER`).
+pub const COMMON_OPTION_KEYS: &[&str] = &[
+    "num_ctx",
+    "num_predict",
+    "keep_alive",
+    "temperature",
+    "top_p",
+];
+
+/// Parse a keep-alive value: an integer (seconds) or a Go-style duration
+/// string ("5m", "1h", "1h30m", "90s") as accepted by Ollama's wire format.
+pub fn keep_alive_value_to_secs(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64)),
+        Value::String(s) => parse_keep_alive_str(s),
+        _ => None,
+    }
+}
+
+fn parse_keep_alive_str(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(n);
+    }
+    // Compound Go-style duration: one or more <n>{h,m,s} components.
+    let mut total: i64 = 0;
+    let mut rest = s;
+    while !rest.is_empty() {
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits_end == 0 {
+            return None;
+        }
+        let n: i64 = rest[..digits_end].parse().ok()?;
+        rest = &rest[digits_end..];
+        let (multiplier, unit_len) = match rest.as_bytes().first() {
+            Some(b'h') => (3_600, 1),
+            Some(b'm') => (60, 1),
+            Some(b's') => (1, 1),
+            _ => return None,
+        };
+        total = total.checked_add(n.checked_mul(multiplier)?)?;
+        rest = &rest[unit_len..];
+    }
+    Some(total)
+}
 
 /// Human label for a raw num_ctx value, or `"Ollama/model default"` when
 /// unset/zero.
@@ -112,7 +170,9 @@ pub fn num_ctx_to_label(n: u64) -> String {
             return (*label).to_string();
         }
     }
-    format!("{}K (custom)", n / 1024)
+    // Raw token count, not a K approximation: integer division claimed e.g.
+    // 49152 was "48K" (= 49152, fine) but 65537 was "64K" (= 65536, wrong).
+    format!("{n} (custom)")
 }
 
 /// Parse a preset label (or custom integer string) into a raw num_ctx value.
@@ -123,12 +183,12 @@ pub fn label_to_num_ctx(label: &str) -> Option<u64> {
             return Some(*val);
         }
     }
-    label
-        .trim()
-        .strip_suffix('K')
+    let trimmed = label.trim();
+    let bare = trimmed.strip_suffix(" (custom)").unwrap_or(trimmed);
+    bare.strip_suffix('K')
         .and_then(|s| s.parse::<u64>().ok())
         .map(|k| k * 1024)
-        .or_else(|| label.trim().parse::<u64>().ok())
+        .or_else(|| bare.parse::<u64>().ok())
 }
 
 /// Human label for a raw num_predict value.
@@ -151,7 +211,12 @@ pub fn label_to_num_predict(label: &str) -> Option<u64> {
             return Some(*val);
         }
     }
-    label.trim().parse::<u64>().ok()
+    let trimmed = label.trim();
+    let bare = trimmed.strip_suffix(" (custom)").unwrap_or(trimmed);
+    bare.strip_suffix('K')
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|k| k * 1024)
+        .or_else(|| bare.parse::<u64>().ok())
 }
 
 /// Human label for a raw keep_alive value (seconds).
@@ -164,20 +229,20 @@ pub fn keep_alive_to_label(n: i64) -> String {
     if n < 0 {
         return "forever".to_string();
     }
-    format!("{n}s (custom)")
+    format!("{n} (custom)")
 }
 
-/// Parse a preset label into raw keep_alive seconds.
+/// Parse a preset label into raw keep_alive seconds. Duration strings
+/// ("5m", "1h30m", "90s") and bare integers are accepted.
 pub fn label_to_keep_alive(label: &str) -> Option<i64> {
     for (name, val) in OLLAMA_KEEP_ALIVE_PRESETS {
         if *name == label {
             return Some(*val);
         }
     }
-    label
-        .trim()
-        .strip_suffix('s')
-        .and_then(|s| s.parse::<i64>().ok())
+    let trimmed = label.trim();
+    let bare = trimmed.strip_suffix(" (custom)").unwrap_or(trimmed);
+    parse_keep_alive_str(bare)
 }
 
 /// Human label for a raw temperature value.
@@ -197,7 +262,9 @@ pub fn label_to_temperature(label: &str) -> Option<f64> {
             return Some(*val);
         }
     }
-    label.trim().parse::<f64>().ok()
+    let trimmed = label.trim();
+    let bare = trimmed.strip_suffix(" (custom)").unwrap_or(trimmed);
+    bare.parse::<f64>().ok()
 }
 
 /// Human label for a raw top_p value.
@@ -217,7 +284,72 @@ pub fn label_to_top_p(label: &str) -> Option<f64> {
             return Some(*val);
         }
     }
-    label.trim().parse::<f64>().ok()
+    let trimmed = label.trim();
+    let bare = trimmed.strip_suffix(" (custom)").unwrap_or(trimmed);
+    bare.parse::<f64>().ok()
+}
+
+// ---------------------------------------------------------------------------
+// Canonical value normalization (settings raw value <-> canonical JSON)
+// ---------------------------------------------------------------------------
+
+/// Normalize one persisted value for the common options into its canonical
+/// JSON shape: numbers over numeric strings, keep_alive duration strings
+/// resolved to seconds, zero token counts treated as unset. Returns `None`
+/// for unset-shaped (null/empty) or unrepresentable values so callers can
+/// omit the key entirely instead of persisting a value that renders as
+/// "unset".
+pub fn normalize_common_option(key: &str, value: &Value) -> Option<Value> {
+    if value.is_null() {
+        return None;
+    }
+    if let Value::String(s) = value {
+        if s.trim().is_empty() {
+            return None;
+        }
+    }
+    match key {
+        "num_ctx" | "num_predict" => {
+            let n = value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .or_else(|| {
+                    value
+                        .as_f64()
+                        .filter(|f| *f >= 0.0 && f.fract() == 0.0)
+                        .map(|f| f as u64)
+                })?;
+            (n > 0).then_some(json!(n))
+        }
+        "keep_alive" => keep_alive_value_to_secs(value).map(|n| json!(n)),
+        "temperature" | "top_p" => {
+            let t = value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
+            Some(json!(t))
+        }
+        _ => Some(value.clone()),
+    }
+}
+
+/// Display label for one canonical raw common-option value. Callers
+/// representing "unset" use an absent raw value, never an empty string;
+/// this helper is only invoked for values that are actually set.
+pub fn common_option_label(key: &str, value: &Value) -> String {
+    match key {
+        "num_ctx" => num_ctx_to_label(value.as_u64().unwrap_or(0)),
+        "num_predict" => num_predict_to_label(value.as_u64().unwrap_or(0)),
+        "keep_alive" => keep_alive_to_label(value.as_i64().unwrap_or(-1)),
+        "temperature" => value
+            .as_f64()
+            .map(temperature_to_label)
+            .unwrap_or_else(|| value.to_string()),
+        "top_p" => value
+            .as_f64()
+            .map(top_p_to_label)
+            .unwrap_or_else(|| value.to_string()),
+        _ => value.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +412,14 @@ pub fn native_options_value(options: &serde_json::Map<String, Value>) -> Value {
         // Zero means "Ollama/model default" for the token-count options (the
         // UI preset tables map 0 to unset); other keys treat 0 as a real
         // value (keep_alive 0 = unload after request, temperature 0 = greedy).
-        if (*key == "num_ctx" || *key == "num_predict") && value.as_u64() == Some(0) {
+        // Common keys also canonicalize here (numeric strings over strings,
+        // keep_alive durations to seconds) so hand-edited settings values
+        // reach the wire in Ollama's expected shape.
+        if COMMON_OPTION_KEYS.contains(key) {
+            let Some(canonical) = normalize_common_option(key, value) else {
+                continue;
+            };
+            obj.insert((*key).to_string(), canonical);
             continue;
         }
         if *key == "stop" {
@@ -383,6 +522,106 @@ mod tests {
         assert_eq!(label_to_temperature("0.2 (precise)"), Some(0.2));
         assert_eq!(temperature_to_label(0.7), "0.7 (balanced)");
         assert_eq!(label_to_top_p("0.9 (typical)"), Some(0.9));
+    }
+
+    #[test]
+    fn custom_labels_round_trip_losslessly() {
+        // Every custom label must parse back to the exact raw value — the
+        // dialog round-trips persisted values through these labels, and a
+        // lossy label used to delete the setting on save.
+        for n in [65537u64, 49152, 5000] {
+            let label = num_ctx_to_label(n);
+            assert!(label.ends_with(" (custom)"), "{n}: {label}");
+            assert_eq!(label_to_num_ctx(&label), Some(n));
+        }
+        // Raw token count, not the integer-division K approximation
+        // (65537 was formerly rendered as "64K (custom)").
+        assert_eq!(num_ctx_to_label(65537), "65537 (custom)");
+
+        for n in [3000u64, 96, 1] {
+            let label = num_predict_to_label(n);
+            assert!(label.ends_with(" (custom)"), "{n}: {label}");
+            assert_eq!(label_to_num_predict(&label), Some(n));
+        }
+
+        for n in [90i64, 7200, 1] {
+            let label = keep_alive_to_label(n);
+            assert!(label.ends_with(" (custom)"), "{n}: {label}");
+            assert_eq!(label_to_keep_alive(&label), Some(n));
+        }
+
+        for t in [0.15f64, 1.3, 0.05] {
+            let label = temperature_to_label(t);
+            assert!(label.ends_with(" (custom)"), "{t}: {label}");
+            assert_eq!(label_to_temperature(&label), Some(t));
+            let label = top_p_to_label(t);
+            assert!(label.ends_with(" (custom)"), "{t}: {label}");
+            assert_eq!(label_to_top_p(&label), Some(t));
+        }
+    }
+
+    #[test]
+    fn keep_alive_parses_duration_strings() {
+        assert_eq!(parse_keep_alive_str("5m"), Some(300));
+        assert_eq!(parse_keep_alive_str("1h"), Some(3_600));
+        assert_eq!(parse_keep_alive_str("1h30m"), Some(5_400));
+        assert_eq!(parse_keep_alive_str("90s"), Some(90));
+        assert_eq!(parse_keep_alive_str("600"), Some(600));
+        assert_eq!(parse_keep_alive_str(""), None);
+        assert_eq!(parse_keep_alive_str("abc"), None);
+        assert_eq!(parse_keep_alive_str("5x"), None);
+        assert_eq!(keep_alive_value_to_secs(&json!("10m")), Some(600));
+        assert_eq!(keep_alive_value_to_secs(&json!(120)), Some(120));
+        assert_eq!(keep_alive_value_to_secs(&json!(true)), None);
+    }
+
+    #[test]
+    fn normalize_common_option_canonicalizes_shapes() {
+        assert_eq!(
+            normalize_common_option("num_ctx", &json!(32768)),
+            Some(json!(32768))
+        );
+        assert_eq!(normalize_common_option("num_ctx", &json!(0)), None);
+        assert_eq!(
+            normalize_common_option("num_ctx", &json!("65536")),
+            Some(json!(65536))
+        );
+        assert_eq!(normalize_common_option("num_ctx", &json!(null)), None);
+        assert_eq!(normalize_common_option("num_ctx", &json!("")), None);
+        assert_eq!(
+            normalize_common_option("num_predict", &json!("4096")),
+            Some(json!(4096))
+        );
+        assert_eq!(
+            normalize_common_option("keep_alive", &json!("5m")),
+            Some(json!(300))
+        );
+        assert_eq!(
+            normalize_common_option("keep_alive", &json!(0)),
+            Some(json!(0))
+        );
+        assert_eq!(
+            normalize_common_option("keep_alive", &json!("forever")),
+            None
+        );
+        assert_eq!(
+            normalize_common_option("temperature", &json!("0.15")),
+            Some(json!(0.15))
+        );
+        assert_eq!(
+            normalize_common_option("temperature", &json!(0.2)),
+            Some(json!(0.2))
+        );
+        assert_eq!(
+            normalize_common_option("top_p", &json!("0.9")),
+            Some(json!(0.9))
+        );
+        // Unknown keys pass through untouched (arbitrary passthrough options).
+        let passthrough = json!({"a": 1});
+        assert_eq!(
+            normalize_common_option("other", &passthrough),
+            Some(passthrough)
+        );
     }
 
     #[test]

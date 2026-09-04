@@ -128,6 +128,13 @@ controls tool access only:
   process-wide, so do not run conflicting isolated and online sessions in
   the same process.
 
+The mode is persisted at the canonical nested location
+`config.provider_configs.ollama.options.mode` (written by the `/ollama` screen
+and `/ollama online|isolated`). A legacy top-level
+`providers.ollama.options.mode` is still honored when the nested key is
+absent, but the nested value wins when both are set, so a stale top-level
+`mode` cannot override the TUI's choice.
+
 ```json
 {
   "provider": "ollama",

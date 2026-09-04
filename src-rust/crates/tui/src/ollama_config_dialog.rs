@@ -169,6 +169,11 @@ impl OllamaConfigDialogState {
     /// Seed the mode + option rows from persisted settings. Called on open;
     /// uses the centralized preset tables so the screen can never drift from
     /// the request pipeline.
+    ///
+    /// Values are canonicalized first (numeric strings over strings,
+    /// keep-alive duration strings like "5m" resolved to seconds), so a
+    /// hand-edited settings value shows its real value instead of rendering
+    /// as unset — which would delete it on the next save.
     pub fn set_mode_and_options(
         &mut self,
         mode_isolated: bool,
@@ -176,33 +181,18 @@ impl OllamaConfigDialogState {
     ) {
         use clawde_api::providers::ollama_options as oo;
         self.mode_isolated = mode_isolated;
-        self.num_ctx_label = options
-            .get("num_ctx")
-            .and_then(|v| v.as_u64())
-            .filter(|n| *n > 0)
-            .map(oo::num_ctx_to_label)
-            .unwrap_or_default();
-        self.num_predict_label = options
-            .get("num_predict")
-            .and_then(|v| v.as_u64())
-            .filter(|n| *n > 0)
-            .map(oo::num_predict_to_label)
-            .unwrap_or_default();
-        self.keep_alive_label = options
-            .get("keep_alive")
-            .and_then(|v| v.as_i64())
-            .map(oo::keep_alive_to_label)
-            .unwrap_or_default();
-        self.temperature_label = options
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .map(oo::temperature_to_label)
-            .unwrap_or_default();
-        self.top_p_label = options
-            .get("top_p")
-            .and_then(|v| v.as_f64())
-            .map(oo::top_p_to_label)
-            .unwrap_or_default();
+        let seed = |key: &str| -> String {
+            options
+                .get(key)
+                .and_then(|v| oo::normalize_common_option(key, v))
+                .map(|v| oo::common_option_label(key, &v))
+                .unwrap_or_default()
+        };
+        self.num_ctx_label = seed("num_ctx");
+        self.num_predict_label = seed("num_predict");
+        self.keep_alive_label = seed("keep_alive");
+        self.temperature_label = seed("temperature");
+        self.top_p_label = seed("top_p");
     }
 
     /// The common-option rows in display order (key, current label). The
@@ -272,11 +262,18 @@ impl OllamaConfigDialogState {
                 .collect(),
             _ => return,
         };
-        // "" (unset) first, then presets, wrapping both directions.
-        let mut all = vec![String::new()];
-        all.extend(presets);
+        // "" (unset) first, then presets, wrapping both directions. A custom
+        // value (raw set, label not a preset) occupies its own slot right
+        // after unset so cycling away is explicit: forward lands on the first
+        // preset, backward on unset — it never silently vanishes by wrapping.
         let current = self.option_label(key).to_string();
-        let idx = all.iter().position(|l| *l == current).unwrap_or(0);
+        let is_preset = presets.contains(&current);
+        let mut all = vec![String::new()];
+        if !current.is_empty() && !is_preset {
+            all.push(current.clone());
+        }
+        all.extend(presets);
+        let idx = all.iter().position(|l| l == &current).unwrap_or(0);
         let next = if direction >= 0 {
             (idx + 1) % all.len()
         } else {
@@ -291,9 +288,12 @@ impl OllamaConfigDialogState {
         self.mode_isolated = !self.mode_isolated;
     }
 
-    /// The effective-options preview rows (label, applied status) from
-    /// the centralized helper — spec §Option defaults and UI priorities.
-    pub fn effective_preview_rows(&self) -> Vec<(String, String)> {
+    /// The canonical raw option map for the five common rows: the display
+    /// labels parsed back through the centralized parsers. Empty string
+    /// labels mean unset and are omitted, matching the omit-unless-set
+    /// persistence rule. This is the single conversion point the preview and
+    /// the settings writer both consume, so they can never disagree.
+    pub fn common_options_map(&self) -> serde_json::Map<String, serde_json::Value> {
         use clawde_api::providers::ollama_options as oo;
         let mut raw = serde_json::Map::new();
         if let Some(n) = oo::label_to_num_ctx(&self.num_ctx_label) {
@@ -311,7 +311,14 @@ impl OllamaConfigDialogState {
         if let Some(t) = oo::label_to_top_p(&self.top_p_label) {
             raw.insert("top_p".to_string(), serde_json::json!(t));
         }
-        oo::effective_preview(&raw)
+        raw
+    }
+
+    /// The effective-options preview rows (label, applied status) from
+    /// the centralized helper — spec §Option defaults and UI priorities.
+    pub fn effective_preview_rows(&self) -> Vec<(String, String)> {
+        use clawde_api::providers::ollama_options as oo;
+        oo::effective_preview(&self.common_options_map())
     }
 
     /// Whether an exact model tag is currently loaded in VRAM. Ollama treats
@@ -1816,6 +1823,77 @@ mod tests {
         assert_eq!(state.temperature_label, "0.2 (precise)");
         assert_eq!(state.keep_alive_label, "10 min");
         assert_eq!(state.num_predict_label, "");
+    }
+
+    #[test]
+    fn custom_option_values_survive_seed_and_save() {
+        // Regression: a hand-set non-preset value used to render as a lossy
+        // label that failed to parse back, so opening the screen and pressing
+        // Enter (connect) deleted the setting. The full seed -> map path must
+        // preserve it exactly.
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        let options = serde_json::json!({
+            "num_ctx": 49_152u64,
+            "num_predict": 3_000u64,
+            "keep_alive": 90i64,
+            "temperature": 0.15,
+            "top_p": 0.93,
+        });
+        state.set_mode_and_options(false, options.as_object().unwrap());
+        assert_eq!(state.num_ctx_label, "49152 (custom)");
+        assert_eq!(state.num_predict_label, "3000 (custom)");
+        assert_eq!(state.keep_alive_label, "90 (custom)");
+        assert_eq!(state.temperature_label, "0.15 (custom)");
+        assert_eq!(state.top_p_label, "0.93 (custom)");
+        assert_eq!(state.common_options_map(), *options.as_object().unwrap());
+    }
+
+    #[test]
+    fn string_typed_settings_values_canonicalize_on_seed() {
+        // Ollama's wire format accepts keep-alive duration strings and
+        // numeric strings; settings may hold either. They must not render as
+        // unset (which would delete them on save).
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        let options = serde_json::json!({
+            "num_ctx": "65536",
+            "keep_alive": "5m",
+            "temperature": "0.15",
+        });
+        state.set_mode_and_options(false, options.as_object().unwrap());
+        assert_eq!(state.num_ctx_label, "64K");
+        assert_eq!(state.keep_alive_label, "5 min");
+        assert_eq!(state.temperature_label, "0.15 (custom)");
+        let map = state.common_options_map();
+        assert_eq!(map.get("num_ctx"), Some(&serde_json::json!(65_536)));
+        assert_eq!(map.get("keep_alive"), Some(&serde_json::json!(300)));
+        assert_eq!(map.get("temperature"), Some(&serde_json::json!(0.15)));
+    }
+
+    #[test]
+    fn cycling_from_custom_value_lands_on_neighbor_slots() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        state.active_field = OllamaConfigField::Options;
+        state.num_ctx_label = "49152 (custom)".to_string();
+
+        // Custom slot sits between unset and the first preset: forward
+        // reaches 2K, backward reaches unset.
+        state.cycle_option_value(1);
+        assert_eq!(state.num_ctx_label, "2K");
+        state.num_ctx_label = "49152 (custom)".to_string();
+        state.cycle_option_value(-1);
+        assert_eq!(state.num_ctx_label, "");
+
+        // Leaving the custom slot is explicit: the custom slot only exists
+        // while it is the current value. After cycling away, the list is
+        // unset + presets (9 slots), and a full wrap returns to 2K.
+        state.cycle_option_value(1); // custom -> 2K
+        for _ in 0..(clawde_api::providers::ollama_options::OLLAMA_CTX_PRESETS.len() + 1) {
+            state.cycle_option_value(1);
+        }
+        assert_eq!(state.num_ctx_label, "2K");
     }
 
     #[test]

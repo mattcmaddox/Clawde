@@ -1597,6 +1597,11 @@ pub struct App {
     pub ollama_ping_pending: bool,
     /// Monotonically changing identity for the active Ollama ping request.
     pub ollama_ping_request_id: u64,
+    /// Host URL captured when the active ping was started. Results whose
+    /// snapshot no longer matches `ollama_config_dialog.host_url_input` are
+    /// dropped, so editing the host while a probe is in flight cannot let
+    /// the old server's success/failure paint the new host's health dot.
+    pub ollama_ping_host: String,
     /// Whether the active ping should populate the model picker. A background
     /// health refresh leaves the dialog in its current Default phase.
     pub ollama_ping_for_models: bool,
@@ -2276,6 +2281,7 @@ impl App {
             ollama_config_dialog: crate::ollama_config_dialog::OllamaConfigDialogState::new(),
             ollama_ping_pending: false,
             ollama_ping_request_id: 0,
+            ollama_ping_host: String::new(),
             ollama_ping_for_models: false,
             ollama_discovery_request_id: 0,
             ollama_discovery_pending: false,
@@ -3155,14 +3161,14 @@ impl App {
     /// the network-block flag. Shared by `/ollama online|isolated` (command
     /// consolidation) and the Alt+O toggle path.
     fn apply_ollama_mode(&mut self, mode: clawde_core::OllamaMode) {
-        let mode_val = match mode {
-            clawde_core::OllamaMode::Online => "online",
-            clawde_core::OllamaMode::Isolated => "isolated",
-        };
         // Update the live session config before persisting. The CLI copies
         // App.config into ToolContext before the next turn; without this, the
         // global flag would be the only live signal and could leak one
-        // session's isolation state into another.
+        // session's isolation state into another. The nested
+        // `config.provider_configs.ollama.options.mode` is both the live
+        // store and the canonical persisted location (see
+        // `Settings::set_ollama_mode`): it wins the effective-config merge,
+        // so a stale value there can no longer shadow the user's choice.
         self.config
             .provider_configs
             .entry("ollama".to_string())
@@ -3170,19 +3176,19 @@ impl App {
             .options
             .insert(
                 "mode".to_string(),
-                serde_json::Value::String(mode_val.to_string()),
+                serde_json::Value::String(
+                    match mode {
+                        clawde_core::OllamaMode::Online => "online",
+                        clawde_core::OllamaMode::Isolated => "isolated",
+                    }
+                    .to_string(),
+                ),
             );
-        // Persist to settings so the choice survives restarts.
+        // Persist to settings so the choice survives restarts. The nested
+        // location is canonical; the setter also clears a stale top-level
+        // `providers.ollama.options.mode` so the two can never disagree.
         if let Ok(mut settings) = Settings::load_sync() {
-            settings
-                .providers
-                .entry("ollama".to_string())
-                .or_default()
-                .options
-                .insert(
-                    "mode".to_string(),
-                    serde_json::Value::String(mode_val.to_string()),
-                );
+            settings.set_ollama_mode(mode);
             let _ = settings.save_sync();
             // Rebuild the free provider chain so the mode change takes effect
             // immediately without a restart, and refresh the TUI's free-model
@@ -3201,9 +3207,12 @@ impl App {
     }
 
     /// Start an asynchronous Ollama request and invalidate older results.
+    /// The current host input is snapshotted so a result for a host the user
+    /// has since edited is dropped instead of attributed to the new host.
     fn start_ollama_ping(&mut self, for_model_picker: bool) {
         self.ollama_ping_request_id = self.ollama_ping_request_id.wrapping_add(1);
         self.ollama_ping_for_models = for_model_picker;
+        self.ollama_ping_host = self.ollama_config_dialog.host_url_input.clone();
         if for_model_picker {
             self.ollama_config_dialog.start_ping();
         }
@@ -3224,7 +3233,6 @@ impl App {
     /// options to settings.json.
     /// Returns Ok(()) on success, or Err(message) on failure.
     fn persist_ollama_config(&mut self, host_url: &str, model: &str) -> Result<(), String> {
-        use clawde_api::providers::ollama_options as oo;
         let mut settings =
             Settings::load_sync().map_err(|e| format!("Failed to load settings: {}", e))?;
 
@@ -3249,46 +3257,13 @@ impl App {
             .insert("model".to_string(), serde_json::json!(model));
 
         // Canonical request options: write only explicitly-set values (spec:
-        // "omit unless explicitly set"), converting preset labels back to
-        // raw values through the centralized helper.
-        let dialog = &self.ollama_config_dialog;
-        let set = |options: &mut std::collections::HashMap<String, serde_json::Value>,
-                   key: &str,
-                   value: Option<serde_json::Value>| {
-            match value {
-                Some(v) => {
-                    options.insert(key.to_string(), v);
-                }
-                None => {
-                    options.remove(key);
-                }
-            }
-        };
-        set(
-            &mut provider.options,
-            "num_ctx",
-            oo::label_to_num_ctx(&dialog.num_ctx_label).map(serde_json::Value::from),
-        );
-        set(
-            &mut provider.options,
-            "num_predict",
-            oo::label_to_num_predict(&dialog.num_predict_label).map(serde_json::Value::from),
-        );
-        set(
-            &mut provider.options,
-            "keep_alive",
-            oo::label_to_keep_alive(&dialog.keep_alive_label).map(serde_json::Value::from),
-        );
-        set(
-            &mut provider.options,
-            "temperature",
-            oo::label_to_temperature(&dialog.temperature_label).map(serde_json::Value::from),
-        );
-        set(
-            &mut provider.options,
-            "top_p",
-            oo::label_to_top_p(&dialog.top_p_label).map(serde_json::Value::from),
-        );
+        // "omit unless explicitly set"). The dialog's common_options_map is
+        // the single conversion point — custom (non-preset) values round-trip
+        // through their labels, and rows the user cycled back to unset are
+        // removed.
+        for (key, value) in self.ollama_config_dialog.common_options_map() {
+            provider.options.insert(key, value);
+        }
 
         settings
             .save_sync()
@@ -4076,6 +4051,7 @@ impl App {
         self.ollama_config_dialog = crate::ollama_config_dialog::OllamaConfigDialogState::new();
         self.ollama_ping_pending = false;
         self.ollama_ping_request_id = self.ollama_ping_request_id.wrapping_add(1);
+        self.ollama_ping_host = String::new();
         self.ollama_ping_for_models = false;
         self.free_mode_dialog = crate::free_mode_dialog::FreeModeDialogState::new();
         self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
@@ -4116,6 +4092,12 @@ impl App {
         let cmd = cmd.as_str();
 
         if cmd == "mcp" && !args.trim().is_empty() {
+            return false;
+        }
+        // Bare `/chat` opens the Cat Chat popup; subcommands like
+        // `/chat password <id> --set PW` fall through to the command
+        // registry so they execute instead of reopening the popup.
+        if cmd == "chat" && !args.trim().is_empty() {
             return false;
         }
         // `/ollama status` is an async command because it queries the native
@@ -12032,6 +12014,14 @@ impl App {
                 if request_id != self.ollama_ping_request_id || !self.ollama_config_dialog.visible {
                     return;
                 }
+                // The request id only changes when a new ping starts, so it
+                // alone cannot detect the user editing the host while a probe
+                // is in flight. Compare against the host snapshot taken at
+                // ping start: a result for a host that no longer matches the
+                // input is stale and must not paint the new host's dot.
+                if self.ollama_ping_host != self.ollama_config_dialog.host_url_input {
+                    return;
+                }
                 if for_model_picker
                     && matches!(
                         self.ollama_config_dialog.phase,
@@ -15343,6 +15333,7 @@ mod tests {
         );
         // Server goes down while user is viewing NoModels.
         app.ollama_ping_request_id = 7;
+        app.ollama_ping_host = app.ollama_config_dialog.host_url_input.clone();
         app.handle_query_event(QueryEvent::OllamaPingResult {
             request_id: 7,
             for_model_picker: false,
@@ -15355,6 +15346,37 @@ mod tests {
         assert_eq!(
             app.ollama_config_dialog.phase,
             crate::ollama_config_dialog::OllamaConfigPhase::NoModels
+        );
+    }
+
+    #[test]
+    fn ollama_ping_result_for_edited_host_is_ignored() {
+        // P4 regression: the request id only changes when a new ping starts,
+        // so editing the host while a probe is in flight must be caught by
+        // the host-snapshot guard instead — the old server's success must
+        // not flip the new host's health dot green.
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        // Ping the first host.
+        app.ollama_ping_request_id = 11;
+        app.ollama_ping_host = "http://gpu.example.test:11434".to_string();
+        // User edits the host while the probe is in flight.
+        app.ollama_config_dialog.host_url_input = "http://other.example.test:11434".to_string();
+        // The old host's result arrives.
+        app.handle_query_event(QueryEvent::OllamaPingResult {
+            request_id: 11,
+            for_model_picker: false,
+            result: Ok(vec![]),
+        });
+        // It must not be attributed to the new host.
+        assert_eq!(
+            app.ollama_config_dialog.health,
+            crate::ollama_config_dialog::HealthStatus::Untested
+        );
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Default
         );
     }
 
@@ -15400,6 +15422,7 @@ mod tests {
         app.ollama_config_dialog
             .open(Some("http://gpu.example.test:11434".to_string()), None);
         app.ollama_ping_request_id = 9;
+        app.ollama_ping_host = app.ollama_config_dialog.host_url_input.clone();
         app.handle_query_event(QueryEvent::OllamaPingResult {
             request_id: 9,
             for_model_picker: false,
@@ -15436,14 +15459,22 @@ mod tests {
             clawde_core::OllamaMode::Online
         );
         assert!(!clawde_core::is_ollama_network_blocked());
-        // The mode was persisted to settings.
+        // The mode was persisted to the canonical nested location.
         let persisted = Settings::load_sync()
             .expect("settings load")
-            .providers
+            .config
+            .provider_configs
             .get("ollama")
             .and_then(|c| c.options.get("mode"))
             .and_then(|v| v.as_str().map(str::to_owned));
         assert_eq!(persisted.as_deref(), Some("online"));
+        // No stale top-level copy remains to shadow a later read.
+        let settings_after = Settings::load_sync().expect("settings load");
+        let top_level = settings_after
+            .providers
+            .get("ollama")
+            .and_then(|c| c.options.get("mode"));
+        assert!(top_level.is_none());
         clawde_core::set_ollama_network_blocked(was_blocked);
     }
 
@@ -15999,7 +16030,7 @@ mod tests {
         std::env::set_var("CLAWDE_HOME", tmp.path());
 
         let mut store = guest::GuestStore::default();
-        store.create_link("friends", "pw", None, 2);
+        let friends_id = store.create_link("friends", "pw", None, 2);
         let dead = store.create_link("old crew", "pw", None, 2);
         store.revoke_link(&dead);
         guest::save(&store).unwrap();
@@ -16013,10 +16044,24 @@ mod tests {
         assert!(titles.iter().any(|t| t.starts_with("friends — ")));
         assert!(titles.iter().any(|t| t.starts_with("old crew — ")));
         // ...but only the live link gets the destructive rotate/delete rows.
-        assert!(titles.contains(&"New password — friends"));
+        // Two distinct password rows: generate (one keypress) vs set-your-own
+        // (seeds the prompt with /chat password <id> --set for you to type).
+        assert!(titles.contains(&"New random password — friends"));
+        assert!(titles.contains(&"Set your own password — friends"));
         assert!(titles.contains(&"Delete link — friends"));
-        assert!(!titles.contains(&"New password — old crew"));
-        assert!(!titles.contains(&"Delete link — old crew")); // The generate row seeds the prompt for the user to type a name.
+        assert!(!titles.contains(&"New random password — old crew"));
+        assert!(!titles.contains(&"Set your own password — old crew"));
+        assert!(!titles.contains(&"Delete link — old crew"));
+        // The set-your-own row seeds the prompt but does not submit.
+        let set_own = items
+            .iter()
+            .find(|i| i.title == "Set your own password — friends")
+            .unwrap();
+        assert_eq!(
+            set_own.command,
+            format!("/chat password {} --set ", friends_id)
+        );
+        assert!(!set_own.complete);
         let generate = items
             .iter()
             .find(|i| i.title == "Generate a new link + password")

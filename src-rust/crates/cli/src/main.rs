@@ -6958,7 +6958,12 @@ async fn run_interactive(
             app.ollama_ping_pending = false;
             let request_id = app.ollama_ping_request_id;
             let for_model_picker = app.ollama_ping_for_models;
-            let host_url = app.ollama_config_dialog.host_url_input.clone();
+            // Probe the host snapshot taken when the ping was requested, not
+            // the live input: the user may have started editing between the
+            // keypress and this spawn. The App-side result handler drops
+            // results when the snapshot no longer matches the input, keeping
+            // the health dot attributed to the host the user is looking at.
+            let host_url = app.ollama_ping_host.clone();
             let tx = event_tx.clone();
             tokio::spawn(async move {
                 let result = ping_ollama_and_fetch_models(&host_url).await;
