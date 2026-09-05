@@ -1,17 +1,18 @@
 // The two guest-server pages: the Clawde TUI's design language (ACCENT_BUILD
 // green, square corners, JetBrains Mono, transcript rows) framed in the
 // retro-terminal structure of the original Clawde landing page — 1px section
-// lines with crosshair `+` marks at the intersections, a 🐾 Cat Chat header,
+// lines with crosshair `+` marks at the intersections, a Cat Chat header,
 // staggered fade-in entrances, a blinking block cursor in the prompt, and a
 // subtle CRT scanline overlay.
 //
 // The chat page additionally mirrors the TUI *startup screen* (crates/tui
-// render.rs + rustail.rs): the two-column welcome box with the animated
-// Rustail mascot, the BUILD modeline, full-width accent rules framing the
-// prompt, and the bottom status bar (cwd / guest pill / ctx / branch). The
-// mascot frames and timings match rustail.rs (frame 0 rest 3000 ms, frame 2
-// extend 2000 ms, frame 3 stairs 2000 ms) so the web cat breathes like the
-// terminal one.
+// render.rs + rustail.rs): the two-column welcome box — including the TUI's
+// "🐾 Clawde vX.Y" border title, notched into the box's accent outline — with
+// the animated Rustail mascot, the BUILD modeline, full-width accent rules
+// framing the prompt, and the bottom status bar (cwd / guest pill / ctx /
+// branch). The mascot frames and timings match rustail.rs (frame 0 rest
+// 3000 ms, frame 2 extend 2000 ms, frame 3 stairs 2000 ms) so the web cat
+// breathes like the terminal one.
 //
 // The chat page is served through `chat_page_html()` — a LazyLock that
 // injects `clawde_core::constants::APP_VERSION` into the welcome title, the
@@ -86,8 +87,6 @@ pub(crate) const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
   .cross-tr{top:-5px;right:-5px}
   .bar{display:flex;justify-content:center;align-items:center;padding:14px 20px}
   .brand{display:flex;align-items:center;gap:.8rem;font-weight:700;letter-spacing:.05em;font-size:1.25rem}
-  /* Emoji font stack so the 🐾 renders in color on every platform. */
-  .brand .glyph{font-family:'Noto Color Emoji','Apple Color Emoji','Segoe UI Emoji','Noto Emoji',sans-serif}
   .body{padding:28px 24px}
   p{color:var(--muted);margin:0 0 20px;font-size:13px}
   /* Rustail mascot — drawn as an inline SVG (block glyphs mapped to
@@ -99,7 +98,9 @@ pub(crate) const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
   .mascot svg{display:block;width:100%;height:100%}
   .tagline{font-size:14px;color:var(--accent);text-align:center;margin:0 0 18px;letter-spacing:.02em}
   .field{display:flex;align-items:center;border:1px solid var(--border);background:#0f0f16;margin-bottom:14px}
-  .field:focus-within{border-color:var(--accent)}
+  /* 2px green focus line (outline, so focus causes no 1px reflow) — same
+     thickness as every other accent line on the pages. */
+  .field:focus-within{border-color:var(--accent);outline:2px solid var(--accent);outline-offset:-2px}
   .field .glyph{padding:0 0 0 12px;color:var(--accent);font-weight:700;user-select:none}
   /* Block cursor: near-white like the TUI's input caret, not the old green. */
   .cursor{display:inline-block;width:9px;height:1.05em;background:var(--text);margin-left:8px;vertical-align:text-bottom;animation:blink 1.1s steps(1) infinite}
@@ -126,7 +127,7 @@ pub(crate) const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
   <div class="section top">
     <div class="cross-tl"></div><div class="cross-tr"></div>
     <div class="bar">
-      <div class="brand"><span class="glyph">🐾</span> Cat Chat</div>
+      <div class="brand">Cat Chat</div>
     </div>
   </div>
   <div class="section">
@@ -246,19 +247,25 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
   .cross-tl{top:-5px;left:-5px}
   .cross-tr{top:-5px;right:-5px}
   header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:var(--bg);gap:12px}
-  .brand{display:flex;align-items:center;gap:.8rem;font-weight:700;letter-spacing:.05em;font-size:1.25rem}
-  /* Emoji font stack so the 🐾 renders in color on every platform. */
-  .brand .glyph{font-family:'Noto Color Emoji','Apple Color Emoji','Segoe UI Emoji','Noto Emoji',sans-serif}
-  header button{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:12px;border-radius:0;padding:6px 12px;cursor:pointer;transition:border-color .15s,color .15s}
-  header button:hover{border-color:rgba(57,211,83,.4);color:var(--text)}
+  /* ── Top band ── the header's replacement: a grey terminal strip with a
+     little top padding; the welcome box's notched "🐾 Clawde vX.Y" title is
+     the page's focus. ── */
+  .topband{padding:16px 8px 8px;background:var(--panel)}
 
-  /* ── Welcome box ── the TUI's two-column startup box ─────────────── */
-  .welcome{display:flex;background:var(--panel);padding:10px 0 8px}
+  /* ── Welcome box ── the TUI's two-column startup box, including its full
+     accent outline (render.rs draws a rounded accent border around the whole
+     box; here it is square per the site's no-radius language). The box title
+     notches the border like the TUI's "🐾 Clawde vX.Y" border title, and all
+     accent lines on the page share one 2px thickness. ── */
+  .welcome{position:relative;display:flex;background:var(--panel);padding:10px 0 8px;border:2px solid var(--accent);margin:0 2px}
+  .welcome-title{position:absolute;top:-11px;left:10px;padding:0 8px;background:var(--panel);color:var(--accent);font-weight:700;font-size:13px;letter-spacing:.02em}
+  /* Emoji font stack so the 🐾 renders in color on every platform. */
+  .welcome-title .glyph{font-family:'Noto Color Emoji','Apple Color Emoji','Segoe UI Emoji','Noto Emoji',sans-serif}
+  .welcome-title .ver{color:#8b8b99;font-weight:400;font-size:12px}
   .w-left{width:250px;min-width:220px;padding:0 12px}
-  .w-div{width:1px;background:var(--accent)}
+  .w-div{width:2px;background:var(--accent)}
   .w-right{flex:1;min-width:0;padding:0 14px;font-size:12.5px}
   .welcome .hi{font-weight:700;color:#ffffff;font-size:14px;margin:0 0 2px}
-  .welcome .hi .ver{color:#8b8b99;font-weight:400;font-size:12px}
   /* Rustail mascot — drawn as an inline SVG (block glyphs mapped to
      quadrant rects) so alignment never depends on webfont fallback for
      the Block Elements range, which Google Fonts' unicode-range subsets
@@ -276,6 +283,11 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
   .r-act::before{content:'\25B8  ';color:var(--accent);font-style:normal}
 
   /* ── Transcript ── */
+  /* #log is a scroll container; its corner crosshair marks sit 5px outside
+     the padding box (bottom:-5px left/right:-5px), which keeps both
+     scrollbars permanently visible inside the message area. Suppress just
+     these two — every other section keeps its crosshairs. */
+  #log::before,#log::after{display:none}
   #log{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
   .msg{white-space:pre-wrap;line-height:1.65;font-size:14px;animation:fadeIn .25s ease}
   .user{background:var(--user-bg);padding:10px 14px}
@@ -292,14 +304,15 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
   .summary-head button:hover{color:var(--text)}
 
   /* ── Modeline + prompt + status bar ── the TUI's bottom trio ─────── */
-  .modeline{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:7px 14px 5px;background:var(--bg)}
+  /* 11px — same size as the statusbar's guest:online label. */
+  .modeline{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:7px 14px 5px;background:var(--bg);font-size:11px}
   .pill{background:var(--accent);color:#030303;font-weight:700;font-size:11.5px;padding:1px 7px;letter-spacing:.03em}
   .ml-model{font-weight:700;color:var(--text)}
   .ml-dim{color:#6e6e76}
   .ml-effort{color:var(--effort)}
   .ml-right{color:#6e6e76;font-size:12px;white-space:nowrap}
   .ml-right b{color:var(--hint-blue);font-weight:400}
-  .rule{height:1px;background:var(--accent)}
+  .rule{height:2px;background:var(--accent)}
   form{display:flex;gap:0;background:var(--panel)}
   .field{flex:1;display:flex;align-items:center}
   .field .glyph{padding:0 0 0 20px;color:var(--accent);font-weight:700;user-select:none}
@@ -314,9 +327,11 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
   form button:disabled{opacity:.5;cursor:wait}
   .statusbar{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 14px 11px;font-size:12px;background:var(--bg)}
   .sb-cwd{color:#6e6e76;display:flex;align-items:center;gap:14px}
-  .sb-pill{color:#508c50;border:1px solid rgba(80,140,80,.35);padding:0 6px;font-size:11px}
-  .sb-pill.on{color:#50c850;font-weight:700;border-color:rgba(80,200,80,.45)}
+  .sb-pill{color:#508c50;font-size:11px}
+  .sb-pill.on{color:#50c850;font-weight:700}
   .sb-right{display:flex;align-items:center;gap:14px;white-space:nowrap}
+  .sb-right button{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:11px;border-radius:0;padding:2px 8px;cursor:pointer;transition:border-color .15s,color .15s}
+  .sb-right button:hover{border-color:rgba(57,211,83,.4);color:var(--text)}
   .sb-ctx{color:#50c850}
   .sb-branch{color:#3ddbd9}
   .fade-in{opacity:0;animation:fadeIn .8s ease forwards}
@@ -326,7 +341,6 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
   @keyframes fadeIn{to{opacity:1}}
   @media (max-width:640px){
     #log{padding:14px}
-    header{padding:10px 14px}
     form .field .glyph{padding-left:14px}
     .frame{border-left:0;border-right:0}
     .w-left{min-width:0;width:44%}
@@ -338,14 +352,11 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
 <div class="bg-glow"></div>
 <div class="scanlines"></div>
 <div class="frame">
-  <header class="section top fade-in d-1">
-    <div class="cross-tl"></div><div class="cross-tr"></div>
-    <div class="brand"><span class="glyph">🐾</span> Cat Chat</div>
-    <button id="sumBtn">Download session summary</button>
-  </header>
-  <div class="welcome section fade-in d-2">
+  <div class="topband fade-in d-1">
+    <div class="welcome section fade-in d-2">
+    <div class="welcome-title"><span class="glyph">🐾</span> Clawde <span class="ver">v{VERSION}</span></div>
     <div class="w-left">
-      <p class="hi">Welcome back! <span class="ver">v{VERSION}</span></p>
+      <p class="hi">Welcome back!</p>
       <div class="mascot" id="mascot" aria-hidden="true"></div>
       <div class="tagline">All borders Are porous to cats</div>
     </div>
@@ -359,6 +370,7 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
       </div>
     </div>
   </div>
+  </div>
   <div id="log" class="section fade-in d-3"><div class="note">Chat with Clawde</div></div>
   <div class="summary-row"><div id="summary"><div class="summary-head"><span>session summary</span><button id="sumClose" title="Close">&times;</button></div><span id="sumBody"></span></div></div>
   <div class="modeline">
@@ -370,7 +382,7 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
   <div class="rule"></div>
   <div class="statusbar">
     <div class="sb-cwd"><span>~/catchat</span><span class="sb-pill on">guest:online</span></div>
-    <div class="sb-right"><span class="sb-ctx">ctx: 0%</span><span class="sb-branch">&#8806; catchat</span></div>
+    <div class="sb-right"><button id="sumBtn">Download</button><span class="sb-ctx">ctx: 0%</span><span class="sb-branch">&#8806; catchat</span></div>
   </div>
 </div>
 <script>

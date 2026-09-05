@@ -77,7 +77,7 @@ Two separate surfaces: **Cat Chat** is the password-protected guest chat you sha
 | `/chat` | Open the Cat Chat link manager (popup) |
 | `/chat create <NAME>` | Create a guest link — prints the password once |
 | `/chat links` / `/chat show <ID>` | List links / link details |
-| `/chat password <ID>` | Rotate a link's password |
+| `/chat password <ID>` | Rotate a link's password (`--set "PW"` to choose your own, 8+ chars) |
 | `/chat revoke <ID>` | Delete a link (kicks its devices) |
 | `/chat unblock <IP>` | Clear login lockouts for an IP |
 | `/chat status` | Links, devices, exposure, lockouts |

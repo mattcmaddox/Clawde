@@ -25,13 +25,17 @@ pub const STORE_VERSION: u32 = 1;
 pub const DEFAULT_EXPIRY_DAYS: u64 = 30;
 pub const DEFAULT_MAX_CONCURRENT: usize = 2;
 /// Wrong-password attempts allowed on the first strike before the lockout.
-pub const MAX_FAILED_ATTEMPTS: u32 = 5;
+pub const MAX_FAILED_ATTEMPTS: u32 = 4;
 /// Wrong-password attempts allowed on later strikes before the next lockout.
-pub const MAX_FAILED_ATTEMPTS_SUBSEQUENT: u32 = 3;
+pub const MAX_FAILED_ATTEMPTS_SUBSEQUENT: u32 = 5;
 /// Seconds an IP stays locked out after a strike (3 minutes).
 pub const LOCKOUT_SECS: u64 = 180;
-/// Lockout strikes before the IP is blocked permanently (5, then 3, then 3).
+/// Lockout strikes before the IP is blocked (4, then 5, then 5).
 pub const MAX_STRIKES: u32 = 3;
+/// Duration of the block served after the final strike (24 hours). During
+/// the block every auth attempt gets the same flat refusal (no countdown);
+/// when it lapses the ladder resets fresh.
+pub const BLOCK_SECS: u64 = 24 * 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,12 +67,13 @@ pub struct FailedAttempt {
     pub count: u32,
     /// Unix seconds until the IP may try again.
     pub locked_until: Option<u64>,
-    /// How many lockout windows this IP has served (5 -> 3 -> 3 ladder).
+    /// How many lockout windows this IP has served (4 -> 5 -> 5 ladder).
     #[serde(default)]
     pub strikes: u32,
-    /// Set on the third strike: this IP may never try again.
+    /// Set on the third strike: until this unix second the IP is refused
+    /// outright (24 hours). After it lapses the ladder resets fresh.
     #[serde(default)]
-    pub permanently_blocked: bool,
+    pub blocked_until: Option<u64>,
 }
 
 /// What `record_failed_attempt` decided.
@@ -78,8 +83,8 @@ pub enum LockoutResult {
     None,
     /// Locked out until this unix time.
     Temporary(u64),
-    /// Permanently blocked.
-    Permanent,
+    /// Blocked for BLOCK_SECS; every attempt gets the same flat refusal.
+    Blocked,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -154,13 +159,18 @@ pub(crate) fn hash(salt: &str, value: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// The shared wrong-password lockout ladder (the user's policy: 5 wrong ->
+/// The shared wrong-password lockout ladder (the user's policy: 4 wrong ->
 /// lock 3 min, 3 more -> lock 3 min, 3 more -> permanent). Used by both the
 /// guest store and the admin board store so both surfaces enforce the same
 /// ladder.
 pub(crate) fn apply_failed_attempt(entry: &mut FailedAttempt, now: u64) -> LockoutResult {
-    if entry.permanently_blocked {
-        return LockoutResult::Permanent;
+    // A served 24h block lapses into a fresh ladder (new lives).
+    if let Some(until) = entry.blocked_until {
+        if now >= until {
+            *entry = FailedAttempt::default();
+        } else {
+            return LockoutResult::Blocked;
+        }
     }
     // Clear the counter if a previous lockout has lapsed.
     if let Some(until) = entry.locked_until {
@@ -179,9 +189,9 @@ pub(crate) fn apply_failed_attempt(entry: &mut FailedAttempt, now: u64) -> Locko
         entry.strikes += 1;
         entry.count = 0;
         if entry.strikes >= MAX_STRIKES {
-            entry.permanently_blocked = true;
+            entry.blocked_until = Some(now + BLOCK_SECS);
             entry.locked_until = None;
-            return LockoutResult::Permanent;
+            return LockoutResult::Blocked;
         }
         entry.locked_until = Some(now + LOCKOUT_SECS);
         return LockoutResult::Temporary(entry.locked_until.unwrap_or(now));
@@ -199,6 +209,61 @@ pub fn generate_password() -> String {
         password.push(ALPHABET[idx] as char);
     }
     password
+}
+
+/// Validate a host-chosen guest password. Only sanity guards apply (the
+/// host dictates what friends must remember): non-empty, not all-digit,
+/// not a single-character-repeat, not on the top-spray list. There is no
+/// minimum length — a short word is the host's choice to make.
+pub fn validate_set_password(password: &str) -> Result<(), String> {
+    let trimmed = password.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "password cannot be empty (or omit --set to generate a random one)".to_string(),
+        );
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.chars().all(|c| c.is_ascii_digit()) {
+        return Err("password cannot be all digits".to_string());
+    }
+    let mut chars = lower.chars();
+    if let Some(first) = chars.next() {
+        if chars.all(|c| c == first) {
+            return Err("password cannot be a single repeated character".to_string());
+        }
+    }
+    // The tiny list bots actually spray against login forms — free guesses,
+    // so they are refused even though the lockout would catch the attack.
+    const COMMON: &[&str] = &[
+        "password",
+        "password1",
+        "password123",
+        "passw0rd",
+        "passwort",
+        "12345678",
+        "123456789",
+        "qwertyui",
+        "letmein1",
+        "iloveyou",
+        "catchat1",
+        "catchat!",
+        "dragon1",
+        "monkey12",
+        "admin123",
+        "welcome1",
+        "sunshine",
+        "princess",
+        "football",
+        "baseball",
+        "trustno1",
+        "master12",
+    ];
+    if COMMON.contains(&lower.as_str()) {
+        return Err(
+            "password is on the common-password list — pick something less guessable".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// True when the link is usable right now (not revoked, not expired).
@@ -320,7 +385,7 @@ impl GuestStore {
     }
 
     /// Record a wrong password from an IP. Lockout ladder (per the user's
-    /// policy): 5 wrong -> lock 3 min, then 3 more -> lock 3 min, then 3 more
+    /// policy): 4 wrong -> lock 3 min, then 5 more -> lock 3 min, then 5 more
     /// -> permanent block.
     pub fn record_failed_attempt(&mut self, ip: &str) -> LockoutResult {
         let now = now_secs();
@@ -335,16 +400,63 @@ impl GuestStore {
             .filter(|until| *until > now)
     }
 
+    /// True while the IP is serving its post-ladder 24h block.
     pub fn is_permanently_blocked(&self, ip: &str) -> bool {
+        self.blocked_until(ip, now_secs()).is_some()
+    }
+
+    /// Unix second until which the IP is flatly refused, if it is serving
+    /// the 24h post-ladder block right now.
+    pub fn blocked_until(&self, ip: &str, now: u64) -> Option<u64> {
         self.failed_attempts
             .get(ip)
-            .is_some_and(|attempt| attempt.permanently_blocked)
+            .and_then(|attempt| attempt.blocked_until)
+            .filter(|until| *until > now)
     }
 
     /// Admin escape hatch: clear an IP's failed attempts and any permanent
     /// block. `guest unblock <IP>`.
     pub fn reset_failed_attempts(&mut self, ip: &str) {
         self.failed_attempts.remove(ip);
+    }
+}
+
+#[cfg(test)]
+mod set_password_validation_tests {
+    use super::validate_set_password;
+
+    #[test]
+    fn accepts_reasonable_simple_passwords() {
+        for password in ["fuzzylampcat", "porous-border-9", "copper ferret mows"] {
+            assert!(validate_set_password(password).is_ok(), "{password}");
+        }
+    }
+
+    #[test]
+    fn accepts_short_passwords() {
+        // No minimum length — the host dictates what friends remember.
+        for password in ["cat1", "blue", "fuzzylampcat", "porous-border-9"] {
+            assert!(validate_set_password(password).is_ok(), "{password}");
+        }
+    }
+
+    #[test]
+    fn rejects_trivially_sprayed_passwords() {
+        for password in ["password", "Password1", "12345678", "qwertyui", "11111111"] {
+            assert!(validate_set_password(password).is_err(), "{password}");
+        }
+    }
+
+    #[test]
+    fn rejects_all_digits_and_repeats() {
+        assert!(validate_set_password("98765432").is_err());
+        assert!(validate_set_password("aaaaaaaa").is_err());
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        assert!(validate_set_password("  fuzzylampcat  ").is_ok());
+        assert!(validate_set_password("   ").is_err());
     }
 }
 
@@ -453,7 +565,7 @@ mod tests {
         let mut store = GuestStore::default();
         let ip = "203.0.113.7";
 
-        // Strike 1: 5 wrong attempts -> 3-minute lock.
+        // Strike 1: 4 wrong attempts -> 3-minute lock.
         let mut result = LockoutResult::None;
         for _ in 0..MAX_FAILED_ATTEMPTS {
             result = store.record_failed_attempt(ip);
@@ -474,22 +586,54 @@ mod tests {
         };
         assert_eq!(until2, now_secs() + LOCKOUT_SECS);
 
-        // Lock lapses; 3 more wrong attempts -> permanent block.
+        // Lock lapses; 5 more wrong attempts -> 24h block (épée de Damoclès).
         lapse(&mut store, ip);
         for _ in 0..MAX_FAILED_ATTEMPTS_SUBSEQUENT {
             result = store.record_failed_attempt(ip);
         }
-        assert_eq!(result, LockoutResult::Permanent);
+        assert_eq!(result, LockoutResult::Blocked);
         assert!(store.is_permanently_blocked(ip));
         assert!(store.locked_until(ip, now_secs()).is_none());
 
-        // Even after the (nonexistent) lock would lapse, it stays permanent.
-        assert!(store.is_permanently_blocked(ip));
-        assert_eq!(store.record_failed_attempt(ip), LockoutResult::Permanent);
+        // While the block is served, every attempt is flatly refused.
+        assert_eq!(store.record_failed_attempt(ip), LockoutResult::Blocked);
 
         // Admin escape hatch clears everything.
         store.reset_failed_attempts(ip);
         assert!(!store.is_permanently_blocked(ip));
+    }
+
+    #[test]
+    fn block_lapses_into_a_fresh_ladder() {
+        let mut store = GuestStore::default();
+        let ip = "192.0.2.44";
+
+        // Serve the full ladder into the 24h block.
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            store.record_failed_attempt(ip);
+        }
+        lapse(&mut store, ip);
+        for _ in 0..MAX_FAILED_ATTEMPTS_SUBSEQUENT {
+            store.record_failed_attempt(ip);
+        }
+        lapse(&mut store, ip);
+        let mut result = LockoutResult::None;
+        for _ in 0..MAX_FAILED_ATTEMPTS_SUBSEQUENT {
+            result = store.record_failed_attempt(ip);
+        }
+        assert_eq!(result, LockoutResult::Blocked);
+        assert!(store.is_permanently_blocked(ip));
+
+        // Once the block lapses the ladder is fresh again: the IP gets its
+        // lives back (4 wrong attempts before the first lockout).
+        let entry = store.failed_attempts.get_mut(ip).unwrap();
+        entry.blocked_until = Some(now_secs());
+        assert!(!store.is_permanently_blocked(ip));
+        let mut result = LockoutResult::None;
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            result = store.record_failed_attempt(ip);
+        }
+        assert!(matches!(result, LockoutResult::Temporary(_)));
     }
 
     #[test]
@@ -499,11 +643,12 @@ mod tests {
         for _ in 0..MAX_FAILED_ATTEMPTS {
             store.record_failed_attempt(ip);
         }
-        // A single wrong attempt after the lock lapses stays under the 3
+        // A single wrong attempt after the lock lapses stays under the 5
         // needed for the second strike.
         lapse(&mut store, ip);
-        assert_eq!(store.record_failed_attempt(ip), LockoutResult::None);
-        assert_eq!(store.record_failed_attempt(ip), LockoutResult::None);
+        for _ in 0..MAX_FAILED_ATTEMPTS_SUBSEQUENT - 1 {
+            assert_eq!(store.record_failed_attempt(ip), LockoutResult::None);
+        }
         assert_eq!(
             store.record_failed_attempt(ip),
             LockoutResult::Temporary(now_secs() + LOCKOUT_SECS)

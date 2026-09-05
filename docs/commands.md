@@ -1568,6 +1568,7 @@ links directly. This is the chat-facing surface; the Kanban board stays under
 /chat show <ID>             — link details (devices, expiry)
 /chat revoke <ID>           — revoke a link (kicks its devices)
 /chat password <ID>         — rotate a link's password
+/chat password <ID> --set "PW" — set your own password (8+ chars, not printed)
 /chat unblock <IP>          — clear lockouts + permanent blocks
 ```
 

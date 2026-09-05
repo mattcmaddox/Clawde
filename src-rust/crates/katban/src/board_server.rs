@@ -477,7 +477,10 @@ async fn api_login(
         .unwrap_or_else(|e| e.into_inner())
         .is_permanently_blocked(&ip)
     {
-        return json_message(StatusCode::FORBIDDEN, "this address is permanently blocked");
+        return json_message(
+            StatusCode::FORBIDDEN,
+            "this address is blocked for 24 hours",
+        );
     }
     if let Some(until) = state
         .store
@@ -509,10 +512,10 @@ async fn api_login(
             let result = store.record_failed_attempt(&ip);
             let _ = crate::board_admin::save(&store);
             match result {
-                crate::guest::LockoutResult::Permanent => {
+                crate::guest::LockoutResult::Blocked => {
                     return json_message(
                         StatusCode::FORBIDDEN,
-                        "too many attempts — permanently blocked",
+                        "too many attempts — blocked for 24 hours",
                     );
                 }
                 crate::guest::LockoutResult::Temporary(_) => {

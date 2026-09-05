@@ -101,8 +101,8 @@ Commands:
   links list                                  List guest links
   links show <ID>                             Show one link (URL, expiry, devices)
   links revoke <ID>                           Revoke a link (kicks its devices)
-  links password <ID>                         Rotate a link's password (prints the new one once)
-  unblock <IP>                                Clear an IP's lockouts / permanent block
+  links password <ID> [--set "PW"]            Rotate the password (generated, or --set your own)
+  unblock <IP>                                Clear an IP's lockouts / 24h block
   status                                      Overview of links, exposure, lockouts
   help                                        Show this help
 
@@ -152,7 +152,9 @@ fn catchat_status() -> anyhow::Result<()> {
     let blocked: Vec<_> = store
         .failed_attempts
         .iter()
-        .filter(|(_, a)| a.permanently_blocked || a.locked_until.is_some_and(|u| u > now))
+        .filter(|(_, a)| {
+            a.blocked_until.is_some_and(|u| u > now) || a.locked_until.is_some_and(|u| u > now)
+        })
         .collect();
     if blocked.is_empty() {
         println!("lockouts:   none");
@@ -1655,7 +1657,8 @@ const LINK_USAGE: &str = r#"Usage: clawde catchat links <command>
   list                                       List guest links
   show <ID>                                  Show one link (URL, expiry, devices)
   revoke <ID>                                Revoke a link (kicks its devices)
-  password <ID>                              Rotate a link's password (prints the new one once)
+  password <ID> [--set "YOUR PASSWORD"]      Rotate the password (generated, or your own
+                                             choice — the chosen one is not printed)
 "#;
 
 const GUEST_USAGE: &str = r#"Usage: clawde katban guest <command> [OPTIONS]
@@ -1666,7 +1669,7 @@ const GUEST_USAGE: &str = r#"Usage: clawde katban guest <command> [OPTIONS]
   expose [--subdomain HOST] [--port N] [--dry-run] [--caddy-dir DIR]
          [--duckdns-token TOKEN]              Put the guest chat behind caddy
                                               (writes the managed katban.conf)
-  unblock <IP>                                Clear an IP's lockouts / permanent block
+  unblock <IP>                                Clear an IP's lockouts / 24h block
 
 Runs the guest chat server: friends open the URL, type the shared password,
 and chat with Clawde (chat + web search only — no files, no shell, nothing
@@ -1843,16 +1846,50 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
             let id = args
                 .get(1)
                 .context("link password needs an id: clawde catchat links password <ID>")?;
-            let password = generate_password();
+            // `--set "..."` (or `--set=...`) chooses your own password;
+            // otherwise a random one is generated.
+            let mut chosen: Option<String> = None;
+            let mut index = 2;
+            while index < args.len() {
+                let flag = &args[index];
+                if let Some(value) = flag.strip_prefix("--set=") {
+                    chosen = Some(value.to_string());
+                    index += 1;
+                } else if flag == "--set" {
+                    chosen = Some(
+                        args.get(index + 1)
+                            .context("--set needs a value: --set \"YOUR PASSWORD\"")?
+                            .clone(),
+                    );
+                    index += 2;
+                } else {
+                    anyhow::bail!("unknown option: {flag}\n\n{LINK_USAGE}");
+                }
+            }
+            let password = match chosen {
+                Some(ref pw) => {
+                    if let Err(message) = clawde_katban::guest::validate_set_password(pw) {
+                        anyhow::bail!("{message}");
+                    }
+                    pw.trim().to_string()
+                }
+                None => generate_password(),
+            };
             let mut store = load()?;
             if !store.set_password(id, &password) {
                 anyhow::bail!("no guest link '{id}'");
             }
             save(&store)?;
             println!("rotated password for guest link '{id}'");
-            println!("password: {password}");
-            println!();
-            println!("The old password no longer works. The new one is shown once — keep it safe.");
+            if chosen.is_some() {
+                println!("password: (your chosen password — not printed)");
+            } else {
+                println!("password: {password}");
+                println!();
+                println!(
+                    "The old password no longer works. The new one is shown once — keep it safe."
+                );
+            }
             Ok(())
         }
         "help" | "--help" | "-h" => {
@@ -2100,7 +2137,7 @@ fn run_guest_unblock(args: &[String]) -> anyhow::Result<()> {
     let mut store = load()?;
     store.reset_failed_attempts(ip);
     save(&store)?;
-    println!("cleared lockouts and permanent blocks for '{ip}'");
+    println!("cleared lockouts and 24h blocks for '{ip}'");
     Ok(())
 }
 

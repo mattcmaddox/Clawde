@@ -393,7 +393,8 @@ fn status_text() -> String {
         .failed_attempts
         .iter()
         .filter(|(_, attempt)| {
-            attempt.permanently_blocked || attempt.locked_until.is_some_and(|u| u > now)
+            attempt.blocked_until.is_some_and(|u| u > now)
+                || attempt.locked_until.is_some_and(|u| u > now)
         })
         .map(|(ip, _)| ip.as_str())
         .collect();

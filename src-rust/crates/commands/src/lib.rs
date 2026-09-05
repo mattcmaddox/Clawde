@@ -1936,7 +1936,8 @@ impl SlashCommand for ChatCommand {
          /chat show <ID>             — link details (devices, expiry)\n\
          /chat revoke <ID>           — revoke a link (kicks its devices)\n\
          /chat password <ID>         — rotate a link's password\n\
-         /chat unblock <IP>          — clear lockouts + permanent blocks\n\n\
+         /chat password <ID> --set \"PW\" — set your own password (not printed)\n\
+         /chat unblock <IP>          — clear lockouts + 24h blocks\n\n\
          The Kanban board lives under /katban — /chat is the guest chat."
     }
 
@@ -1972,6 +1973,13 @@ impl SlashCommand for ChatCommand {
                     });
                 }
             }
+            ["password", _] => {
+                out.push(ArgCompletion {
+                    value: format!("password {} --set", args[1]),
+                    description: "Choose your own password".into(),
+                    available: false,
+                });
+            }
             ["create"] => {
                 out.push(ArgCompletion {
                     value: "create <name>".into(),
@@ -1983,12 +1991,12 @@ impl SlashCommand for ChatCommand {
                 let store = chat_load_store();
                 let now = chat_now_secs();
                 for (ip, attempt) in &store.failed_attempts {
-                    let locked = attempt.locked_until.is_some_and(|until| until > now)
-                        || attempt.permanently_blocked;
+                    let blocked = attempt.blocked_until.is_some_and(|until| until > now);
+                    let locked = attempt.locked_until.is_some_and(|until| until > now) || blocked;
                     out.push(ArgCompletion {
                         value: format!("unblock {ip}"),
-                        description: if attempt.permanently_blocked {
-                            "permanently blocked".into()
+                        description: if blocked {
+                            "blocked for 24h".into()
                         } else {
                             "locked out".into()
                         },
@@ -2042,10 +2050,20 @@ fn chat_execute(args: &str) -> CommandResult {
                 CommandResult::Error(format!("no guest link '{id}'"))
             }
         }
-        ["password", id] => match chat_rotate_password(id) {
+        ["password", id] => match chat_rotate_password(id, None) {
             Ok(text) => CommandResult::Message(text),
             Err(message) => CommandResult::Error(message),
         },
+        ["password", _id, "--set"] => CommandResult::Error(
+            "--set needs a value: /chat password <ID> --set \"YOUR PASSWORD\"".into(),
+        ),
+        ["password", id, "--set", rest @ ..] => {
+            let chosen = rest.join(" ");
+            match chat_rotate_password(id, Some(&chosen)) {
+                Ok(text) => CommandResult::Message(text),
+                Err(message) => CommandResult::Error(message),
+            }
+        }
         ["unblock", ip] => {
             let mut store = chat_load_store();
             store.reset_failed_attempts(ip);
@@ -2053,7 +2071,7 @@ fn chat_execute(args: &str) -> CommandResult {
                 return CommandResult::Error(format!("could not save: {error:#}"));
             }
             CommandResult::Message(format!(
-                "cleared lockouts and permanent blocks for '{ip}'"
+                "cleared lockouts and 24h blocks for '{ip}'"
             ))
         }
         _ => CommandResult::Error(
@@ -2098,7 +2116,9 @@ fn chat_status_text() -> String {
     let blocked = store
         .failed_attempts
         .iter()
-        .filter(|(_, a)| a.permanently_blocked || a.locked_until.is_some_and(|u| u > now))
+        .filter(|(_, a)| {
+            a.blocked_until.is_some_and(|u| u > now) || a.locked_until.is_some_and(|u| u > now)
+        })
         .count();
     if blocked == 0 {
         out.push_str("\nlockouts:   none");
@@ -2177,18 +2197,31 @@ fn chat_link_show_text(id: &str) -> Result<String, String> {
     ))
 }
 
-fn chat_rotate_password(id: &str) -> Result<String, String> {
-    let password = guest::generate_password();
+fn chat_rotate_password(id: &str, chosen: Option<&str>) -> Result<String, String> {
+    let password = match chosen {
+        Some(pw) => {
+            let pw = pw.trim();
+            guest::validate_set_password(pw)?;
+            pw.to_string()
+        }
+        None => guest::generate_password(),
+    };
     let mut store = chat_load_store();
     if !store.set_password(id, &password) {
         return Err(format!("no guest link '{id}'"));
     }
     guest::save(&store).map_err(|e| format!("could not save: {e:#}"))?;
-    Ok(format!(
-        "rotated password for guest link '{id}'\n\
-         new password: {password}\n\n\
-         The old password no longer works. The new one is shown once — keep it safe."
-    ))
+    Ok(match chosen {
+        Some(_) => format!(
+            "rotated password for guest link '{id}'\n\
+             password: (your chosen password — not printed)"
+        ),
+        None => format!(
+            "rotated password for guest link '{id}'\n\
+             new password: {password}\n\n\
+             The old password no longer works. The new one is shown once — keep it safe."
+        ),
+    })
 }
 
 // ---- /hooks --------------------------------------------------------------
@@ -4059,6 +4092,23 @@ mod tests {
                 let link = store.link(&id).unwrap();
                 assert!(!store.verify_password(link, "anything-before"));
                 assert!(store.verify_password(link, &new_password));
+
+                // Set your own password (trims surrounding whitespace).
+                let result = cmd
+                    .execute(&format!("password {id} --set   fuzzylampcat  "), &mut ctx)
+                    .await;
+                let CommandResult::Message(text) = result else {
+                    panic!("expected message, got {result:?}");
+                };
+                assert!(
+                    text.contains("not printed"),
+                    "chosen password must not be echoed: {text}"
+                );
+                assert!(!text.contains("fuzzylampcat"));
+                let store = clawde_katban::guest::load().unwrap();
+                let link = store.link(&id).unwrap();
+                assert!(store.verify_password(link, "fuzzylampcat"));
+                assert!(!store.verify_password(link, &new_password));
 
                 // Show + revoke.
                 let result = cmd.execute(&format!("show {id}"), &mut ctx).await;

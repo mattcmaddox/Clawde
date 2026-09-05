@@ -442,7 +442,7 @@ async fn auth(
     if permanently_blocked {
         return Err((
             StatusCode::FORBIDDEN,
-            "this address is permanently blocked from guest chat",
+            "l'épée de Damoclès — your lives are gone",
         )
             .into_response());
     }
@@ -455,7 +455,7 @@ async fn auth(
         let remaining = until.saturating_sub(now);
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
-            format!("too many attempts — try again in {remaining}s"),
+            format!("Use your remaining lives carefully — try again in {remaining}s"),
         )
             .into_response());
     }
@@ -481,10 +481,10 @@ async fn auth(
             None => {
                 let result = store.record_failed_attempt(&ip);
                 persist_store(&store, &state);
-                if result == crate::guest::LockoutResult::Permanent {
+                if result == crate::guest::LockoutResult::Blocked {
                     return Err((
                         StatusCode::FORBIDDEN,
-                        "too many attempts — this address is now permanently blocked from guest chat",
+                        "l'épée de Damoclès — your lives are gone",
                     )
                         .into_response());
                 }
@@ -494,12 +494,11 @@ async fn auth(
     };
 
     let Some(token) = token else {
-        // No active link at all vs wrong password: same message, no leak.
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "wrong password (or no guest links are active)",
-        )
-            .into_response());
+        // No active link at all vs wrong password: same message pool, no
+        // leak — the cat noise is picked at random per request.
+        const NOISES: [&str; 5] = ["Hsssss!", "Yeoooww!", "Fsssss!", "Rrrr-YOW!", "WRAOOR"];
+        let noise = NOISES[(rand::random::<u32>() as usize) % NOISES.len()];
+        return Err((StatusCode::UNAUTHORIZED, noise).into_response());
     };
     let mut response = Redirect::to("/chat").into_response();
     let secure = headers
@@ -849,7 +848,10 @@ mod tests {
             !page.contains("{VERSION}"),
             "version placeholder not filled"
         );
-        // Welcome box structure.
+        // Welcome box structure — title notched into the accent border,
+        // TUI-style, with the paw + version.
+        assert!(page.contains("welcome-title"));
+        assert!(page.contains("\u{1f43e} Clawde"));
         for marker in [
             "Welcome back!",
             "Tips for getting started",
@@ -898,10 +900,6 @@ mod tests {
                 "{page} missing crosshair line marks"
             );
             assert!(
-                markup.contains("\u{1f43e}"),
-                "{page} missing the paw brand glyph"
-            );
-            assert!(
                 markup.contains("fade-in"),
                 "{page} missing entrance animations"
             );
@@ -918,6 +916,10 @@ mod tests {
                 "{page} missing the deep retro backdrop"
             );
         }
+        // The paw lives only in the chat page's welcome-box title (the TUI's
+        // "🐾 Clawde vX.Y" border title); the Cat Chat headers are paw-free.
+        assert!(crate::guest_pages::chat_page_html().contains('\u{1f43e}'));
+        assert!(!crate::guest_pages::LOGIN_PAGE.contains('\u{1f43e}'));
     }
 
     #[tokio::test]
@@ -1005,8 +1007,8 @@ mod tests {
                 .unwrap();
             statuses.push(response.status());
         }
-        // The first four wrong attempts are plain rejections; the fifth arms
-        // the lockout, so the *next* request is refused with 429.
+        // Every request inside the loop is a plain rejection (the final one
+        // arms the lockout), so the *next* request is refused with 429.
         assert!(statuses.iter().all(|s| *s == StatusCode::UNAUTHORIZED));
         // Even the correct password is refused while locked out.
         let response = router
@@ -1170,7 +1172,7 @@ mod tests {
                 count: 0,
                 locked_until: None,
                 strikes: 3,
-                permanently_blocked: true,
+                blocked_until: Some(crate::guest::now_secs() + 3600),
             },
         );
 

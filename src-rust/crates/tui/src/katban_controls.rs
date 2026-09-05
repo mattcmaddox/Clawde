@@ -149,14 +149,15 @@ pub fn build_control_items() -> Vec<KatbanControlItem> {
         .failed_attempts
         .iter()
         .filter(|(_, attempt)| {
-            attempt.permanently_blocked || attempt.locked_until.is_some_and(|u| u > now)
+            attempt.blocked_until.is_some_and(|u| u > now)
+                || attempt.locked_until.is_some_and(|u| u > now)
         })
         .collect();
     if !blocked.is_empty() {
         items.push(section("Locked IPs"));
         for (ip, attempt) in blocked {
-            let subtitle = if attempt.permanently_blocked {
-                "permanently blocked".to_string()
+            let subtitle = if attempt.blocked_until.is_some_and(|u| u > now) {
+                "blocked for 24h".to_string()
             } else {
                 format!(
                     "locked {}s",

@@ -166,10 +166,17 @@ impl AdminStore {
             .filter(|until| *until > now)
     }
 
+    /// True while the IP is serving its post-ladder 24h block.
     pub fn is_permanently_blocked(&self, ip: &str) -> bool {
+        self.blocked_until(ip, now_secs()).is_some()
+    }
+
+    /// Unix second until which the IP is flatly refused (24h block), if any.
+    pub fn blocked_until(&self, ip: &str, now: u64) -> Option<u64> {
         self.failed_attempts
             .get(ip)
-            .is_some_and(|attempt| attempt.permanently_blocked)
+            .and_then(|attempt| attempt.blocked_until)
+            .filter(|until| *until > now)
     }
 
     /// Record a wrong admin password from an IP using the shared lockout ladder.
@@ -256,6 +263,7 @@ fn sorted(mut v: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::MAX_FAILED_ATTEMPTS;
 
     #[test]
     fn password_roundtrips_and_is_hashed_not_plaintext() {
@@ -305,10 +313,11 @@ mod tests {
         let ip = "10.0.0.9";
         let now = now_secs();
         assert!(store.locked_until(ip, now).is_none());
-        for _ in 0..4 {
+        // The threshold tracks the shared guest policy (MAX_FAILED_ATTEMPTS
+        // wrong attempts before the first 3-minute lockout).
+        for _ in 0..(MAX_FAILED_ATTEMPTS - 1) {
             assert_eq!(store.record_failed_attempt(ip), LockoutResult::None);
         }
-        // 5th wrong attempt triggers the first 3-minute lockout.
         let locked = store.record_failed_attempt(ip);
         assert!(matches!(locked, LockoutResult::Temporary(_)));
         assert!(store.locked_until(ip, now).is_some());

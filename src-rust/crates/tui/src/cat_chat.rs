@@ -115,10 +115,16 @@ pub fn build_cat_chat_items() -> Vec<CatChatItem> {
         });
         if live {
             items.push(CatChatItem {
-                title: format!("New password — {}", link.name),
-                subtitle: "old password stops working; devices stay logged in".into(),
+                title: format!("New random password — {}", link.name),
+                subtitle: "strong 12-char, printed once · old password stops working".into(),
                 command: format!("/chat password {}", link.id),
                 complete: true,
+            });
+            items.push(CatChatItem {
+                title: format!("Set your own password — {}", link.name),
+                subtitle: "the word friends must remember — type it after this".into(),
+                command: format!("/chat password {} --set ", link.id),
+                complete: false,
             });
             items.push(CatChatItem {
                 title: format!("Delete link — {}", link.name),
