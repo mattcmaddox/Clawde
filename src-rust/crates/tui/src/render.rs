@@ -3874,6 +3874,24 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let mut spans: Vec<Span> = Vec::new();
 
+        // Paused-stream pill — the transcript is Esc-paused during a turn.
+        // Deliberately honest: states that the stream is still receiving
+        // (tokens still burning) and shows how much has buffered since the
+        // pause. Cleared by resume / cancel / turn completion.
+        if app.stream_paused {
+            let buffered =
+                app.paused_text_buffer.chars().count() + app.paused_thinking_buffer.chars().count();
+            spans.push(Span::styled(
+                format!(
+                    " \u{23f8} paused · buffered {} · esc stop · any key resume",
+                    buffered
+                ),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
         // Agent type badge (shown when running as subagent / coordinator)
         if let Some(ref badge) = app.agent_type_badge {
             spans.push(Span::styled(
@@ -4238,12 +4256,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // During streaming show "esc to interrupt". The "? shortcuts" hint is
-        // rendered in the top-right status bar (see render_prompt area), so do
-        // not duplicate it here (issue #149 follow-up).
+        // During streaming show the ESC affordance. Esc pauses the live
+        // transcript (a second Esc hard-cancels); Ctrl+C remains the direct
+        // interrupt. The "? shortcuts" hint is rendered in the top-right
+        // status bar (see render_prompt area), so do not duplicate it here
+        // (issue #149 follow-up).
         if spans.is_empty() && app.is_streaming {
             spans.push(Span::styled(
-                "esc interrupt",
+                "esc pause · ctrl+c stop",
                 Style::default().fg(Color::DarkGray),
             ));
         }

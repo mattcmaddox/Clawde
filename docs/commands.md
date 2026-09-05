@@ -8,21 +8,22 @@ This document is the complete reference for every slash command available in Cla
 
 1. [Command System Overview](#command-system-overview)
 2. [Session & Navigation](#session--navigation)
-3. [Model & Provider](#model--provider) — `/model`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
-4. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/autopilot`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
-5. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/spec`, `/spec-mode`, `/spec-review`, `/security-review`, `/init`, `/search`
-6. [Search & Files](#search--files) — `/files`, `/context`
-7. [Memory & Context](#memory--context) — `/memory`, `/usage`, `/cost`, `/stats`, `/status`, `/insights`
-8. [Agents & Tasks](#agents--tasks) — `/agents`, `/tasks`, `/goal`, `/managed-agents`, `/agent`
-9. [Planning & Review](#planning--review) — `/plan`, `/ultraplan`, `/ultrareview`
-10. [MCP & Integrations](#mcp--integrations) — `/mcp`, `/skills`, `ultracode`, `/plugin`, `/chrome`
-11. [Authentication](#authentication) — `/login`, `/logout`, `/accounts`, `/switch`, `/refresh`
-12. [Display & Terminal](#display--terminal) — `/theme`, `/output-style`, `/statusline`, `/vim`, `/terminal-setup`, `/caveman`, `/cathead`, `/normal`, `/mobile`, `/color`, `/stickers`
-13. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/health`, `/verify`, `/version`, `/update`
-14. [Export & Sharing](#export--sharing) — `/export`, `/copy`
-15. [Advanced & Internal](#advanced--internal) — `/thinking`, `/connect`, `/fork`, `/effort`, `/summary`, `/brief`, `/sandbox-toggle`, `/think-back`, `/thinkback-play`
-16. [Self-Hosting & Katban](#self-hosting--katban) — `/katban`
-17. [Command Availability](#command-availability)
+3. [Streaming & Interrupts](#streaming--interrupts)
+4. [Model & Provider](#model--provider) — `/model`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
+5. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/autopilot`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
+6. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/spec`, `/spec-mode`, `/spec-review`, `/security-review`, `/init`, `/search`
+7. [Search & Files](#search--files) — `/files`, `/context`
+8. [Memory & Context](#memory--context) — `/memory`, `/usage`, `/cost`, `/stats`, `/status`, `/insights`
+9. [Agents & Tasks](#agents--tasks) — `/agents`, `/tasks`, `/goal`, `/managed-agents`, `/agent`
+10. [Planning & Review](#planning--review) — `/plan`, `/ultraplan`, `/ultrareview`
+11. [MCP & Integrations](#mcp--integrations) — `/mcp`, `/skills`, `ultracode`, `/plugin`, `/chrome`
+12. [Authentication](#authentication) — `/login`, `/logout`, `/accounts`, `/switch`, `/refresh`
+13. [Display & Terminal](#display--terminal) — `/theme`, `/output-style`, `/statusline`, `/vim`, `/terminal-setup`, `/caveman`, `/cathead`, `/normal`, `/mobile`, `/color`, `/stickers`
+14. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/health`, `/verify`, `/version`, `/update`
+15. [Export & Sharing](#export--sharing) — `/export`, `/copy`
+16. [Advanced & Internal](#advanced--internal) — `/thinking`, `/connect`, `/fork`, `/effort`, `/summary`, `/brief`, `/sandbox-toggle`, `/think-back`, `/thinkback-play`
+17. [Self-Hosting & Katban](#self-hosting--katban) — `/katban`
+18. [Command Availability](#command-availability)
 
 ---
 
@@ -267,6 +268,37 @@ Summarize and compress the conversation history to reduce context window usage. 
 ```
 /compact
 ```
+
+---
+
+## Streaming & Interrupts
+
+How to control a turn while the model is responding.
+
+### Esc — pause, then stop
+
+While Clawde is streaming a response, `Esc` works in two stages:
+
+1. **First `Esc` — pause.** The live transcript freezes so you can read or scroll in peace. The turn is *not* stopped: the request keeps running in the background and everything the model produces is buffered. The status bar shows a yellow `⏸ paused · buffered N · esc stop · any key resume` pill with a live count of buffered characters, so it is always obvious that tokens are still arriving.
+2. **Second `Esc` — stop.** Cancels the request outright: the stream is aborted, running tools are cancelled, and the turn is marked interrupted in the transcript. Status shows `Cancelling…` until the task unwinds.
+
+Any other key resumes: the buffered tail folds back into the live view and typing falls through into the prompt normally (so you can compose a follow-up while it catches up). If the model finishes while paused, the buffered text is flushed into the transcript — nothing is lost.
+
+Precedence note: while a notification banner or dialog is on screen, its keys are handled first — the first `Esc` dismisses the banner rather than pausing, and keys aimed at an open dialog neither pause nor resume. Pause/resume needs a clear screen.
+
+```
+Esc          # pause the live transcript (stream keeps buffering)
+any key      # resume
+Esc, Esc     # pause, then hard-stop the turn
+```
+
+### Ctrl+C — direct interrupt
+
+`Ctrl+C` skips the pause stage and cancels the request immediately — the same hard stop as the second `Esc` above. While text is selected it copies the selection instead; when idle, pressing it twice (or `Ctrl+D` on an empty prompt) confirms exit.
+
+### Shift+Enter — dismiss without cancelling
+
+`Shift+Enter` during a turn dismisses the live streaming display and lets you resubmit right away, while the abandoned request continues in the background; the next prompt triggers a fresh dispatch. Use `Esc` pause/stop when you want to keep the response, and `Shift+Enter` when you just want the input box back.
 
 ---
 

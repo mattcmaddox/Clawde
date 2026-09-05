@@ -118,7 +118,7 @@ Guest-link management lives under `/chat`, not `/katban` — old `/katban link .
 | `Alt+R` | Search command history |
 | `Ctrl+O` | Expand / collapse thinking blocks |
 | `Alt+/` | Open help |
-| `Esc` | Close a dialog / cancel |
+| `Esc` | Close a dialog / cancel. While streaming: pause the live transcript — press any key to resume, or `Esc` again to stop the turn. `Ctrl+C` stops directly |
 | `Up / Down` | Previous / next prompt in history |
 
 ---

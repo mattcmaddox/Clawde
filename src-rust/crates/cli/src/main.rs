@@ -4312,6 +4312,35 @@ async fn run_interactive(
                         continue;
                     }
 
+                    // Cancel-pending: a second Esc set stream_cancel_requested.
+                    // Cancel the token, drop this Esc, and swallow subsequent
+                    // events until the task unwinds so late deltas cannot
+                    // re-arm the spinner over the "Cancelling…" state.
+                    if app.stream_cancel_requested {
+                        if let Some(ref ct) = cancel {
+                            ct.cancel();
+                        }
+                        if matches!(
+                            key.code,
+                            crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Enter
+                        ) && !app.any_modal_open()
+                        {
+                            continue;
+                        }
+                    }
+
+                    // Resume-on-key: any non-Esc keypress while paused folds
+                    // the buffered tail back into the live view and falls
+                    // through for normal handling (typing goes into the
+                    // prompt, Enter submits/queues as usual). Dialogs are
+                    // exempt so their Esc/Enter handling is unaffected.
+                    if app.stream_paused
+                        && key.code != crossterm::event::KeyCode::Esc
+                        && !app.any_modal_open()
+                    {
+                        app.resume_stream();
+                    }
+
                     // Ctrl+C and Ctrl+D: exit confirmation handling
                     if handle_exit_key(&mut app, key, &cancel) {
                         if app.should_exit {
@@ -6068,6 +6097,16 @@ async fn run_interactive(
 
         // Drain query events — also forward relevant ones to the bridge as outbound.
         while let Ok(evt) = event_rx.try_recv() {
+            // Post-cancel drain guard: after a second-Esc cancel the UI is
+            // in the "Cancelling…" state; late deltas from the unwinding task
+            // must not re-arm `is_streaming` over it. TurnComplete still gets
+            // through so completion bookkeeping runs normally.
+            if app.stream_cancel_requested {
+                match evt {
+                    QueryEvent::TurnComplete { .. } => {}
+                    _ => continue,
+                }
+            }
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
                 let outbound: Option<BridgeOutbound> = match &evt {
@@ -7155,6 +7194,9 @@ async fn run_interactive(
                 session.working_dir = Some(tool_ctx.working_dir.display().to_string());
                 app.is_streaming = false;
                 app.status_message = None;
+                // The query task has fully unwound — re-enable normal event
+                // handling after a second-Esc cancel.
+                app.stream_cancel_requested = false;
                 // Drain one queued message into the prompt and request an
                 // auto-submit on the next loop iteration (issue #149).
                 if let Some(next) = app.queued_messages.pop_front() {

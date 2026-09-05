@@ -1335,6 +1335,14 @@ pub struct App {
     /// Set by Esc while [`App::is_compacting`] — the CLI frame loop observes
     /// this and cancels the in-flight compaction's cancellation token.
     pub compact_cancel_requested: bool,
+    /// True while the user paused the live transcript with Esc during a turn.
+    /// The stream keeps running; deltas buffer into [`App::paused_text_buffer`]
+    /// / [`App::paused_thinking_buffer`] until a non-Esc key resumes display.
+    pub stream_paused: bool,
+    /// Set by a second Esc while [`App::stream_paused`] — the CLI frame loop
+    /// observes this and cancels the live query's cancellation token (the
+    /// same hard interrupt Ctrl+C uses in `handle_exit_key`).
+    pub stream_cancel_requested: bool,
     pub input: String,
     pub prompt_input: PromptInputState,
     pub input_history: Vec<String>,
@@ -1343,6 +1351,10 @@ pub struct App {
     pub is_streaming: bool,
     pub streaming_text: String,
     pub streaming_thinking: String,
+    /// Text deltas that arrived while the transcript was Esc-paused.
+    pub paused_text_buffer: String,
+    /// Thinking deltas that arrived while the transcript was Esc-paused.
+    pub paused_thinking_buffer: String,
     /// Whether the current turn has produced any assistant text or thinking.
     /// This survives stream-buffer flushing and is the source of truth for
     /// followup completion attribution.
@@ -2161,6 +2173,8 @@ impl App {
             is_verifying: false,
             is_compacting: false,
             compact_cancel_requested: false,
+            stream_paused: false,
+            stream_cancel_requested: false,
             input: String::new(),
             prompt_input: PromptInputState::new(),
             input_history: Vec::new(),
@@ -2169,6 +2183,8 @@ impl App {
             is_streaming: false,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            paused_text_buffer: String::new(),
+            paused_thinking_buffer: String::new(),
             assistant_output_received: false,
             status_message: None,
             spinner_verb: None,
@@ -2563,6 +2579,11 @@ impl App {
         self.assistant_output_received = false;
         self.last_turn_elapsed = None;
         self.last_turn_verb = None;
+        // A fresh turn starts with a live transcript and no stale stop request.
+        self.stream_paused = false;
+        self.stream_cancel_requested = false;
+        self.paused_text_buffer.clear();
+        self.paused_thinking_buffer.clear();
     }
 
     fn sync_turn_metadata_to_messages(&mut self) {
@@ -2601,6 +2622,37 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Pause the live transcript (first Esc during a turn): freeze the visible
+    /// streaming tail and buffer every delta that arrives afterwards. The
+    /// query keeps running — this is a display pause, not an interrupt.
+    pub fn pause_stream(&mut self) {
+        self.stream_paused = true;
+        self.invalidate_transcript();
+    }
+
+    /// Resume a paused transcript (any non-Esc key while paused): fold the
+    /// buffered deltas back into the live view and unpause. A no-op when not
+    /// paused.
+    pub fn resume_stream(&mut self) {
+        if !self.stream_paused {
+            return;
+        }
+        let text = std::mem::take(&mut self.paused_text_buffer);
+        let thinking = std::mem::take(&mut self.paused_thinking_buffer);
+        self.streaming_text.push_str(&text);
+        self.streaming_thinking.push_str(&thinking);
+        self.stream_paused = false;
+        self.invalidate_transcript();
+    }
+
+    /// Request a hard cancel of the live query (second Esc while paused, or
+    /// Ctrl+C while streaming). The CLI frame loop observes this flag and
+    /// cancels the query's cancellation token, exactly like `handle_exit_key`
+    /// does for Ctrl+C. Mirrors [`App::compact_cancel_requested`].
+    pub fn request_stream_cancel(&mut self) {
+        self.stream_cancel_requested = true;
     }
 
     /// Select and insert a followup from either the current response or history.
@@ -4716,6 +4768,10 @@ impl App {
                 self.display_messages.clear();
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
+                self.paused_text_buffer.clear();
+                self.paused_thinking_buffer.clear();
+                self.stream_paused = false;
+                self.stream_cancel_requested = false;
                 self.tool_use_blocks.clear();
                 self.turn_metadata.clear();
                 self.cost_usd = 0.0;
@@ -5175,6 +5231,10 @@ impl App {
         self.is_streaming
             || self.is_verifying
             || self.is_compacting
+            // The paused-state pill shows a buffered-chars counter that
+            // updates as deltas arrive (deliberately honest); keep the fast
+            // cadence while paused so it stays live.
+            || self.stream_paused
             || self.effort_picker.wants_animation()
             // A held chord-prefix key (Tab) waits for a follow-up keystroke
             // within a short window; poll fast so the timeout fires promptly
@@ -8727,16 +8787,33 @@ impl App {
         }
 
         match key.code {
-            // ---- ESC: cancel streaming (status bar advertises "esc interrupt") ----
+            // ---- ESC: pause transcript, second ESC cancels the query ----------
+            // First press freezes the visible stream (deltas keep buffering so
+            // nothing is lost); a second press sets `stream_cancel_requested`
+            // which the CLI frame loop turns into a real token cancel — the
+            // same hard interrupt Ctrl+C uses. Any non-Esc key resumes.
             KeyCode::Esc if self.is_streaming => {
-                self.is_streaming = false;
-                self.spinner_verb = None;
-                self.streaming_text.clear();
-                self.streaming_thinking.clear();
-                self.assistant_output_received = false;
-                self.tool_use_blocks.clear();
-                self.status_message = Some("Cancelled.".to_string());
-                self.complete_current_turn_snapshot(true);
+                if self.stream_paused {
+                    // Second ESC — hard cancel, mirroring the Ctrl+C cleanup:
+                    // the query task's authoritative partial message is synced
+                    // back into the transcript when the task finishes.
+                    self.is_streaming = false;
+                    self.spinner_verb = None;
+                    self.stream_paused = false;
+                    self.streaming_text.clear();
+                    self.streaming_thinking.clear();
+                    self.paused_text_buffer.clear();
+                    self.paused_thinking_buffer.clear();
+                    self.assistant_output_received = false;
+                    self.tool_use_blocks.clear();
+                    self.status_message = Some("Cancelling…".to_string());
+                    self.request_stream_cancel();
+                    self.complete_current_turn_snapshot(true);
+                } else {
+                    self.pause_stream();
+                    self.status_message =
+                        Some("Paused — still receiving. Esc stop · any key resume".to_string());
+                }
             }
 
             // ---- Quit / cancel ----------------------------------------
@@ -9681,6 +9758,9 @@ impl App {
                     self.spinner_verb = None;
                     self.streaming_text.clear();
                     self.streaming_thinking.clear();
+                    self.paused_text_buffer.clear();
+                    self.paused_thinking_buffer.clear();
+                    self.stream_paused = false;
                     self.assistant_output_received = false;
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
@@ -10274,6 +10354,9 @@ impl App {
                     self.spinner_verb = None;
                     self.streaming_text.clear();
                     self.streaming_thinking.clear();
+                    self.paused_text_buffer.clear();
+                    self.paused_thinking_buffer.clear();
+                    self.stream_paused = false;
                     self.assistant_output_received = false;
                     self.tool_use_blocks.clear();
                     self.status_message =
@@ -11680,15 +11763,25 @@ impl App {
                         self.stall_start = None;
                         match delta {
                             clawde_api::streaming::ContentDelta::TextDelta { text } => {
-                                self.streaming_text.push_str(&text);
+                                if self.stream_paused {
+                                    // Transcript is Esc-paused: buffer instead of
+                                    // rendering. Resuming folds this into the live view.
+                                    self.paused_text_buffer.push_str(&text);
+                                } else {
+                                    self.streaming_text.push_str(&text);
+                                    self.invalidate_transcript();
+                                }
                                 self.assistant_output_received = true;
-                                self.invalidate_transcript();
                             }
                             clawde_api::streaming::ContentDelta::ThinkingDelta { thinking } => {
                                 debug!(len = thinking.len(), "Thinking delta received");
-                                self.streaming_thinking.push_str(&thinking);
+                                if self.stream_paused {
+                                    self.paused_thinking_buffer.push_str(&thinking);
+                                } else {
+                                    self.streaming_thinking.push_str(&thinking);
+                                    self.invalidate_transcript();
+                                }
                                 self.assistant_output_received = true;
-                                self.invalidate_transcript();
                             }
                             _ => {}
                         }
@@ -11697,6 +11790,13 @@ impl App {
                         self.is_streaming = false;
                         self.spinner_verb = None;
                         self.stall_start = None;
+                        // The model finished while paused — fold the buffered
+                        // tail in so the full response is flushed to the transcript.
+                        let text = std::mem::take(&mut self.paused_text_buffer);
+                        let thinking = std::mem::take(&mut self.paused_thinking_buffer);
+                        self.streaming_text.push_str(&text);
+                        self.streaming_thinking.push_str(&thinking);
+                        self.stream_paused = false;
                         self.flush_streamed_assistant_message();
                     }
                     _ => {
@@ -11827,6 +11927,15 @@ impl App {
                     self.pending_followup_text = None;
                 }
                 self.assistant_output_received = false;
+                // The model finished — fold any Esc-paused buffered tail in
+                // BEFORE the flush so the full response reaches the transcript.
+                if self.stream_paused {
+                    let text = std::mem::take(&mut self.paused_text_buffer);
+                    let thinking = std::mem::take(&mut self.paused_thinking_buffer);
+                    self.streaming_text.push_str(&text);
+                    self.streaming_thinking.push_str(&thinking);
+                    self.stream_paused = false;
+                }
                 self.flush_streamed_assistant_message();
                 // The flushed message was rebuilt from stream text and lost the
                 // per-turn attribution the query loop attached. Restore it from
@@ -11846,6 +11955,11 @@ impl App {
                 }
                 self.tool_use_blocks
                     .retain(|b| b.status != ToolStatus::Running);
+                // The turn is over — a stale pause flag must not eat the next
+                // turn's first deltas. (The paused buffer was already folded
+                // into the flush above.)
+                self.stream_paused = false;
+                self.stream_cancel_requested = false;
                 self.complete_current_turn_snapshot(
                     stop_reason.contains("abort") || stop_reason.contains("cancel"),
                 );
@@ -13077,6 +13191,142 @@ mod tests {
         assert!(msg.contains("applied immediately"), "got: {msg}");
         assert!(app.take_routing_changed(), "save must set the rebuild flag");
         assert!(!app.take_routing_changed(), "flag is one-shot");
+    }
+
+    /// Drive a text delta through `handle_query_event` while paused and live;
+    /// returns the app for further assertions.
+    fn push_text_delta(app: &mut App, text: &str) {
+        app.handle_query_event(QueryEvent::Stream(
+            clawde_api::AnthropicStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: clawde_api::streaming::ContentDelta::TextDelta {
+                    text: text.to_string(),
+                },
+            },
+        ));
+    }
+
+    fn push_esc(app: &mut App) {
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn esc_pauses_stream_and_buffers_deltas() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        push_text_delta(&mut app, "visible part");
+        assert!(app.is_streaming);
+        assert!(!app.stream_paused);
+
+        push_esc(&mut app);
+        assert!(app.stream_paused, "first ESC must pause");
+        assert!(!app.stream_cancel_requested, "first ESC must not cancel");
+        assert!(app.is_streaming, "pause keeps the turn alive");
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|m| m.contains("Paused")));
+
+        // Deltas after the pause land in the buffer, not the live tail.
+        push_text_delta(&mut app, " hidden part");
+        assert_eq!(app.paused_text_buffer, " hidden part");
+        assert_eq!(app.streaming_text, "visible part");
+    }
+
+    #[test]
+    fn resume_folds_buffered_tail_back() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        push_text_delta(&mut app, "before");
+        push_esc(&mut app);
+        push_text_delta(&mut app, " after");
+
+        app.resume_stream();
+        assert!(!app.stream_paused);
+        assert!(app.paused_text_buffer.is_empty());
+        assert_eq!(app.streaming_text, "before after");
+    }
+
+    #[test]
+    fn second_esc_requests_real_cancel() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        push_text_delta(&mut app, "partial");
+        push_esc(&mut app);
+        push_esc(&mut app);
+
+        assert!(
+            app.stream_cancel_requested,
+            "second ESC must request cancel"
+        );
+        assert!(!app.stream_paused, "pause is cleared on cancel");
+        assert!(!app.is_streaming);
+        assert!(app.paused_text_buffer.is_empty());
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|m| m.contains("Cancelling")));
+        // Turn marked interrupted, matching the old Esc-detach behavior.
+        // push_message(user) calls begin_user_turn_snapshot itself, which
+        // seeds a metadata entry for the synthetic turn.
+        app.push_message(clawde_core::types::Message::user("hi"));
+        app.complete_current_turn_snapshot(true);
+        let meta = app.turn_metadata.last().expect("turn metadata");
+        assert!(meta.interrupted);
+    }
+
+    #[test]
+    fn turn_complete_after_pause_flushes_buffer_and_clears_flags() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        push_text_delta(&mut app, "before");
+        push_esc(&mut app);
+        push_text_delta(&mut app, " tail");
+
+        app.handle_query_event(QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".into(),
+            usage: None,
+            observability: None,
+        });
+        assert!(!app.stream_paused, "turn end clears stale pause");
+        assert!(app.streaming_text.is_empty(), "live tail flushed");
+        // The flushed assistant message must contain pre-ESC and buffered text.
+        let flushed = app
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == clawde_core::types::Role::Assistant)
+            .map(|m| match &m.content {
+                clawde_core::types::MessageContent::Text(t) => t.clone(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+        assert_eq!(flushed, "before tail", "buffer joins the flush");
+    }
+
+    #[test]
+    fn esc_with_notification_shown_dismisses_first_and_pauses_second() {
+        // Precedence contract: notification dismissal runs before the
+        // streaming pause arm, so the first ESC goes to the toast.
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.push_notification(NotificationKind::Info, "note".to_string(), Some(3));
+        push_esc(&mut app);
+        assert!(!app.stream_paused, "first ESC dismisses the notification");
+        push_esc(&mut app);
+        assert!(app.stream_paused, "second ESC pauses");
+    }
+
+    #[test]
+    fn new_turn_resets_stale_pause_flags() {
+        let mut app = make_app();
+        app.stream_paused = true;
+        app.paused_text_buffer.push_str("stale");
+        app.begin_user_turn_snapshot();
+        assert!(!app.stream_paused);
+        assert!(app.paused_text_buffer.is_empty());
+        assert!(!app.stream_cancel_requested);
     }
 
     /// Point CLAWDE_HOME at a throwaway temp dir for the duration of a test so
