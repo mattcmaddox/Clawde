@@ -3794,22 +3794,64 @@ async fn run_interactive(
     // loaded in VRAM. The result drives the footer badge color/icon.
     // Re-reads the persisted settings each cycle so `/settings` host edits
     // and `/ollama` mode changes take effect without a restart.
+    //
+    // The same loop also serves the `/ollama` screen's server-info panel:
+    // while the screen is open (OllamaInfoWish.visible, updated every main
+    // loop frame), it additionally probes /api/version + /api/show for the
+    // model the dialog shows and streams the snapshot over a dedicated
+    // channel. Otherwise it sleeps — no network traffic, no idle-CPU
+    // regression.
+    struct OllamaInfoWish {
+        visible: bool,
+        model: String,
+    }
     let (ollama_loaded_tx, mut ollama_loaded_rx) =
         tokio::sync::mpsc::unbounded_channel::<Vec<clawde_core::OllamaLoadedModel>>();
-    tokio::spawn(async move {
-        let poll_interval = std::time::Duration::from_secs(5);
-        loop {
-            tokio::time::sleep(poll_interval).await;
-            let config = Settings::load_sync()
-                .map(|settings| settings.effective_config())
-                .unwrap_or_default();
-            let models = match clawde_core::ollama_status_for_config(&config).await {
-                Ok(status) => status.models,
-                Err(_) => Vec::new(),
-            };
-            let _ = ollama_loaded_tx.send(models);
-        }
-    });
+    let (ollama_info_tx, mut ollama_info_rx) =
+        tokio::sync::mpsc::unbounded_channel::<clawde_query::OllamaPolledServerInfo>();
+    // std (not tokio) mutex: the critical section is two field copies with
+    // no await, and one side runs on the sync TUI main loop where a tokio
+    // mutex would panic ("cannot block the current thread from within a
+    // runtime"). Never held across an await by either side.
+    let ollama_info_wish = std::sync::Arc::new(std::sync::Mutex::new(OllamaInfoWish {
+        visible: false,
+        model: String::new(),
+    }));
+    {
+        let ollama_info_wish = ollama_info_wish.clone();
+        tokio::spawn(async move {
+            let poll_interval = std::time::Duration::from_secs(5);
+            loop {
+                tokio::time::sleep(poll_interval).await;
+                let config = Settings::load_sync()
+                    .map(|settings| settings.effective_config())
+                    .unwrap_or_default();
+                let models = match clawde_core::ollama_status_for_config(&config).await {
+                    Ok(status) => status.models,
+                    Err(_) => Vec::new(),
+                };
+                let _ = ollama_loaded_tx.send(models);
+                // Server-info probe only while the /ollama screen is open.
+                let (visible, model) = {
+                    let wish = ollama_info_wish
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    (wish.visible, wish.model.clone())
+                };
+                if !visible {
+                    continue;
+                }
+                let info = match clawde_core::config::resolve_ollama_host() {
+                    Some(host) => {
+                        let client = reqwest::Client::new();
+                        Some(fetch_ollama_server_info(&client, &host, &model).await)
+                    }
+                    None => None,
+                };
+                let _ = ollama_info_tx.send(clawde_query::OllamaPolledServerInfo { model, info });
+            }
+        });
+    }
 
     // Wire the ask-user question channel into the app so the TUI can show
     // the dialog and return an answer to the query loop.
@@ -6843,6 +6885,26 @@ async fn run_interactive(
             app.ollama_loaded_models = models;
         }
 
+        // Publish the server-info wish for the poller: whether the /ollama
+        // screen is open and which model it currently shows. Updated every
+        // frame; the poller only probes while the wish is visible.
+        {
+            let mut wish = ollama_info_wish
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            wish.visible = app.ollama_config_dialog.visible;
+            wish.model = app.ollama_config_dialog.model_input.clone();
+        }
+        // Drain the latest server-info snapshot and let the App decide
+        // whether it still matches what the user is looking at.
+        let mut ollama_info_latest: Option<clawde_query::OllamaPolledServerInfo> = None;
+        while let Ok(polled) = ollama_info_rx.try_recv() {
+            ollama_info_latest = Some(polled);
+        }
+        if let Some(polled) = ollama_info_latest {
+            app.apply_ollama_polled_server_info(polled.model, polled.info);
+        }
+
         // ---- Device code / OAuth auth: spawn background task when pending ----
         if let Some(provider_id) = app.device_auth_pending.take() {
             let _tx = device_auth_tx.clone();
@@ -8458,6 +8520,77 @@ mod ollama_discovery_tests {
             .unwrap_err();
         assert_eq!(error, "Connection timed out");
         task.await.unwrap();
+    }
+
+    /// Serve /api/version then /api/show for one `fetch_ollama_server_info`
+    /// call, asserting the show request names the expected model.
+    async fn mock_version_and_show_server(
+        version_body: &'static str,
+        show_body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("GET /api/version "));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{version_body}",
+                version_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /api/show "));
+            assert!(request.contains("qwen3:32b"), "show must name the model");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{show_body}",
+                show_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (format!("http://{}", address), task)
+    }
+
+    #[tokio::test]
+    async fn server_info_parses_version_params_and_context_length() {
+        let (base_url, task) = mock_version_and_show_server(
+            r#"{"version":"0.12.6"}"#,
+            r#"{
+                "parameters": "temperature 0.7\nnum_ctx 32768\nstop <|im_start|>",
+                "model_info": { "qwen3.context_length": 131072 }
+            }"#,
+        )
+        .await;
+        let info = super::fetch_ollama_server_info(&test_client(), &base_url, "qwen3:32b").await;
+        assert_eq!(info.version.as_deref(), Some("0.12.6"));
+        assert!(info
+            .params
+            .contains(&("temperature".to_string(), "0.7".to_string())));
+        assert!(info
+            .params
+            .contains(&("num_ctx".to_string(), "32768".to_string())));
+        assert_eq!(info.context_length, Some(131_072));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_info_tolerates_dead_server() {
+        // Bind then immediately drop the listener: connection refused.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let info =
+            super::fetch_ollama_server_info(&test_client(), &format!("http://{address}"), "m")
+                .await;
+        assert_eq!(info.version, None);
+        assert!(info.params.is_empty());
+        assert_eq!(info.context_length, None);
     }
 }
 

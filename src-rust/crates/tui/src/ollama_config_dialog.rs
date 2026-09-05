@@ -175,9 +175,17 @@ impl OllamaConfigDialogState {
 
     /// Replace the server-reported info snapshot (version + effective
     /// request parameters). Called when a ping result passes the App-side
-    /// staleness guards.
+    /// staleness guards, and by the continuous poll while the screen is
+    /// open.
     pub fn set_server_info(&mut self, info: clawde_query::OllamaServerInfo) {
         self.server_info = Some(info);
+    }
+
+    /// Drop the server-reported snapshot — used when a continuous-poll
+    /// probe fails so a dead server does not keep displaying stale
+    /// parameters.
+    pub fn clear_server_info(&mut self) {
+        self.server_info = None;
     }
 
     /// The parameters the server reported for the selected model, as

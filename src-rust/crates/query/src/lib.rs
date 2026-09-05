@@ -567,6 +567,21 @@ pub enum QueryEvent {
         candidates: Vec<(String, u128, usize)>,
         scanned: usize,
     },
+    /// Server-reported info (version + effective request parameters) from
+    /// the continuous background poll while the `/ollama` screen is open.
+    /// The consumer re-checks dialog visibility and the model match before
+    /// applying (spec §Model/server behavior: never silently mismatched).
+    OllamaServerInfoPolled(Box<OllamaPolledServerInfo>),
+}
+
+/// One cycle of the continuous server-info poll. `model` is the model the
+/// snapshot describes — the dialog only applies it when it still matches
+/// what the user is looking at. `None` inside `info` means the probe failed
+/// (server down); the consumer clears its display in that case.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OllamaPolledServerInfo {
+    pub model: String,
+    pub info: Option<OllamaServerInfo>,
 }
 
 /// A model returned by Ollama's `/api/tags` endpoint.

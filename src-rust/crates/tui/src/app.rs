@@ -3212,6 +3212,39 @@ impl App {
         self.status_message = Some(format!("Ollama mode: {}.", label));
     }
 
+    /// Apply one cycle of the continuous server-info poll (delivered by the
+    /// CLI main loop only while the `/ollama` screen is open).
+    ///
+    /// Guards, in order:
+    /// 1. screen closed → drop (the poller should have stopped, but a
+    ///    snapshot may still be in flight);
+    /// 2. `model` does not match what the dialog shows → drop: never render
+    ///    parameters for a model the user has already moved past.
+    /// 3. probe failed (`info == None`) → clear the stored snapshot so a
+    ///    dead server does not keep displaying stale parameters.
+    pub fn apply_ollama_polled_server_info(
+        &mut self,
+        model: String,
+        info: Option<clawde_query::OllamaServerInfo>,
+    ) {
+        if !self.ollama_config_dialog.visible {
+            return;
+        }
+        if model != self.ollama_config_dialog.model_input {
+            return;
+        }
+        match info {
+            Some(info) => {
+                self.ollama_server_info = Some(info.clone());
+                self.ollama_config_dialog.set_server_info(info);
+            }
+            None => {
+                self.ollama_server_info = None;
+                self.ollama_config_dialog.clear_server_info();
+            }
+        }
+    }
+
     /// Start an asynchronous Ollama request and invalidate older results.
     /// The current host input is snapshotted so a result for a host the user
     /// has since edited is dropped instead of attributed to the new host.
@@ -12120,6 +12153,14 @@ impl App {
                     ));
                 }
             }
+            QueryEvent::OllamaServerInfoPolled(polled) => {
+                // Continuous poll cycle from the CLI main loop (delivered
+                // only while the /ollama screen is open). The apply helper
+                // re-checks visibility and the model match, and clears the
+                // display when the probe failed.
+                let clawde_query::OllamaPolledServerInfo { model, info } = *polled;
+                self.apply_ollama_polled_server_info(model, info);
+            }
         }
 
         // Update token count from tracker.
@@ -15364,6 +15405,66 @@ mod tests {
             app.ollama_config_dialog.phase,
             crate::ollama_config_dialog::OllamaConfigPhase::NoModels
         );
+    }
+
+    #[test]
+    fn ollama_polled_server_info_applies_and_mirrors_when_model_matches() {
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_config_dialog.model_input = "qwen3:32b".to_string();
+        let info = clawde_query::OllamaServerInfo {
+            version: Some("0.12.6".to_string()),
+            params: vec![("temperature".to_string(), "0.7".to_string())],
+            context_length: Some(131_072),
+        };
+        app.apply_ollama_polled_server_info("qwen3:32b".to_string(), Some(info.clone()));
+        assert_eq!(app.ollama_server_info.as_ref(), Some(&info));
+        assert_eq!(app.ollama_config_dialog.server_info.as_ref(), Some(&info));
+    }
+
+    #[test]
+    fn ollama_polled_server_info_for_other_model_is_dropped() {
+        // The poller snapshots the dialog model at cycle start; by the time
+        // the result lands the user may have moved on. Never render params
+        // for a model the user is no longer looking at.
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_config_dialog.model_input = "qwen3:32b".to_string();
+        app.apply_ollama_polled_server_info(
+            "llama3:8b".to_string(),
+            Some(clawde_query::OllamaServerInfo::default()),
+        );
+        assert!(app.ollama_server_info.is_none());
+        assert!(app.ollama_config_dialog.server_info.is_none());
+    }
+
+    #[test]
+    fn ollama_polled_server_info_failure_clears_stale_display() {
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_config_dialog.model_input = "qwen3:32b".to_string();
+        app.ollama_config_dialog
+            .set_server_info(clawde_query::OllamaServerInfo::default());
+        app.ollama_server_info = Some(clawde_query::OllamaServerInfo::default());
+
+        // Server went down mid-session: probe returned None.
+        app.apply_ollama_polled_server_info("qwen3:32b".to_string(), None);
+        assert!(app.ollama_server_info.is_none());
+        assert!(app.ollama_config_dialog.server_info.is_none());
+    }
+
+    #[test]
+    fn ollama_polled_server_info_ignored_when_screen_closed() {
+        let mut app = make_app();
+        assert!(!app.ollama_config_dialog.visible);
+        app.apply_ollama_polled_server_info(
+            "qwen3:32b".to_string(),
+            Some(clawde_query::OllamaServerInfo::default()),
+        );
+        assert!(app.ollama_server_info.is_none());
     }
 
     #[test]
