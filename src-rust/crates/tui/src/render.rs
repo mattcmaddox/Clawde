@@ -4005,21 +4005,47 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
         // Ollama connectivity mode indicator.
         //   - Online  + no VRAM loaded → dim "ollama:online"
-        //   - Online  + VRAM loaded    → bright "ollama:online"
+        //   - Online  + VRAM loaded    → bright badge with VRAM in use
+        //     (summed from `/api/ps` size_vram) and the loaded model name.
+        //     Ollama's API exposes no free/total GPU memory — only per-model
+        //     VRAM usage — so "in use" is the honest metric here.
         //   - Isolated                → "ollama:offline" (lock)
         {
             let has_loaded = !app.ollama_loaded_models.is_empty();
             let (label, color, modifier) = match app.ollama_mode {
-                clawde_core::OllamaMode::Online if has_loaded => (
-                    " \u{1f310} ollama:online ",
-                    Color::Rgb(80, 200, 80),
-                    Modifier::BOLD,
-                ),
-                clawde_core::OllamaMode::Online => {
-                    (" ollama:online ", Color::Rgb(80, 140, 80), Modifier::DIM)
+                clawde_core::OllamaMode::Online if has_loaded => {
+                    let vram_bytes: u64 = app
+                        .ollama_loaded_models
+                        .iter()
+                        .filter_map(|m| m.size_vram)
+                        .sum();
+                    let model_name = app
+                        .ollama_loaded_models
+                        .first()
+                        .map(|m| m.name.clone())
+                        .unwrap_or_default();
+                    // Omit the VRAM segment entirely when the server reports
+                    // no per-model sizes (older Ollama) instead of showing a
+                    // bogus 0.0GiB.
+                    let detail = if vram_bytes > 0 {
+                        let vram_gib = vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                        format!(" · {vram_gib:.1}GiB VRAM · {model_name}")
+                    } else {
+                        format!(" · {model_name}")
+                    };
+                    (
+                        format!(" \u{1f310} ollama:online{detail} "),
+                        Color::Rgb(80, 200, 80),
+                        Modifier::BOLD,
+                    )
                 }
+                clawde_core::OllamaMode::Online => (
+                    " ollama:online ".to_string(),
+                    Color::Rgb(80, 140, 80),
+                    Modifier::DIM,
+                ),
                 clawde_core::OllamaMode::Isolated => (
-                    " \u{1f512} ollama:offline ",
+                    " \u{1f512} ollama:offline ".to_string(),
                     Color::Rgb(60, 140, 200),
                     Modifier::DIM,
                 ),
@@ -6572,6 +6598,66 @@ mod ollama_indicator_tests {
             !out.contains("ollama:offline"),
             "'ollama:offline' must NOT appear when online models are loaded. Output: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn ollama_footer_badge_shows_vram_in_use_and_loaded_model() {
+        // With models loaded, the badge surfaces the summed `/api/ps`
+        // size_vram and the (first) loaded model name.
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.ollama_mode = clawde_core::OllamaMode::Online;
+        app.ollama_loaded_models = vec![
+            clawde_core::OllamaLoadedModel {
+                name: "qwen3:32b".to_string(),
+                size: Some(20_000_000_000),
+                size_vram: Some(19_300_000_000),
+                expires_at: None,
+                context_length: Some(40_960),
+            },
+            clawde_core::OllamaLoadedModel {
+                name: "nomic-embed-text".to_string(),
+                size: Some(274_000_000),
+                size_vram: Some(274_000_000),
+                expires_at: None,
+                context_length: Some(2_048),
+            },
+        ];
+        app.status_message = Some("test".to_string());
+        let out = render_screen(&app);
+        // (19.3e9 + 0.274e9) bytes = 18.2 GiB in use.
+        assert!(
+            out.contains("18.2GiB VRAM"),
+            "VRAM-in-use total should appear. Output: {out:?}"
+        );
+        assert!(
+            out.contains("qwen3:32b"),
+            "first loaded model name should appear. Output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ollama_footer_badge_hides_vram_when_size_missing() {
+        // A model without size_vram (older server) still names the model;
+        // no "NaN"/"0.0GiB" nonsense is rendered.
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.ollama_mode = clawde_core::OllamaMode::Online;
+        app.ollama_loaded_models = vec![clawde_core::OllamaLoadedModel {
+            name: "llama3.2".to_string(),
+            size: None,
+            size_vram: None,
+            expires_at: None,
+            context_length: None,
+        }];
+        app.status_message = Some("test".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("llama3.2"),
+            "model name should appear: {out:?}"
+        );
+        assert!(
+            !out.contains("0.0GiB"),
+            "no bogus VRAM total when the server reports none. Output: {out:?}"
         );
     }
 

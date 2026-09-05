@@ -123,6 +123,12 @@ pub struct OllamaConfigDialogState {
     /// periodic `/api/ps` poll). Drives the loaded-state markers in the
     /// model picker; kept outside `models` so it survives refreshes.
     pub loaded_model_names: Vec<String>,
+    /// What the server reported about itself during the last ping: version
+    /// plus the effective request parameters for the selected model
+    /// (modelfile parameters via `/api/show`). `None` until a ping
+    /// succeeds — the screen then shows a server-reported block below the
+    /// options rows.
+    pub server_info: Option<clawde_query::OllamaServerInfo>,
     pub health: HealthStatus,
     /// Vim-modal insert state (only used when vim is enabled).
     pub vim_search: VimSearch,
@@ -155,6 +161,7 @@ impl OllamaConfigDialogState {
             selected_model_idx: 0,
             model_scroll_offset: 0,
             loaded_model_names: Vec::new(),
+            server_info: None,
             health: HealthStatus::Untested,
             vim_search: VimSearch::new(),
         }
@@ -164,6 +171,37 @@ impl OllamaConfigDialogState {
     /// `/api/ps`). Called on screen open and when a poll updates.
     pub fn set_loaded_model_names(&mut self, names: Vec<String>) {
         self.loaded_model_names = names;
+    }
+
+    /// Replace the server-reported info snapshot (version + effective
+    /// request parameters). Called when a ping result passes the App-side
+    /// staleness guards.
+    pub fn set_server_info(&mut self, info: clawde_query::OllamaServerInfo) {
+        self.server_info = Some(info);
+    }
+
+    /// The parameters the server reported for the selected model, as
+    /// `(name, value)` display rows. Used by the config screen to show what
+    /// Ollama will actually apply (modelfile values) next to what the user
+    /// configured (request overrides).
+    pub fn server_param_rows(&self) -> Vec<(String, String)> {
+        let Some(info) = self.server_info.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows: Vec<(String, String)> = info
+            .params
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        // Surface the model's context window even when num_ctx is not in
+        // the modelfile: `model_info.<family>.context_length` is the
+        // architecture limit the request-level num_ctx clamps into.
+        if let Some(ctx) = info.context_length {
+            if !rows.iter().any(|(name, _)| name == "num_ctx") {
+                rows.push(("context_length".to_string(), ctx.to_string()));
+            }
+        }
+        rows
     }
 
     /// Seed the mode + option rows from persisted settings. Called on open;
@@ -691,7 +729,8 @@ fn render_default_view(
     render_dark_overlay(frame, area);
 
     let width = 62u16.min(area.width.saturating_sub(4));
-    let height = 19u16;
+    // Room for the server-reported block (version + up to 3 params).
+    let height = 24u16;
     let dialog_area = centered_rect(width, height, area);
     state.last_rect.set(dialog_area);
     render_dialog_bg(frame, dialog_area);
@@ -891,6 +930,44 @@ fn render_default_view(
         ])
     };
     lines.push(loaded_line);
+
+    // Server-reported block (spec §Model/server behavior): version and the
+    // effective request parameters Ollama reports for the selected model
+    // (`/api/show` modelfile parameters). Only drawn once a ping has
+    // succeeded — before that there is nothing to show.
+    if let Some(info) = state.server_info.as_ref() {
+        let version_text = info.version.as_deref().unwrap_or("unknown");
+        lines.push(Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled(format!("server {version_text}"), Style::default().fg(dim)),
+        ]));
+        let param_rows = state.server_param_rows();
+        if param_rows.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "   Server model defaults in effect (no modelfile overrides)",
+                Style::default().fg(dim),
+            )));
+        } else {
+            for (name, value) in param_rows.iter().take(3) {
+                lines.push(Line::from(vec![
+                    Span::styled("   · ", Style::default().fg(dim)),
+                    Span::styled(
+                        format!("{:<14}", format!("{name}:")),
+                        Style::default().fg(muted),
+                    ),
+                    Span::styled(value.clone(), Style::default().fg(muted)),
+                ]));
+            }
+            let more = param_rows.len().saturating_sub(3);
+            if more > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("   +{more} more server parameter(s)"),
+                    Style::default().fg(dim),
+                )));
+            }
+        }
+    }
+
     let mut hint_spans = vec![
         Span::styled("enter", Style::default().fg(dim)),
         Span::styled(" connect  ", Style::default().fg(dim)),
@@ -1358,6 +1435,26 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
 mod tests {
     use super::*;
 
+    /// Render the dialog on a test backend and return the visible text.
+    fn render_screen_for_test(state: &OllamaConfigDialogState) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|f| render_ollama_config_dialog(f, state, false, f.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     #[test]
     fn test_open_close() {
         let mut state = OllamaConfigDialogState::new();
@@ -1680,6 +1777,77 @@ mod tests {
         // Model with spaces
         state.model_input = "qwen 2.5".to_string();
         assert!(state.validate_model_name().is_err());
+    }
+
+    #[test]
+    fn server_param_rows_surface_context_length_and_params() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        // Nothing reported yet.
+        assert!(state.server_param_rows().is_empty());
+
+        state.set_server_info(clawde_query::OllamaServerInfo {
+            version: Some("0.12.6".to_string()),
+            params: vec![
+                ("temperature".to_string(), "0.7".to_string()),
+                ("num_ctx".to_string(), "32768".to_string()),
+            ],
+            context_length: Some(131_072),
+        });
+        let rows = state.server_param_rows();
+        assert!(rows.contains(&("temperature".to_string(), "0.7".to_string())));
+        // num_ctx from the modelfile wins; no synthetic context_length row.
+        assert!(rows.contains(&("num_ctx".to_string(), "32768".to_string())));
+        assert!(!rows.iter().any(|(name, _)| name == "context_length"));
+
+        // Without a modelfile num_ctx, the architecture context window is
+        // surfaced as its own row.
+        state.set_server_info(clawde_query::OllamaServerInfo {
+            version: None,
+            params: vec![("temperature".to_string(), "0.8".to_string())],
+            context_length: Some(131_072),
+        });
+        let rows = state.server_param_rows();
+        assert!(rows.contains(&("context_length".to_string(), "131072".to_string())));
+    }
+
+    #[test]
+    fn server_info_block_renders_version_and_params() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(Some("http://gpu.example.test:11434".to_string()), None);
+        state.set_server_info(clawde_query::OllamaServerInfo {
+            version: Some("0.12.6".to_string()),
+            params: vec![
+                ("temperature".to_string(), "0.7".to_string()),
+                ("top_p".to_string(), "0.9".to_string()),
+            ],
+            context_length: Some(131_072),
+        });
+        let out = render_screen_for_test(&state);
+        // The Default view should surface the server-reported block.
+        assert!(
+            out.contains("server 0.12.6"),
+            "version should render. Output: {out:?}"
+        );
+        assert!(
+            out.contains("temperature:") && out.contains("0.7"),
+            "temperature row should render. Output: {out:?}"
+        );
+        assert!(
+            out.contains("context_length:") && out.contains("131072"),
+            "context_length row should render. Output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn server_info_block_absent_before_first_ping() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(Some("http://gpu.example.test:11434".to_string()), None);
+        let out = render_screen_for_test(&state);
+        assert!(
+            !out.contains("server "),
+            "no server line before a ping succeeded. Output: {out:?}"
+        );
     }
 
     #[test]

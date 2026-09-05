@@ -550,10 +550,14 @@ pub enum QueryEvent {
     Compact(CompactOutcome),
     /// Result of an Ollama server ping. Carries the request identity and
     /// whether the ping was intended to populate the model picker.
+    /// `server_info` carries what the server reported about itself (version
+    /// plus the effective request parameters from `/api/show` for the
+    /// model the dialog has selected) when the ping succeeded.
     OllamaPingResult {
         request_id: u64,
         for_model_picker: bool,
         result: Result<Vec<OllamaPingModel>, String>,
+        server_info: Option<OllamaServerInfo>,
     },
     /// Result of an explicit `/ollama discover` LAN scan. Candidates are
     /// `(host_url, latency_ms, model_count)` for every host that answered
@@ -573,6 +577,22 @@ pub struct OllamaPingModel {
     pub size: u64,
     pub quantization: String,
     pub parameter_size: String,
+}
+
+/// What an Ollama server reported about itself during a ping: the version
+/// string from `/api/version` and the effective request parameters for the
+/// selected model from `/api/show` (modelfile `parameters` plus
+/// `model_info` context-length keys). Parameters absent from the modelfile
+/// are simply not listed — Ollama then uses its built-in defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OllamaServerInfo {
+    pub version: Option<String>,
+    /// `(parameter, value)` pairs as the server reports them, e.g.
+    /// `("temperature", "0.7")`, `("num_ctx", "32768")`.
+    pub params: Vec<(String, String)>,
+    /// Context window from `model_info` (`<family>.context_length`), when
+    /// the model metadata exposes it.
+    pub context_length: Option<u64>,
 }
 
 /// Result of a background `/compact` request, delivered via

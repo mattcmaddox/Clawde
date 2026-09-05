@@ -1716,6 +1716,11 @@ pub struct App {
     /// `/api/ps`). Empty when no models are loaded or when Ollama is not
     /// configured.
     pub ollama_loaded_models: Vec<clawde_core::OllamaLoadedModel>,
+    /// What the Ollama server last reported about itself during a dialog
+    /// ping: version string plus the effective request parameters
+    /// (`/api/show`) for the model the screen selected. `None` until the
+    /// first successful ping in this session.
+    pub ollama_server_info: Option<clawde_query::OllamaServerInfo>,
     /// Outcome of the most recent background health sweep. Used by the footer
     /// to show a marker when dead keys were found (also updated by /health).
     pub last_health_sweep: Option<clawde_api::health_poller::ProbeOutcome>,
@@ -2334,6 +2339,7 @@ impl App {
             free_model_lists: Vec::new(),
             ollama_mode: clawde_core::OllamaMode::default(),
             ollama_loaded_models: Vec::new(),
+            ollama_server_info: None,
             last_health_sweep: None,
             free_upstream_index: 0,
             free_model_popup: crate::free_model_popup::FreeModelPopupState::default(),
@@ -4053,6 +4059,7 @@ impl App {
         self.ollama_ping_request_id = self.ollama_ping_request_id.wrapping_add(1);
         self.ollama_ping_host = String::new();
         self.ollama_ping_for_models = false;
+        self.ollama_server_info = None;
         self.free_mode_dialog = crate::free_mode_dialog::FreeModeDialogState::new();
         self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
         self.device_auth_pending = None;
@@ -12010,6 +12017,7 @@ impl App {
                 request_id,
                 for_model_picker,
                 result,
+                server_info,
             } => {
                 if request_id != self.ollama_ping_request_id || !self.ollama_config_dialog.visible {
                     return;
@@ -12021,6 +12029,14 @@ impl App {
                 // input is stale and must not paint the new host's dot.
                 if self.ollama_ping_host != self.ollama_config_dialog.host_url_input {
                     return;
+                }
+                // Server-reported info (version + effective params) passed
+                // the same staleness guards, so it describes the host and
+                // model the user is actually looking at; store it and mirror
+                // it into the open screen.
+                if let Some(info) = server_info {
+                    self.ollama_server_info = Some(info.clone());
+                    self.ollama_config_dialog.set_server_info(info);
                 }
                 if for_model_picker
                     && matches!(
@@ -15338,6 +15354,7 @@ mod tests {
             request_id: 7,
             for_model_picker: false,
             result: Err("connection refused".to_string()),
+            server_info: None,
         });
         assert_eq!(
             app.ollama_config_dialog.health,
@@ -15368,6 +15385,7 @@ mod tests {
             request_id: 11,
             for_model_picker: false,
             result: Ok(vec![]),
+            server_info: None,
         });
         // It must not be attributed to the new host.
         assert_eq!(
@@ -15390,6 +15408,7 @@ mod tests {
             request_id: 3,
             for_model_picker: true,
             result: Ok(vec![]),
+            server_info: None,
         });
         assert_eq!(
             app.ollama_config_dialog.phase,
@@ -15427,6 +15446,7 @@ mod tests {
             request_id: 9,
             for_model_picker: false,
             result: Ok(vec![]),
+            server_info: None,
         });
         assert_eq!(
             app.ollama_config_dialog.phase,

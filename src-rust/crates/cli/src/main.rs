@@ -6964,13 +6964,25 @@ async fn run_interactive(
             // results when the snapshot no longer matches the input, keeping
             // the health dot attributed to the host the user is looking at.
             let host_url = app.ollama_ping_host.clone();
+            // Server-reported info (version + effective params) is fetched
+            // for the model the dialog currently shows so the `/ollama`
+            // screen can display it; best effort, None on failure.
+            let show_model = app.ollama_config_dialog.model_input.clone();
             let tx = event_tx.clone();
             tokio::spawn(async move {
+                let server_info = match clawde_core::config::normalize_ollama_host(&host_url) {
+                    Some(host) => {
+                        let client = reqwest::Client::new();
+                        Some(fetch_ollama_server_info(&client, &host, &show_model).await)
+                    }
+                    None => None,
+                };
                 let result = ping_ollama_and_fetch_models(&host_url).await;
                 let _ = tx.send(QueryEvent::OllamaPingResult {
                     request_id,
                     for_model_picker,
                     result,
+                    server_info,
                 });
             });
         }
@@ -8130,6 +8142,84 @@ async fn ping_ollama_and_fetch_models(
         .ok_or_else(|| "Ollama must run on another computer's GPU".to_string())?;
     let client = reqwest::Client::new();
     fetch_ollama_models_at(&client, &normalized, std::time::Duration::from_secs(5)).await
+}
+
+/// Fetch the Ollama server version from `/api/version` (best effort).
+async fn fetch_ollama_version_at(client: &reqwest::Client, host: &str) -> Option<String> {
+    let url = format!("{}/api/version", host.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = response.json().await.ok()?;
+    json.get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+/// Fetch the effective request parameters Ollama reports for one model via
+/// `/api/show` (modelfile `parameters` lines plus `model_info`
+/// context-length keys). Best effort: an empty result means the server did
+/// not report anything (older server, unknown model, or no modelfile
+/// parameters — Ollama then uses its built-in defaults).
+async fn fetch_ollama_server_info(
+    client: &reqwest::Client,
+    host: &str,
+    model: &str,
+) -> clawde_query::OllamaServerInfo {
+    let host = host.trim_end_matches('/');
+    let version = fetch_ollama_version_at(client, host).await;
+    let mut info = clawde_query::OllamaServerInfo {
+        version,
+        params: Vec::new(),
+        context_length: None,
+    };
+    if model.trim().is_empty() {
+        return info;
+    }
+    let show_url = format!("{host}/api/show");
+    let response = match client
+        .post(&show_url)
+        .json(&serde_json::json!({ "name": model }))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return info,
+    };
+    let json: serde_json::Value = match response.json().await {
+        Ok(j) => j,
+        Err(_) => return info,
+    };
+    // Modelfile parameters arrive as one newline-separated string:
+    // "temperature 0.7\nnum_ctx 32768".
+    if let Some(parameters) = json.get("parameters").and_then(|v| v.as_str()) {
+        for line in parameters.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((name, value)) = line.split_once(char::is_whitespace) {
+                info.params
+                    .push((name.trim().to_string(), value.trim().to_string()));
+            }
+        }
+    }
+    info.context_length = json
+        .get("model_info")
+        .and_then(|mi| mi.as_object())
+        .and_then(|mi| {
+            mi.iter()
+                .find(|(key, _)| key.ends_with(".context_length"))
+                .and_then(|(_, v)| v.as_u64())
+        });
+    info
 }
 
 /// OLLAMA_DISCOVERY_PORT is the well-known Ollama native-API port.
