@@ -242,10 +242,45 @@ pub fn commit_card(
     // `add -A` records additions, modifications, and deletions (where the
     // runner's diff helper used `add -N` intent-to-add for display only).
     git(work_dir, &["add", "-A"])?;
+    unstage_tracked_artifacts(work_dir);
     // Single `-m` arg — git parses `--message`'s value, never as an option.
     git(work_dir, &["commit", "-m", message])?;
     git(repo_root, &["rev-parse", branch])
 }
+
+/// Artifact paths tracked in the card worktree's index (i.e. committed into
+/// the project before the exclude file existed). gitignore-style excludes
+/// only affect UNtracked files, so a base commit that already tracks e.g.
+/// `src/__pycache__/demo.pyc` (a pre-katban test run) re-stages it on every
+/// `add -A` — the live smoke shipped a 500-byte pytest cache blob inside a
+/// card commit this way. Unstaging the tracked artifact paths stages their
+/// deletion while leaving the file on disk (the gate's checks still run
+/// against it); a subsequent add -A keeps it out (untracked + excluded).
+fn unstage_tracked_artifacts(work_dir: &Path) {
+    for pathspec in ARTIFACT_PATHSPECS {
+        // A bare directory name as pathspec only matches the top level (git
+        // returns 128 "did not match any files" for `__pycache__` under
+        // `src/`), so each pattern is a `:(glob)**/...` magic pathspec that
+        // matches at any depth. A no-match result is the common case (the
+        // artifact was never tracked) and is swallowed.
+        let _ = git(work_dir, &["rm", "-r", "-q", "--cached", pathspec]);
+    }
+}
+
+/// Artifact pathspecs that gate/pytest runs generate inside a card worktree,
+/// matching at any depth. Mirror of the patterns in
+/// `ensure_artifact_excludes` (which can only ever keep NEW files out)
+/// expressed as git magic pathspecs for un-staging already-tracked ones.
+const ARTIFACT_PATHSPECS: &[&str] = &[
+    ":(glob)**/node_modules/**",
+    ":(glob)**/node_modules",
+    ":(glob)**/target/**",
+    ":(glob)**/target",
+    ":(glob)**/__pycache__/**",
+    ":(glob)**/__pycache__",
+    ":(glob)**/.venv/**",
+    ":(glob)**/.venv",
+];
 
 /// Merge the (pinned) card branch into the project's current checkout branch.
 /// On conflict the merge is aborted so the admin's checkout is never left
@@ -377,6 +412,71 @@ mod tests {
             assert_ne!(sha, main);
             // Git sees the commit (object exists).
             assert!(git(repo.path(), &["cat-file", "-e", &sha]).is_ok());
+        });
+    }
+
+    #[test]
+    fn commit_card_drops_artifacts_tracked_in_the_base() {
+        // The live-smoke regression: a base commit that already tracks an
+        // artifact path (e.g. `src/__pycache__/demo.pyc` committed before the
+        // exclude file existed) re-stages the regenerated blob on `add -A`,
+        // shipping a pytest cache inside the card commit. The card commit
+        // must carry the artifact's deletion instead (disk copy stays for the
+        // gate's checks; excludes keep the untracked file out afterwards).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        with_home(tmp.path(), || {
+            // A repo whose HEAD already tracks a pycache blob.
+            let init = std::process::Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(init.status.success());
+            std::fs::create_dir_all(repo.path().join("src/__pycache__")).unwrap();
+            std::fs::write(repo.path().join("src/__pycache__/demo.pyc"), "stale blob").unwrap();
+            std::fs::write(repo.path().join("src/demo.py"), "orig\n").unwrap();
+            std::fs::write(repo.path().join("README.md"), "# demo\n").unwrap();
+            let add = std::process::Command::new("git")
+                .args(["add", "."])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(add.status.success());
+            let commit = std::process::Command::new("git")
+                .args(["commit", "-q", "-m", "init (accidentally tracks pyc)"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(commit.status.success());
+
+            let wt = worktree_root().join("c3");
+            create_worktree(repo.path(), &wt, None).unwrap();
+            // The agent's fix, plus pytest regenerating the tracked pyc.
+            std::fs::write(wt.join("src/demo.py"), "fixed\n").unwrap();
+            std::fs::write(wt.join("src/__pycache__/demo.pyc"), "regenerated blob").unwrap();
+
+            let sha = commit_card(repo.path(), &wt, "katban/ef02", "katban: fix").unwrap();
+            let files = git(&wt, &["ls-tree", "-r", "--name-only", &sha]).unwrap();
+            assert!(
+                !files.contains("__pycache__"),
+                "card commit must not carry pytest artifacts, got: {files}"
+            );
+            assert!(
+                files.contains("src/demo.py"),
+                "the actual work is committed"
+            );
+            // The artifact stays on disk (the gate's checks run against it).
+            assert!(wt.join("src/__pycache__/demo.pyc").exists());
+            // And a follow-up add -A (the next rung / follow-up commit) keeps
+            // it out too — untracked + excluded now.
+            std::fs::write(wt.join("more.txt"), "x\n").unwrap();
+            let _ = git(&wt, &["add", "-A"]);
+            let staged = git(&wt, &["diff", "--cached", "--name-only"]).unwrap();
+            assert!(
+                !staged.contains("__pycache__"),
+                "regenerated pyc must stay untracked, staged: {staged}"
+            );
         });
     }
 
