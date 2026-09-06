@@ -1896,6 +1896,41 @@ pub fn resolve_free_upstream_keys(
     None
 }
 
+/// Upstream ids currently in a persisted cooldown (5xx / circuit-breaker or
+/// empty-completion track), i.e. ones a recent clawde process found dead or
+/// returning empty completions.
+///
+/// Reads `{config_dir}/empty-cooldown-state/free.json` — the snapshot every
+/// FreeProvider writes (`ENABLE_EMPTY_COOLDOWN_PERSISTENCE`). Timestamps are
+/// absolute unix seconds, so a separate process (e.g. the katban scheduler
+/// deciding which rungs to pin) can consume this without sharing memory with
+/// the dispatching provider. Expired entries are ignored, and a missing or
+/// unparseable file simply means "nothing known to be cooling".
+pub fn cooling_free_upstreams() -> std::collections::HashSet<String> {
+    let path = clawde_core::config::Settings::config_dir()
+        .join("empty-cooldown-state")
+        .join("free.json");
+    let Ok(json) = std::fs::read_to_string(&path) else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<UpstreamCooldownSnapshot>>(&json) else {
+        return std::collections::HashSet::new();
+    };
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    entries
+        .into_iter()
+        .filter(|e| {
+            let empty_active = e.empty_cooldown_until_unix.is_some_and(|u| u > now_unix);
+            let cb_active = e.cooldown_until_unix.is_some_and(|u| u > now_unix);
+            empty_active || cb_active
+        })
+        .map(|e| e.upstream)
+        .collect()
+}
+
 /// All stored keys for a free-catalog upstream, including single-key / OAuth
 /// credentials (e.g. github-copilot), deduplicated, with OpenCode Zen sharing
 /// the OpenCode Go slots.
@@ -2589,6 +2624,54 @@ mod cache_tests {
         assert!(
             reason.starts_with("groq: [groq] Rate limited"),
             "got: {reason}"
+        );
+    }
+
+    /// `cooling_free_upstreams` reads the persisted cooldown snapshot and
+    /// reports only upstreams whose cooldown expiry is still in the future —
+    /// expired entries, unknown upstreams, and missing files are ignored.
+    #[test]
+    fn cooling_free_upstreams_reads_persisted_snapshot() {
+        let _home = TestHome::new();
+        let dir = clawde_core::config::Settings::config_dir().join("empty-cooldown-state");
+        std::fs::create_dir_all(&dir).unwrap();
+        // No file yet: nothing known to be cooling.
+        assert!(cooling_free_upstreams().is_empty());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(
+            dir.join("free.json"),
+            format!(
+                r#"[
+                    {{"upstream": "nvidia", "consecutive_empties": 2, "empty_cooldown_until_unix": {}}},
+                    {{"upstream": "cerebras", "consecutive_empties": 0, "cooldown_until_unix": {}}},
+                    {{"upstream": "groq", "consecutive_empties": 1, "empty_cooldown_until_unix": {}}},
+                    {{"upstream": "mistral", "consecutive_empties": 1, "empty_cooldown_until_unix": null}}
+                ]"#,
+                now_unix + 600,
+                now_unix + 600,
+                now_unix - 1
+            ),
+        )
+        .unwrap();
+        let cooling = cooling_free_upstreams();
+        assert!(
+            cooling.contains("nvidia"),
+            "active empty cooldown: {cooling:?}"
+        );
+        assert!(
+            cooling.contains("cerebras"),
+            "active 5xx cooldown: {cooling:?}"
+        );
+        assert!(
+            !cooling.contains("groq"),
+            "expired entries ignored: {cooling:?}"
+        );
+        assert!(
+            !cooling.contains("mistral"),
+            "no active track means not cooling: {cooling:?}"
         );
     }
 
