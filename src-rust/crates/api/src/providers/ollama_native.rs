@@ -219,11 +219,12 @@ impl OllamaNativeProvider {
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for (idx, call) in calls.iter().enumerate() {
                 let function = call.get("function").cloned().unwrap_or(Value::Null);
-                let name = function
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                let name = crate::tool_name::sanitize_tool_name(
+                    function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                );
                 let raw_args = function.get("arguments").cloned().unwrap_or(Value::Null);
                 let input = match raw_args {
                     Value::String(s) => {
@@ -468,11 +469,12 @@ impl LlmProvider for OllamaNativeProvider {
                         }
                         for call in calls {
                             let function = call.get("function").cloned().unwrap_or(Value::Null);
-                            let name = function
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
+                            let name = crate::tool_name::sanitize_tool_name(
+                                function
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            );
                             let raw_args = function.get("arguments").cloned().unwrap_or(Value::Null);
                             let args_json = match raw_args {
                                 Value::String(s) => s,

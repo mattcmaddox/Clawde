@@ -157,11 +157,9 @@ impl MinimaxProvider {
                     },
                     "tool_use" => {
                         let id = value.get("content_block")?.get("id")?.as_str()?.to_string();
-                        let name = value
-                            .get("content_block")?
-                            .get("name")?
-                            .as_str()?
-                            .to_string();
+                        let name = crate::tool_name::sanitize_tool_name(
+                            value.get("content_block")?.get("name")?.as_str()?,
+                        );
                         ContentBlock::ToolUse {
                             id,
                             name,

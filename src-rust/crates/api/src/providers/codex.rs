@@ -482,11 +482,9 @@ impl CodexProvider {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let name = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let name = crate::tool_name::sanitize_tool_name(
+                        item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                    );
                     let args = item
                         .get("arguments")
                         .and_then(|v| v.as_str())
@@ -705,11 +703,11 @@ impl LlmProvider for CodexProvider {
                                                 .and_then(|value| value.as_str())
                                                 .unwrap_or("")
                                                 .to_string();
-                                            let name = item
-                                                .get("name")
-                                                .and_then(|value| value.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
+                                            let name = crate::tool_name::sanitize_tool_name(
+                                                item.get("name")
+                                                    .and_then(|value| value.as_str())
+                                                    .unwrap_or(""),
+                                            );
                                             if open_blocks.insert(output_index) {
                                                 yield Ok(StreamEvent::ContentBlockStart {
                                                     index: output_index,

@@ -507,12 +507,12 @@ impl OpenAiProvider {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let name = crate::tool_name::sanitize_tool_name(
+                    tc.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                );
                 let args_str = tc
                     .get("function")
                     .and_then(|f| f.get("arguments"))
@@ -680,6 +680,48 @@ impl OpenAiProvider {
 mod tests {
     use super::*;
     use clawde_core::types::Message;
+
+    #[test]
+    fn non_streaming_tool_names_lose_harmony_channel_markers() {
+        // The measured nvidia/gpt-oss leak: tool names arrive with the
+        // harmony `<|channel|>` marker embedded. The parser must resolve the
+        // real tool name or the call dies as "Unknown tool" (live smoke
+        // 2026-09-06: 2 of 10 tool calls lost to this).
+        let json = json!({
+            "id": "c1",
+            "model": "gpt-oss-120b",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "Write<|channel|>json",
+                            "arguments": "{\"file_path\":\"a.py\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = OpenAiProvider::parse_non_streaming_response(
+            &json,
+            &ProviderId::new(ProviderId::OPENAI),
+        )
+        .unwrap();
+        let tool_use = response
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .expect("tool use block");
+        assert_eq!(tool_use, "Write");
+    }
 
     #[test]
     fn user_tool_results_become_tool_messages() {
@@ -1075,12 +1117,12 @@ impl LlmProvider for OpenAiProvider {
                             if let Some(tc_id) =
                                 tc.get("id").and_then(|v| v.as_str())
                             {
-                                let name = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                                let name = crate::tool_name::sanitize_tool_name(
+                                    tc.get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(""),
+                                );
                                 // OpenAI tool calls sit after the text block.
                                 // Use index 1 + tc_index.
                                 let block_index = 1 + tc_index;

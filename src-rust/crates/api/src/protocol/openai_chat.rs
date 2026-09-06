@@ -226,12 +226,12 @@ impl OpenAiChatDecoder {
             for tc in tool_calls {
                 let tc_index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 if let Some(tc_id) = tc.get("id").and_then(|v| v.as_str()) {
-                    let name = tc
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let name = crate::tool_name::sanitize_tool_name(
+                        tc.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    );
                     let block_index = 1 + tc_index;
                     self.tool_call_buffers.insert(
                         block_index,
@@ -473,6 +473,29 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 1 })));
+    }
+
+    #[test]
+    fn streamed_tool_names_lose_harmony_channel_markers() {
+        // The measured nvidia/gpt-oss leak (katban live smoke 2026-09-06):
+        // the serving stack leaks `<|channel|>` into the streamed tool name,
+        // which then dies as "Unknown tool". The decoder must resolve the
+        // real name in the ContentBlockStart event.
+        let mut d = OpenAiChatDecoder::new(None);
+        let (events, _done) = drain(
+            &mut d,
+            &[
+                r#"data: {"id":"c","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"Write<|channel|>json","arguments":"{}"}}]}}]}"#,
+                r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ],
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentBlock::ToolUse { name, .. }
+            } if name == "Write"
+        )));
     }
 
     #[test]

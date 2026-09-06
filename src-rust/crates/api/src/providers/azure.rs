@@ -358,12 +358,12 @@ impl LlmProvider for AzureProvider {
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0) as usize;
                             if let Some(tc_id) = tc.get("id").and_then(|v| v.as_str()) {
-                                let name = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                                let name = crate::tool_name::sanitize_tool_name(
+                                    tc.get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(""),
+                                );
                                 let block_index = 1 + tc_index;
                                 tool_call_buffers.insert(
                                     block_index,
