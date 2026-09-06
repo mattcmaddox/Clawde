@@ -80,6 +80,8 @@ impl SlashCommand for KatbanCommand {
          /katban board card feedback <id> — send the card's review comments to its agent\n\
          /katban board auto-review on|off — toggle the auto-review pass\n\
          /katban board verify on|off    — toggle the verification gate\n\
+         /katban board attempts <N>      — run each card up to N times (1-5); first verify pass wins\n\
+         /katban board attempts-upstreams [ids...] — pin the attempts rotation (empty = auto)\n\
          /katban board card show <id>    — show a card's status, result, commit, diff\n\
          /katban board link <a> <b>      — make <a> wait for <b> (cycle-checked)\n\
          /katban board unlink <a> <b>    — remove that dependency\n\
@@ -297,6 +299,20 @@ impl SlashCommand for KatbanCommand {
                 Ok(text) => CommandResult::Message(text),
                 Err(message) => CommandResult::Error(message),
             },
+            ["board", "attempts", n] => match board_set_attempts(project, n) {
+                Ok(text) => CommandResult::Message(text),
+                Err(message) => CommandResult::Error(message),
+            },
+            ["board", "attempts-upstreams"] => match board_set_attempt_upstreams(project, &[]) {
+                Ok(text) => CommandResult::Message(text),
+                Err(message) => CommandResult::Error(message),
+            },
+            ["board", "attempts-upstreams", ids @ ..] => {
+                match board_set_attempt_upstreams(project, ids) {
+                    Ok(text) => CommandResult::Message(text),
+                    Err(message) => CommandResult::Error(message),
+                }
+            }
             ["board", "card", "merge", id] => {
                 // Option B — pin-commit flow: merge the review card's branch
                 // into the project and close it (dependents then unblock).
@@ -606,6 +622,53 @@ fn board_set_auto_review(project: Option<&str>, state: &str) -> Result<String, S
         if enabled { "enabled" } else { "disabled" },
         project_name(project)
     ))
+}
+
+/// Set the board's per-card attempts:N ladder count
+/// (`/katban board attempts <N>`, spec §7).
+fn board_set_attempts(project: Option<&str>, n: &str) -> Result<String, String> {
+    let value: u32 = n.parse().map_err(|_| {
+        format!(
+            "attempts must be a number 1-{}, got '{n}'",
+            clawde_katban::board::MAX_ATTEMPTS
+        )
+    })?;
+    if !(1..=clawde_katban::board::MAX_ATTEMPTS).contains(&value) {
+        return Err(format!(
+            "attempts must be 1-{}, got {value}",
+            clawde_katban::board::MAX_ATTEMPTS
+        ));
+    }
+    let stored = with_board_lock(project, |board| board.set_attempts(value))?;
+    Ok(format!(
+        "attempts {stored} for board '{}'",
+        project_name(project)
+    ))
+}
+
+/// Pin the attempts rotation (`/katban board attempts-upstreams [ID...]`);
+/// empty = auto-derive from the keyed free catalog (spec §6).
+fn board_set_attempt_upstreams(project: Option<&str>, ids: &[&str]) -> Result<String, String> {
+    for id in ids {
+        if clawde_api::providers::free::catalog_entry(id).is_none() {
+            return Err(format!("unknown upstream '{id}' — not in the free catalog"));
+        }
+    }
+    let names: Vec<String> = with_board_lock(project, |board| {
+        board.attempt_upstreams = ids.iter().map(|s| s.to_string()).collect();
+        board.attempt_upstreams.clone()
+    })?;
+    let project = project_name(project);
+    if names.is_empty() {
+        Ok(format!(
+            "attempts-upstreams auto (derived from the free catalog) for board '{project}'"
+        ))
+    } else {
+        Ok(format!(
+            "attempts-upstreams {} for board '{project}'",
+            names.join(", ")
+        ))
+    }
 }
 
 /// Toggle the board's verification gate (`/katban board verify on|off`).

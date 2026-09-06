@@ -28,7 +28,7 @@
 //!   finalization only fires if the card is *still* running: if the admin
 //!   moved it meanwhile, their edit wins.
 
-use crate::board::{self, BoardLock, CardStatus, FailureKind};
+use crate::board::{self, AttemptOutcome, BoardLock, CardStatus, FailureKind, MAX_ATTEMPTS};
 use crate::git;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -38,13 +38,61 @@ use std::time::Duration;
 /// How long the scheduler sleeps between poll cycles.
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
-/// Executor abstraction so tests can substitute a scripted runner for the real
-/// headless clawde subprocess.
-pub trait CardExecutor: Send + Sync {
-    fn execute(&self, work_dir: &Path, prompt: &str) -> Result<String, String>;
+/// Pause before the single bounded retry of a rate-limited attempt (spec
+/// §4.5): short enough to keep the ladder snappy, long enough for a
+/// per-second 429 burst to clear. Bounded — the retry happens at most once
+/// per attempt, then the ladder moves on.
+const RATE_LIMIT_RETRY_PAUSE: Duration = Duration::from_secs(5);
+
+/// Structured result of one agent run (spec §4.1). The executor parses the
+/// headless `--output-format stream-json` events natively (the same shapes
+/// the eval harness validates) and hands the runner attribution + usage so
+/// the ladder can enforce pin honesty and the empty-completion guard.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttemptOutput {
+    /// Human digest of the response text (what `card.result` showed before
+    /// the structured output existed): first non-empty lines of the text.
+    pub digest: String,
+    /// Attribution: the free-catalog upstream that actually served, when the
+    /// stream reported one (`None` = no attribution event, e.g. a non-free
+    /// provider answered or the run failed before dispatch).
+    pub served_upstream: Option<String>,
+    /// The model id attribution reported (when present).
+    pub model: Option<String>,
+    pub output_tokens: u64,
+    pub text_chars: usize,
+    pub tool_calls: usize,
+    /// An in-stream error event (`{"type":"error",...}`), e.g. the pinned
+    /// upstream's rate limit after the chain exhausted.
+    pub stream_error: Option<String>,
 }
 
-/// Real executor: spawn the current clawde binary headless in the worktree.
+impl AttemptOutput {
+    /// The eval's empty-completion guard (`is_empty_completion` semantics):
+    /// no text + no tool calls + zero output tokens is a provider flake (the
+    /// model spent the whole reply in a thinking block), not a pass. A no-op
+    /// must never reach the verify gate — real projects have pass-as-shipped
+    /// checks, and an unchanged tree skips the gate today (spec §4.6).
+    pub fn is_empty_completion(&self) -> bool {
+        self.text_chars == 0 && self.tool_calls == 0 && self.output_tokens == 0
+    }
+}
+
+/// Executor abstraction so tests can substitute a scripted runner for the
+/// real headless clawde subprocess. `model` is the attempt's pin
+/// (`free/<upstream>/<model>` route string) or `None` for the default chain.
+pub trait CardExecutor: Send + Sync {
+    fn execute(
+        &self,
+        work_dir: &Path,
+        prompt: &str,
+        model: Option<&str>,
+    ) -> Result<AttemptOutput, String>;
+}
+
+/// Real executor: spawn the current clawde binary headless in the worktree,
+/// with `--output-format stream-json` so the run yields attribution and usage
+/// instead of just prose.
 pub struct ClawdeExecutor {
     clawde_bin: PathBuf,
 }
@@ -64,24 +112,37 @@ impl Default for ClawdeExecutor {
 }
 
 impl CardExecutor for ClawdeExecutor {
-    fn execute(&self, work_dir: &Path, prompt: &str) -> Result<String, String> {
-        let output = std::process::Command::new(&self.clawde_bin)
-            .current_dir(work_dir)
-            .args(["--print", prompt])
+    fn execute(
+        &self,
+        work_dir: &Path,
+        prompt: &str,
+        model: Option<&str>,
+    ) -> Result<AttemptOutput, String> {
+        let mut command = std::process::Command::new(&self.clawde_bin);
+        // bypass-permissions is required for headless execution: there is no
+        // TUI to approve tool prompts, so without it every Bash/Edit/Write is
+        // denied and the agent can only talk (the card's live smoke caught
+        // this — tools all denied, tree unchanged, gate skipped). The card's
+        // worktree is the safety lane on the host tier (spec §2); the
+        // container tier (§8) is the hard boundary.
+        command.current_dir(work_dir).args([
+            "--print",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--permission-mode",
+            "bypass-permissions",
+        ]);
+        if let Some(model) = model {
+            command.args(["--model", model]);
+        }
+        let output = command
             .output()
             .map_err(|e| format!("could not start clawde: {e}"))?;
         if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let digest: Vec<&str> = text
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .take(4)
-                .collect();
-            Ok(if digest.is_empty() {
-                "completed".to_string()
-            } else {
-                digest.join("\n")
-            })
+            Ok(parse_attempt_stream(&String::from_utf8_lossy(
+                &output.stdout,
+            )))
         } else {
             let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
             Err(if err.is_empty() {
@@ -97,6 +158,249 @@ impl CardExecutor for ClawdeExecutor {
                     .collect::<Vec<_>>()
                     .join(" ")
             })
+        }
+    }
+}
+
+/// Parse one attempt's stream-json lines into an [`AttemptOutput`]. Mirrors
+/// the eval harness's `parse_stream_events` event shapes (`text_delta`,
+/// `tool_start`, `provider_attribution`, `result`, `error`). A stream with no
+/// parseable events degrades to the old plain-text digest so an unexpected
+/// writer still produces a useful result.
+fn parse_attempt_stream(stdout: &str) -> AttemptOutput {
+    let mut out = AttemptOutput::default();
+    let mut text = String::new();
+    let mut saw_event = false;
+    for line in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("text_delta") => {
+                saw_event = true;
+                if let Some(delta) = event.get("text").and_then(|t| t.as_str()) {
+                    text.push_str(delta);
+                }
+            }
+            Some("tool_start") => {
+                saw_event = true;
+                out.tool_calls += 1;
+            }
+            Some("provider_attribution") => {
+                saw_event = true;
+                out.served_upstream = event
+                    .get("upstream_id")
+                    .and_then(|u| u.as_str())
+                    .map(str::to_string);
+                out.model = event
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string);
+            }
+            Some("result") => {
+                saw_event = true;
+                if let Some(tokens) = event
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(|t| t.as_u64())
+                {
+                    out.output_tokens = tokens;
+                }
+                // The final result event is authoritative for attribution.
+                if let Some(upstream) = event.get("upstream").and_then(|u| u.as_str()) {
+                    out.served_upstream = Some(upstream.to_string());
+                }
+                if let Some(model) = event.get("model").and_then(|m| m.as_str()) {
+                    out.model = Some(model.to_string());
+                }
+            }
+            Some("error") => {
+                saw_event = true;
+                if let Some(error) = event.get("error").and_then(|e| e.as_str()) {
+                    out.stream_error = Some(error.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out.text_chars = text.chars().count();
+    out.digest = digest_of(&text, saw_event);
+    out
+}
+
+/// The card's human digest: the first non-empty lines of the response text.
+/// With no stream events at all, the raw stdout was prose — digest that.
+fn digest_of(text: &str, saw_event: bool) -> String {
+    let digest: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(4)
+        .collect();
+    if digest.is_empty() {
+        if saw_event {
+            "completed".to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        digest.join("\n")
+    }
+}
+
+/// Whether an error message is a transient rate limit (the one failure class
+/// that gets a single bounded retry before the ladder moves on, spec §4.5).
+fn is_rate_limited(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("429")
+        || lower.contains("too many requests")
+        || lower.contains("retry after")
+        || lower.contains("retry-after")
+        || lower.contains("quota")
+}
+
+/// One pinned rung of the attempts:N ladder: the catalog upstream the attempt
+/// is pinned to plus the exact `--model` route string (`free/<id>/<model>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttemptPin {
+    upstream: String,
+    model: String,
+}
+
+impl AttemptPin {
+    fn route_string(&self) -> &str {
+        &self.model
+    }
+}
+
+/// Build the attempt ladder's pin list (spec §4.2 + §6):
+/// - `attempt_upstreams` (admin-set) wins verbatim, cycled to N rungs.
+/// - Otherwise derive from the free catalog: keyed upstreams (auth store)
+///   in catalog order, distinct `model_family` first, then distinct hosts of
+///   the same family (groq+nvidia gpt-oss is still real diversity — the
+///   serving stacks differ measurably).
+/// - Fewer available upstreams than N: run min(N, available) rungs — never
+///   reuse the same upstream within one ladder unless families are
+///   exhausted (admin lists are cycled, not truncated, per §4.2).
+/// - Upstreams the free chain recently put into cooldown (5xx circuit
+///   breaker or empty-completion track — the persisted snapshot the
+///   dispatching provider writes) are ranked **after** healthy ones: they
+///   only fill rungs when healthy upstreams can't, and an all-cooling list
+///   runs as-is rather than producing no ladder at all (spec §6.3).
+///
+/// Returns an empty vec for `attempts <= 1` (single-attempt default run — no
+/// pin, no diversity machinery).
+fn ladder_pins(
+    attempts: u32,
+    attempt_upstreams: &[String],
+    keyed_upstreams: &HashSet<String>,
+    cooling_upstreams: &HashSet<String>,
+) -> Vec<AttemptPin> {
+    let rungs = attempts.clamp(1, MAX_ATTEMPTS) as usize;
+    if rungs <= 1 {
+        return Vec::new();
+    }
+    if !attempt_upstreams.is_empty() {
+        // Admin intent: healthy entries cycle first; cooling entries only fill
+        // leftover rungs. If *everything* listed is cooling, run the list as-is.
+        let (healthy, cooling): (Vec<&String>, Vec<&String>) = attempt_upstreams
+            .iter()
+            .partition(|id| !cooling_upstreams.contains(*id));
+        let ordered: Vec<&String> = if healthy.is_empty() {
+            attempt_upstreams.iter().collect()
+        } else {
+            let mut o = healthy.clone();
+            o.extend(cooling);
+            o
+        };
+        return (0..rungs)
+            .map(|i| {
+                let upstream = ordered[i % ordered.len()].clone();
+                let model = catalog_entry_default(&upstream)
+                    .map(|m| format!("free/{upstream}/{m}"))
+                    .unwrap_or_else(|| format!("free/{upstream}"));
+                AttemptPin { upstream, model }
+            })
+            .collect();
+    }
+    // Auto-derive: keyed catalog entries in order, healthy entries before
+    // cooling ones — a cooling upstream only fills rungs the healthy set
+    // can't; all-cooling degrades to the plain family ordering.
+    let keyed: Vec<&clawde_api::providers::free::FreeUpstream> =
+        clawde_api::providers::free::FREE_CATALOG
+            .iter()
+            .filter(|e| keyed_upstreams.contains(e.id))
+            .collect();
+    let (healthy, cooling): (Vec<_>, Vec<_>) = keyed
+        .into_iter()
+        .partition(|e| !cooling_upstreams.contains(e.id));
+    let mut ordered = family_ranked(healthy);
+    ordered.extend(family_ranked(cooling));
+    let available = ordered.len();
+    if available == 0 {
+        return Vec::new();
+    }
+    ordered
+        .into_iter()
+        .take(rungs)
+        .map(|entry| AttemptPin {
+            upstream: entry.id.to_string(),
+            model: format!("free/{}/{}", entry.id, entry.default_model),
+        })
+        .collect()
+}
+
+/// A catalog upstream's default model id, for admin-set pin routes.
+fn catalog_entry_default(upstream: &str) -> Option<&'static str> {
+    clawde_api::providers::free::FREE_CATALOG
+        .iter()
+        .find(|e| e.id == upstream)
+        .map(|e| e.default_model)
+}
+
+/// Distinct `model_family` first, then distinct hosts of already-seen
+/// families (groq+nvidia both serving gpt-oss is still real diversity).
+fn family_ranked(
+    entries: Vec<&clawde_api::providers::free::FreeUpstream>,
+) -> Vec<&clawde_api::providers::free::FreeUpstream> {
+    let mut primary = Vec::new();
+    let mut secondary = Vec::new();
+    let mut seen_families: HashSet<&str> = HashSet::new();
+    for entry in entries {
+        if seen_families.insert(entry.model_family) {
+            primary.push(entry);
+        } else {
+            secondary.push(entry);
+        }
+    }
+    primary.extend(secondary);
+    primary
+}
+
+/// The upstream ids with at least one usable key in the auth store (the same
+/// `>= 8 chars after trim` validity rule the chain applies). The ladder
+/// derives from these so it never pins a dead upstream (spec §6.3).
+fn keyed_upstream_ids() -> HashSet<String> {
+    let store = clawde_core::AuthStore::load();
+    clawde_api::providers::free::FREE_CATALOG
+        .iter()
+        .filter(|e| clawde_api::providers::free::first_free_upstream_key(&store, e.id).is_some())
+        .map(|e| e.id.to_string())
+        .collect()
+}
+
+/// Record one attempt outcome on the card (under the lock) so the matrix is
+/// visible even while later rungs still run — and survives a crashed runner.
+fn record_attempt(project: &str, card_id: &str, outcome: AttemptOutcome) {
+    let Ok(_guard) = BoardLock::acquire(project) else {
+        return;
+    };
+    if let Ok(Some(mut board)) = board::load_board(project) {
+        if let Some(card) = board.cards.iter_mut().find(|c| c.id == card_id) {
+            card.attempts.push(outcome);
+            card.updated_at = crate::time::now_secs();
+            let _ = board::save_board(&board, project);
         }
     }
 }
@@ -171,7 +475,7 @@ fn recover_stale_running(project: &str) -> anyhow::Result<()> {
     for card in &mut board.cards {
         if card.status == CardStatus::Running {
             card.status = CardStatus::Queued;
-            card.updated_at = crate::guest::now_secs();
+            card.updated_at = crate::time::now_secs();
             changed = true;
             // The crashed runner may have left this card's worktree behind;
             // remember it so we can tear it down after the lock releases.
@@ -313,7 +617,17 @@ async fn spawn_ready(
 }
 
 /// Run one card: set up its worktree (creating it when the project has a repo;
-/// otherwise an isolated scratch dir under our root), run the agent, finalize.
+/// otherwise an isolated scratch dir under our root), run the attempts:N
+/// ladder, finalize.
+///
+/// Ladder semantics (spec §4): with `board.attempts = N > 1`, each rung is
+/// pinned to a different free-catalog upstream (distinct model families
+/// first). After every rung the verification gate runs in that rung's tree;
+/// the FIRST gate pass is promoted immediately (the card finalizes on that
+/// tree and the remaining worktrees are torn down). With the gate off, the
+/// first non-empty completion wins (no selector, first-wins degradation).
+/// Pin honesty: a rung whose attribution does not match its pin never counts
+/// as a pass. All rungs' outcomes are recorded on the card.
 async fn run_one_card(
     project: &str,
     repo_root: Option<&Path>,
@@ -359,65 +673,154 @@ async fn run_one_card(
         }
     }
 
-    let outcome = executor.execute(work_dir, prompt);
-    let mut failed = outcome.is_err();
-    let mut failure_kind = outcome.as_ref().err().map(|_| FailureKind::Agent);
-    let mut note: Option<String> = outcome
-        .as_ref()
-        .err()
-        .or(outcome.as_ref().ok())
-        .map(|s| s.to_string());
-
-    // Load the board's per-card toggles once (before either gate): the
-    // verification gate (board audit option 1) and the auto-review pass
-    // (option 2).
-    let (verify_on, auto_review_on) = board::load_board(project)
+    // The board's knobs once per card: gates/toggles plus the ladder shape.
+    let (verify_on, auto_review_on, attempts, attempt_upstreams) = board::load_board(project)
         .ok()
         .flatten()
-        .map(|b| (b.verify, b.auto_review))
-        .unwrap_or((true, false));
+        .map(|b| {
+            (
+                b.verify,
+                b.auto_review,
+                b.attempts,
+                b.attempt_upstreams.clone(),
+            )
+        })
+        .unwrap_or((true, false, 1, Vec::new()));
+    let pins = ladder_pins(
+        attempts,
+        &attempt_upstreams,
+        &keyed_upstream_ids(),
+        &clawde_api::providers::free::cooling_free_upstreams(),
+    );
 
-    if !failed {
-        // Verification gate: the card's work must pass the project's own
-        // checks before it is accepted into review. A failing check fails the
-        // card with the check output in its result; a skip (board off / tree
-        // unchanged / deps not installable) is surfaced on the result so it is
-        // never silent.
+    // The ladder. `winner` = (index, structured output) of the promoted rung.
+    let mut winner: Option<(usize, AttemptOutput)> = None;
+    let mut last_failure: Option<FailureKind> = None;
+    for (idx, pin) in pins.iter().enumerate() {
+        let started = std::time::Instant::now();
+        let (mut outcome, output) =
+            run_attempt(&card_id, work_dir, prompt, executor, Some(pin)).await;
+        outcome.elapsed_ms = Some(started.elapsed().as_millis() as u64);
+
+        // The empty-completion guard runs BEFORE the gate: a no-op must never
+        // pass pass-as-shipped checks (spec §4.6).
+        if output.is_empty_completion() {
+            outcome.error = Some("empty completion".to_string());
+            record_attempt(project, &card_id, outcome.clone());
+            continue;
+        }
+        // Pin honesty: attribution must name the pinned upstream (spec §4.5).
+        // Route::Pinned falls through silently; a fallthrough rung is excluded
+        // even when its verify happened to pass — its identity is wrong for
+        // the diversity policy. No attribution event at all (a non-free
+        // provider answered) keeps the rung eligible.
+        if let Some(served) = &output.served_upstream {
+            if served != &pin.upstream {
+                outcome.error = Some(format!("pin fell through: served by {served}"));
+                outcome.verify_passed = None;
+                record_attempt(project, &card_id, outcome.clone());
+                continue;
+            }
+        }
+
+        // The gate decides (never the agent). The worktree now holds THIS
+        // rung's tree.
         let gate = crate::verify::run_gate(work_dir, verify_on).await;
         if !gate.passed {
-            failed = true;
-            failure_kind = Some(FailureKind::Verification);
-            note = Some(gate.detail.clone());
-        } else if gate.skipped {
-            let base = note.clone().unwrap_or_default();
-            note = Some(format!("{base} · gate skipped: {}", gate.detail));
+            outcome.verify_passed = Some(false);
+            outcome.error = Some(gate.detail.clone());
+            record_attempt(project, &card_id, outcome.clone());
+            last_failure = Some(FailureKind::Verification);
+            continue;
         }
+        outcome.verify_passed = Some(true);
+        if gate.skipped {
+            // Gate off / no checks / skipped install: no selector exists, so
+            // this rung wins on being a real (non-empty) completion — the
+            // documented first-wins degradation (spec §9). The skip reason is
+            // surfaced on the rung, never silent.
+            outcome.error = Some(format!("gate skipped: {}", gate.detail));
+        }
+        record_attempt(project, &card_id, outcome.clone());
+        record_winner(project, &card_id, idx);
+        winner = Some((idx, output));
+        break;
     }
 
-    if !failed {
-        // Auto-review pass (board audit option 2): a second headless agent
-        // reads the diff and attaches findings as ordinary review comments
-        // (best-effort — any failure just skips the pass). Findings are added
-        // under the board lock while the card is still running, so they ride
-        // into the final review state with it.
-        if auto_review_on {
-            let diff = git::diff_clamped(work_dir);
-            if diff.trim().is_empty() {
-                // Nothing changed (e.g. a no-op follow-up): there is no diff to
-                // review — skip the pass instead of spawning a reviewer to look
-                // at an empty diff (and potentially attach noise comments).
-                tracing::info!(project, card = %card_id, "auto-review skipped: empty diff");
+    // Single-attempt default (no ladder): today's behavior exactly — one run,
+    // no pin, gate decides.
+    let (final_failed, final_note, final_failure) = if pins.is_empty() && winner.is_none() {
+        let started = std::time::Instant::now();
+        let (mut outcome, output) = run_attempt(&card_id, work_dir, prompt, executor, None).await;
+        outcome.elapsed_ms = Some(started.elapsed().as_millis() as u64);
+        if output.is_empty_completion() {
+            outcome.error = Some("empty completion".to_string());
+            record_attempt(project, &card_id, outcome);
+            (
+                true,
+                Some("empty completion".to_string()),
+                Some(FailureKind::Agent),
+            )
+        } else {
+            let gate = crate::verify::run_gate(work_dir, verify_on).await;
+            if !gate.passed {
+                outcome.verify_passed = Some(false);
+                outcome.error = Some(gate.detail.clone());
+                record_attempt(project, &card_id, outcome);
+                (true, Some(gate.detail), Some(FailureKind::Verification))
             } else {
-                match crate::verify::auto_review(work_dir, prompt, &diff).await {
-                    Ok(findings) => {
-                        for finding in findings {
-                            let text = format!("[auto-review] {}", finding.text);
-                            let _ = board::add_review(project, &card_id, finding.line, &text);
-                        }
+                outcome.verify_passed = Some(true);
+                let mut note = output.digest.clone();
+                if gate.skipped {
+                    // The old "gate skipped" suffix, preserved verbatim so
+                    // existing result consumers keep parsing it.
+                    let base = if note.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{note} · ")
+                    };
+                    note = format!("{base}gate skipped: {}", gate.detail);
+                    outcome.error = Some(gate.detail.clone());
+                }
+                record_attempt(project, &card_id, outcome);
+                (false, Some(note), None)
+            }
+        }
+    } else if let Some((_, output)) = winner {
+        // A ladder rung won: its digest is the card's result, gate-skip
+        // surfacing included (already recorded on the winning outcome).
+        (false, Some(output.digest.clone()), None)
+    } else {
+        // All rungs failed: a composed result naming each rung's error; the
+        // failure kind is verification when a gate fail was the last signal,
+        // else agent (spec §4.4). auto_retry applies unchanged from here.
+        let summary = attempt_errors_summary(project, &card_id);
+        (
+            true,
+            Some(summary),
+            last_failure.or(Some(FailureKind::Agent)),
+        )
+    };
+
+    // Auto-review (option 2) runs once, on the winning attempt's diff only
+    // (spec §9). The worktree is still present at this point.
+    if !final_failed && auto_review_on {
+        let diff = git::diff_clamped(work_dir);
+        if diff.trim().is_empty() {
+            // Nothing changed (e.g. a no-op follow-up): there is no diff to
+            // review — skip the pass instead of spawning a reviewer to look
+            // at an empty diff (and potentially attach noise comments).
+            tracing::info!(project, card = %card_id, "auto-review skipped: empty diff");
+        } else {
+            match crate::verify::auto_review(work_dir, prompt, &diff).await {
+                Ok(findings) => {
+                    for finding in findings {
+                        let text = format!("[auto-review] {}", finding.text);
+                        let _ = board::add_review(project, &card_id, finding.line, &text);
                     }
-                    Err(error) => {
-                        tracing::info!(project, card = %card_id, error = %error, "auto-review skipped");
-                    }
+                }
+                Err(error) => {
+                    tracing::info!(project, card = %card_id, error = %error, "auto-review skipped");
                 }
             }
         }
@@ -427,10 +830,121 @@ async fn run_one_card(
         project,
         &card_id,
         work_dir,
-        failed,
-        note.as_deref(),
-        failure_kind,
+        final_failed,
+        final_note.as_deref(),
+        final_failure,
     );
+}
+
+/// Run ONE rung of the ladder (or the whole single-attempt run when `pin` is
+/// `None`): the agent subprocess in `work_dir` plus its bookkeeping. The gate
+/// is NOT run here — the caller gates in ladder order. Returns the outcome
+/// (sans elapsed time, which the caller stamps) and the structured output.
+async fn run_attempt(
+    _card_id: &str,
+    work_dir: &Path,
+    prompt: &str,
+    executor: &Arc<dyn CardExecutor>,
+    pin: Option<&AttemptPin>,
+) -> (AttemptOutcome, AttemptOutput) {
+    let mut outcome = AttemptOutcome {
+        upstream: pin.map(|p| p.upstream.clone()).unwrap_or_default(),
+        model: pin.map(|p| p.model.clone()).unwrap_or_default(),
+        ..AttemptOutcome::default()
+    };
+    let route = pin.map(|p| p.route_string().to_string());
+    // `execute` waits on a subprocess; run it on the blocking pool so a long
+    // agent run never stalls the async runtime (works on every runtime flavor).
+    let result = {
+        let executor = executor.clone();
+        let work_dir = work_dir.to_path_buf();
+        let prompt = prompt.to_string();
+        let route = route.clone();
+        tokio::task::spawn_blocking(move || executor.execute(&work_dir, &prompt, route.as_deref()))
+            .await
+            .unwrap_or_else(|e| Err(format!("attempt task panicked: {e}")))
+    };
+    match result {
+        Ok(output) => {
+            outcome.served_upstream = output.served_upstream.clone();
+            if outcome.model.is_empty() {
+                outcome.model = output.model.clone().unwrap_or_default();
+            }
+            (outcome, output)
+        }
+        Err(first_error) => {
+            // The one bounded retry (spec §4.5): a rate-limited rung waits a
+            // short pause and tries once more, then the ladder moves on.
+            if is_rate_limited(&first_error) {
+                tokio::time::sleep(RATE_LIMIT_RETRY_PAUSE).await;
+                let retry = {
+                    let executor = executor.clone();
+                    let work_dir = work_dir.to_path_buf();
+                    let prompt = prompt.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        executor.execute(&work_dir, &prompt, route.as_deref())
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("attempt task panicked: {e}")))
+                };
+                match retry {
+                    Ok(output) => {
+                        outcome.served_upstream = output.served_upstream.clone();
+                        if outcome.model.is_empty() {
+                            outcome.model = output.model.clone().unwrap_or_default();
+                        }
+                        return (outcome, output);
+                    }
+                    Err(retry_error) => {
+                        outcome.error = Some(retry_error.clone());
+                        return (
+                            outcome,
+                            AttemptOutput {
+                                stream_error: Some(retry_error),
+                                ..AttemptOutput::default()
+                            },
+                        );
+                    }
+                }
+            }
+            outcome.error = Some(first_error.clone());
+            (
+                outcome,
+                AttemptOutput {
+                    stream_error: Some(first_error),
+                    ..AttemptOutput::default()
+                },
+            )
+        }
+    }
+}
+
+/// Persist the winning rung index on the card (under the lock). Called once,
+/// immediately after the winning gate pass, so an early promotion is visible
+/// on the record even if the process dies before finalize.
+fn record_winner(project: &str, card_id: &str, index: usize) {
+    let Ok(_guard) = BoardLock::acquire(project) else {
+        return;
+    };
+    if let Ok(Some(mut board)) = board::load_board(project) {
+        if let Some(card) = board.cards.iter_mut().find(|c| c.id == card_id) {
+            card.picked_attempt = Some(index);
+            card.updated_at = crate::time::now_secs();
+            let _ = board::save_board(&board, project);
+        }
+    }
+}
+
+/// Compose the all-rungs-failed result from the card's recorded matrix:
+/// `1: groq (free/groq/gpt-oss-120b) err (rate limit) · 2: nvidia …`.
+fn attempt_errors_summary(project: &str, card_id: &str) -> String {
+    board::load_board(project)
+        .ok()
+        .flatten()
+        .and_then(|b| b.card(card_id).cloned())
+        .filter(|card| !card.attempts.is_empty())
+        .map(|card| card.attempts_summary())
+        .unwrap_or_else(|| "all attempts failed".to_string())
 }
 
 /// Persist a card's final state after its agent exits. Only transitions a card
@@ -523,7 +1037,7 @@ fn finalize(
             }
             // The checkout is about to be torn down; drop the stale path.
             card.work_dir = None;
-            card.updated_at = crate::guest::now_secs();
+            card.updated_at = crate::time::now_secs();
             let _ = board::save_board(&board, project);
         }
     } // lock released (Option<BoardLock> dropped)
@@ -603,12 +1117,25 @@ mod tests {
         }
     }
     impl CardExecutor for FakeExecutor {
-        fn execute(&self, _work_dir: &Path, _prompt: &str) -> Result<String, String> {
+        fn execute(
+            &self,
+            _work_dir: &Path,
+            _prompt: &str,
+            _model: Option<&str>,
+        ) -> Result<AttemptOutput, String> {
             if self.outcomes.is_empty() {
-                return Ok("done".into());
+                return Ok(AttemptOutput {
+                    digest: "done".into(),
+                    text_chars: 4,
+                    ..AttemptOutput::default()
+                });
             }
             match self.outcomes.last().copied().unwrap_or(true) {
-                true => Ok("done".into()),
+                true => Ok(AttemptOutput {
+                    digest: "done".into(),
+                    text_chars: 4,
+                    ..AttemptOutput::default()
+                }),
                 false => Err("boom".into()),
             }
         }
@@ -995,8 +1522,17 @@ mod tests {
 
             struct Noop;
             impl CardExecutor for Noop {
-                fn execute(&self, _work_dir: &Path, _prompt: &str) -> Result<String, String> {
-                    Ok("done".into())
+                fn execute(
+                    &self,
+                    _work_dir: &Path,
+                    _prompt: &str,
+                    _model: Option<&str>,
+                ) -> Result<AttemptOutput, String> {
+                    Ok(AttemptOutput {
+                        digest: "done".into(),
+                        text_chars: 4,
+                        ..AttemptOutput::default()
+                    })
                 }
             }
             let executor: Arc<dyn CardExecutor> = Arc::new(Noop);
@@ -1069,14 +1605,23 @@ mod tests {
 
             struct FailingChecks;
             impl CardExecutor for FailingChecks {
-                fn execute(&self, work_dir: &Path, _prompt: &str) -> Result<String, String> {
+                fn execute(
+                    &self,
+                    work_dir: &Path,
+                    _prompt: &str,
+                    _model: Option<&str>,
+                ) -> Result<AttemptOutput, String> {
                     // The agent "writes" a JS project whose test command fails.
                     std::fs::write(
                         work_dir.join("package.json"),
                         r#"{"scripts":{"test":"node -e \"process.exit(1)\""}}"#,
                     )
                     .unwrap();
-                    Ok("done".into())
+                    Ok(AttemptOutput {
+                        digest: "done".into(),
+                        text_chars: 4,
+                        ..AttemptOutput::default()
+                    })
                 }
             }
             let executor: Arc<dyn CardExecutor> = Arc::new(FailingChecks);
@@ -1148,13 +1693,22 @@ mod tests {
 
             struct FailingChecks;
             impl CardExecutor for FailingChecks {
-                fn execute(&self, work_dir: &Path, _prompt: &str) -> Result<String, String> {
+                fn execute(
+                    &self,
+                    work_dir: &Path,
+                    _prompt: &str,
+                    _model: Option<&str>,
+                ) -> Result<AttemptOutput, String> {
                     std::fs::write(
                         work_dir.join("package.json"),
                         r#"{"scripts":{"test":"node -e \"process.exit(1)\""}}"#,
                     )
                     .unwrap();
-                    Ok("done".into())
+                    Ok(AttemptOutput {
+                        digest: "done".into(),
+                        text_chars: 4,
+                        ..AttemptOutput::default()
+                    })
                 }
             }
             let executor: Arc<dyn CardExecutor> = Arc::new(FailingChecks);
@@ -1300,14 +1854,23 @@ mod tests {
                 Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
             struct Keyed(Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
             impl CardExecutor for Keyed {
-                fn execute(&self, work_dir: &Path, _prompt: &str) -> Result<String, String> {
+                fn execute(
+                    &self,
+                    work_dir: &Path,
+                    _prompt: &str,
+                    _model: Option<&str>,
+                ) -> Result<AttemptOutput, String> {
                     // work_dir is <root>/<project-encoding>/<card>; recover the
                     // project encoding from the parent's file name.
                     if let Some(proj) = work_dir.parent().and_then(|p| p.file_name()) {
                         let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
                         set.insert(proj.to_string_lossy().into_owned());
                     }
-                    Ok("done".into())
+                    Ok(AttemptOutput {
+                        digest: "done".into(),
+                        text_chars: 4,
+                        ..AttemptOutput::default()
+                    })
                 }
             }
             let executor: Arc<dyn CardExecutor> = Arc::new(Keyed(seen.clone()));
@@ -1333,6 +1896,510 @@ mod tests {
                 "live-join failed — schedulers only saw: {seen:?}"
             );
         });
+    }
+
+    // ---- attempts:N ladder (spec §4) -----------------------------------
+
+    /// A scripted executor whose Nth call (0-based) returns the given
+    /// served-upstream/output; unscripted calls serve the pinned upstream
+    /// parsed from the route string (`free/<upstream>/...`) — what the real
+    /// chain reports when a pin holds.
+    struct Scripted {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// (call_index, served_upstream, empty_completion)
+        script: Vec<(usize, Option<String>, bool)>,
+        /// Fail with this error on these call indexes.
+        fail_on: Vec<usize>,
+    }
+    impl CardExecutor for Scripted {
+        fn execute(
+            &self,
+            _work_dir: &Path,
+            _prompt: &str,
+            model: Option<&str>,
+        ) -> Result<AttemptOutput, String> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_on.contains(&n) {
+                return Err("rate limit exceeded, retry after 1s".into());
+            }
+            // The pin holds: attribution names the route's upstream.
+            let pinned = model
+                .and_then(|route| route.strip_prefix("free/"))
+                .and_then(|rest| rest.split('/').next())
+                .map(str::to_string);
+            let entry = self.script.iter().find(|(i, _, _)| *i == n);
+            let (served, empty) = match entry {
+                Some((_, s, e)) => (s.clone().or(pinned), *e),
+                None => (pinned, false),
+            };
+            Ok(if empty {
+                AttemptOutput::default()
+            } else {
+                AttemptOutput {
+                    digest: "did the work".into(),
+                    served_upstream: served,
+                    model: Some("test-model".into()),
+                    output_tokens: 32,
+                    text_chars: 12,
+                    tool_calls: 1,
+                    ..AttemptOutput::default()
+                }
+            })
+        }
+    }
+
+    fn seeded_board(board: &Board) {
+        board::save_board(board, "default").unwrap();
+    }
+
+    #[test]
+    fn ladder_pins_distinct_families_then_hosts() {
+        // Auto-derivation (spec §6): keyed upstreams in catalog order,
+        // distinct model_family first, then distinct hosts of the same
+        // family. nvidia/cerebras/groq all host gpt-oss-120b — groq must not
+        // take a rung until families are exhausted.
+        let keyed: HashSet<String> = ["nvidia", "cerebras", "groq", "zai"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let pins = ladder_pins(3, &[], &keyed, &HashSet::new());
+        assert_eq!(pins.len(), 3, "N rungs from N available");
+        let families: Vec<&str> = pins
+            .iter()
+            .map(|p| {
+                clawde_api::providers::free::FREE_CATALOG
+                    .iter()
+                    .find(|e| e.id == p.upstream)
+                    .map(|e| e.model_family)
+                    .unwrap_or("")
+            })
+            .collect();
+        let mut uniq = families.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        // Primary rungs are distinct families; with only 2 families across 4
+        // keyed upstreams and N=3, the 3rd rung reuses a family on a distinct
+        // host (spec §6.2).
+        assert_eq!(families.len(), 3);
+        assert_eq!(uniq.len(), 2, "families: {families:?}");
+        let ups: Vec<&str> = pins.iter().map(|p| p.upstream.as_str()).collect();
+        assert_eq!(
+            ups.len(),
+            ups.iter().collect::<HashSet<_>>().len(),
+            "no upstream reuse within the ladder: {ups:?}"
+        );
+        // 4 rungs: the 4th may reuse a family but never the same upstream.
+        let pins4 = ladder_pins(4, &[], &keyed, &HashSet::new());
+        let ups: Vec<&str> = pins4.iter().map(|p| p.upstream.as_str()).collect();
+        assert_eq!(
+            ups.len(),
+            ups.iter().collect::<HashSet<_>>().len(),
+            "no upstream reuse: {ups:?}"
+        );
+        // Pin routes are exact `free/<upstream>/<default_model>` strings.
+        for pin in &pins {
+            let def = catalog_entry_default(&pin.upstream).unwrap();
+            assert_eq!(pin.model, format!("free/{}/{}", pin.upstream, def));
+        }
+    }
+
+    #[test]
+    fn ladder_pins_admin_list_cycles_verbatim() {
+        // An admin-set attempt_upstreams wins and cycles to N rungs (§4.2);
+        // unknown ids would have been refused at the CLI surface.
+        let list = vec!["zai".to_string(), "nvidia".to_string()];
+        let pins = ladder_pins(5, &list, &HashSet::new(), &HashSet::new());
+        let ups: Vec<&str> = pins.iter().map(|p| p.upstream.as_str()).collect();
+        assert_eq!(ups, vec!["zai", "nvidia", "zai", "nvidia", "zai"]);
+    }
+
+    #[test]
+    fn ladder_pins_cooling_upstreams_ranked_last() {
+        // Phase 2: an upstream the free chain put into cooldown (5xx breaker
+        // or empty-completion track) only fills rungs healthy upstreams
+        // can't — in both the admin list and auto-derive paths (spec §6.3).
+        let keyed: HashSet<String> = ["zai", "nvidia", "groq"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let cooling: HashSet<String> = ["nvidia"].into_iter().map(str::to_string).collect();
+        let pins = ladder_pins(3, &[], &keyed, &cooling);
+        let ups: Vec<&str> = pins.iter().map(|p| p.upstream.as_str()).collect();
+        assert_eq!(ups.last(), Some(&"nvidia"), "cooling demoted: {ups:?}");
+        assert_eq!(
+            ups.iter().position(|u| *u == "nvidia"),
+            Some(2),
+            "cooling upstream fills only the last rung: {ups:?}"
+        );
+        // Admin list: the cooling entry cycles to the tail.
+        let list = vec!["nvidia".to_string(), "zai".to_string()];
+        let pins = ladder_pins(2, &list, &HashSet::new(), &cooling);
+        let ups: Vec<&str> = pins.iter().map(|p| p.upstream.as_str()).collect();
+        assert_eq!(
+            ups,
+            vec!["zai", "nvidia"],
+            "admin list cooling demoted: {ups:?}"
+        );
+        // All-cooling: run the list as-is rather than producing no ladder.
+        let all_cooling: HashSet<String> =
+            ["zai", "nvidia"].into_iter().map(str::to_string).collect();
+        let pins = ladder_pins(2, &list, &HashSet::new(), &all_cooling);
+        let ups: Vec<&str> = pins.iter().map(|p| p.upstream.as_str()).collect();
+        assert_eq!(
+            ups,
+            vec!["nvidia", "zai"],
+            "all-cooling runs verbatim: {ups:?}"
+        );
+    }
+
+    #[test]
+    fn ladder_empty_without_keys_or_attempts_one() {
+        // No keyed upstreams -> no pins (the ladder degrades to the default
+        // single run rather than pinning dead upstreams, spec §6.3).
+        assert!(ladder_pins(3, &[], &HashSet::new(), &HashSet::new()).is_empty());
+        // attempts = 1 is today's behavior: no pins at all.
+        let keyed: HashSet<String> = ["zai"].into_iter().map(str::to_string).collect();
+        assert!(ladder_pins(1, &[], &keyed, &HashSet::new()).is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ladder_first_gate_pass_wins_and_records_matrix() {
+        // Rung 1 passes the gate -> rung 2 never runs (early promotion,
+        // spec §4.3); the matrix records the picked rung.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            std::fs::write(
+                tmp.path().join("settings.json"),
+                r#"{"config":{"verify":{"enabled":false}}}"#,
+            )
+            .unwrap();
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.attempts = 3;
+            board.attempt_upstreams =
+                vec!["zai".to_string(), "nvidia".to_string(), "groq".to_string()];
+            board.auto_review = false;
+            let a = board.add_card("add a feature");
+            seeded_board(&board);
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor: Arc<dyn CardExecutor> = Arc::new(Scripted {
+                calls,
+                script: vec![],
+                fail_on: vec![],
+            });
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Review);
+            assert_eq!(card.attempts.len(), 1, "only rung 1 ran");
+            assert_eq!(card.picked_attempt, Some(0));
+            assert_eq!(card.attempts[0].upstream, "zai");
+            assert_eq!(card.attempts[0].verify_passed, Some(true));
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ladder_pin_fallthrough_is_excluded_and_ladder_advances() {
+        // Rung 1's attribution names a different upstream than its pin
+        // (Route::Pinned fell through): it must not win even with the gate
+        // off; rung 2 wins instead (spec §4.5).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            std::fs::write(
+                tmp.path().join("settings.json"),
+                r#"{"config":{"verify":{"enabled":false}}}"#,
+            )
+            .unwrap();
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.attempts = 2;
+            board.attempt_upstreams = vec!["nvidia".to_string(), "zai".to_string()];
+            board.auto_review = false;
+            let a = board.add_card("add a feature");
+            seeded_board(&board);
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+
+            // Call 0 serves groq while pinned to nvidia -> fallthrough.
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor: Arc<dyn CardExecutor> = Arc::new(Scripted {
+                calls,
+                script: vec![(0, Some("groq".into()), false)],
+                fail_on: vec![],
+            });
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Review);
+            assert_eq!(card.picked_attempt, Some(1), "rung 2 won");
+            assert_eq!(card.attempts.len(), 2);
+            assert_eq!(
+                card.attempts[0].verify_passed, None,
+                "fallthrough never reached the gate"
+            );
+            assert!(
+                card.attempts[0]
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("pin fell through"),
+                "error: {:?}",
+                card.attempts[0].error
+            );
+            assert_eq!(card.attempts[1].upstream, "zai");
+            assert_eq!(card.attempts[1].verify_passed, Some(true));
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ladder_empty_completion_never_wins() {
+        // Rung 1 is an empty completion (thinking-only flake): it must not
+        // reach the gate and must not win; rung 2 wins (spec §4.6).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            std::fs::write(
+                tmp.path().join("settings.json"),
+                r#"{"config":{"verify":{"enabled":false}}}"#,
+            )
+            .unwrap();
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.attempts = 2;
+            board.attempt_upstreams = vec!["groq".to_string(), "zai".to_string()];
+            board.auto_review = false;
+            let a = board.add_card("add a feature");
+            seeded_board(&board);
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor: Arc<dyn CardExecutor> = Arc::new(Scripted {
+                calls,
+                script: vec![(0, Some("groq".into()), true)],
+                fail_on: vec![],
+            });
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Review);
+            assert_eq!(card.picked_attempt, Some(1));
+            assert_eq!(card.attempts[0].verify_passed, None);
+            assert_eq!(card.attempts[0].error.as_deref(), Some("empty completion"));
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ladder_all_rungs_fail_fails_card_with_matrix() {
+        // Every rung fails: the card fails with the composed matrix in the
+        // result (spec §4.4) and no commit is pinned.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            std::fs::write(
+                tmp.path().join("settings.json"),
+                r#"{"config":{"verify":{"enabled":false}}}"#,
+            )
+            .unwrap();
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.attempts = 2;
+            board.attempt_upstreams = vec!["groq".to_string(), "zai".to_string()];
+            board.auto_review = false;
+            let a = board.add_card("add a feature");
+            seeded_board(&board);
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor: Arc<dyn CardExecutor> = Arc::new(Scripted {
+                calls,
+                // Every call fails (call 2/3 are the retries of rungs 0/1),
+                // so both rungs exhaust including their bounded retry.
+                script: vec![],
+                fail_on: vec![0, 1, 2, 3],
+            });
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Failed);
+            assert_eq!(card.attempts.len(), 2, "both rungs recorded");
+            assert!(card.picked_attempt.is_none());
+            let result = card.result.as_deref().unwrap();
+            assert!(
+                result.contains("groq") && result.contains("zai"),
+                "matrix in result: {result}"
+            );
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_attempt_stream_reads_attribution_and_usage() {
+        // The stream shapes the headless CLI emits (cli main.rs): attribution,
+        // text deltas, tool starts, and the final result with usage.
+        let stream = concat!(
+            r#"{"type":"provider_attribution","provider_id":"free","upstream_id":"groq","model":"gpt-oss-120b","context_tokens_est":41,"retries":0,"fallback_used":false}"#,
+            "\n",
+            r#"{"type":"text_delta","text":"hello "}"#,
+            "\n",
+            r#"{"type":"tool_start","tool":"Edit"}"#,
+            "\n",
+            r#"{"type":"text_delta","text":"world"}"#,
+            "\n",
+            r#"{"type":"result","usage":{"input_tokens":10,"output_tokens":32},"cost_usd":0.0,"provider":"free","upstream":"groq","model":"gpt-oss-120b","retries":0,"fallback_used":false}"#,
+            "\n",
+        );
+        let out = parse_attempt_stream(stream);
+        assert_eq!(out.served_upstream.as_deref(), Some("groq"));
+        assert_eq!(out.model.as_deref(), Some("gpt-oss-120b"));
+        assert_eq!(out.output_tokens, 32);
+        assert_eq!(out.tool_calls, 1);
+        assert_eq!(out.text_chars, "hello world".len());
+        assert!(!out.is_empty_completion());
+        assert_eq!(out.digest, "hello world");
+    }
+
+    #[test]
+    fn empty_completion_guard_matches_eval_semantics() {
+        // Zero text + zero tool calls + zero output tokens = provider flake
+        // (the eval's is_empty_completion), never a gate candidate.
+        assert!(AttemptOutput::default().is_empty_completion());
+        assert!(!AttemptOutput {
+            output_tokens: 1,
+            ..AttemptOutput::default()
+        }
+        .is_empty_completion());
+        assert!(!AttemptOutput {
+            tool_calls: 2,
+            ..AttemptOutput::default()
+        }
+        .is_empty_completion());
+        assert!(!AttemptOutput {
+            text_chars: 5,
+            ..AttemptOutput::default()
+        }
+        .is_empty_completion());
+    }
+
+    #[test]
+    fn rate_limit_classification_covers_the_observed_wording() {
+        // The exact error strings the free chain produced in the eval runs.
+        for message in [
+            "Rate limit exceeded. Please retry after 1s.",
+            "http 429 too many requests",
+            "upstream returned RATE_LIMIT",
+            "quota exhausted for today",
+            "retry-after: 30",
+        ] {
+            assert!(is_rate_limited(message), "{message}");
+        }
+        assert!(!is_rate_limited("could not start clawde"));
+        assert!(!is_rate_limited("test: npm test: exit 1"));
+    }
+
+    #[test]
+    fn attempts_clamped_to_max() {
+        let mut board = Board::new();
+        assert_eq!(board.set_attempts(0), 1);
+        assert_eq!(board.set_attempts(3), 3);
+        assert_eq!(board.set_attempts(50), MAX_ATTEMPTS);
     }
 
     #[test]

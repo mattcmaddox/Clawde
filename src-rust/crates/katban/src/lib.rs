@@ -25,6 +25,7 @@ pub mod reload;
 pub mod runner;
 pub mod search;
 pub mod status;
+pub mod time;
 pub mod verify;
 
 /// Serializes `CLAWDE_HOME` mutation across the crate's test modules —

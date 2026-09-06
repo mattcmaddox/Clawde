@@ -13,6 +13,7 @@ use anyhow::Context;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::iter::Iterator;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +22,10 @@ pub const DEFAULT_PARALLEL_CAP: usize = 3;
 pub const DEFAULT_PROJECT: &str = "default";
 /// Default transient-failure retry count (§16a E16).
 pub const DEFAULT_AUTO_RETRY: u32 = 2;
+/// Default per-card attempt count for the attempts:N ladder (1 = today's
+/// single-attempt behavior). Clamp for user-set values (spec §3).
+pub const DEFAULT_ATTEMPTS: u32 = 1;
+pub const MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -129,6 +134,16 @@ pub struct Card {
     /// shrinks, so this only advances.
     #[serde(default)]
     pub review_ack: usize,
+    /// Per-attempt outcomes of this run, order = attempt index. Recorded
+    /// even when the card overall fails, so `card show` explains what each
+    /// model did (spec §3). Resets each run: attempts are per-run state.
+    #[serde(default)]
+    pub attempts: Vec<AttemptOutcome>,
+    /// Index into `attempts` of the rung that won (first gate pass, or —
+    /// with the gate off — the first non-empty completion). `None` = no
+    /// attempt passed (card failed) or the single-attempt default run.
+    #[serde(default)]
+    pub picked_attempt: Option<usize>,
     #[serde(default)]
     pub created_at: u64,
     #[serde(default)]
@@ -157,6 +172,42 @@ pub struct DiffSummary {
     pub deletions: usize,
 }
 
+/// One rung of a card's attempts:N ladder (spec §3): what was pinned, what
+/// actually served, and how the rung ended. Order in `Card::attempts` is the
+/// attempt index. Recorded even when the card overall fails, so `card show`
+/// explains what each model did. All fields serde-default so older boards
+/// deserialize unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AttemptOutcome {
+    /// Free-catalog upstream id the attempt was pinned to ("" = no pin,
+    /// the single-attempt default run).
+    #[serde(default)]
+    pub upstream: String,
+    /// Full model id actually requested (`free/<upstream>/<model>` when
+    /// pinned; the served model or "" when unpinned).
+    #[serde(default)]
+    pub model: String,
+    /// Attribution: the upstream that actually served the request, when the
+    /// stream reported one. `None` = no attribution event (e.g. a
+    /// non-free provider answered).
+    #[serde(default)]
+    pub served_upstream: Option<String>,
+    /// Whether the verification gate passed in this attempt's tree. `None`
+    /// = the attempt never reached the gate (agent error / flake).
+    #[serde(default)]
+    pub verify_passed: Option<bool>,
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
+    /// FS-diff out-of-scope count (container tier only; host tier records 0).
+    #[serde(default)]
+    pub scope_violations: u32,
+    /// Why the attempt did not win: rate limit, empty completion, pin
+    /// fell through, verify failure detail, crash.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum FailureKind {
@@ -180,6 +231,57 @@ impl Card {
             ),
             _ => self.prompt.clone(),
         }
+    }
+
+    /// Clear per-run attempt state (spec §9: attempts are per-run state — a
+    /// feedback follow-up or auto-retry re-runs the ladder from scratch).
+    pub fn reset_attempts(&mut self) {
+        self.attempts.clear();
+        self.picked_attempt = None;
+    }
+
+    /// One-line human summary of the attempt matrix for `result`/`card list`:
+    /// `attempt 1/3 groq ✓ 74s · 2/3 nvidia ✗ verify · 3/3 zai ✓ 166s` (the
+    /// ✓/✗-free fallback keeps ASCII-only log paths readable).
+    pub fn attempts_summary(&self) -> String {
+        self.attempts
+            .iter()
+            .enumerate()
+            .map(|(idx, a)| {
+                let mark = match a.verify_passed {
+                    Some(true) => "pass",
+                    Some(false) => "FAIL",
+                    None => "err",
+                };
+                let time = a
+                    .elapsed_ms
+                    .map(|ms| format!(" {}s", ms / 1000))
+                    .unwrap_or_default();
+                let err = a
+                    .error
+                    .as_deref()
+                    .map(|e| format!(" ({})", e.chars().take(40).collect::<String>()))
+                    .unwrap_or_default();
+                format!(
+                    "{}: {}{} {}{}{}",
+                    idx + 1,
+                    if a.upstream.is_empty() {
+                        "default"
+                    } else {
+                        a.upstream.as_str()
+                    },
+                    if a.model.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", a.model)
+                    },
+                    mark,
+                    time,
+                    err
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 }
 
@@ -218,6 +320,16 @@ pub struct Board {
     /// `clawde katban board verify on|off`.
     #[serde(default = "default_true")]
     pub verify: bool,
+    /// Run each card N times (N different free-catalog model families) and
+    /// promote the first attempt that passes the verification gate — fastest
+    /// passing attempt wins review (spec §4). 1 = today's single-attempt
+    /// behavior. Clamp 1..=MAX_ATTEMPTS on write.
+    #[serde(default = "default_attempts")]
+    pub attempts: u32,
+    /// Upstream ids attempts rotate over. Empty = derive from the free
+    /// catalog (keyed entries, distinct model families first, spec §6).
+    #[serde(default)]
+    pub attempt_upstreams: Vec<String>,
 }
 
 fn default_parallel_cap() -> usize {
@@ -226,6 +338,10 @@ fn default_parallel_cap() -> usize {
 
 fn default_auto_retry() -> u32 {
     DEFAULT_AUTO_RETRY
+}
+
+fn default_attempts() -> u32 {
+    DEFAULT_ATTEMPTS
 }
 
 fn default_true() -> bool {
@@ -242,6 +358,8 @@ impl Board {
             auto_retry: DEFAULT_AUTO_RETRY,
             auto_review: true,
             verify: true,
+            attempts: DEFAULT_ATTEMPTS,
+            attempt_upstreams: Vec::new(),
         }
     }
 
@@ -270,6 +388,8 @@ impl Board {
             reviews: Vec::new(),
             followup_feedback: None,
             review_ack: 0,
+            attempts: Vec::new(),
+            picked_attempt: None,
             created_at: now,
             updated_at: now,
         });
@@ -287,6 +407,27 @@ impl Board {
             return false;
         };
         card.status = status;
+        card.updated_at = now_secs();
+        true
+    }
+
+    /// Set the board's per-card attempt count, clamped to 1..=MAX_ATTEMPTS
+    /// (spec §3). Returns the clamped value actually stored.
+    pub fn set_attempts(&mut self, attempts: u32) -> u32 {
+        let clamped = attempts.clamp(1, MAX_ATTEMPTS);
+        self.attempts = clamped;
+        clamped
+    }
+
+    /// Replace a card's prompt (web/CLI "edit"). Everything else — id,
+    /// status, reviews, dependencies, pinned branch — is kept, so fixing a
+    /// typo no longer means archive-and-recreate. Returns false when the id
+    /// is unknown.
+    pub fn update_prompt(&mut self, id: &str, prompt: &str) -> bool {
+        let Some(card) = self.cards.iter_mut().find(|card| card.id == id) else {
+            return false;
+        };
+        card.prompt = prompt.trim().to_string();
         card.updated_at = now_secs();
         true
     }
@@ -1056,6 +1197,30 @@ mod tests {
             save_board(&board, "..").unwrap();
             assert!(path.exists());
             assert!(!clawde_home().join("board.json").exists());
+        });
+    }
+
+    #[test]
+    fn update_prompt_replaces_and_preserves_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_home(tmp.path(), || {
+            let mut board = Board::new();
+            let id = board.add_card("  build the landing page  ");
+            board.set_status(&id, CardStatus::Review);
+            save_board(&board, "default").unwrap();
+            add_review("default", &id, Some("9".to_string()), "sticky header").unwrap();
+
+            let mut board = load_board("default").unwrap().unwrap();
+            assert!(board.update_prompt(&id, "  build the marketing site "));
+            let card = board.card(&id).unwrap();
+            assert_eq!(card.prompt, "build the marketing site");
+            assert_eq!(card.status, CardStatus::Review);
+            assert_eq!(card.reviews.len(), 1);
+            save_board(&board, "default").unwrap();
+
+            // Unknown id -> false, board untouched.
+            let mut board = load_board("default").unwrap().unwrap();
+            assert!(!board.update_prompt("nope", "x"));
         });
     }
 

@@ -629,6 +629,7 @@ const BOARD_USAGE: &str = r#"Usage: clawde katban board <command> [--project NAM
   card add <PROMPT>                      Add a card
   card list                              List cards with status
   card set <ID> <STATUS>                 backlog|queued|running|blocked|review|failed|done
+  card edit <ID> <PROMPT>                Replace a card's prompt (keeps id/status/reviews)
   card merge <ID>                        Merge a review card into the project
   card remove <ID>                       Archive (discards its pinned branch)
   link <A> <B>                           B must finish before A starts (cycle-checked)
@@ -1137,6 +1138,55 @@ async fn run_board(args: &[String]) -> anyhow::Result<()> {
                 "verify {} for board '{project}'",
                 if enabled { "enabled" } else { "disabled" }
             );
+            Ok(())
+        }
+        "attempts" => {
+            // attempts:N ladder (spec §7): run each card up to N times on
+            // different free-catalog model families; first verify pass wins.
+            if rest.len() != 1 {
+                anyhow::bail!(
+                    "board attempts needs a number 1-{}",
+                    clawde_katban::board::MAX_ATTEMPTS
+                );
+            }
+            let n: u32 = rest[0].parse().context("attempts must be a number")?;
+            if !(1..=clawde_katban::board::MAX_ATTEMPTS).contains(&n) {
+                anyhow::bail!(
+                    "attempts must be 1-{} (got {n})",
+                    clawde_katban::board::MAX_ATTEMPTS
+                );
+            }
+            let _guard = clawde_katban::board::BoardLock::acquire(project)?;
+            let mut board = load_board(project)?.unwrap_or_default();
+            let stored = board.set_attempts(n);
+            save_board(&board, project)?;
+            println!("attempts {stored} for board '{project}'");
+            Ok(())
+        }
+        "attempts-upstreams" => {
+            // Pin the ladder's rotation explicitly; empty = auto-derive from
+            // the keyed free catalog (spec §6).
+            let _guard = clawde_katban::board::BoardLock::acquire(project)?;
+            let mut board = load_board(project)?.unwrap_or_default();
+            if rest.is_empty() {
+                board.attempt_upstreams.clear();
+                save_board(&board, project)?;
+                println!(
+                    "attempts-upstreams auto (derived from the free catalog) for board '{project}'"
+                );
+            } else {
+                for id in &rest {
+                    if clawde_api::providers::free::catalog_entry(id.as_str()).is_none() {
+                        anyhow::bail!("unknown upstream '{id}' — not in the free catalog");
+                    }
+                }
+                board.attempt_upstreams = rest.to_vec();
+                save_board(&board, project)?;
+                println!(
+                    "attempts-upstreams {} for board '{project}'",
+                    board.attempt_upstreams.join(", ")
+                );
+            }
             Ok(())
         }
         "card" => run_card(project, &rest),
