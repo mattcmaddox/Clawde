@@ -1,5 +1,5 @@
-use clawde_api::provider::LlmProvider;
 use clawde_api::providers::OllamaNativeProvider;
+use clawde_core::{Config, ProviderConfig};
 
 #[tokio::main]
 async fn main() {
@@ -16,61 +16,169 @@ async fn main() {
         model.clone()
     };
 
-    // reload the model first so the unload path is exercised against a loaded model.
-    // Ollama accepts the request and unloads/resident reloads serve
-    // asynchronously, so we do not need a full streamed completion here.
-    // a short no-op load plus a small wait is enough for the unload test.
+    // Constructed to mirror the runtime path under test; the unload behavior
+    // itself is exercised through the core helpers below.
+    let _provider = OllamaNativeProvider::new(inner, native_host.clone());
+
+    // All scenarios run against a Config that pins the core helpers to
+    // OLLAMA_HOST (api_base wins over the env fallback), so the probe never
+    // depends on the dev machine's settings file or its local CPU daemon.
+    let config = config_with_host(&host);
+
+    // ---- Scenario 1: exact-name round trip -------------------------------
+    // Reload so the server has exactly one loaded model, then unload it by
+    // the exact name /api/ps reports.
     reload_model_via_url(&native_host, &requested)
         .await
         .expect("reload");
-    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let tags = inner.discover_models().await.expect("discover");
-    eprintln!(
-        "discovered models via compat layer: {:?}",
-        tags.iter().map(|m| &m.id).collect::<Vec<_>>()
-    );
-
-    // Constructed to mirror the runtime path under test; the unload behavior
-    // itself is exercised through the core helpers below.
-    let _provider = OllamaNativeProvider::new(inner, native_host);
-
-    // 1) status via Clawde's core helper path
-    let config = clawde_core::Settings::load_sync()
-        .map(|s| s.effective_config())
-        .unwrap_or_default();
     let before = clawde_core::ollama_status_for_config(&config)
         .await
-        .expect("ollama_status_for_config");
-    eprintln!("before status =====");
+        .expect("status");
+    eprintln!("scenario 1 (exact name) — before =====");
     for m in &before.models {
         eprintln!("  loaded: name={} size_vram={:?}", m.name, m.size_vram);
     }
+    assert_eq!(
+        before.models.len(),
+        1,
+        "expected exactly the reloaded model resident"
+    );
+    let reported_name = before.models[0].name.clone();
 
-    // 2) unload via Clawde's core helper path
-    let requested = if model.starts_with("ollama/") {
-        model.strip_prefix("ollama/").unwrap().to_string()
-    } else {
-        model.clone()
-    };
-    let unloaded = clawde_core::ollama_unload_models_for_config(&config, Some(&requested))
+    let unloaded = clawde_core::ollama_unload_models_for_config(&config, Some(&reported_name))
         .await
-        .expect("ollama_unload_models_for_config");
-    eprintln!("unload result: unloaded {unloaded}");
+        .expect("unload exact");
+    eprintln!("  unload by exact name {reported_name:?}: unloaded {unloaded}");
+    assert_eq!(
+        unloaded, 1,
+        "exact-name unload must unload the resident model"
+    );
+    assert_empty_server(&config, "after exact-name unload").await;
 
-    // 3) status after
-    let after = clawde_core::ollama_status_for_config(&config)
+    // ---- Scenario 2: tag-variant -----------------------------------------
+    // Request the model under the other tag spelling while the server
+    // reports one form; the unload must still match (the fix under test).
+    reload_model_via_url(&native_host, &requested)
         .await
-        .expect("ollama_status_for_config");
-    eprintln!("after status =====");
-    for m in &after.models {
-        eprintln!("  loaded: name={} size_vram={:?}", m.name, m.size_vram);
+        .expect("reload");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let before = clawde_core::ollama_status_for_config(&config)
+        .await
+        .expect("status");
+    eprintln!("scenario 2 (tag variant) — before =====");
+    for m in &before.models {
+        eprintln!("  loaded: name={}", m.name);
     }
+    assert_eq!(
+        before.models.len(),
+        1,
+        "expected exactly the reloaded model resident"
+    );
+    let reported = before.models[0].name.clone();
+    let variant = tag_variant(&reported);
+    eprintln!("  server reports {reported:?}; unloading under variant {variant:?}");
+    let unloaded = clawde_core::ollama_unload_models_for_config(&config, Some(&variant))
+        .await
+        .expect("unload variant");
+    eprintln!("  unload by variant {variant:?}: unloaded {unloaded}");
+    assert_eq!(
+        unloaded, 1,
+        "tag-variant unload must find the resident model"
+    );
+    assert_empty_server(&config, "after tag-variant unload").await;
 
-    eprintln!("end");
+    // ---- Scenario 3: not-loaded is a named error --------------------------
+    eprintln!("scenario 3 (not loaded) =====");
+    let err = clawde_core::ollama_unload_models_for_config(&config, Some(&requested))
+        .await
+        .expect_err("unloading a not-loaded model must be an error");
+    eprintln!("  error: {err}");
+    assert!(
+        err.contains(requested.as_str()),
+        "error must name the model: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("not currently loaded"),
+        "error must say not loaded: {err}"
+    );
+
+    // ---- Scenario 4: unload-all on an empty server -------------------------
+    eprintln!("scenario 4 (unload-all, empty server) =====");
+    let pre = clawde_core::ollama_status_for_config(&config)
+        .await
+        .expect("status");
+    eprintln!("  pre-unload-all status: {} model(s)", pre.models.len());
+    let unloaded = clawde_core::ollama_unload_models_for_config(&config, None)
+        .await
+        .expect("unload-all");
+    eprintln!("  unload-all on empty server: unloaded {unloaded}");
+    assert_eq!(unloaded, 0, "unload-all on an empty server must be Ok(0)");
+
+    eprintln!("end — all four scenarios behaved as specified");
 }
 
+/// Build a Config whose ollama provider points at `host` so the core helpers
+/// hit the same server the probe talks to, regardless of the dev machine's
+/// settings file or local daemon.
+fn config_with_host(host: &str) -> Config {
+    let mut config = Config::default();
+    config.provider_configs.insert(
+        "ollama".to_string(),
+        ProviderConfig {
+            api_base: Some(host.trim_end_matches('/').to_string()),
+            ..Default::default()
+        },
+    );
+    config
+}
+
+/// The other spelling of the same model: `x:latest` <-> `x`.
+fn tag_variant(name: &str) -> String {
+    match name.rsplit_once(':') {
+        Some((base, tag)) if !base.is_empty() && tag != "latest" => format!("{name}:latest"),
+        Some((base, _)) if !base.is_empty() => base.to_string(),
+        _ => format!("{name}:latest"),
+    }
+}
+
+async fn assert_empty_server(config: &Config, when: &str) {
+    let after = clawde_core::ollama_status_for_config(config)
+        .await
+        .expect("status");
+    assert!(
+        after.models.is_empty(),
+        "{when} must leave the server empty, found {:?}",
+        after.models.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+    eprintln!("  {when}: server empty, as expected");
+}
+
+// reload the model first so the unload path is exercised against a loaded model.
+// Ollama accepts the request and unloads/resident reloads serve
+// asynchronously, so we do not need a full streamed completion here.
+// a short no-op load plus a small wait is enough for the unload test.
+//
+// The LAN link is lossy (600ms RTT Wi-Fi) and cold loads have measured up
+// to ~90s, so a single POST is not reliable: retry transport failures and
+// allow a full load cycle per attempt.
 async fn reload_model_via_url(base: &str, model: &str) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 1..=3 {
+        match reload_once(base, model).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                eprintln!("reload attempt {attempt} failed: {err}");
+                last_err = err;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+async fn reload_once(base: &str, model: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
     let body = serde_json::json!({
         "model": model,
@@ -81,8 +189,6 @@ async fn reload_model_via_url(base: &str, model: &str) -> Result<(), String> {
     let resp = client
         .post(format!("{}/api/generate", base))
         .json(&body)
-        // A cold load of a 7B model measured >45s on the LAN GPU box
-        // (page cache cold); allow a full load cycle.
         .timeout(std::time::Duration::from_secs(300))
         .send()
         .await
