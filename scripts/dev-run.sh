@@ -37,8 +37,9 @@ needs_build() {
 
 if needs_build; then
     echo ":: Building clawde ..." >&2
-    cd "$SRC_DIR" || { echo "Failed to enter $SRC_DIR" >&2; exit 1; }
-    cargo build --package clawde-cli || {
+    # Subshell: keep the cd local so `exec` below inherits the caller's cwd
+    # and clawde starts in the directory it was launched from.
+    ( cd "$SRC_DIR" && cargo build --package clawde-cli ) || {
         echo "Build failed — aborting." >&2
         exit 1
     }
