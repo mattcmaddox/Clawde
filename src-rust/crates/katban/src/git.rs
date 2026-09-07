@@ -282,6 +282,19 @@ const ARTIFACT_PATHSPECS: &[&str] = &[
     ":(glob)**/.venv",
 ];
 
+/// Hard-reset a card worktree to its checked-out base commit (HEAD) and
+/// drop untracked files. Used between ladder rungs so a failed rung's
+/// partial, unverified edits never bleed into the next rung's diff (and a
+/// winning rung's tree is only ever its own work). Non-repo scratch dirs
+/// are a silent no-op, matching the rest of this module's tolerance.
+pub fn reset_worktree_to_base(work_dir: &Path) {
+    if !is_repo(work_dir) {
+        return;
+    }
+    let _ = git(work_dir, &["reset", "--hard", "HEAD"]);
+    let _ = git(work_dir, &["clean", "-fd"]);
+}
+
 /// Merge the (pinned) card branch into the project's current checkout branch.
 /// On conflict the merge is aborted so the admin's checkout is never left
 /// mid-merge: they resolve manually and the card stays in review. `--no-edit`

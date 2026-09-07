@@ -553,6 +553,11 @@ async fn spawn_ready(
                 if c.branch.is_none() {
                     c.branch = Some(format!("katban/{id}"));
                 }
+                // Attempts are per-run state (spec §9): a previous run's
+                // matrix (auto-retry, review follow-up) must not bleed into
+                // this run's records, and a stale picked_attempt from a
+                // failed run must not survive into the new one.
+                c.reset_attempts();
             }
         }
         // For each spawn we also record the card's pinned branch when this is a
@@ -696,17 +701,51 @@ async fn run_one_card(
     // The ladder. `winner` = (index, structured output) of the promoted rung.
     let mut winner: Option<(usize, AttemptOutput)> = None;
     let mut last_failure: Option<FailureKind> = None;
+    // A no-op rung (tree unchanged vs its base) may only win when the card
+    // already carries a prior commit — a follow-up that correctly changes
+    // nothing keeps that commit as the net result. On a FIRST run an
+    // unchanged tree means the agent delivered nothing (the 2026-09-06 live
+    // smoke: "fixed the bug" claim, zero diff, zero commit) and must not be
+    // promoted to review.
+    let base_had_commit = board::load_board(project)
+        .ok()
+        .flatten()
+        .and_then(|b| b.card(&card_id).cloned())
+        .map(|c| c.commit.is_some())
+        .unwrap_or(false);
     for (idx, pin) in pins.iter().enumerate() {
+        if idx > 0 {
+            // The previous rung failed: its partial, unverified edits must not
+            // bleed into this rung's diff — a winning rung's tree is only
+            // ever its own work (per-attempt isolation, spec §4.3, on the
+            // shared per-card worktree).
+            git::reset_worktree_to_base(work_dir);
+        }
         let started = std::time::Instant::now();
         let (mut outcome, output) =
             run_attempt(&card_id, work_dir, prompt, executor, Some(pin)).await;
         outcome.elapsed_ms = Some(started.elapsed().as_millis() as u64);
 
+        // A real error outranks the empty-completion heuristic: an errored
+        // run returns an all-zeros output, and without this check the guard
+        // below would overwrite "rate limit exceeded" with "empty
+        // completion", hiding the cause and breaking retry classification.
+        let pre_gate_error = output
+            .stream_error
+            .clone()
+            .or_else(|| outcome.error.clone());
+        if let Some(err) = pre_gate_error {
+            outcome.error = Some(err);
+            record_attempt(project, &card_id, outcome.clone());
+            last_failure = Some(FailureKind::Agent);
+            continue;
+        }
         // The empty-completion guard runs BEFORE the gate: a no-op must never
         // pass pass-as-shipped checks (spec §4.6).
         if output.is_empty_completion() {
             outcome.error = Some("empty completion".to_string());
             record_attempt(project, &card_id, outcome.clone());
+            last_failure = Some(FailureKind::Agent);
             continue;
         }
         // Pin honesty: attribution must name the pinned upstream (spec §4.5).
@@ -719,6 +758,7 @@ async fn run_one_card(
                 outcome.error = Some(format!("pin fell through: served by {served}"));
                 outcome.verify_passed = None;
                 record_attempt(project, &card_id, outcome.clone());
+                last_failure = Some(FailureKind::Agent);
                 continue;
             }
         }
@@ -731,6 +771,21 @@ async fn run_one_card(
             outcome.error = Some(gate.detail.clone());
             record_attempt(project, &card_id, outcome.clone());
             last_failure = Some(FailureKind::Verification);
+            continue;
+        }
+        // An unchanged tree carries no deliverable: on a first run such a
+        // rung is demoted even when the gate skipped (the skip reason is
+        // usually exactly this — "tree unchanged"), so the ladder keeps
+        // looking for an attempt that actually did the work. Scratch-dir
+        // cards (no repo) have no diff notion; their agent work IS the tree.
+        let in_repo = git::is_repo(work_dir);
+        let base_diff_nonempty = in_repo && !git::diff_clamped(work_dir).trim().is_empty();
+        if gate.skipped && in_repo && !base_diff_nonempty && !base_had_commit {
+            // verify_passed stays None: the gate never really judged this
+            // rung — there was nothing for it to judge.
+            outcome.error = Some(format!("no-op run: {}", gate.detail));
+            record_attempt(project, &card_id, outcome.clone());
+            last_failure = Some(FailureKind::Agent);
             continue;
         }
         outcome.verify_passed = Some(true);
@@ -753,7 +808,21 @@ async fn run_one_card(
         let started = std::time::Instant::now();
         let (mut outcome, output) = run_attempt(&card_id, work_dir, prompt, executor, None).await;
         outcome.elapsed_ms = Some(started.elapsed().as_millis() as u64);
-        if output.is_empty_completion() {
+        // A real error outranks the empty-completion heuristic (same rule as
+        // the ladder): an errored run returns an all-zeros output, and without
+        // this check the guard below would overwrite "rate limit exceeded"
+        // with "empty completion", hiding the cause and breaking retry
+        // classification.
+        let pre_gate_error = output
+            .stream_error
+            .clone()
+            .or_else(|| outcome.error.clone());
+        if let Some(err) = pre_gate_error {
+            let note = err.clone();
+            outcome.error = Some(err);
+            record_attempt(project, &card_id, outcome);
+            (true, Some(note), Some(FailureKind::Agent))
+        } else if output.is_empty_completion() {
             outcome.error = Some("empty completion".to_string());
             record_attempt(project, &card_id, outcome);
             (
@@ -770,20 +839,36 @@ async fn run_one_card(
                 (true, Some(gate.detail), Some(FailureKind::Verification))
             } else {
                 outcome.verify_passed = Some(true);
-                let mut note = output.digest.clone();
-                if gate.skipped {
-                    // The old "gate skipped" suffix, preserved verbatim so
-                    // existing result consumers keep parsing it.
-                    let base = if note.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{note} · ")
-                    };
-                    note = format!("{base}gate skipped: {}", gate.detail);
-                    outcome.error = Some(gate.detail.clone());
+                // The ladder's no-op guard, mirrored: an unchanged tree on a
+                // first run delivered nothing even when the gate skipped, so
+                // the card fails as agent error (retryable) instead of
+                // reaching review with an empty diff.
+                let in_repo = git::is_repo(work_dir);
+                let base_diff_nonempty = in_repo && !git::diff_clamped(work_dir).trim().is_empty();
+                if gate.skipped && in_repo && !base_diff_nonempty && !base_had_commit {
+                    outcome.error = Some(format!("no-op run: {}", gate.detail));
+                    record_attempt(project, &card_id, outcome);
+                    (
+                        true,
+                        Some(format!("no-op run: {}", gate.detail)),
+                        Some(FailureKind::Agent),
+                    )
+                } else {
+                    let mut note = output.digest.clone();
+                    if gate.skipped {
+                        // The old "gate skipped" suffix, preserved verbatim so
+                        // existing result consumers keep parsing it.
+                        let base = if note.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{note} · ")
+                        };
+                        note = format!("{base}gate skipped: {}", gate.detail);
+                        outcome.error = Some(gate.detail.clone());
+                    }
+                    record_attempt(project, &card_id, outcome);
+                    (false, Some(note), None)
                 }
-                record_attempt(project, &card_id, outcome);
-                (false, Some(note), None)
             }
         }
     } else if let Some((_, output)) = winner {
@@ -1030,6 +1115,14 @@ fn finalize(
                 card.failure_kind = None;
                 card.status = CardStatus::Review;
             }
+            // A follow-up that legitimately changed nothing keeps its prior
+            // pinned commit as the net result; say so instead of showing the
+            // run's own (empty) digest as if this run had delivered it.
+            let note = if !failed && diff.is_empty() && card.commit.is_some() {
+                format!("{note} (no changes this run; prior commit stands)")
+            } else {
+                note
+            };
             card.result = Some(note);
             if !diff.is_empty() {
                 card.diff_summary = Some(crate::git::diff_summary(&diff));
@@ -1496,9 +1589,10 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn auto_review_skips_empty_diff() {
-        // A run whose agent changes nothing has an empty diff: the auto-review
-        // pass must not spawn a reviewer (nothing to review) and must not
-        // attach `[auto-review]` noise comments to a change-less card.
+        // A follow-up run whose agent changes nothing keeps the prior commit
+        // (a legitimate no-op) and has an empty diff: the auto-review pass
+        // must not spawn a reviewer (nothing to review) and must not attach
+        // `[auto-review]` noise comments to a change-less card.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
@@ -1511,13 +1605,16 @@ mod tests {
             let a = board.add_card("add a feature");
             board::save_board(&board, "default").unwrap();
             // `run_one_card` creates the worktree itself (the card is marked
-            // running first), so we only reserve the slot.
+            // running first), so we only reserve the slot. The pre-seeded
+            // commit makes this a FOLLOW-UP run — the only path where an
+            // unchanged tree may still win.
             let wt = git::card_worktree_dir("default", &a);
             let mut b = board::load_board("default").unwrap().unwrap();
             b.set_status(&a, CardStatus::Running);
             b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
             b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
                 Some(wt.to_string_lossy().into_owned());
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().commit = Some("prior".into());
             board::save_board(&b, "default").unwrap();
 
             struct Noop;
@@ -1914,7 +2011,7 @@ mod tests {
     impl CardExecutor for Scripted {
         fn execute(
             &self,
-            _work_dir: &Path,
+            work_dir: &Path,
             _prompt: &str,
             model: Option<&str>,
         ) -> Result<AttemptOutput, String> {
@@ -1932,18 +2029,21 @@ mod tests {
                 Some((_, s, e)) => (s.clone().or(pinned), *e),
                 None => (pinned, false),
             };
-            Ok(if empty {
-                AttemptOutput::default()
-            } else {
-                AttemptOutput {
-                    digest: "did the work".into(),
-                    served_upstream: served,
-                    model: Some("test-model".into()),
-                    output_tokens: 32,
-                    text_chars: 12,
-                    tool_calls: 1,
-                    ..AttemptOutput::default()
-                }
+            if empty {
+                return Ok(AttemptOutput::default());
+            }
+            // A real agent changes the tree; the no-op demotion treats an
+            // unchanged first-run tree as a delivery failure. The fake must
+            // behave the same way: every successful call leaves work behind.
+            std::fs::write(work_dir.join("agent-work.md"), "did the work\n").unwrap();
+            Ok(AttemptOutput {
+                digest: "did the work".into(),
+                served_upstream: served,
+                model: Some("test-model".into()),
+                output_tokens: 32,
+                text_chars: 12,
+                tool_calls: 1,
+                ..AttemptOutput::default()
             })
         }
     }
@@ -2263,6 +2363,140 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn errored_rung_keeps_real_error_not_empty_completion() {
+        // A rate-limited rung returns an all-zeros output; the empty-completion
+        // guard must not overwrite its real error (which retry classification
+        // and the matrix summary depend on). Rung 0 errors, rung 1 wins.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            std::fs::write(
+                tmp.path().join("settings.json"),
+                r#"{"config":{"verify":{"enabled":false}}}"#,
+            )
+            .unwrap();
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.attempts = 2;
+            board.attempt_upstreams = vec!["groq".to_string(), "zai".to_string()];
+            board.auto_review = false;
+            let a = board.add_card("add a feature");
+            seeded_board(&board);
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+
+            // Calls 0/1 are rung 0's rate-limited run and its bounded retry;
+            // call 2 is rung 1, which succeeds.
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor: Arc<dyn CardExecutor> = Arc::new(Scripted {
+                calls,
+                script: vec![],
+                fail_on: vec![0, 1],
+            });
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Review);
+            assert_eq!(card.picked_attempt, Some(1));
+            assert_eq!(card.attempts.len(), 2);
+            let err = card.attempts[0].error.as_deref().unwrap();
+            assert!(
+                err.contains("rate limit"),
+                "real error preserved, got: {err}"
+            );
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn single_attempt_error_keeps_real_error_not_empty_completion() {
+        // Same rule on the single-attempt path (attempts: 1): an errored run
+        // fails the card with its real error, never "empty completion".
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            std::fs::write(
+                tmp.path().join("settings.json"),
+                r#"{"config":{"verify":{"enabled":false}}}"#,
+            )
+            .unwrap();
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.attempts = 1;
+            board.auto_review = false;
+            let a = board.add_card("add a feature");
+            seeded_board(&board);
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor: Arc<dyn CardExecutor> = Arc::new(Scripted {
+                calls,
+                script: vec![],
+                fail_on: vec![0, 1],
+            });
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Failed);
+            let err = card.attempts[0].error.as_deref().unwrap();
+            assert!(
+                err.contains("rate limit"),
+                "real error preserved, got: {err}"
+            );
+            let result = card.result.as_deref().unwrap();
+            assert!(
+                result.contains("rate limit") && !result.contains("empty completion"),
+                "result: {result}"
+            );
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn ladder_all_rungs_fail_fails_card_with_matrix() {
