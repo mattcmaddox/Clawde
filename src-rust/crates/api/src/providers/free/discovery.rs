@@ -895,11 +895,13 @@ const KNOWN_FREE_MODELS: &[(&str, &[&str])] = &[
         &["poolside/laguna-s-2.1", "poolside/laguna-xs-2.1"],
     ),
     // Mistral's models.dev free pick (labs-devstral-small-2512) is retired
-    // (3/31/2026); the Experiment tier makes every current model free, so
-    // pin the flagship. Z.AI's docs mark GLM-4.7-Flash / GLM-4.5-Flash free
+    // (3/31/2026). Free-tier reality (probed 2026-09-06): Large-tier models
+    // are hard-gated (403 tier_not_allowed, absent from a free key's
+    // /models), so prefer Small — the highest tier a free key can serve.
+    // Z.AI's docs mark GLM-4.7-Flash / GLM-4.5-Flash free
     // (GLM-4.7 itself is paid); models.dev agrees but the catalog fallback
     // must never land on the paid variant.
-    ("mistral", &["mistral-large-2512"]),
+    ("mistral", &["mistral-small-latest", "mistral-small-2603"]),
     ("zai", &["glm-4.7-flash", "glm-4.5-flash"]),
 ];
 
@@ -908,7 +910,8 @@ const KNOWN_FREE_MODELS: &[(&str, &[&str])] = &[
 /// give monthly token credits rather than per-model free access, so the
 /// Alt+J/K popup should show every model the API returns.
 ///
-/// - Mistral: Experiment tier (~1B tokens/month, all models)
+/// - Mistral: Experiment tier (credit-based; Large tier-gated — picks must
+///   stay on Small or lower)
 /// - SambaNova: Developer tier (~600M tokens/month, all models)
 const CREDIT_BASED_FREE: &[&str] = &["mistral", "sambanova"];
 
@@ -1520,15 +1523,16 @@ mod tests {
     #[test]
     fn select_available_model_mistral_pins_current_model_over_retired_modelsdev_pick() {
         // models.dev still marks labs-devstral-small-2512 (retired 3/31/2026)
-        // as free; the allowlist must win and pin the current flagship.
-        let available: Vec<&str> = vec!["labs-devstral-small-2512", "mistral-large-2512"];
+        // as free; the allowlist must win and pin the free tier's ceiling —
+        // Small (Large is tier-gated, probed 2026-09-06).
+        let available: Vec<&str> = vec!["labs-devstral-small-2512", "mistral-small-latest"];
         let auto = HashMap::from([(
             "mistral".to_string(),
             "labs-devstral-small-2512".to_string(),
         )]);
         assert_eq!(
             select_available_model("mistral", &available, &auto).as_deref(),
-            Some("mistral-large-2512")
+            Some("mistral-small-latest")
         );
     }
 
@@ -1619,8 +1623,12 @@ mod tests {
             "pixtral-12b",
         ];
         let list = select_available_models_from("mistral", &available, &HashMap::new(), &[]);
-        // Allowlisted model is first.
-        assert_eq!(list.first().map(String::as_str), Some("mistral-large-2512"));
+        // Allowlisted model is first: the free tier's ceiling is Small
+        // (Large is tier-gated), so mistral-large-2512 must NOT lead.
+        assert_eq!(
+            list.first().map(String::as_str),
+            Some("mistral-small-latest")
+        );
         // All live models are present.
         assert_eq!(list.len(), 4);
         assert!(list.contains(&"mistral-small-latest".to_string()));

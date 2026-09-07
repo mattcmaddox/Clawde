@@ -101,6 +101,11 @@ pub struct FreeUpstream {
     /// provider's 400 InvalidRequest can't hard-fail the whole request
     /// (audit spec §8.4 "capability match").
     pub vision: bool,
+    /// Whether the upstream's default model supports thinking/reasoning mode.
+    /// Requests with thinking enabled skip non-thinking upstreams at
+    /// plan-build time so the provider doesn't silently drop thinking blocks
+    /// (most providers drop them, a few reject the request).
+    pub thinking: bool,
     /// Hard cap on `max_tokens` for this upstream's default model.
     /// When set, requests are silently clamped to this value.
     pub max_tokens_cap: Option<u32>,
@@ -139,6 +144,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "GPT-4o (16K ctx) — free OAuth via /connect",
         tool_calling: true,
         vision: true,
+        thinking: true,
         max_tokens_cap: Some(16_384),
         context_window: 16_384,
         fallback_models: &["gpt-4o-2024-08-06"],
@@ -155,6 +161,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "Laguna S 2.1 (118B MoE, 256K ctx) — free in Preview",
         tool_calling: true,
         vision: false,
+        thinking: false,
         max_tokens_cap: Some(8_192),
         context_window: 262_144,
         fallback_models: &[],
@@ -173,6 +180,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "GPT-OSS 120B — 2 keys",
         tool_calling: true,
         vision: false,
+        thinking: true,
         max_tokens_cap: Some(8_192),
         context_window: 128_000,
         specialty: "strong generalist",
@@ -189,9 +197,14 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         key_url: "cloud.cerebras.ai",
         default_model: "gpt-oss-120b",
         model_family: "gpt-oss-120b",
+        // Account-level quota exhaustion presents as 402 payment_required on
+        // EVERY model (probed 2026-09-06, incl. gemma-4-31b) — the classifier
+        // maps it to QuotaExhausted (1h cooldown), which is correct: time or
+        // billing fixes it, no catalog change can.
         note: "GPT-OSS 120B (65K ctx) · Gemma 4 31B",
         tool_calling: true,
         vision: false,
+        thinking: true,
         max_tokens_cap: Some(8_192),
         context_window: 65_536,
         fallback_models: &[],
@@ -208,6 +221,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "Gemini 2.5 Flash",
         tool_calling: true,
         vision: true,
+        thinking: true,
         max_tokens_cap: Some(8_192),
         context_window: 128_000,
         fallback_models: &[],
@@ -223,6 +237,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "10K neurons/day — key format ACCOUNT_ID:API_TOKEN",
         tool_calling: true,
         vision: false,
+        thinking: true,
         max_tokens_cap: Some(8_192),
         context_window: 128_000,
         fallback_models: &[],
@@ -238,6 +253,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "GPT-OSS 120B · Llama 3.3 70B — 1K req/day",
         tool_calling: true,
         vision: false,
+        thinking: true,
         specialty: "large context",
         usage: "1K req/day",
         // The groq() factory's own quirks clamp max_tokens to 512 and total
@@ -256,6 +272,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "Llama 3.3 70B · DeepSeek V3",
         tool_calling: true,
         vision: false,
+        thinking: false,
         max_tokens_cap: Some(8_192),
         context_window: 128_000,
         fallback_models: &[],
@@ -272,6 +289,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "live free-model API — auto-discovers best model at startup (currently deepseek-v4-flash)",
         tool_calling: true,
         vision: false,
+        thinking: true,
         max_tokens_cap: Some(8_192),
         context_window: 128_000,
         fallback_models: &[],
@@ -282,19 +300,22 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         id: "mistral",
         title: "Mistral",
         key_url: "console.mistral.ai/api-keys",
-        // The free "Experiment" tier rate-limits ALL API models at $0; the
-        // old Devstral Small default was retired 2026-03-31. Mistral Large 3
-        // (25.12) is the current flagship and is free on that tier.
-        default_model: "mistral-large-2512",
-        model_family: "mistral-large",
-        note: "Mistral Large 3 (free Experiment tier) · Codestral",
+        // Free "Experiment" tier reality (probed 2026-09-06): Large-tier
+        // models are hard-gated (403 tier_not_allowed; not even listed in
+        // /models), so the default must be Small. When the tier's token pool
+        // is exhausted, chat requests 429 with x-ratelimit-limit-req-minute:
+        // 0 until the pool resets — a calendar wait, not a per-minute one.
+        default_model: "mistral-small-latest",
+        model_family: "mistral-small",
+        note: "Mistral Small (free-tier ceiling) · Large is tier-gated",
         tool_calling: true,
         vision: false,
+        thinking: false,
         max_tokens_cap: None,
         context_window: 128_000,
-        fallback_models: &[],
+        fallback_models: &["mistral-small-2603"],
         specialty: "creative",
-        usage: "free · 128K",
+        usage: "free tier · 128K",
     },
     FreeUpstream {
         id: "opencode-zen",
@@ -307,6 +328,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "dynamic Zen free pool — current `*-free` model via /models",
         tool_calling: true,
         vision: false,
+        thinking: true,
         max_tokens_cap: Some(8_192),
         context_window: 128_000,
         fallback_models: &[],
@@ -324,6 +346,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "GLM-4.7-Flash (free) · GLM-4.5-Flash · GLM-5 — Zhipu AI international",
         tool_calling: true,
         vision: false,
+        thinking: true,
         max_tokens_cap: Some(8_192),
         context_window: 128_000,
         fallback_models: &[],
@@ -340,6 +363,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "19 free-tier models — requires $10 prepaid credits",
         tool_calling: true,
         vision: false,
+        thinking: false,
         max_tokens_cap: None,
         context_window: 128_000,
         fallback_models: &[],

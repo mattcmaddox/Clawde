@@ -34,11 +34,14 @@ class EvalHarnessTests(unittest.TestCase):
         entries = parse_catalog(CATALOG_RS)
         cloudflare = next(entry for entry in entries if entry["id"] == "cloudflare")
         self.assertEqual(cloudflare["default_model"], "@cf/qwen/qwen3-30b-a3b-fp8")
-        self.assertEqual(len(entries), 14)
+        # Count is asserted against the facts snapshot, not a literal: the
+        # catalog changes (additions/retirements) must not require test edits.
+        self.assertEqual(len(entries), len(load_catalog_facts()["ids"]))
 
     def test_runtime_catalog_facts_match_checked_in_snapshot(self):
         facts = load_catalog_facts()
-        self.assertEqual(len(facts["ids"]), 14)
+        parsed = parse_catalog(CATALOG_RS)
+        self.assertEqual(len(facts["ids"]), len(parsed))
         self.assertEqual(facts["ids"][0], "github-copilot")
         self.assertEqual(facts["upstreams"][5]["default_model"], "@cf/qwen/qwen3-30b-a3b-fp8")
 

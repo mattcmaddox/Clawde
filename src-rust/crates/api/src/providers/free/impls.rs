@@ -21,6 +21,7 @@ use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
     SystemPromptStyle,
 };
+use clawde_core::effort::EffortLevel;
 use clawde_core::types::{ContentBlock, MessageContent};
 use rand::seq::SliceRandom;
 
@@ -416,11 +417,14 @@ impl FreeProvider {
         // whole message history 14 times.
         let has_images = request.map(Self::request_has_images).unwrap_or(false);
         let has_tools = request.map(Self::request_has_tools).unwrap_or(false);
+        let has_thinking = request.map(Self::request_has_thinking).unwrap_or(false);
         let estimate = request.map(Self::estimate_request_tokens).unwrap_or(0);
         plan = plan
             .into_iter()
             .filter(|(idx, _)| !self.is_disabled_upstream(*idx))
-            .filter(|(idx, _)| self.entry_fits_request(*idx, has_images, has_tools, estimate))
+            .filter(|(idx, _)| {
+                self.entry_fits_request(*idx, has_images, has_tools, has_thinking, estimate)
+            })
             .collect();
 
         // Capacity observations are a soft ordering signal. Preserve an
@@ -449,8 +453,9 @@ impl FreeProvider {
     /// Capability gate (audit spec §8.4 "capability match"): drop upstreams
     /// whose capabilities cannot serve the request's content before dispatch.
     ///
-    /// `has_images`, `has_tools`, and `estimate` are precomputed once in
-    /// [`Self::attempt_plan`] so this check stays O(1) per chain entry.
+    /// `has_images`, `has_tools`, `has_thinking`, and `estimate` are
+    /// precomputed once in [`Self::attempt_plan`] so this check stays O(1)
+    /// per chain entry.
     ///
     /// - Image-bearing requests skip non-vision upstreams: a text-only
     ///   provider rejects the image with a 400 `InvalidRequest`, which
@@ -462,6 +467,10 @@ impl FreeProvider {
     ///   and produce a text-only response, wasting a round-trip. The query
     ///   loop's auto-switch catches this reactively, but the capability gate
     ///   prevents the wasted round-trip proactively.
+    /// - Thinking-enabled requests skip non-thinking upstreams: providers that
+    ///   don't support thinking mode drop the thinking blocks silently (most)
+    ///   or reject the request (a few), so sending `effort_level` to them
+    ///   wastes the shaping work and loses the thinking signal.
     /// - Requests whose estimated input-token count exceeds an upstream's
     ///   documented context window are skipped, so the plan does not burn a
     ///   guaranteed-overflow round-trip (e.g. Copilot's 16K serving cap).
@@ -474,6 +483,7 @@ impl FreeProvider {
         idx: usize,
         has_images: bool,
         has_tools: bool,
+        has_thinking: bool,
         estimate: u64,
     ) -> bool {
         let Some(entry) = self.chain.get(idx) else {
@@ -483,6 +493,9 @@ impl FreeProvider {
             return false;
         }
         if has_tools && !entry.upstream.tool_calling {
+            return false;
+        }
+        if has_thinking && !entry.upstream.thinking {
             return false;
         }
         if estimate > 0 && estimate > u64::from(entry.upstream.context_window) {
@@ -506,6 +519,14 @@ impl FreeProvider {
     /// requests are routed only to upstreams that support function calling.
     fn request_has_tools(request: &ProviderRequest) -> bool {
         !request.tools.is_empty()
+    }
+
+    /// Whether the request has thinking/reasoning enabled. Thinking-enabled
+    /// requests are routed only to upstreams whose default model supports
+    /// thinking mode (catalog flag). Providers that don't support thinking
+    /// drop the thinking blocks silently or reject the request.
+    fn request_has_thinking(request: &ProviderRequest) -> bool {
+        matches!(request.effort_level, Some(level) if level != EffortLevel::None)
     }
 
     /// Estimated input-token size of the request (heuristic from
@@ -2950,11 +2971,12 @@ impl LlmProvider for FreeProvider {
         // vision iff at least one configured upstream can serve it.
         let tool_calling = self.chain.iter().any(|entry| entry.upstream.tool_calling);
         let image_input = self.chain.iter().any(|entry| entry.upstream.vision);
+        let thinking = self.chain.iter().any(|entry| entry.upstream.thinking);
 
         ProviderCapabilities {
             streaming: true,
             tool_calling,
-            thinking: false,
+            thinking,
             image_input,
             pdf_input: false,
             audio_input: false,
@@ -2967,36 +2989,81 @@ impl LlmProvider for FreeProvider {
 
     fn tool_calling_for(&self, model: &str) -> Option<bool> {
         let route = self.resolve_route(model);
-        let (idx, _) = match route {
-            Route::Auto => self.chain.first().map(|e| (0, e))?,
-            Route::Pinned { start_idx, .. } => (start_idx, self.chain.get(start_idx)?),
-            Route::Family { model_family } => {
-                let idx = self
-                    .chain
-                    .iter()
-                    .position(|e| e.upstream.model_family == model_family)?;
-                (idx, self.chain.get(idx)?)
+        match route {
+            Route::Auto => {
+                // For the synthetic auto model, tool calling is available if
+                // ANY configured upstream supports it — the free dispatch loop
+                // falls through to a tool-capable upstream when the first one
+                // can't serve the request. This must match `capabilities()`.
+                Some(self.chain.iter().any(|e| e.upstream.tool_calling))
             }
-            Route::Strict { idx, .. } => (idx, self.chain.get(idx)?),
-        };
-        Some(self.chain[idx].upstream.tool_calling)
+            Route::Pinned { start_idx, .. } => self
+                .chain
+                .get(start_idx)
+                .map(|_| self.chain[start_idx].upstream.tool_calling),
+            Route::Family { model_family } => {
+                // A family route can land on any host upstream; tool calling
+                // is available if any hosting upstream supports it.
+                Some(
+                    self.chain.iter().any(|e| {
+                        e.upstream.model_family == model_family && e.upstream.tool_calling
+                    }),
+                )
+            }
+            Route::Strict { idx, .. } => self
+                .chain
+                .get(idx)
+                .map(|_| self.chain[idx].upstream.tool_calling),
+        }
     }
 
     fn max_tokens_cap_for(&self, model: &str) -> Option<u32> {
         let route = self.resolve_route(model);
-        let (idx, _) = match route {
-            Route::Auto => self.chain.first().map(|e| (0, e))?,
-            Route::Pinned { start_idx, .. } => (start_idx, self.chain.get(start_idx)?),
-            Route::Family { model_family } => {
-                let idx = self
+        match route {
+            Route::Auto => {
+                // For the synthetic auto model, return the most restrictive
+                // cap across all configured upstreams so the query layer
+                // doesn't send more tokens than every upstream can handle.
+                // None means at least one upstream has no cap — leave it to
+                // the per-upstream clamp in `clamp_max_tokens`.
+                if self
                     .chain
                     .iter()
-                    .position(|e| e.upstream.model_family == model_family)?;
-                (idx, self.chain.get(idx)?)
+                    .any(|e| e.upstream.max_tokens_cap.is_none())
+                {
+                    None
+                } else {
+                    self.chain
+                        .iter()
+                        .filter_map(|e| e.upstream.max_tokens_cap)
+                        .min()
+                }
             }
-            Route::Strict { idx, .. } => (idx, self.chain.get(idx)?),
-        };
-        self.chain[idx].upstream.max_tokens_cap
+            Route::Pinned { start_idx, .. } => self
+                .chain
+                .get(start_idx)
+                .and_then(|e| e.upstream.max_tokens_cap),
+            Route::Family { model_family } => {
+                // Family routes can land on any host; use the most restrictive
+                // cap among hosting upstreams. None if any host has no cap.
+                let hosting: Vec<u32> = self
+                    .chain
+                    .iter()
+                    .filter(|e| e.upstream.model_family == model_family)
+                    .filter_map(|e| e.upstream.max_tokens_cap)
+                    .collect();
+                if self.chain.iter().any(|e| {
+                    e.upstream.model_family == model_family && e.upstream.max_tokens_cap.is_none()
+                }) {
+                    None
+                } else {
+                    hosting.into_iter().min()
+                }
+            }
+            Route::Strict { idx, .. } => {
+                self.chain.get(idx).and_then(|e| e.upstream.max_tokens_cap)
+            }
+        }
     }
 }
 
@@ -3826,13 +3893,14 @@ mod tests {
         // No request (e.g. a plan built for the stream re-dispatch without
         // classification) degrades to the code-generation defaults: mistral
         // is in that preference list and leads, the rest follow in catalog
-        // order.
+        // order. Mistral contributes TWO rows since its catalog entry gained
+        // a fallback model (primary + fallback), so its id maps twice.
         let plan = provider.attempt_plan(&Route::Auto, None);
         let order: Vec<&str> = plan
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(order, vec!["mistral", "zai"]);
+        assert_eq!(order, vec!["mistral", "mistral", "zai"]);
     }
 
     #[test]
