@@ -41,6 +41,7 @@ Agent-facing rules for working on Clawde. Mirrors and extends `src-rust/.claude/
 
 Run from `src-rust/` unless noted.
 
+- **Ollama runs on the LAN GPU box, never localhost.** All Ollama probes, curls, and manual tests target `http://192.168.1.45:11434` — set `OLLAMA_HOST=http://192.168.1.45:11434` for env-driven tools or pass the host explicitly. A local CPU `ollama` systemd service also listens on 127.0.0.1:11434 on this dev machine; it is NOT the test target and its model list differs. Core's resolver already rejects loopback in online mode (`is_ollama_network_blocked`) — never work around a connection failure by pointing at localhost.
 - After Rust changes (not docs): `cargo check --workspace` — fix every error and warning before committing.
 - Clippy: `cargo clippy --workspace --all-targets -- -D warnings`. Fix lints; do not `#[allow(...)]` without justification.
 - Format: `cargo fmt --all`. Run before committing.
