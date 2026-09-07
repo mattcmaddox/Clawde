@@ -28,7 +28,10 @@
 //!   finalization only fires if the card is *still* running: if the admin
 //!   moved it meanwhile, their edit wins.
 
-use crate::board::{self, AttemptOutcome, BoardLock, CardStatus, FailureKind, MAX_ATTEMPTS};
+use crate::board::{
+    self, AttemptOutcome, BoardLock, CardStatus, ContainerRuntime, FailureKind, MAX_ATTEMPTS,
+};
+use crate::container::ManifestDiff;
 use crate::git;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -43,6 +46,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 /// per-second 429 burst to clear. Bounded — the retry happens at most once
 /// per attempt, then the ladder moves on.
 const RATE_LIMIT_RETRY_PAUSE: Duration = Duration::from_secs(5);
+
+/// Max agent turns for container attempts (the harness's --max-turns bound;
+/// an agent stuck in a loop must not hold a container forever).
+const MAX_AGENT_TURNS: u32 = 40;
+
+/// Wall-clock bound for the whole in-container agent run. A pinned free
+/// upstream can be slow (first byte >30s measured on gemini), so this is
+/// generous — but an agent must never hold a container indefinitely.
+const AGENT_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Structured result of one agent run (spec §4.1). The executor parses the
 /// headless `--output-format stream-json` events natively (the same shapes
@@ -679,18 +691,46 @@ async fn run_one_card(
     }
 
     // The board's knobs once per card: gates/toggles plus the ladder shape.
-    let (verify_on, auto_review_on, attempts, attempt_upstreams) = board::load_board(project)
-        .ok()
-        .flatten()
-        .map(|b| {
-            (
-                b.verify,
-                b.auto_review,
-                b.attempts,
-                b.attempt_upstreams.clone(),
-            )
-        })
-        .unwrap_or((true, false, 1, Vec::new()));
+    let (verify_on, auto_review_on, attempts, attempt_upstreams, runtime) =
+        board::load_board(project)
+            .ok()
+            .flatten()
+            .map(|b| {
+                (
+                    b.verify,
+                    b.auto_review,
+                    b.attempts,
+                    b.attempt_upstreams.clone(),
+                    b.runtime,
+                )
+            })
+            .unwrap_or((true, false, 1, Vec::new(), ContainerRuntime::default()));
+    // Container tier (spec §8): the whole attempt flow moves into ephemeral
+    // Incus containers; this host-tier function is done (finalize happens on
+    // the container path).
+    if runtime == ContainerRuntime::Incus {
+        if let Some(repo) = repo_root {
+            run_one_card_container(project, Some(repo), work_dir, prompt, executor).await;
+        } else {
+            // The container tier is meaningless without a repo to push; the
+            // pre-check above already failed the card when the project has
+            // one but it is not a git repo, so this is the no-repo scratch
+            // case: finalize with a clear environment error.
+            let card_id = work_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            finalize(
+                project,
+                &card_id,
+                work_dir,
+                true,
+                Some("container runtime needs a registered git repo (project set <DIR>)"),
+                Some(FailureKind::Worktree),
+            );
+        }
+        return;
+    }
     let pins = ladder_pins(
         attempts,
         &attempt_upstreams,
@@ -919,6 +959,578 @@ async fn run_one_card(
         final_note.as_deref(),
         final_failure,
     );
+}
+
+/// Run argv inside the container synchronously and capture output. Thin
+/// wrapper so attempt code reads uniformly; blocking calls are made from
+/// `spawn_blocking` by the caller.
+fn exec_capture_sync(name: &str, argv: &[String]) -> Result<(String, String), String> {
+    crate::container::exec_capture(name, argv, Duration::from_secs(120))
+}
+
+/// Run one `incus exec` for the agent run with a hard wall-clock deadline.
+/// Two reader threads drain the pipes as the stream arrives (a full pipe
+/// would otherwise deadlock incus), the poll loop kills the client at the
+/// deadline, and the buffers are joined after exit. Blocking — call from
+/// `spawn_blocking`. Returns (stdout, stderr, exit_code); a timeout yields
+/// code -1 with whatever streamed before the kill, so the caller's
+/// error/empty-completion checks classify the partial run honestly.
+fn incus_exec_lines(
+    name: &str,
+    argv: &[String],
+    timeout: Duration,
+) -> Result<(String, String, i32), String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("incus")
+        .args(["exec", name, "--"])
+        .args(argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start incus exec: {e}"))?;
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let mut code: i32 = -1;
+    loop {
+        match child.try_wait() {
+            Err(e) => return Err(format!("incus exec wait failed: {e}")),
+            Ok(Some(status)) => {
+                code = status.code().unwrap_or(-1);
+                break;
+            }
+            Ok(None) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let stdout = String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+    Ok((stdout, stderr, code))
+}
+
+/// Run one card on the CONTAINER tier (board `runtime incus`, spec §8): each
+/// attempt is an ephemeral Incus container — worktree pushed in, agent with
+/// `bypass-permissions` (the container is the safety boundary), verify gate
+/// in-container, FS-manifest diff for the scope gate, task tar pulled as the
+/// attempt's artifact, all-or-nothing teardown. Selection semantics mirror
+/// `run_one_card` exactly: first gate pass wins, pin honesty, empty-completion
+/// guard, real errors outrank the guard; plus the container tier's own
+/// selector — zero scope violations (spec §5, the git diff cannot see
+/// untracked/ignored files, the manifest can).
+async fn run_one_card_container(
+    project: &str,
+    repo_root: Option<&Path>,
+    work_dir: &Path,
+    prompt: &str,
+    executor: &Arc<dyn CardExecutor>,
+) {
+    let card_id = work_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let Some(repo) = repo_root.filter(|r| git::is_repo(r)) else {
+        finalize(
+            project,
+            &card_id,
+            work_dir,
+            true,
+            Some("container runtime needs a registered git repo for this project"),
+            Some(FailureKind::Worktree),
+        );
+        return;
+    };
+    let (verify_on, attempts, attempt_upstreams, auto_review_on) = board::load_board(project)
+        .ok()
+        .flatten()
+        .map(|b| {
+            (
+                b.verify,
+                b.attempts,
+                b.attempt_upstreams.clone(),
+                b.auto_review,
+            )
+        })
+        .unwrap_or((true, 1, Vec::new(), false));
+    let pins = ladder_pins(
+        attempts,
+        &attempt_upstreams,
+        &keyed_upstream_ids(),
+        &clawde_api::providers::free::cooling_free_upstreams(),
+    );
+    let card_scope = board::load_board(project)
+        .ok()
+        .flatten()
+        .and_then(|b| b.card(&card_id).map(|c| c.scope_paths.clone()))
+        .unwrap_or_default();
+
+    // The container binary: the running clawde (this is it).
+    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clawde"));
+    let catalog_ids: Vec<&str> = clawde_api::providers::free::FREE_CATALOG
+        .iter()
+        .map(|e| e.id)
+        .collect();
+
+    let mut winner: Option<(usize, ManifestDiff)> = None;
+    let mut last_failure: Option<FailureKind> = None;
+    for (idx, pin) in pins.iter().enumerate() {
+        let session = format!("{}-{}-{}", card_id, idx, crate::time::now_secs());
+        let name = format!("{}-{}", crate::container::CONTAINER_PREFIX, {
+            let safe: String = session
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            safe
+        });
+        let started = std::time::Instant::now();
+        let rung = run_container_attempt(
+            project,
+            repo,
+            work_dir,
+            &card_id,
+            &session,
+            &name,
+            prompt,
+            pin,
+            &binary,
+            &catalog_ids,
+            &card_scope,
+            verify_on,
+            executor,
+        )
+        .await;
+        let mut outcome = rung.outcome;
+        outcome.elapsed_ms = Some(started.elapsed().as_millis() as u64);
+
+        if outcome.error.is_some() {
+            record_attempt(project, &card_id, outcome);
+            last_failure = Some(rung.failure_kind);
+            continue;
+        }
+        if outcome.verify_passed != Some(true) {
+            // run_container_attempt already recorded the error text.
+            record_attempt(project, &card_id, outcome);
+            last_failure = Some(rung.failure_kind);
+            continue;
+        }
+        // Scope gate (container tier's advantage): any FS-diff path outside
+        // the card's allowlist demotes the rung, same weight as a gate fail.
+        if !card_scope.is_empty() {
+            let violations = crate::scope::violations(&rung.fs_diff, &card_scope);
+            outcome.scope_violations = violations.len() as u32;
+            if !violations.is_empty() {
+                outcome.verify_passed = Some(false);
+                outcome.error = Some(format!(
+                    "scope violations: {}",
+                    violations
+                        .into_iter()
+                        .take(6)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                record_attempt(project, &card_id, outcome);
+                last_failure = Some(FailureKind::Verification);
+                continue;
+            }
+        }
+        record_attempt(project, &card_id, outcome);
+        record_winner(project, &card_id, idx);
+        winner = Some((idx, rung.fs_diff));
+        break;
+    }
+
+    let (final_failed, final_note, final_failure) = if winner.is_some() {
+        (false, Some(attempt_winner_note(project, &card_id)), None)
+    } else {
+        (
+            true,
+            Some(attempt_errors_summary(project, &card_id)),
+            last_failure.or(Some(FailureKind::Agent)),
+        )
+    };
+    let _ = executor; // host executor unused on this tier (the agent argv is built in-container)
+    let _ = auto_review_on; // auto-review reads the host diff; the container tier's artifact tar is the review surface
+    finalize(
+        project,
+        &card_id,
+        work_dir,
+        final_failed,
+        final_note.as_deref(),
+        final_failure,
+    );
+}
+
+/// Everything one container attempt produces beyond the standard outcome.
+struct ContainerRung {
+    outcome: AttemptOutcome,
+    fs_diff: ManifestDiff,
+    failure_kind: FailureKind,
+}
+
+impl ContainerRung {
+    fn failure(mut outcome: AttemptOutcome, kind: FailureKind, msg: String) -> Self {
+        outcome.error = Some(msg);
+        ContainerRung {
+            outcome,
+            fs_diff: ManifestDiff::default(),
+            failure_kind: kind,
+        }
+    }
+}
+
+/// One container attempt: launch, push, seed, run, verify, manifest, pull,
+/// teardown. Every infrastructure failure is a loud `Err` recorded as an
+/// environment-shaped agent error on the rung (never silent data). Teardown
+/// is all-or-nothing in both success and failure paths.
+#[allow(clippy::too_many_arguments)]
+async fn run_container_attempt(
+    _project: &str,
+    repo: &Path,
+    work_dir: &Path,
+    card_id: &str,
+    session: &str,
+    name: &str,
+    prompt: &str,
+    pin: &AttemptPin,
+    binary: &Path,
+    catalog_ids: &[&str],
+    card_scope: &[String],
+    verify_on: bool,
+    _executor: &Arc<dyn CardExecutor>,
+) -> ContainerRung {
+    let mut outcome = AttemptOutcome {
+        upstream: pin.upstream.clone(),
+        model: pin.model.clone(),
+        ..AttemptOutcome::default()
+    };
+
+    // Materialize the worktree (the same per-card worktree the host tier
+    // uses — it is the push source and the finalize surface).
+    if let Err(e) = git::create_worktree(repo, work_dir, None) {
+        return ContainerRung::failure(
+            outcome,
+            FailureKind::Worktree,
+            format!("could not create worktree: {e}"),
+        );
+    }
+    if let Err(err) = crate::container::launch(name, crate::container::DEFAULT_IMAGE) {
+        return ContainerRung::failure(outcome, FailureKind::Worktree, err);
+    }
+    // Seeded home: the real auth store (keys ride in the container only) plus
+    // the pin hardening so a failed dispatch fails the attempt instead of
+    // silently falling through to another upstream (pin honesty, spec §4.5).
+    let home = std::env::temp_dir().join(format!("clawde-home-{session}"));
+    let _ = std::fs::remove_dir_all(&home);
+    if let Err(e) = std::fs::create_dir_all(&home) {
+        crate::container::stop_force(name);
+        return ContainerRung::failure(outcome, FailureKind::Worktree, format!("seed home: {e}"));
+    }
+    let auth_src = clawde_core::paths::clawde_home().join("auth.json");
+    if auth_src.exists() {
+        if let Err(e) = std::fs::copy(&auth_src, home.join("auth.json")) {
+            cleanup_container_home(name, &home);
+            return ContainerRung::failure(
+                outcome,
+                FailureKind::Worktree,
+                format!("seed auth: {e}"),
+            );
+        }
+    }
+    let settings = crate::container::pin_settings_json(&pin.upstream, catalog_ids);
+    if let Err(e) = std::fs::write(home.join("settings.json"), settings) {
+        cleanup_container_home(name, &home);
+        return ContainerRung::failure(
+            outcome,
+            FailureKind::Worktree,
+            format!("seed settings: {e}"),
+        );
+    }
+    let push_home = home.clone();
+    let push_name = name.to_string();
+    if let Err(err) = tokio::task::spawn_blocking(move || {
+        crate::container::push_dir(
+            &push_home,
+            &push_name,
+            crate::container::CONTAINER_ROOT_HOME,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("seed home push panicked: {e}")))
+    {
+        cleanup_container_home(name, &home);
+        return ContainerRung::failure(outcome, FailureKind::Worktree, err);
+    }
+    // Binary push + dep provisioning (environment phase — its failure is an
+    // environment error, mirroring the gate's install-failure skip semantics;
+    // the rung is excluded, the card is not blamed).
+    let push_binary = binary.to_path_buf();
+    let push_name = name.to_string();
+    if let Err(err) = tokio::task::spawn_blocking(move || {
+        crate::container::push_file(&push_binary, &push_name, crate::container::CONTAINER_BINARY)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("binary push panicked: {e}")))
+    {
+        cleanup_container_home(name, &home);
+        return ContainerRung::failure(
+            outcome,
+            FailureKind::Worktree,
+            format!("binary deps: {err}"),
+        );
+    }
+    let dep_name = name.to_string();
+    if let Err(err) =
+        tokio::task::spawn_blocking(move || crate::container::ensure_binary_deps(&dep_name))
+            .await
+            .unwrap_or_else(|e| Err(format!("binary deps panicked: {e}")))
+    {
+        cleanup_container_home(name, &home);
+        return ContainerRung::failure(
+            outcome,
+            FailureKind::Worktree,
+            format!("binary deps: {err}"),
+        );
+    }
+    // Worktree push + the before-manifest.
+    let push_wt = work_dir.to_path_buf();
+    let push_name = name.to_string();
+    if let Err(err) = tokio::task::spawn_blocking(move || {
+        crate::container::push_dir(&push_wt, &push_name, crate::container::CONTAINER_TASK_DIR)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("worktree push panicked: {e}")))
+    {
+        cleanup_container_home(name, &home);
+        return ContainerRung::failure(outcome, FailureKind::Worktree, err);
+    }
+    let (before_text, _) = match exec_capture_sync(
+        name,
+        &crate::container::manifest_argv(crate::container::CONTAINER_TASK_DIR),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            cleanup_container_home(name, &home);
+            return ContainerRung::failure(outcome, FailureKind::Worktree, err);
+        }
+    };
+    let before = crate::container::parse_manifest(&before_text);
+
+    // The agent run (spawn_blocking: incus exec blocks this thread otherwise).
+    let argv = crate::container::agent_argv(
+        prompt,
+        &pin.model,
+        crate::container::CONTAINER_BINARY,
+        session,
+        MAX_AGENT_TURNS,
+    );
+    let agent_name = name.to_string();
+    let agent_result =
+        tokio::task::spawn_blocking(move || incus_exec_lines(&agent_name, &argv, AGENT_TIMEOUT))
+            .await
+            .unwrap_or_else(|e| Err(format!("agent exec panicked: {e}")));
+    let (stdout, stderr, exit_code) = match agent_result {
+        Ok(result) => result,
+        Err(err) => {
+            cleanup_container_home(name, &home);
+            return ContainerRung::failure(outcome, FailureKind::Agent, err);
+        }
+    };
+    let output = crate::runner::parse_attempt_stream(&stdout);
+    outcome.served_upstream = output.served_upstream.clone();
+    if outcome.model.is_empty() {
+        outcome.model = output.model.clone().unwrap_or_default();
+    }
+    let stderr_tail: String = stderr
+        .trim()
+        .chars()
+        .rev()
+        .take(300)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    // Real error outranks the empty-completion heuristic (the audit rule):
+    // a non-zero child exit or a stream error event is the attempt's cause.
+    let pre_gate_error = output
+        .stream_error
+        .clone()
+        .or_else(|| (exit_code != 0).then(|| format!("clawde exited {exit_code}: {stderr_tail}")));
+    if let Some(err) = pre_gate_error {
+        cleanup_container_home(name, &home);
+        return ContainerRung::failure(outcome, FailureKind::Agent, err);
+    }
+    if output.is_empty_completion() {
+        cleanup_container_home(name, &home);
+        return ContainerRung::failure(outcome, FailureKind::Agent, "empty completion".to_string());
+    }
+    // Pin honesty (spec §4.5): Route::Pinned's settings leave exactly one
+    // upstream enabled; a different attribution means the chain fell through.
+    let pin_fell_through = outcome
+        .served_upstream
+        .as_ref()
+        .is_some_and(|served| served != &pin.upstream);
+    if pin_fell_through {
+        cleanup_container_home(name, &home);
+        let served = outcome.served_upstream.clone().unwrap_or_default();
+        return ContainerRung::failure(
+            outcome,
+            FailureKind::Agent,
+            format!("pin fell through: served by {served}"),
+        );
+    }
+
+    // The verify gate, in-container, independent of the agent. The board's
+    // verify switch decides whether it runs at all (spec §9 degradation).
+    let verify_passed = if verify_on {
+        let config = crate::verify::verify_config();
+        let info = clawde_tools::detect_project::detect_project_info(work_dir);
+        let cmds: Vec<String> = [
+            config
+                .auto_test
+                .then(|| info.test_commands.first().cloned())
+                .flatten(),
+            config
+                .auto_lint
+                .then(|| info.lint_commands.first().cloned())
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if cmds.is_empty() {
+            outcome.error = Some("gate skipped: no test/lint commands detected".to_string());
+            Some(true)
+        } else {
+            let mut failures: Vec<String> = Vec::new();
+            for cmd in &cmds {
+                let (vout, _) = match exec_capture_sync(name, &crate::container::verify_argv(cmd)) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        failures.push(format!("{cmd}: {err}"));
+                        continue;
+                    }
+                };
+                match crate::container::parse_verify_rc(&vout) {
+                    Some(0) => {}
+                    Some(rc) => {
+                        let tail: String = vout
+                            .trim()
+                            .chars()
+                            .rev()
+                            .take(400)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect();
+                        failures.push(format!("{cmd}: exit {rc}: {tail}"));
+                    }
+                    None => failures.push(format!("{cmd}: verify marker missing (infra gap)")),
+                }
+            }
+            if failures.is_empty() {
+                Some(true)
+            } else {
+                outcome.error = Some(failures.join("; "));
+                Some(false)
+            }
+        }
+    } else {
+        outcome.error = Some("gate skipped: board verify off".to_string());
+        Some(true)
+    };
+    if verify_passed != Some(true) {
+        cleanup_container_home(name, &home);
+        let detail = outcome.error.take().unwrap_or_default();
+        return ContainerRung::failure(outcome, FailureKind::Verification, detail);
+    }
+
+    // FS forensics: what the agent actually touched (the scope gate's data).
+    let (after_text, _) = match exec_capture_sync(
+        name,
+        &crate::container::manifest_argv(crate::container::CONTAINER_TASK_DIR),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            cleanup_container_home(name, &home);
+            return ContainerRung::failure(
+                outcome,
+                FailureKind::Worktree,
+                format!("manifest: {err}"),
+            );
+        }
+    };
+    let after = crate::container::parse_manifest(&after_text);
+    let fs_diff = crate::container::diff_manifests(&before, &after);
+    let _ = card_scope; // judged by the caller (selection order matters there)
+
+    // Artifact: pull the final tree for post-mortem review, best-effort.
+    let pull_name = name.to_string();
+    if let Ok(tar) =
+        tokio::task::spawn_blocking(move || crate::container::pull_task_tar(&pull_name))
+            .await
+            .unwrap_or_else(|e| Err(format!("artifact pull panicked: {e}")))
+    {
+        let dir = crate::container::artifacts_dir(card_id, session);
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(dir.join("task.tar"), &tar);
+        }
+    }
+    cleanup_container_home(name, &home);
+    ContainerRung {
+        outcome,
+        fs_diff,
+        failure_kind: FailureKind::Agent,
+    }
+}
+
+/// Best-effort teardown shared by every early return: stop the container and
+/// drop the seeded home dir.
+fn cleanup_container_home(name: &str, home: &Path) {
+    crate::container::stop_force(name);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// Winner note for the container tier (same shape as the host tier's
+/// digest): the winning rung's upstream plus its gate-skip note when the
+/// selector was off (never silent).
+fn attempt_winner_note(project: &str, card_id: &str) -> String {
+    board::load_board(project)
+        .ok()
+        .flatten()
+        .and_then(|b| b.card(card_id).cloned())
+        .and_then(|card| {
+            card.picked_attempt
+                .and_then(|i| card.attempts.get(i))
+                .map(|a| match &a.error {
+                    Some(err) if err.starts_with("gate skipped:") => {
+                        format!("{} won ({err})", a.upstream)
+                    }
+                    _ => format!("{} passed the gate", a.upstream),
+                })
+        })
+        .unwrap_or_else(|| "completed".to_string())
 }
 
 /// Run ONE rung of the ladder (or the whole single-attempt run when `pin` is
@@ -2160,6 +2772,82 @@ mod tests {
         // attempts = 1 is today's behavior: no pins at all.
         let keyed: HashSet<String> = ["zai"].into_iter().map(str::to_string).collect();
         assert!(ladder_pins(1, &[], &keyed, &HashSet::new()).is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn container_runtime_without_incus_fails_loudly_per_rung() {
+        // Container tier (spec §8) with incus unavailable: every rung records
+        // a loud environment error (Worktree failure kind), the card fails —
+        // nothing silently passes or misclassifies as an agent error. This
+        // is the CI-safe contract; a live incus run exercises the happy path.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            std::fs::write(
+                tmp.path().join("settings.json"),
+                r#"{"config":{"verify":{"enabled":false}}}"#,
+            )
+            .unwrap();
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.runtime = crate::board::ContainerRuntime::Incus;
+            board.attempts = 2;
+            board.attempt_upstreams = vec!["zai".to_string(), "groq".to_string()];
+            board.auto_review = false;
+            let a = board.add_card("add a feature");
+            seeded_board(&board);
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor: Arc<dyn CardExecutor> = Arc::new(Scripted {
+                calls,
+                script: vec![],
+                fail_on: vec![],
+            });
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            if crate::container::available() {
+                // incus IS reachable on this host: the happy path ran (or a
+                // real infra error surfaced). Either way the ladder engaged —
+                // assert the matrix exists and skip the unavailable-path
+                // assertions.
+                assert!(!card.attempts.is_empty(), "container ladder ran");
+            } else {
+                assert_eq!(card.status, CardStatus::Failed);
+                assert!(!card.attempts.is_empty(), "rungs attempted");
+                for rung in &card.attempts {
+                    assert_eq!(rung.verify_passed, None, "no gate without a container");
+                    let err = rung.error.as_deref().unwrap_or_default();
+                    assert!(!err.is_empty(), "loud failure: {err}");
+                }
+                assert!(card.picked_attempt.is_none());
+            }
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
     }
 
     #[tokio::test]

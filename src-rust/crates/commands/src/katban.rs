@@ -303,6 +303,20 @@ impl SlashCommand for KatbanCommand {
                 Ok(text) => CommandResult::Message(text),
                 Err(message) => CommandResult::Error(message),
             },
+            ["board", "runtime", token] => match board_set_runtime(project, token) {
+                Ok(text) => CommandResult::Message(text),
+                Err(message) => CommandResult::Error(message),
+            },
+            ["board", "card", "scope", id] => match board_set_card_scope(project, id, &[]) {
+                Ok(text) => CommandResult::Message(text),
+                Err(message) => CommandResult::Error(message),
+            },
+            ["board", "card", "scope", id, paths @ ..] => {
+                match board_set_card_scope(project, id, paths) {
+                    Ok(text) => CommandResult::Message(text),
+                    Err(message) => CommandResult::Error(message),
+                }
+            }
             ["board", "attempts-upstreams"] => match board_set_attempt_upstreams(project, &[]) {
                 Ok(text) => CommandResult::Message(text),
                 Err(message) => CommandResult::Error(message),
@@ -644,6 +658,50 @@ fn board_set_attempts(project: Option<&str>, n: &str) -> Result<String, String> 
         "attempts {stored} for board '{}'",
         project_name(project)
     ))
+}
+
+/// Set where card attempts execute (`/katban board runtime incus|host`,
+/// spec §8). Container attempts need the `incus` CLI; `host` is the default.
+fn board_set_runtime(project: Option<&str>, token: &str) -> Result<String, String> {
+    let Some(runtime) = clawde_katban::board::ContainerRuntime::parse(token) else {
+        return Err(format!("runtime needs 'host' or 'incus', got '{token}'"));
+    };
+    if runtime == clawde_katban::board::ContainerRuntime::Incus
+        && !clawde_katban::container::available()
+    {
+        return Err(
+            "incus is not reachable (`incus list` failed) — is incusd running?".to_string(),
+        );
+    }
+    let stored = with_board_lock(project, |board| board.set_runtime(runtime))?;
+    Ok(format!(
+        "runtime {} for board '{}'",
+        stored.as_str(),
+        project_name(project)
+    ))
+}
+
+/// Set a card's scope allowlist (`/katban board card scope <ID> [PATH...]`);
+/// empty = no scope opinion. Enforced by the FS-manifest scope gate on the
+/// container tier.
+fn board_set_card_scope(project: Option<&str>, id: &str, paths: &[&str]) -> Result<String, String> {
+    let list: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
+    let stored = with_board_lock(project, |board| {
+        if !board.set_card_scope(id, list) {
+            return Err(format!("no such card: {id}"));
+        }
+        Ok::<_, String>(
+            board
+                .card(id)
+                .map(|c| c.scope_paths.clone())
+                .unwrap_or_default(),
+        )
+    })??;
+    if stored.is_empty() {
+        Ok(format!("scope cleared for card {id} (no scope opinion)"))
+    } else {
+        Ok(format!("scope for card {id}: {}", stored.join(", ")))
+    }
 }
 
 /// Pin the attempts rotation (`/katban board attempts-upstreams [ID...]`);

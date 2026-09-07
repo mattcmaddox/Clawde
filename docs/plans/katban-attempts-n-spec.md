@@ -1,13 +1,18 @@
 # Katban per-card `attempts: N` — design spec
 
-Status: **Phases 1–2 implemented** (host tier, sequential ladder): structured
+Status: **Phases 1–3 implemented** (host tier, sequential ladder): structured
 executor output (`runner.rs::AttemptOutput`, stream-json attribution), pin
 filter + empty-completion guard, rotation (§6), early promotion, per-attempt
 matrix on the card, CLI `board attempts [N]` / `board attempts-upstreams`,
 `/katban` parity, web meta + card matrix. Phase 2's dead-upstream skip is in
 (`cooling_free_upstreams()` reads the persisted cooldown snapshot the free
-chain writes; `ladder_pins` ranks cooling upstreams after healthy ones). Phases
-3–4 (container tier, parallel racing) remain proposed.
+chain writes; `ladder_pins` ranks cooling upstreams after healthy ones).
+Phase 3's container tier is in (`board.rs::ContainerRuntime`,
+`container.rs` incus plumbing, `scope.rs` FS-manifest scope gate,
+`runner.rs::run_one_card_container`): `board runtime incus` + `board card
+scope <ID> [PATHS...]`, ephemeral container per attempt with in-container
+verify, manifest-diff scope checking, artifact tar pull, env-error
+provisioning semantics. Phase 4 (parallel racing) remains proposed.
 Companions: [best-of-n-eval-spec.md](best-of-n-eval-spec.md) (the measured
 experiment this promotes), [katban.md](../katban.md) (current board behavior),
 [katban-selfhost-spec.md](katban-selfhost-spec.md) (§12 agent execution model).
@@ -240,7 +245,12 @@ same primitives behind a board-level flag:
    exposes this).
 3. **Phase 3 — container tier** (§8) behind the runtime flag, reusing the
    best_of_n probe's container primitives as a Rust module in `clawde-katban`
-   (the Python harness remains the eval-side reference).
+   (the Python harness remains the eval-side reference). **Implemented:**
+   `crates/katban/src/container.rs` (launch/push/exec/manifest/deps/teardown
+   + pin-settings hardening), `crates/katban/src/scope.rs` (allowlist
+   matcher), `Board::runtime` + `Card::scope_paths`, and
+   `runner.rs::run_one_card_container` wiring the ladder to the container
+   flow with the scope gate in the selection order.
 4. **Phase 4 — per-card parallel attempts** (opt-in): attempts race in
    parallel containers, first verify-pass cancels the rest. Only after the
    sequential ladder is proven; multiplies quota pressure.

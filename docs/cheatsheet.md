@@ -81,7 +81,7 @@ Two separate surfaces: **Cat Chat** is the password-protected guest chat you sha
 | `/chat revoke <ID>` | Delete a link (kicks its devices) |
 | `/chat unblock <IP>` | Clear login lockouts for an IP |
 | `/chat status` | Links, devices, exposure, lockouts |
-| `/katban ...` | Kanban boards: `board list`, `card add`, `project list`, `site list` |
+| `/katban ...` | Kanban boards: `board list`, `card add`, `project list`, `site list`. Attempts:N ladder — `board attempts <N>` runs each card up to N times on different free-catalog model families; `board attempts-upstreams [ids...]` pins the rotation; `board runtime incus` + `board card scope <ID> <paths...>` move attempts into ephemeral Incus containers with an FS-manifest scope gate |
 | `Alt+G` | Katban controls menu (board quick actions) |
 
 Guest-link management lives under `/chat`, not `/katban` — old `/katban link ...` commands redirect there.

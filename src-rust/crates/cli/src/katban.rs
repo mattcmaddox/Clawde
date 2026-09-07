@@ -637,6 +637,16 @@ const BOARD_USAGE: &str = r#"Usage: clawde katban board <command> [--project NAM
   ready [--cap N]                        Cards that can start now (queue order)
   auto-review on|off                     Toggle the auto-review pass for cards
   verify on|off                          Toggle the verification gate for cards
+  attempts <N>                           Run each card up to N times (1-5) on
+                                         different free-catalog model families;
+                                         first attempt to pass the verify gate wins
+  attempts-upstreams [ID...]             Pin the attempts rotation to catalog
+                                         upstream ids (empty = auto-derive)
+  runtime host|incus                     Where attempts execute: the host
+                                         worktree lane (default) or an
+                                         ephemeral Incus container per attempt
+                                         (in-container verify, FS-manifest
+                                         scope gate; requires incusd)
   run [--project NAME]                   Run the scheduler for one project (executes ready cards)
 
 The board UI serves on 127.0.0.1:<port> (default 8790). Binding a
@@ -1163,6 +1173,26 @@ async fn run_board(args: &[String]) -> anyhow::Result<()> {
             println!("attempts {stored} for board '{project}'");
             Ok(())
         }
+        "runtime" => {
+            // Container tier switch (spec §8): where card attempts execute.
+            if rest.len() != 1 {
+                anyhow::bail!("board runtime needs 'host' or 'incus'");
+            }
+            let Some(runtime) = clawde_katban::board::ContainerRuntime::parse(&rest[0]) else {
+                anyhow::bail!("runtime needs 'host' or 'incus' (got '{}')", rest[0]);
+            };
+            if runtime == clawde_katban::board::ContainerRuntime::Incus
+                && !clawde_katban::container::available()
+            {
+                anyhow::bail!("incus is not reachable (`incus list` failed) — is incusd running?");
+            }
+            let _guard = clawde_katban::board::BoardLock::acquire(project)?;
+            let mut board = load_board(project)?.unwrap_or_default();
+            let stored = board.set_runtime(runtime);
+            save_board(&board, project)?;
+            println!("runtime {} for board '{project}'", stored.as_str());
+            Ok(())
+        }
         "attempts-upstreams" => {
             // Pin the ladder's rotation explicitly; empty = auto-derive from
             // the keyed free catalog (spec §6).
@@ -1282,7 +1312,7 @@ fn run_card(project: &str, args: &[String]) -> anyhow::Result<()> {
 
     let Some(action) = args.first().map(|s| s.as_str()) else {
         anyhow::bail!(
-            "board card needs an action: add|list|set|merge|remove|comment|feedback|show"
+            "board card needs an action: add|list|set|edit|scope|merge|remove|comment|feedback|show"
         );
     };
     let rest = &args[1..];
@@ -1312,6 +1342,30 @@ fn run_card(project: &str, args: &[String]) -> anyhow::Result<()> {
                         card.prompt
                     );
                 }
+            }
+            Ok(())
+        }
+        "scope" => {
+            // Scope allowlist (spec §5/§8): enforced by the FS-manifest scope
+            // gate on the container tier. Empty = clear (no scope opinion).
+            let Some(id) = rest.first() else {
+                anyhow::bail!("board card scope needs an id: card scope <ID> [PATH...]");
+            };
+            let paths: Vec<String> = rest[1..].to_vec();
+            let _guard = clawde_katban::board::BoardLock::acquire(project)?;
+            let mut board = load_board(project)?.unwrap_or_default();
+            if !board.set_card_scope(id, paths) {
+                anyhow::bail!("no such card: {id}");
+            }
+            let stored = board
+                .card(id)
+                .map(|c| c.scope_paths.clone())
+                .unwrap_or_default();
+            save_board(&board, project)?;
+            if stored.is_empty() {
+                println!("scope cleared for card {id} (no scope opinion)");
+            } else {
+                println!("scope for card {id}: {}", stored.join(", "));
             }
             Ok(())
         }

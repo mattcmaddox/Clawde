@@ -144,6 +144,12 @@ pub struct Card {
     /// attempt passed (card failed) or the single-attempt default run.
     #[serde(default)]
     pub picked_attempt: Option<usize>,
+    /// Repo-relative paths this card's work may touch (spec §5/§8). Empty =
+    /// no scope opinion (host tier never checks; container tier only checks
+    /// when non-empty). Enforced by the FS-manifest scope gate on the
+    /// container tier.
+    #[serde(default)]
+    pub scope_paths: Vec<String>,
     #[serde(default)]
     pub created_at: u64,
     #[serde(default)]
@@ -170,6 +176,39 @@ pub struct DiffSummary {
     pub files_changed: usize,
     pub additions: usize,
     pub deletions: usize,
+}
+
+/// Where card attempts execute (spec §8). `Host` is the default: the agent
+/// runs in the per-card worktree and safety comes from the worktree lane.
+/// `Incus` runs each attempt inside an ephemeral Incus container — the
+/// container is the safety boundary (`bypass-permissions` is safe there),
+/// the verify gate runs in-container, and the FS-manifest diff gives the
+/// scope gate real data. Serde default keeps older boards on `Host`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ContainerRuntime {
+    #[default]
+    Host,
+    Incus,
+}
+
+impl ContainerRuntime {
+    /// The `board runtime` CLI/slash token.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContainerRuntime::Host => "host",
+            ContainerRuntime::Incus => "incus",
+        }
+    }
+
+    /// Parse a `board runtime` token (case-insensitive).
+    pub fn parse(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "host" => Some(ContainerRuntime::Host),
+            "incus" => Some(ContainerRuntime::Incus),
+            _ => None,
+        }
+    }
 }
 
 /// One rung of a card's attempts:N ladder (spec §3): what was pinned, what
@@ -330,6 +369,12 @@ pub struct Board {
     /// catalog (keyed entries, distinct model families first, spec §6).
     #[serde(default)]
     pub attempt_upstreams: Vec<String>,
+    /// Where card attempts execute. Default `Host` (the worktree lane);
+    /// `Incus` runs each attempt in an ephemeral container with in-container
+    /// verify + FS-manifest scope checking (spec §8). Set with
+    /// `clawde katban board runtime incus|host`.
+    #[serde(default)]
+    pub runtime: ContainerRuntime,
 }
 
 fn default_parallel_cap() -> usize {
@@ -360,6 +405,7 @@ impl Board {
             verify: true,
             attempts: DEFAULT_ATTEMPTS,
             attempt_upstreams: Vec::new(),
+            runtime: ContainerRuntime::default(),
         }
     }
 
@@ -390,6 +436,7 @@ impl Board {
             review_ack: 0,
             attempts: Vec::new(),
             picked_attempt: None,
+            scope_paths: Vec::new(),
             created_at: now,
             updated_at: now,
         });
@@ -417,6 +464,28 @@ impl Board {
         let clamped = attempts.clamp(1, MAX_ATTEMPTS);
         self.attempts = clamped;
         clamped
+    }
+
+    /// Set where attempts execute (`board runtime incus|host`, spec §8).
+    /// Returns the stored value.
+    pub fn set_runtime(&mut self, runtime: ContainerRuntime) -> ContainerRuntime {
+        self.runtime = runtime;
+        runtime
+    }
+
+    /// Replace a card's scope allowlist (`board card scope <ID> [PATH...]`).
+    /// Empty = no scope opinion. Returns false when the id is unknown.
+    pub fn set_card_scope(&mut self, id: &str, paths: Vec<String>) -> bool {
+        let Some(card) = self.cards.iter_mut().find(|card| card.id == id) else {
+            return false;
+        };
+        card.scope_paths = paths
+            .into_iter()
+            .map(|p| p.trim().trim_end_matches('/').to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        card.updated_at = crate::time::now_secs();
+        true
     }
 
     /// Replace a card's prompt (web/CLI "edit"). Everything else — id,
@@ -885,6 +954,65 @@ mod tests {
             None => std::env::remove_var("CLAWDE_HOME"),
         }
         result
+    }
+
+    #[test]
+    fn runtime_parses_tokens_and_defaults_to_host() {
+        assert_eq!(ContainerRuntime::default(), ContainerRuntime::Host);
+        assert_eq!(
+            ContainerRuntime::parse("incus"),
+            Some(ContainerRuntime::Incus)
+        );
+        assert_eq!(
+            ContainerRuntime::parse("INCUS"),
+            Some(ContainerRuntime::Incus)
+        );
+        assert_eq!(
+            ContainerRuntime::parse("host"),
+            Some(ContainerRuntime::Host)
+        );
+        assert_eq!(ContainerRuntime::parse("docker"), None);
+        assert_eq!(ContainerRuntime::Incus.as_str(), "incus");
+        let mut board = Board::new();
+        assert_eq!(board.runtime, ContainerRuntime::Host, "serde default");
+        assert_eq!(
+            board.set_runtime(ContainerRuntime::Incus),
+            ContainerRuntime::Incus
+        );
+        assert_eq!(board.runtime, ContainerRuntime::Incus);
+    }
+
+    #[test]
+    fn older_board_files_default_to_host_runtime_and_no_scope() {
+        // A pre-Phase-3 board file has no runtime/scopePaths keys: both must
+        // deserialize to their defaults instead of failing the load.
+        let legacy = serde_json::json!({
+            "version": BOARD_VERSION,
+            "cards": [{
+                "id": "abc", "prompt": "p", "createdAt": 1, "updatedAt": 1,
+            }],
+        });
+        let board: Board = serde_json::from_value(legacy).unwrap();
+        assert_eq!(board.runtime, ContainerRuntime::Host);
+        assert_eq!(board.cards[0].scope_paths, Vec::<String>::new());
+        assert_eq!(board.cards[0].picked_attempt, None);
+    }
+
+    #[test]
+    fn set_card_scope_trims_and_drops_empty_segments() {
+        let mut board = Board::new();
+        let id = board.add_card("p");
+        assert!(board.set_card_scope(&id, vec!["src/".into(), "  ".into(), "stats.py".into()]));
+        assert_eq!(
+            board.card(&id).unwrap().scope_paths,
+            vec!["src", "stats.py"]
+        );
+        assert!(board.set_card_scope(&id, vec![]));
+        assert!(
+            board.card(&id).unwrap().scope_paths.is_empty(),
+            "empty = clear"
+        );
+        assert!(!board.set_card_scope("missing", vec!["x".into()]));
     }
 
     #[test]

@@ -98,6 +98,38 @@ clawde katban board attempts-upstreams nvidia zai --project my-app   # empty = a
   fully-failed ladder fails the card with the matrix in the result, and
   `auto_retry` applies as usual from there.
 
+### Container tier (`board runtime incus`)
+
+By default attempts execute on the host: the agent runs in the card's
+worktree and safety comes from the worktree lane. Boards that want a hard
+boundary can opt into the container tier:
+
+    clawde katban board runtime incus --project my-app   # default: host
+
+With `incus`, every attempt runs inside an ephemeral Incus container
+(`images:ubuntu/24.04/cloud`, torn down no matter how the attempt ends): the
+worktree is pushed in, the agent runs with `bypass-permissions` (the
+container IS the safety boundary), the verify gate runs in-container, and a
+sha256 filesystem manifest before/after the run captures everything the
+agent actually touched — including untracked and gitignored files the git
+diff cannot see.
+
+- **Scope gate**: give a card an allowlist with
+  `clawde katban board card scope <ID> src/ stats.py` (empty = no scope
+  opinion). Any manifest-diff path outside the allowlist is a scope
+  violation and the rung cannot win — an out-of-scope edit is exactly the
+  blast-radius signal the host tier's git diff misses.
+- **Dependency provisioning is setup, not card state**: missing shared libs
+  for the binary are apt-installed into the container; a failed install
+  excludes the rung as an environment error instead of failing the card
+  (mirrors the verify gate's install-failure skip semantics).
+- **Artifacts**: the attempt's final tree is pulled as a tar under
+  `~/.clawde/katban/container-artifacts/<card>/` for post-mortem review.
+- **Requirements**: the `incus` CLI must be installed and incusd reachable
+  (`incus list`); `board runtime incus` refuses to switch otherwise. The
+  per-attempt cost is real (container launch + push + apt), so host tier
+  remains the default.
+
 Spec: [plans/katban-attempts-n-spec.md](plans/katban-attempts-n-spec.md)
 (motivated by the measured best-of-N eval:
 [plans/best-of-n-eval-spec.md](plans/best-of-n-eval-spec.md)).

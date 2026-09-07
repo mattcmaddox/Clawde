@@ -75,7 +75,7 @@ pub struct AutoReviewFinding {
 /// The global verify configuration (`settings.json` `"config.verify"` block),
 /// falling back to defaults when unset. The gate reads it fresh per card so a
 /// settings change applies to the next card without a board restart.
-fn verify_config() -> VerifyConfig {
+pub(crate) fn verify_config() -> VerifyConfig {
     Settings::load_sync()
         .ok()
         .map(|settings| settings.config.verify.clone())
@@ -231,7 +231,7 @@ async fn provision_deps(work_dir: &Path, timeout_secs: u64) -> Result<Option<Pat
 /// --no-package-lock`: it installs deps but never writes a `package-lock.json`,
 /// so a card whose project lacks a lockfile isn't handed a gate-generated one
 /// to commit into its branch (audit gap #1).
-fn package_install(work_dir: &Path) -> String {
+pub(crate) fn package_install(work_dir: &Path) -> String {
     if work_dir.join("yarn.lock").exists() && tool_available("yarn") {
         "yarn install --frozen-lockfile".to_string()
     } else if work_dir.join("pnpm-lock.yaml").exists() && tool_available("pnpm") {
@@ -249,7 +249,7 @@ fn package_install(work_dir: &Path) -> String {
 /// modern `pyproject.toml` (audit gap #2). The checks then resolve `python3`
 /// to the venv via the prepended PATH. Any step failing is an env gap; the
 /// caller skips the gate rather than failing the card.
-fn python_installs(work_dir: &Path) -> Vec<String> {
+pub(crate) fn python_installs(work_dir: &Path) -> Vec<String> {
     let dep_cmd = if work_dir.join("requirements.txt").exists() {
         ".venv/bin/pip install -r requirements.txt pytest"
     } else {
