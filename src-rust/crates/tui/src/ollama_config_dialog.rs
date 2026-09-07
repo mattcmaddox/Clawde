@@ -29,6 +29,10 @@ use std::cell::Cell;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OllamaConfigField {
     Host,
+    /// LAN discovery state + picker entry: the in-menu surface for found
+    /// servers. Enter scans when nothing is cached, otherwise opens the
+    /// SelectHost picker — same convention as the Model row.
+    Servers,
     Model,
     Mode,
     /// Common request options editor (num_ctx / num_predict / keep_alive /
@@ -51,6 +55,16 @@ pub enum OllamaConfigPhase {
     NoModels,
     /// Ping succeeded, showing model list.
     SelectModel,
+    /// LAN scan found servers, showing host picker.
+    SelectHost,
+}
+
+/// A LAN-discovered Ollama server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredHost {
+    pub host_url: String,
+    pub latency_ms: u128,
+    pub model_count: usize,
 }
 
 /// Health status of the Ollama server.
@@ -119,6 +133,23 @@ pub struct OllamaConfigDialogState {
     pub models: Vec<OllamaModel>,
     pub selected_model_idx: usize,
     pub model_scroll_offset: usize,
+    /// LAN-discovered candidate servers (from the auto/manual scan). Shown
+    /// in the SelectHost picker; the configured host is never silently
+    /// replaced.
+    pub discovered_hosts: Vec<DiscoveredHost>,
+    pub selected_host_idx: usize,
+    pub host_scroll_offset: usize,
+    /// Whether a LAN scan is in flight (drives the Servers row to
+    /// "scanning…"). Mirrored from the App-side pending flag.
+    pub discovery_scanning: bool,
+    /// Whether at least one scan has completed this dialog session — the
+    /// Servers row distinguishes "not scanned yet" from "scanned, none
+    /// found".
+    pub discovery_checked: bool,
+    /// Set once the host picker auto-opened for the current host-less
+    /// dialog session, so the 60s background rescan cannot yank the user
+    /// back into the picker after they left it.
+    pub auto_host_prompted: bool,
     /// Exact model names currently loaded in the server's VRAM (from the
     /// periodic `/api/ps` poll). Drives the loaded-state markers in the
     /// model picker; kept outside `models` so it survives refreshes.
@@ -160,6 +191,12 @@ impl OllamaConfigDialogState {
             models: Vec::new(),
             selected_model_idx: 0,
             model_scroll_offset: 0,
+            discovered_hosts: Vec::new(),
+            selected_host_idx: 0,
+            host_scroll_offset: 0,
+            discovery_scanning: false,
+            discovery_checked: false,
+            auto_host_prompted: false,
             loaded_model_names: Vec::new(),
             server_info: None,
             health: HealthStatus::Untested,
@@ -394,6 +431,12 @@ impl OllamaConfigDialogState {
         self.models.clear();
         self.selected_model_idx = 0;
         self.model_scroll_offset = 0;
+        self.discovered_hosts.clear();
+        self.selected_host_idx = 0;
+        self.host_scroll_offset = 0;
+        self.discovery_scanning = false;
+        self.discovery_checked = false;
+        self.auto_host_prompted = false;
         self.health = HealthStatus::Untested;
         self.vim_search.reset();
         // NOTE: mode/option labels are NOT cleared here — the caller seeds
@@ -409,23 +452,32 @@ impl OllamaConfigDialogState {
         self.models.clear();
         self.selected_model_idx = 0;
         self.model_scroll_offset = 0;
+        self.discovered_hosts.clear();
+        self.selected_host_idx = 0;
+        self.host_scroll_offset = 0;
+        self.discovery_scanning = false;
+        self.discovery_checked = false;
+        self.auto_host_prompted = false;
         self.health = HealthStatus::Untested;
         self.vim_search.reset();
     }
 
     /// Enter edit mode for the active field.
     pub fn start_edit(&mut self) {
-        // Only free-text fields get a cursor; Mode/Options are value rows.
+        // Only free-text fields get a cursor; Mode/Options/Servers are
+        // value rows.
         match self.active_field {
             OllamaConfigField::Host | OllamaConfigField::Model => {}
-            OllamaConfigField::Mode | OllamaConfigField::Options => return,
+            OllamaConfigField::Mode | OllamaConfigField::Options | OllamaConfigField::Servers => {
+                return
+            }
         }
         self.phase = OllamaConfigPhase::EditField(self.active_field);
         // Set cursor to end of current text
         self.cursor_pos = match self.active_field {
             OllamaConfigField::Host => self.host_url_input.len(),
             OllamaConfigField::Model => self.model_input.len(),
-            OllamaConfigField::Mode | OllamaConfigField::Options => 0,
+            OllamaConfigField::Mode | OllamaConfigField::Options | OllamaConfigField::Servers => 0,
         };
         self.vim_search.enter_insert();
     }
@@ -439,7 +491,8 @@ impl OllamaConfigDialogState {
     /// Navigate to the next field (j or Down).
     pub fn move_next_field(&mut self) {
         self.active_field = match self.active_field {
-            OllamaConfigField::Host => OllamaConfigField::Model,
+            OllamaConfigField::Host => OllamaConfigField::Servers,
+            OllamaConfigField::Servers => OllamaConfigField::Model,
             OllamaConfigField::Model => OllamaConfigField::Mode,
             OllamaConfigField::Mode => OllamaConfigField::Options,
             OllamaConfigField::Options => OllamaConfigField::Host,
@@ -450,10 +503,39 @@ impl OllamaConfigDialogState {
     pub fn move_prev_field(&mut self) {
         self.active_field = match self.active_field {
             OllamaConfigField::Host => OllamaConfigField::Options,
-            OllamaConfigField::Model => OllamaConfigField::Host,
+            OllamaConfigField::Servers => OllamaConfigField::Host,
+            OllamaConfigField::Model => OllamaConfigField::Servers,
             OllamaConfigField::Mode => OllamaConfigField::Model,
             OllamaConfigField::Options => OllamaConfigField::Mode,
         };
+    }
+
+    /// Value text for the Servers row, reflecting the current discovery
+    /// state inside the menu.
+    pub fn servers_row_value(&self) -> String {
+        if self.discovery_scanning {
+            return "scanning the LAN…".to_string();
+        }
+        if let Some(best) = self.discovered_hosts.first() {
+            if self.discovered_hosts.len() == 1 {
+                if best.model_count > 0 {
+                    return format!(
+                        "{} — {} model(s), {}ms",
+                        best.host_url, best.model_count, best.latency_ms
+                    );
+                }
+                return format!("{} — {}ms", best.host_url, best.latency_ms);
+            }
+            return format!(
+                "{} servers found — enter to pick",
+                self.discovered_hosts.len()
+            );
+        }
+        if self.discovery_checked {
+            "no Ollama servers answered on the LAN".to_string()
+        } else {
+            "not scanned — enter scans the LAN".to_string()
+        }
     }
 
     /// Insert a character at the cursor position (edit mode only).
@@ -470,8 +552,10 @@ impl OllamaConfigDialogState {
                     self.model_input.insert(self.cursor_pos, c);
                     self.cursor_pos += c.len_utf8();
                 }
-                // Mode/Options rows have no text cursor.
-                OllamaConfigField::Mode | OllamaConfigField::Options => {}
+                // Mode/Options/Servers rows have no text cursor.
+                OllamaConfigField::Mode
+                | OllamaConfigField::Options
+                | OllamaConfigField::Servers => {}
             }
         }
     }
@@ -504,8 +588,10 @@ impl OllamaConfigDialogState {
                     self.model_input.drain(prev_char_start..self.cursor_pos);
                     self.cursor_pos = prev_char_start;
                 }
-                // Mode/Options rows have no text cursor.
-                OllamaConfigField::Mode | OllamaConfigField::Options => {}
+                // Mode/Options/Servers rows have no text cursor.
+                OllamaConfigField::Mode
+                | OllamaConfigField::Options
+                | OllamaConfigField::Servers => {}
             }
         }
     }
@@ -623,6 +709,33 @@ impl OllamaConfigDialogState {
         removed
     }
 
+    /// Refresh the installed-model list from the background poll (delivered
+    /// every poll cycle while a host is configured) without yanking the
+    /// phase or losing the selection: the selected model is preserved by
+    /// name (falling back to the first row when it vanished), and a server
+    /// that earlier reported no models but now has some opens the picker.
+    pub fn update_models_auto(&mut self, models: Vec<OllamaModel>) {
+        self.health = HealthStatus::Healthy;
+        if models.is_empty() {
+            // An authoritative empty list means every model was removed —
+            // the picker has nothing left to show.
+            if self.phase == OllamaConfigPhase::SelectModel {
+                self.models.clear();
+                self.phase = OllamaConfigPhase::NoModels;
+            }
+            return;
+        }
+        let keep = self.selected_model().map(|m| m.name.clone());
+        self.models = models;
+        self.selected_model_idx = keep
+            .and_then(|name| self.models.iter().position(|m| m.name == name))
+            .unwrap_or(0);
+        self.ensure_model_visible();
+        if self.phase == OllamaConfigPhase::NoModels {
+            self.phase = OllamaConfigPhase::SelectModel;
+        }
+    }
+
     /// Handle a failed ping: show error.
     pub fn ping_failed(&mut self, error: String) {
         self.health = HealthStatus::Unhealthy;
@@ -670,6 +783,53 @@ impl OllamaConfigDialogState {
         self.models.get(self.selected_model_idx)
     }
 
+    /// Replace the LAN-discovered host list (from the auto/manual scan).
+    /// Keeps the current selection when the host survives a refresh.
+    pub fn set_discovered_hosts(&mut self, hosts: Vec<DiscoveredHost>) {
+        let keep = self.selected_host().map(|h| h.host_url.clone());
+        self.discovered_hosts = hosts;
+        self.selected_host_idx = keep
+            .and_then(|url| self.discovered_hosts.iter().position(|h| h.host_url == url))
+            .unwrap_or(0);
+        self.ensure_host_visible();
+    }
+
+    fn ensure_host_visible(&mut self) {
+        if self.selected_host_idx < self.host_scroll_offset {
+            self.host_scroll_offset = self.selected_host_idx;
+        } else if self.selected_host_idx >= self.host_scroll_offset + MODEL_PICKER_VISIBLE_ROWS {
+            self.host_scroll_offset = self
+                .selected_host_idx
+                .saturating_sub(MODEL_PICKER_VISIBLE_ROWS - 1);
+        }
+    }
+
+    /// Navigate to the previous discovered host.
+    pub fn move_host_up(&mut self) {
+        if self.selected_host_idx > 0 {
+            self.selected_host_idx -= 1;
+            self.ensure_host_visible();
+        }
+    }
+
+    /// Navigate to the next discovered host.
+    pub fn move_host_down(&mut self) {
+        if self.selected_host_idx + 1 < self.discovered_hosts.len() {
+            self.selected_host_idx += 1;
+            self.ensure_host_visible();
+        }
+    }
+
+    /// Return the currently selected discovered host, if any.
+    pub fn selected_host(&self) -> Option<&DiscoveredHost> {
+        self.discovered_hosts.get(self.selected_host_idx)
+    }
+
+    /// Whether the SelectHost picker has anything to show.
+    pub fn has_discovered_hosts(&self) -> bool {
+        !self.discovered_hosts.is_empty()
+    }
+
     /// Consume the dialog and return `(host_url, model_name)`.
     pub fn take_values(&mut self) -> (String, String) {
         let host = self.host_url_input.trim().to_string();
@@ -684,7 +844,7 @@ impl OllamaConfigDialogState {
         self.phase = OllamaConfigPhase::Default;
     }
 
-    /// Check if we're in a modal sub-state (editing, pinging, model picker).
+    /// Check if we're in a modal sub-state (editing, pinging, pickers).
     pub fn is_modal(&self) -> bool {
         matches!(
             self.phase,
@@ -693,6 +853,7 @@ impl OllamaConfigDialogState {
                 | OllamaConfigPhase::PingFailed(_)
                 | OllamaConfigPhase::NoModels
                 | OllamaConfigPhase::SelectModel
+                | OllamaConfigPhase::SelectHost
         )
     }
 }
@@ -720,6 +881,7 @@ pub fn render_ollama_config_dialog(
         OllamaConfigPhase::PingFailed(err) => render_ping_failed(frame, state, err, area),
         OllamaConfigPhase::NoModels => render_no_models(frame, state, area),
         OllamaConfigPhase::SelectModel => render_model_picker(frame, state, area),
+        OllamaConfigPhase::SelectHost => render_host_picker(frame, state, area),
     }
 }
 
@@ -737,8 +899,9 @@ fn render_default_view(
     render_dark_overlay(frame, area);
 
     let width = 62u16.min(area.width.saturating_sub(4));
-    // Room for the server-reported block (version + up to 3 params).
-    let height = 24u16;
+    // Room for the Servers row plus the server-reported block (version +
+    // up to 3 params).
+    let height = 26u16;
     let dialog_area = centered_rect(width, height, area);
     state.last_rect.set(dialog_area);
     render_dialog_bg(frame, dialog_area);
@@ -771,6 +934,7 @@ fn render_default_view(
     };
 
     let is_host_selected = state.active_field == OllamaConfigField::Host;
+    let is_servers_selected = state.active_field == OllamaConfigField::Servers;
     let is_model_selected = state.active_field == OllamaConfigField::Model;
     let is_mode_selected = state.active_field == OllamaConfigField::Mode;
     let is_options_selected = state.active_field == OllamaConfigField::Options;
@@ -809,6 +973,32 @@ fn render_default_view(
         Span::styled(format!(" {} Host:  ", host_indicator), host_style),
         Span::styled(health_dot, Style::default().fg(health_color)),
         Span::styled(format!(" {}", host_display), host_style),
+    ]));
+
+    // Servers row: the in-menu surface for LAN discovery. Enter opens the
+    // host picker (or starts a scan); the value text reflects the current
+    // discovery state so found servers are announced inside the menu, not
+    // through an out-of-menu status toast.
+    let servers_indicator = if is_servers_selected { "▸" } else { " " };
+    let servers_style = selected_row_style(is_servers_selected);
+    let servers_value = state.servers_row_value();
+    let servers_value = servers_value.chars().take(34).collect::<String>();
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {} Servers:", servers_indicator), servers_style),
+        Span::styled(
+            if servers_value.is_empty() {
+                "-".to_string()
+            } else {
+                format!(" {servers_value}")
+            },
+            if is_servers_selected {
+                servers_style
+            } else if state.discovered_hosts.is_empty() && !state.discovery_scanning {
+                Style::default().fg(dim)
+            } else {
+                Style::default().fg(muted)
+            },
+        ),
     ]));
 
     // Model row
@@ -978,7 +1168,7 @@ fn render_default_view(
 
     let mut hint_spans = vec![
         Span::styled("enter", Style::default().fg(dim)),
-        Span::styled(" connect  ", Style::default().fg(dim)),
+        Span::styled(" open row  ", Style::default().fg(dim)),
         Span::styled("j/k", Style::default().fg(dim)),
         Span::styled(" navigate  ", Style::default().fg(dim)),
         Span::styled("e", Style::default().fg(dim)),
@@ -1435,6 +1625,111 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
     frame.render_widget(para, inner);
 }
 
+fn render_host_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area: Rect) {
+    let pink = CLAWDE_ACCENT;
+    let dim = Color::Rgb(90, 90, 90);
+    let muted = Color::Rgb(180, 180, 180);
+    let highlight_bg = CLAWDE_ACCENT;
+    let highlight_fg = Color::White;
+    let dialog_bg = CLAWDE_PANEL_BG;
+
+    render_dark_overlay(frame, area);
+
+    let width = 68u16.min(area.width.saturating_sub(4));
+    let host_rows = state.discovered_hosts.len().min(MODEL_PICKER_VISIBLE_ROWS) as u16;
+    let height = (5 + host_rows + 2).max(9);
+    let dialog_area = centered_rect(width, height, area);
+    state.last_rect.set(dialog_area);
+    render_dialog_bg(frame, dialog_area);
+
+    let inner = Rect {
+        x: dialog_area.x + 1,
+        y: dialog_area.y + 1,
+        width: dialog_area.width.saturating_sub(2),
+        height: dialog_area.height.saturating_sub(2),
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            " Select Host",
+            Style::default().fg(pink).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "{:>width$}",
+                "esc ",
+                width = inner.width.saturating_sub(14) as usize
+            ),
+            Style::default().fg(dim),
+        ),
+    ]));
+    lines.push(Line::from(vec![Span::styled(
+        " Ollama servers on the LAN (port 11434)",
+        Style::default().fg(muted),
+    )]));
+    lines.push(Line::from(""));
+
+    if state.discovered_hosts.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            " No servers answered. Run /ollama discover to rescan.",
+            Style::default().fg(muted),
+        )]));
+    } else {
+        for (i, host) in state
+            .discovered_hosts
+            .iter()
+            .enumerate()
+            .skip(state.host_scroll_offset)
+            .take(MODEL_PICKER_VISIBLE_ROWS)
+        {
+            let is_selected = i == state.selected_host_idx;
+            let indicator = if is_selected { "▸" } else { " " };
+            let row_style = if is_selected {
+                Style::default()
+                    .bg(highlight_bg)
+                    .fg(highlight_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let detail = if host.model_count > 0 {
+                format!("{} model(s) · {}ms", host.model_count, host.latency_ms)
+            } else {
+                format!("{}ms", host.latency_ms)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", indicator), row_style),
+                Span::styled(format!("{:<40}", host.host_url), row_style),
+                Span::styled(
+                    detail,
+                    if is_selected {
+                        Style::default().bg(highlight_bg).fg(highlight_fg)
+                    } else {
+                        Style::default().fg(muted)
+                    },
+                ),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    let hint_spans = vec![
+        Span::styled("j/k", Style::default().fg(dim)),
+        Span::styled(" select  ", Style::default().fg(dim)),
+        Span::styled("enter", Style::default().fg(dim)),
+        Span::styled(" use host  ", Style::default().fg(dim)),
+        Span::styled("r", Style::default().fg(dim)),
+        Span::styled(" rescan  ", Style::default().fg(dim)),
+        Span::styled("esc", Style::default().fg(dim)),
+        Span::styled(" back", Style::default().fg(dim)),
+    ];
+    lines.push(Line::from(hint_spans));
+
+    let para = Paragraph::new(lines).bg(dialog_bg);
+    frame.render_widget(para, inner);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1489,6 +1784,9 @@ mod tests {
         assert_eq!(state.active_field, OllamaConfigField::Host);
 
         state.move_next_field();
+        assert_eq!(state.active_field, OllamaConfigField::Servers);
+
+        state.move_next_field();
         assert_eq!(state.active_field, OllamaConfigField::Model);
 
         state.move_next_field();
@@ -1506,6 +1804,15 @@ mod tests {
 
         state.move_prev_field();
         assert_eq!(state.active_field, OllamaConfigField::Mode);
+
+        state.move_prev_field();
+        assert_eq!(state.active_field, OllamaConfigField::Model);
+
+        state.move_prev_field();
+        assert_eq!(state.active_field, OllamaConfigField::Servers);
+
+        state.move_prev_field();
+        assert_eq!(state.active_field, OllamaConfigField::Host);
     }
 
     #[test]
@@ -1932,6 +2239,83 @@ mod tests {
         assert_eq!(state.keep_alive_label, "unload after request");
         state.cycle_option_value(-1);
         assert_eq!(state.keep_alive_label, "");
+    }
+
+    #[test]
+    fn test_update_models_auto_preserves_selection_and_phase() {
+        let model = |name: &str| OllamaModel {
+            name: name.to_string(),
+            size: 1,
+            quantization: "Q4".to_string(),
+            parameter_size: "1B".to_string(),
+        };
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        state.ping_success(vec![model("a"), model("b"), model("c")]);
+        state.move_model_down(); // select b
+        assert_eq!(state.phase, OllamaConfigPhase::SelectModel);
+        assert_eq!(state.selected_model().unwrap().name, "b");
+
+        // Auto-poll with the selected model still present: list refreshes
+        // in place, phase and selection survive.
+        state.update_models_auto(vec![model("a"), model("b"), model("c"), model("d")]);
+        assert_eq!(state.models.len(), 4);
+        assert_eq!(state.phase, OllamaConfigPhase::SelectModel);
+        assert_eq!(state.selected_model().unwrap().name, "b");
+
+        // Selected model vanished: fall back to the first row, stay in the
+        // picker (no phase yank).
+        state.update_models_auto(vec![model("a"), model("c")]);
+        assert_eq!(state.phase, OllamaConfigPhase::SelectModel);
+        assert_eq!(state.selected_model().unwrap().name, "a");
+
+        // Authoritative empty list (everything deleted): picker reports no
+        // models instead of showing a stale list.
+        state.update_models_auto(vec![]);
+        assert_eq!(state.phase, OllamaConfigPhase::NoModels);
+        assert!(state.models.is_empty());
+
+        // A later poll with models recovers back to the picker.
+        state.update_models_auto(vec![model("x")]);
+        assert_eq!(state.phase, OllamaConfigPhase::SelectModel);
+        assert_eq!(state.models.len(), 1);
+    }
+
+    #[test]
+    fn test_servers_row_value_states() {
+        let mut state = OllamaConfigDialogState::new();
+        // Not scanned yet.
+        assert_eq!(
+            state.servers_row_value(),
+            "not scanned — enter scans the LAN"
+        );
+        // Scanning in flight.
+        state.discovery_scanning = true;
+        assert_eq!(state.servers_row_value(), "scanning the LAN…");
+        // Scanned, nothing found.
+        state.discovery_scanning = false;
+        state.discovery_checked = true;
+        assert_eq!(
+            state.servers_row_value(),
+            "no Ollama servers answered on the LAN"
+        );
+        // One host found.
+        state.discovered_hosts = vec![DiscoveredHost {
+            host_url: "http://192.168.1.45:11434".to_string(),
+            latency_ms: 213,
+            model_count: 2,
+        }];
+        assert_eq!(
+            state.servers_row_value(),
+            "http://192.168.1.45:11434 — 2 model(s), 213ms"
+        );
+        // Multiple hosts found.
+        state.discovered_hosts.push(DiscoveredHost {
+            host_url: "http://192.168.1.99:11434".to_string(),
+            latency_ms: 5,
+            model_count: 1,
+        });
+        assert_eq!(state.servers_row_value(), "2 servers found — enter to pick");
     }
 
     #[test]

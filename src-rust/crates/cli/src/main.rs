@@ -1396,7 +1396,7 @@ async fn main() -> anyhow::Result<()> {
     // Build the full tool list: built-ins from cc-tools plus AgentTool from cc-query
     // (AgentTool lives in cc-query to avoid a circular cc-tools ↔ cc-query dependency).
     // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
-    let tools = build_tools_with_mcp(mcp_manager_arc.clone(), &config);
+    let tools = build_tools_with_mcp(mcp_manager_arc.clone(), &config, is_non_interactive);
 
     // Load plugins and register any plugin-provided MCP servers into the
     // in-memory config (does not modify the settings file on disk).
@@ -1522,7 +1522,13 @@ async fn main() -> anyhow::Result<()> {
             if let Some(turns) = def.max_turns {
                 query_config.max_turns = turns;
             }
-            filter_tools_for_agent(tools, &access, &config, mcp_manager_arc.clone())
+            filter_tools_for_agent(
+                tools,
+                &access,
+                &config,
+                mcp_manager_arc.clone(),
+                is_non_interactive,
+            )
         } else {
             eprintln!(
                 "Warning: unknown agent '{}'. Run /agent to see available agents.",
@@ -1623,14 +1629,25 @@ async fn connect_mcp_manager_arc(
 fn build_tools_with_mcp_vec(
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
     config: &Config,
+    non_interactive: bool,
 ) -> Vec<Box<dyn clawde_tools::Tool>> {
     let network_blocked = clawde_core::network_isolation_enabled(config);
+    // `StructuredOutput` (SyntheticOutputTool) is a capture mechanism for
+    // coordinator / SDK / headless sessions only. Exposing it in interactive
+    // sessions makes small local models "answer" via a tool call (its
+    // description says "You MUST call this tool exactly once") instead of
+    // plain text, burying the answer in the tool arguments, which the TUI
+    // then renders as raw JSON. Keep it only when the run is explicitly
+    // non-interactive or coordinator mode is active.
+    let expose_synthetic_output =
+        non_interactive || clawde_query::coordinator::is_coordinator_mode();
     let mut v: Vec<Box<dyn clawde_tools::Tool>> = clawde_tools::all_tools()
         .into_iter()
         .filter(|tool| {
-            (!network_blocked
-                || !tool.network_capable()
-                || tool.available_in_ollama_isolated_mode())
+            (tool.name() != "StructuredOutput" || expose_synthetic_output)
+                && (!network_blocked
+                    || !tool.network_capable()
+                    || tool.available_in_ollama_isolated_mode())
                 && (config.allowed_tools.is_empty()
                     || config
                         .allowed_tools
@@ -1685,8 +1702,61 @@ fn build_tools_with_mcp_vec(
 fn build_tools_with_mcp(
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
     config: &Config,
+    non_interactive: bool,
 ) -> Arc<Vec<Box<dyn clawde_tools::Tool>>> {
-    Arc::new(build_tools_with_mcp_vec(mcp_manager, config))
+    Arc::new(build_tools_with_mcp_vec(
+        mcp_manager,
+        config,
+        non_interactive,
+    ))
+}
+
+#[cfg(test)]
+mod synthetic_output_exposure_tests {
+    use super::*;
+
+    fn names(v: &[Box<dyn clawde_tools::Tool>]) -> Vec<String> {
+        v.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    #[test]
+    fn structured_output_hidden_in_interactive_sessions() {
+        let tools = build_tools_with_mcp_vec(None, &Config::default(), false);
+        let names = names(&tools);
+        assert!(
+            !names.iter().any(|n| n == "StructuredOutput"),
+            "interactive sessions must not expose SyntheticOutputTool"
+        );
+        assert!(
+            names.iter().any(|n| n == "Bash"),
+            "normal tools must remain"
+        );
+    }
+
+    #[test]
+    fn structured_output_kept_in_non_interactive_sessions() {
+        let tools = build_tools_with_mcp_vec(None, &Config::default(), true);
+        let names = names(&tools);
+        assert!(
+            names.iter().any(|n| n == "StructuredOutput"),
+            "headless/SDK sessions keep the structured-output capture tool"
+        );
+    }
+
+    #[test]
+    fn structured_output_kept_in_coordinator_mode() {
+        // Mutates CLAWDE_COORDINATOR_MODE — must serialize against other
+        // env-mutating tests (see the crate-root ENV_LOCK comment).
+        let _guard = super::ENV_LOCK.blocking_lock();
+        std::env::set_var(clawde_query::coordinator::COORDINATOR_ENV_VAR, "1");
+        let tools = build_tools_with_mcp_vec(None, &Config::default(), false);
+        std::env::remove_var(clawde_query::coordinator::COORDINATOR_ENV_VAR);
+        let names = names(&tools);
+        assert!(
+            names.iter().any(|n| n == "StructuredOutput"),
+            "coordinator sessions keep the structured-output capture tool"
+        );
+    }
 }
 
 fn model_cache_dir() -> PathBuf {
@@ -2301,6 +2371,7 @@ fn filter_tools_for_agent(
     access: &str,
     config: &Config,
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
+    non_interactive: bool,
 ) -> Arc<Vec<Box<dyn clawde_tools::Tool>>> {
     use clawde_tools::PermissionLevel as PL;
     let network_blocked = clawde_core::network_isolation_enabled(config);
@@ -2324,7 +2395,7 @@ fn filter_tools_for_agent(
                 })
                 .map(|t| t.name().to_string())
                 .collect();
-            let rebuilt = build_tools_with_mcp_vec(mcp_manager, config);
+            let rebuilt = build_tools_with_mcp_vec(mcp_manager, config, non_interactive);
             let filtered: Vec<Box<dyn clawde_tools::Tool>> = rebuilt
                 .into_iter()
                 .filter(|t| allowed_names.iter().any(|n| n == t.name()))
@@ -2333,7 +2404,7 @@ fn filter_tools_for_agent(
         }
         "search-only" => {
             const SEARCH_TOOLS: &[&str] = &["Grep", "Glob", "Read", "WebSearch", "WebFetch"];
-            let rebuilt = build_tools_with_mcp_vec(mcp_manager, config);
+            let rebuilt = build_tools_with_mcp_vec(mcp_manager, config, non_interactive);
             let filtered: Vec<Box<dyn clawde_tools::Tool>> = rebuilt
                 .into_iter()
                 .filter(|t| SEARCH_TOOLS.contains(&t.name()))
@@ -2349,7 +2420,11 @@ fn filter_tools_for_agent(
             if network_blocked {
                 // Rebuild from the same runtime registry because the Arc holds
                 // boxed trait objects that cannot be moved out by value.
-                Arc::new(build_tools_with_mcp_vec(mcp_manager, config))
+                Arc::new(build_tools_with_mcp_vec(
+                    mcp_manager,
+                    config,
+                    non_interactive,
+                ))
             } else {
                 tools
             }
@@ -2364,6 +2439,7 @@ fn tools_for_agent_mode(
     mode: Option<&str>,
     config: &Config,
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
+    non_interactive: bool,
 ) -> Arc<Vec<Box<dyn clawde_tools::Tool>>> {
     let Some(mode) = mode else {
         return all_tools;
@@ -2373,7 +2449,15 @@ fn tools_for_agent_mode(
     all_agents.extend(config.agents.clone());
     all_agents
         .get(mode)
-        .map(|def| filter_tools_for_agent(all_tools.clone(), &def.access, config, mcp_manager))
+        .map(|def| {
+            filter_tools_for_agent(
+                all_tools.clone(),
+                &def.access,
+                config,
+                mcp_manager,
+                non_interactive,
+            )
+        })
         .unwrap_or(all_tools)
 }
 
@@ -3473,6 +3557,22 @@ fn reset_autonomy_for_session(tool_ctx: &mut ToolContext, session_id: &str) {
     }
 }
 
+/// Resolve the Ollama model this session should release from the remote GPU
+/// on exit. Returns the bare model name (no `ollama/` prefix) when the active
+/// provider is Ollama and a model is set; `None` otherwise. Only the session's
+/// own model is targeted so a shared Ollama server's other models are never
+/// evicted.
+fn exit_ollama_model_target(config: &Config, model_name: &str) -> Option<String> {
+    if config.selected_provider_id() != "ollama" {
+        return None;
+    }
+    let bare = model_name.strip_prefix("ollama/").unwrap_or(model_name);
+    if bare.trim().is_empty() {
+        return None;
+    }
+    Some(bare.to_string())
+}
+
 async fn run_interactive(
     config: Config,
     settings: clawde_core::config::Settings,
@@ -3809,6 +3909,13 @@ async fn run_interactive(
         tokio::sync::mpsc::unbounded_channel::<Vec<clawde_core::OllamaLoadedModel>>();
     let (ollama_info_tx, mut ollama_info_rx) =
         tokio::sync::mpsc::unbounded_channel::<clawde_query::OllamaPolledServerInfo>();
+    // Auto-polled model list (`/api/tags`) from the same loop: keeps the
+    // /ollama model picker populated and fresh whenever a host is configured
+    // — the footer badge renders ollama in every frame, so "ollama hinted"
+    // is effectively "host configured". `None` = host unreachable (drives
+    // the health dot red); `Some` = authoritative list (even when empty).
+    let (ollama_tags_tx, mut ollama_tags_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Option<Vec<clawde_query::OllamaPingModel>>>();
     // std (not tokio) mutex: the critical section is two field copies with
     // no await, and one side runs on the sync TUI main loop where a tokio
     // mutex would panic ("cannot block the current thread from within a
@@ -3831,6 +3938,18 @@ async fn run_interactive(
                     Err(_) => Vec::new(),
                 };
                 let _ = ollama_loaded_tx.send(models);
+                // Model-list poll: one small GET per cycle, skipped entirely
+                // when no host is configured. Same cadence + gate as the
+                // /api/ps poll above, so the picker auto-populates without
+                // an explicit refresh.
+                if let Some(host) = clawde_core::config::resolve_ollama_host() {
+                    let client = reqwest::Client::new();
+                    let result =
+                        fetch_ollama_models_at(&client, &host, std::time::Duration::from_secs(3))
+                            .await
+                            .ok();
+                    let _ = ollama_tags_tx.send(result);
+                }
                 // Server-info probe only while the /ollama screen is open.
                 let (visible, model) = {
                     let wish = ollama_info_wish
@@ -4061,7 +4180,11 @@ async fn run_interactive(
     // Keep the complete runtime registry (built-ins + Agent + MCP wrappers) so
     // agent-mode switching can re-filter without silently dropping tools that
     // were not part of the bare `clawde_tools::all_tools()` list.
-    let mut all_tools_arc = build_tools_with_mcp(tool_ctx.mcp_manager.clone(), &tool_ctx.config);
+    let mut all_tools_arc = build_tools_with_mcp(
+        tool_ctx.mcp_manager.clone(),
+        &tool_ctx.config,
+        tool_ctx.non_interactive,
+    );
     let mut tools_arc = tools;
 
     // Current cancel token (replaced each turn)
@@ -4184,6 +4307,11 @@ async fn run_interactive(
         app.tick_rustail_pose();
         app.rustail_editor.tick_blink();
         app.notifications.tick();
+        // Service the one-shot background loads (welcome-screen "Recent
+        // activity" + the /session browser) that App::run also drives — the
+        // interactive loop owns the frame pump here, so without this call the
+        // welcome list would stay permanently empty.
+        app.poll_background_loads();
 
         // Process file injection dialog outcome (if any)
         if let Some((outcome, pending_input, pending_imgs)) =
@@ -4897,12 +5025,14 @@ async fn run_interactive(
                                     all_tools_arc = build_tools_with_mcp(
                                         tool_ctx.mcp_manager.clone(),
                                         &cmd_ctx.config,
+                                        tool_ctx.non_interactive,
                                     );
                                     tools_arc = tools_for_agent_mode(
                                         all_tools_arc.clone(),
                                         app.agent_mode.as_deref(),
                                         &cmd_ctx.config,
                                         tool_ctx.mcp_manager.clone(),
+                                        tool_ctx.non_interactive,
                                     );
                                     if let Some(manager) = tool_ctx.permission_manager.as_ref() {
                                         if let Ok(mut manager) = manager.lock() {
@@ -4975,12 +5105,14 @@ async fn run_interactive(
                                     all_tools_arc = build_tools_with_mcp(
                                         tool_ctx.mcp_manager.clone(),
                                         &cmd_ctx.config,
+                                        tool_ctx.non_interactive,
                                     );
                                     tools_arc = tools_for_agent_mode(
                                         all_tools_arc.clone(),
                                         app.agent_mode.as_deref(),
                                         &cmd_ctx.config,
                                         tool_ctx.mcp_manager.clone(),
+                                        tool_ctx.non_interactive,
                                     );
                                     if let Some(manager) = tool_ctx.permission_manager.as_ref() {
                                         if let Ok(mut manager) = manager.lock() {
@@ -5780,13 +5912,17 @@ async fn run_interactive(
                         // the active tool boundary. Rebuild both the full
                         // registry and the current agent-filtered slice so
                         // tools disappear/return immediately.
-                        all_tools_arc =
-                            build_tools_with_mcp(tool_ctx.mcp_manager.clone(), &cmd_ctx.config);
+                        all_tools_arc = build_tools_with_mcp(
+                            tool_ctx.mcp_manager.clone(),
+                            &cmd_ctx.config,
+                            tool_ctx.non_interactive,
+                        );
                         tools_arc = tools_for_agent_mode(
                             all_tools_arc.clone(),
                             app.agent_mode.as_deref(),
                             &cmd_ctx.config,
                             tool_ctx.mcp_manager.clone(),
+                            tool_ctx.non_interactive,
                         );
                     }
                     tool_ctx.config = app.config.clone();
@@ -5836,6 +5972,7 @@ async fn run_interactive(
                                 Some(mode),
                                 &cmd_ctx.config,
                                 tool_ctx.mcp_manager.clone(),
+                                tool_ctx.non_interactive,
                             );
                         } else {
                             // "build" with no explicit definition = full access, no agent
@@ -6943,6 +7080,20 @@ async fn run_interactive(
         if let Some(polled) = ollama_info_latest {
             app.apply_ollama_polled_server_info(polled.model, polled.info);
         }
+        // Drain the latest auto-polled model list (keeps the /ollama model
+        // picker populated and fresh without an explicit refresh).
+        let mut ollama_tags_latest: Option<Option<Vec<clawde_query::OllamaPingModel>>> = None;
+        while let Ok(result) = ollama_tags_rx.try_recv() {
+            ollama_tags_latest = Some(result);
+        }
+        if let Some(result) = ollama_tags_latest {
+            app.apply_ollama_polled_models(result);
+        }
+        // Auto LAN scan while the /ollama screen is open: immediately on
+        // first open, then every OLLAMA_AUTO_SCAN_INTERVAL. The due-check is
+        // a cheap elapsed-time comparison; the scan itself is bounded and
+        // spawned below via the pending flag.
+        app.maybe_start_auto_ollama_scan();
 
         // ---- Device code / OAuth auth: spawn background task when pending ----
         if let Some(provider_id) = app.device_auth_pending.take() {
@@ -7187,6 +7338,18 @@ async fn run_interactive(
                 }
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();
+                // Push any messages the query task wrote (e.g. a partial
+                // assistant response after an Esc cancel) into the TUI
+                // transcript. The task mutates msgs_arc directly; the TUI's
+                // app.messages is only updated via push_message/flush, so after
+                // a cancel those buffers were cleared and the partial response
+                // would otherwise be lost from the visible transcript.
+                let app_len = app.messages.len();
+                if messages.len() > app_len {
+                    for msg in messages.iter().skip(app_len).cloned() {
+                        app.push_message(msg);
+                    }
+                }
                 session.messages = messages.clone();
                 session.updated_at = chrono::Utc::now();
                 session.model =
@@ -7414,12 +7577,17 @@ async fn run_interactive(
             let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            all_tools_arc = build_tools_with_mcp(new_mcp_manager.clone(), &cmd_ctx.config);
+            all_tools_arc = build_tools_with_mcp(
+                new_mcp_manager.clone(),
+                &cmd_ctx.config,
+                tool_ctx.non_interactive,
+            );
             tools_arc = tools_for_agent_mode(
                 all_tools_arc.clone(),
                 app.agent_mode.as_deref(),
                 &cmd_ctx.config,
                 new_mcp_manager.clone(),
+                tool_ctx.non_interactive,
             );
 
             if app.mcp_view.visible {
@@ -7573,6 +7741,37 @@ async fn run_interactive(
     // an exit. Shadow snapshots are intentionally untouched (they are keyed
     // by working_dir and shared across sessions).
     clawde_tools::teardown_session(&tool_ctx.session_id).await;
+
+    // Release the Ollama model this session held on the remote GPU. Covers
+    // every graceful exit path (/exit, Ctrl+C/Ctrl+D, SIGTERM — all converge
+    // here). Bounded so a slow/unreachable server can't hang shutdown; only
+    // the session's own model is targeted (never every model on a shared
+    // server). Uses the live app config so /ollama host/model edits made this
+    // session are respected.
+    if let Some(model) = exit_ollama_model_target(&app.config, &app.model_name) {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            clawde_core::ollama_unload_models_for_config(&app.config, Some(&model)),
+        )
+        .await
+        {
+            Ok(Ok(n)) => {
+                eprintln!("[clawde] ollama unload on exit: unloaded {n} model(s) from VRAM");
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[clawde] ollama unload on exit: failed to unload model '{}': {e}",
+                    model
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "[clawde] ollama unload on exit: timed out while unloading model '{}'",
+                    model
+                );
+            }
+        }
+    }
 
     restore_terminal(&mut terminal)?;
     Ok(())
@@ -8798,7 +8997,7 @@ mod bare_mode_tests {
             ..Default::default()
         };
 
-        let tools = build_tools_with_mcp_vec(None, &config);
+        let tools = build_tools_with_mcp_vec(None, &config, false);
         assert!(tools.iter().any(|tool| tool.name() == "Read"));
         assert!(!tools.iter().any(|tool| tool.name() == "Grep"));
         assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
@@ -8806,7 +9005,7 @@ mod bare_mode_tests {
 
     #[test]
     fn full_runtime_registry_includes_bash() {
-        let tools = build_tools_with_mcp(None, &Config::default());
+        let tools = build_tools_with_mcp(None, &Config::default(), false);
         assert!(tools.iter().any(|tool| tool.name() == "Bash"));
     }
 
@@ -8822,7 +9021,7 @@ mod bare_mode_tests {
                 ..Default::default()
             },
         );
-        let tools = build_tools_with_mcp(None, &config);
+        let tools = build_tools_with_mcp(None, &config, false);
         assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
         assert!(tools.iter().any(|tool| tool.name() == "RunTests"));
         assert!(tools.iter().any(|tool| tool.name() == "RunLints"));
@@ -8831,9 +9030,9 @@ mod bare_mode_tests {
     #[test]
     fn restricted_agent_modes_exclude_bash() {
         let config = Config::default();
-        let full = build_tools_with_mcp(None, &config);
-        let plan = filter_tools_for_agent(full.clone(), "read-only", &config, None);
-        let explore = filter_tools_for_agent(full, "search-only", &config, None);
+        let full = build_tools_with_mcp(None, &config, false);
+        let plan = filter_tools_for_agent(full.clone(), "read-only", &config, None, false);
+        let explore = filter_tools_for_agent(full, "search-only", &config, None, false);
 
         assert!(!plan.iter().any(|tool| tool.name() == "Bash"));
         assert!(!plan

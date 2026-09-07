@@ -1251,6 +1251,9 @@ pub struct RecentSession {
     pub label: String,
     /// Transcript modification time, used to derive a relative timestamp.
     pub mtime: std::time::SystemTime,
+    /// Approximate message count (user + assistant entries in the transcript
+    /// tail). `0` when the session has none or the count is unknown.
+    pub message_count: usize,
 }
 
 /// Build the display label for a recent session. Preference order:
@@ -1622,6 +1625,10 @@ pub struct App {
     pub ollama_discovery_request_id: u64,
     /// When `true`, the main loop should spawn the bounded LAN discovery scan.
     pub ollama_discovery_pending: bool,
+    /// When the last LAN scan was requested; gates the automatic re-scan
+    /// while the `/ollama` screen is open (see
+    /// [`App::maybe_start_auto_ollama_scan`]).
+    pub ollama_discovery_last_result: Option<std::time::Instant>,
     /// "Free" composite-provider setup dialog (multi-key health dots).
     pub free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState,
     /// Alt+G Katban controls menu (guest links, unblock IPs, status).
@@ -2084,6 +2091,11 @@ fn matches_capability_groups(
     })
 }
 
+/// Status line shown while the transcript is Esc-paused during a turn (first
+/// Esc). Cleared when the stream resumes or the turn ends; see
+/// [`App::clear_paused_status_message`].
+const PAUSED_STREAM_MESSAGE: &str = "Paused — still receiving. Esc stop · any key resume";
+
 impl App {
     /// Bind UI filesystem lookups to the active project directory rather than
     /// the process launch directory. This is especially important for slash
@@ -2306,6 +2318,7 @@ impl App {
             ollama_ping_for_models: false,
             ollama_discovery_request_id: 0,
             ollama_discovery_pending: false,
+            ollama_discovery_last_result: None,
             free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState::new(),
             katban_controls: crate::katban_controls::KatbanControlsState::default(),
             cat_chat: crate::cat_chat::CatChatState::default(),
@@ -2644,7 +2657,34 @@ impl App {
         self.streaming_text.push_str(&text);
         self.streaming_thinking.push_str(&thinking);
         self.stream_paused = false;
+        // Restore a truthful status row. The first Esc clobbered whatever was
+        // showing ("Running Bash…", a progress note, …) with the pause line;
+        // if a tool is still in flight, re-derive its line from the
+        // authoritative block state so the row does not pretend the tool is
+        // gone. Pre-pause text that no event re-sent is unrecoverable (it was
+        // overwritten, not buffered), so drop the pause line and let the
+        // spinner / live events take over.
+        if let Some(running) = self
+            .tool_use_blocks
+            .iter()
+            .find(|b| b.status == ToolStatus::Running)
+        {
+            self.status_message = Some(format!("Running {}…", running.name));
+        } else {
+            self.clear_paused_status_message();
+        }
         self.invalidate_transcript();
+    }
+
+    /// Clear the "Paused — still receiving…" status line. It only describes
+    /// the paused state; leaving it set would mislabel a live (resumed) or
+    /// finished stream until the next status event overwrites it. Messages
+    /// produced by events while paused (tool results, status notes) are left
+    /// untouched — they are the current truth.
+    fn clear_paused_status_message(&mut self) {
+        if self.status_message.as_deref() == Some(PAUSED_STREAM_MESSAGE) {
+            self.status_message = None;
+        }
     }
 
     /// Request a hard cancel of the live query (second Esc while paused, or
@@ -3264,6 +3304,80 @@ impl App {
         self.status_message = Some(format!("Ollama mode: {}.", label));
     }
 
+    /// Apply the dialog's common request options to a provider config:
+    /// insert explicitly-set values, remove keys the user cycled back to
+    /// unset (spec: "omit unless explicitly set"). Non-common keys
+    /// (`default_host`, `model`, `mode`, advanced options) are preserved.
+    fn write_common_options(
+        provider: &mut clawde_core::config::ProviderConfig,
+        map: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        for key in clawde_api::providers::ollama_options::COMMON_OPTION_KEYS {
+            match map.get(*key) {
+                Some(value) => {
+                    provider.options.insert((*key).to_string(), value.clone());
+                }
+                None => {
+                    provider.options.remove(*key);
+                }
+            }
+        }
+    }
+
+    /// Persist the dialog's common request options immediately, mirroring
+    /// the Mode row's "apply immediately and persist" behavior. Written on
+    /// every option cycle so a change survives Esc/restart without requiring
+    /// a connect. Mirrors into the live session config so in-session readers
+    /// (`/ollama status`, the per-turn tool-registry sync) see it too.
+    fn apply_ollama_options(&mut self) {
+        let map = self.ollama_config_dialog.common_options_map();
+        let Ok(mut settings) = Settings::load_sync() else {
+            return;
+        };
+        {
+            let provider = settings
+                .config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default();
+            Self::write_common_options(provider, &map);
+        }
+        if settings.save_sync().is_err() {
+            return;
+        }
+        // Mirror the persisted entry into the live session config, same as
+        // `persist_ollama_config`.
+        if let Some(saved) = settings.config.provider_configs.get("ollama") {
+            self.config
+                .provider_configs
+                .insert("ollama".to_string(), saved.clone());
+        }
+    }
+
+    /// Apply the auto-polled model list (`/api/tags`, delivered by the CLI
+    /// main loop every poll cycle while a host is configured). Populates
+    /// and refreshes the model picker without an explicit refresh; a fetch
+    /// failure marks the health dot rather than yanking the last good list.
+    pub fn apply_ollama_polled_models(
+        &mut self,
+        result: Option<Vec<clawde_query::OllamaPingModel>>,
+    ) {
+        match result {
+            Some(models) => self.ollama_config_dialog.update_models_auto(
+                models
+                    .into_iter()
+                    .map(|m| crate::ollama_config_dialog::OllamaModel {
+                        name: m.name,
+                        size: m.size,
+                        quantization: m.quantization,
+                        parameter_size: m.parameter_size,
+                    })
+                    .collect(),
+            ),
+            None => self.ollama_config_dialog.health_check_failed(),
+        }
+    }
+
     /// Apply one cycle of the continuous server-info poll (delivered by the
     /// CLI main loop only while the `/ollama` screen is open).
     ///
@@ -3310,14 +3424,60 @@ impl App {
         self.ollama_ping_pending = true;
     }
 
-    /// Start the bounded LAN discovery scan (spec §Discovery constraints:
-    /// explicit action only, bounded concurrency/duration, never loopback,
-    /// never silent). The main loop spawns the scan; results arrive as
-    /// `QueryEvent::OllamaDiscoveryResult`.
-    fn start_ollama_discovery(&mut self) {
+    /// Start the bounded LAN discovery scan (bounded concurrency/duration,
+    /// never loopback/unspecified/public ranges). `silent` suppresses the
+    /// status banner for background re-scans. The main loop spawns the scan;
+    /// results arrive as `QueryEvent::OllamaDiscoveryResult`.
+    /// In-menu LAN surface (Servers row / `d`): open the host picker when a
+    /// scan already produced results, otherwise start one. No-op while a
+    /// scan is in flight so repeated presses cannot stack scans.
+    fn open_or_scan_ollama_hosts(&mut self) {
+        if self.ollama_config_dialog.discovery_scanning {
+            return;
+        }
+        if self.ollama_config_dialog.has_discovered_hosts() {
+            self.ollama_config_dialog.phase =
+                crate::ollama_config_dialog::OllamaConfigPhase::SelectHost;
+        } else {
+            self.start_ollama_discovery(false);
+        }
+    }
+
+    fn start_ollama_discovery(&mut self, silent: bool) {
         self.ollama_discovery_request_id = self.ollama_discovery_request_id.wrapping_add(1);
         self.ollama_discovery_pending = true;
-        self.status_message = Some("Discovering Ollama servers on the LAN…".to_string());
+        self.ollama_discovery_last_result = Some(std::time::Instant::now());
+        // The Servers row is the in-menu feedback surface: it shows
+        // "scanning the LAN…" until the result lands.
+        self.ollama_config_dialog.discovery_scanning = true;
+        if !silent {
+            self.status_message = Some("Discovering Ollama servers on the LAN…".to_string());
+        }
+    }
+
+    /// Interval between automatic LAN scans while the `/ollama` screen is
+    /// open. Scanning a whole /24 is heavier than the per-host model poll, so
+    /// it runs on screen open and then refreshes at this cadence rather than
+    /// per frame.
+    pub const OLLAMA_AUTO_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Kick an automatic LAN scan when due: immediately on first screen
+    /// open and every [`App::OLLAMA_AUTO_SCAN_INTERVAL`] while the screen
+    /// stays open. No-op when the screen is closed — background scanning a
+    /// whole subnet forever would be discourteous on shared networks.
+    /// Called every frame by the main loop; the due-check is a cheap
+    /// elapsed-time comparison.
+    pub fn maybe_start_auto_ollama_scan(&mut self) {
+        if !self.ollama_config_dialog.visible {
+            return;
+        }
+        let due = self
+            .ollama_discovery_last_result
+            .map(|t| t.elapsed() >= Self::OLLAMA_AUTO_SCAN_INTERVAL)
+            .unwrap_or(true);
+        if due {
+            self.start_ollama_discovery(true);
+        }
     }
 
     /// Persist Ollama host URL, model, and the screen's canonical request
@@ -3351,10 +3511,8 @@ impl App {
         // "omit unless explicitly set"). The dialog's common_options_map is
         // the single conversion point — custom (non-preset) values round-trip
         // through their labels, and rows the user cycled back to unset are
-        // removed.
-        for (key, value) in self.ollama_config_dialog.common_options_map() {
-            provider.options.insert(key, value);
-        }
+        // removed from settings rather than left stale.
+        Self::write_common_options(provider, &self.ollama_config_dialog.common_options_map());
 
         settings
             .save_sync()
@@ -3370,6 +3528,52 @@ impl App {
                 .insert("ollama".to_string(), saved.clone());
         }
         self.auth_store.reload();
+        Ok(())
+    }
+
+    /// Persist a single confirmed edit from the dialog (Host or Model
+    /// field) without requiring a full connect. Confirming an edit must
+    /// not lose the value: previously the dialog only persisted inside the
+    /// connect transaction, so typing a host and closing with Esc discarded
+    /// it. Writes only the field that was confirmed — an empty or unedited
+    /// counterpart is left untouched so a model-less host save cannot wipe
+    /// a previously saved model (and vice versa). Mirrors into the live
+    /// session config like `persist_ollama_config`.
+    fn persist_ollama_edit(
+        &mut self,
+        field: crate::ollama_config_dialog::OllamaConfigField,
+    ) -> Result<(), String> {
+        let mut settings =
+            Settings::load_sync().map_err(|e| format!("Failed to load settings: {}", e))?;
+        let provider = settings
+            .config
+            .provider_configs
+            .entry("ollama".to_string())
+            .or_default();
+        match field {
+            crate::ollama_config_dialog::OllamaConfigField::Host => {
+                let host = self.ollama_config_dialog.validate_host_url()?;
+                provider.api_base = Some(format!("{}/v1", host));
+                provider
+                    .options
+                    .insert("default_host".to_string(), serde_json::json!(host));
+            }
+            crate::ollama_config_dialog::OllamaConfigField::Model => {
+                let model = self.ollama_config_dialog.validate_model_name()?;
+                provider
+                    .options
+                    .insert("model".to_string(), serde_json::json!(model));
+            }
+            _ => return Ok(()),
+        }
+        settings
+            .save_sync()
+            .map_err(|e| format!("Failed to save settings: {}", e))?;
+        if let Some(saved) = settings.config.provider_configs.get("ollama") {
+            self.config
+                .provider_configs
+                .insert("ollama".to_string(), saved.clone());
+        }
         Ok(())
     }
 
@@ -4234,13 +4438,12 @@ impl App {
                     return true;
                 }
                 "discover" => {
-                    // Spec §Discovery constraints: explicit action only,
-                    // bounded concurrency and duration, never loopback,
-                    // never silent. Runs the scan and reports candidates;
-                    // the Ollama screen (already open) receives the winner.
+                    // Explicit scan: bounded concurrency and duration, never
+                    // loopback, announced. Auto-scan covers the open screen,
+                    // but the user asked for one now.
                     self.close_secondary_views();
                     self.open_ollama_config_screen();
-                    self.start_ollama_discovery();
+                    self.start_ollama_discovery(false);
                     return true;
                 }
                 _ => {}
@@ -6076,8 +6279,10 @@ impl App {
             return false;
         }
 
-        // Dismiss error modal with Esc
-        if key.code == KeyCode::Esc && self.notifications.current_is_error() {
+        // Dismiss error modal with Esc. While a turn is streaming this is
+        // deferred so the first Esc always pauses the transcript; the banner
+        // is dismissible once the turn is idle.
+        if !self.is_streaming && key.code == KeyCode::Esc && self.notifications.current_is_error() {
             self.dismiss_error_notifications();
             return false;
         }
@@ -7041,60 +7246,65 @@ impl App {
                             self.apply_ollama_mode(mode);
                         }
                         // Options rows: ←/→ cycles the focused option's
-                        // value through its presets.
+                        // value through its presets and persists immediately
+                        // (same "apply and persist" semantics as the Mode
+                        // row), so a change survives Esc/restart without
+                        // requiring a connect.
                         KeyCode::Left if active_field == OllamaConfigField::Options => {
                             self.ollama_config_dialog.cycle_option_value(-1);
+                            self.apply_ollama_options();
                         }
                         KeyCode::Right if active_field == OllamaConfigField::Options => {
                             self.ollama_config_dialog.cycle_option_value(1);
+                            self.apply_ollama_options();
                         }
                         // h/l cycle values on the Options value rows. No text
                         // entry happens while a value row is focused, so these
                         // work regardless of vim mode.
                         KeyCode::Char('h') if active_field == OllamaConfigField::Options => {
                             self.ollama_config_dialog.cycle_option_value(-1);
+                            self.apply_ollama_options();
                         }
                         KeyCode::Char('l') if active_field == OllamaConfigField::Options => {
                             self.ollama_config_dialog.cycle_option_value(1);
+                            self.apply_ollama_options();
                         }
-                        KeyCode::Enter => {
-                            // Fast path: connect with an existing model. A first-time
-                            // setup must discover a real server model instead of
-                            // silently selecting a hardcoded tag that may not exist.
+                        // Servers row: Enter opens the LAN host picker (or
+                        // starts the scan) — the in-menu way to see and
+                        // switch servers. Must precede the bare Enter
+                        // (connect) arm.
+                        KeyCode::Enter if active_field == OllamaConfigField::Servers => {
+                            self.open_or_scan_ollama_hosts();
+                        }
+                        // Model row: Enter browses the remote server — ping
+                        // the configured host and list its installed models
+                        // for selection (spec §Model/server behavior). Same
+                        // flow as 'm'; the generic connect arm below stays for
+                        // Host focus. Must precede it: bare Enter would shadow
+                        // this guarded arm.
+                        KeyCode::Enter if active_field == OllamaConfigField::Model => {
                             if self.ollama_config_dialog.can_connect() {
-                                let host_url = match self.ollama_config_dialog.validate_host_url() {
-                                    Ok(url) => url,
-                                    Err(e) => {
-                                        self.status_message = Some(format!("Invalid host: {}", e));
-                                        return false;
-                                    }
-                                };
-                                if self.ollama_config_dialog.model_input.trim().is_empty() {
+                                if let Err(e) = self.ollama_config_dialog.validate_host_url() {
+                                    self.status_message = Some(format!("Invalid host: {}", e));
+                                } else {
                                     self.start_ollama_ping(true);
-                                    return false;
                                 }
-                                let model = match self.ollama_config_dialog.validate_model_name() {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        self.status_message = Some(format!("Invalid model: {}", e));
-                                        return false;
-                                    }
-                                };
-                                self.ollama_config_dialog.close();
-                                if let Err(e) = self.persist_ollama_config(&host_url, &model) {
-                                    self.status_message =
-                                        Some(format!("Failed to save config: {}", e));
-                                    return false;
-                                }
-                                self.activate_provider_with_model(
-                                    "ollama".to_string(),
-                                    "Ollama".to_string(),
-                                    "Connected to",
-                                    Some(model),
-                                );
                             } else {
                                 self.status_message = Some("Host URL is required.".to_string());
                             }
+                        }
+                        // Enter always acts on the focused row — the row is
+                        // the menu item. Host enters its text field (same as
+                        // 'e'); connecting happens by confirming a model in
+                        // the model picker.
+                        KeyCode::Enter if active_field == OllamaConfigField::Host => {
+                            self.ollama_config_dialog.start_edit();
+                        }
+                        // Options rows: Enter advances the focused option's
+                        // value (same as →), never a global connect.
+                        KeyCode::Enter if active_field == OllamaConfigField::Options => {
+                            self.ollama_config_dialog.cycle_option_value(1);
+                            self.apply_ollama_options();
                         }
                         KeyCode::Down => {
                             self.ollama_config_dialog.move_next_field();
@@ -7143,6 +7353,60 @@ impl App {
                                 self.start_ollama_ping(true);
                             }
                         }
+                        KeyCode::Char('d') => {
+                            // Silent shortcut for the Servers row.
+                            self.open_or_scan_ollama_hosts();
+                        }
+                        _ => {}
+                    }
+                }
+                crate::ollama_config_dialog::OllamaConfigPhase::SelectHost => {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.ollama_config_dialog.back_to_default();
+                        }
+                        KeyCode::Char('r') => {
+                            // Rescan the LAN in place.
+                            self.start_ollama_discovery(false);
+                        }
+                        KeyCode::Up => {
+                            self.ollama_config_dialog.move_host_up();
+                        }
+                        KeyCode::Char('k') => {
+                            self.ollama_config_dialog.move_host_up();
+                        }
+                        KeyCode::Down => {
+                            self.ollama_config_dialog.move_host_down();
+                        }
+                        KeyCode::Char('j') => {
+                            self.ollama_config_dialog.move_host_down();
+                        }
+                        KeyCode::Enter => {
+                            // Use the selected host: fill the field, persist
+                            // immediately (same edit-confirm semantics), and
+                            // return to the config view. The model list then
+                            // auto-populates via the background poll.
+                            if let Some(host) = self.ollama_config_dialog.selected_host() {
+                                let url = host.host_url.clone();
+                                self.ollama_config_dialog.host_url_input = url.clone();
+                                if let Err(e) = self.persist_ollama_edit(
+                                    crate::ollama_config_dialog::OllamaConfigField::Host,
+                                ) {
+                                    self.status_message = Some(format!("Failed to save: {}", e));
+                                }
+                                // In-menu feedback: the Host row now shows the
+                                // picked URL and the model list auto-populates
+                                // via the background poll — no external toast
+                                // needed.
+                                self.ollama_config_dialog.back_to_default();
+                                // Smooth first-run pipeline: no model set yet
+                                // — jump straight to browsing this server's
+                                // models (picking one connects).
+                                if self.ollama_config_dialog.model_input.trim().is_empty() {
+                                    self.start_ollama_ping(true);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -7178,8 +7442,22 @@ impl App {
                             self.ollama_config_dialog.start_edit();
                         }
                         KeyCode::Enter => {
-                            // Confirm edit and return to default view
+                            // Confirm edit and return to default view. The
+                            // confirmed field persists immediately (same
+                            // "apply and persist" semantics as the Mode and
+                            // Options rows), so a typed host/model survives
+                            // Esc + exit without requiring a connect.
+                            let field = self.ollama_config_dialog.active_field;
                             self.ollama_config_dialog.cancel_edit();
+                            if matches!(
+                                field,
+                                crate::ollama_config_dialog::OllamaConfigField::Host
+                                    | crate::ollama_config_dialog::OllamaConfigField::Model
+                            ) {
+                                if let Err(e) = self.persist_ollama_edit(field) {
+                                    self.status_message = Some(format!("Failed to save: {}", e));
+                                }
+                            }
                         }
                         KeyCode::Left => {
                             self.ollama_config_dialog.move_cursor_left();
@@ -8377,14 +8655,16 @@ impl App {
             return false;
         }
 
-        // Notification dismiss
-        if key.code == KeyCode::Esc && !self.notifications.is_empty() {
+        // Notification dismiss. Deferred while streaming: the first Esc must
+        // pause the transcript, not silently eat a banner — the toast expires
+        // on its own or is dismissible once the turn is idle.
+        if !self.is_streaming && key.code == KeyCode::Esc && !self.notifications.is_empty() {
             self.notifications.dismiss_current();
             return false;
         }
 
-        // Plugin hint dismiss
-        if key.code == KeyCode::Esc {
+        // Plugin hint dismiss (deferred while streaming — Esc pauses first)
+        if !self.is_streaming && key.code == KeyCode::Esc {
             if let Some(hint) = self.plugin_hints.iter_mut().find(|h| h.is_visible()) {
                 hint.dismiss();
                 return false;
@@ -8444,8 +8724,10 @@ impl App {
             }
         }
 
-        // Memory update notification dismiss
-        if key.code == KeyCode::Esc && self.memory_update_notification.visible {
+        // Memory update notification dismiss (deferred while streaming — Esc
+        // pauses the transcript first)
+        if !self.is_streaming && key.code == KeyCode::Esc && self.memory_update_notification.visible
+        {
             self.memory_update_notification.dismiss();
             return false;
         }
@@ -8770,7 +9052,11 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.focus = FocusTarget::Input;
-                    return false;
+                    if !self.is_streaming {
+                        return false;
+                    }
+                    // Streaming: fall through so Esc reaches the pause/cancel
+                    // arm below — returning focus must not eat the pause.
                 }
                 KeyCode::PageUp | KeyCode::PageDown => {
                     // Let these fall through to the normal scroll handling below.
@@ -8811,8 +9097,7 @@ impl App {
                     self.complete_current_turn_snapshot(true);
                 } else {
                     self.pause_stream();
-                    self.status_message =
-                        Some("Paused — still receiving. Esc stop · any key resume".to_string());
+                    self.status_message = Some(PAUSED_STREAM_MESSAGE.to_string());
                 }
             }
 
@@ -11797,6 +12082,7 @@ impl App {
                         self.streaming_text.push_str(&text);
                         self.streaming_thinking.push_str(&thinking);
                         self.stream_paused = false;
+                        self.clear_paused_status_message();
                         self.flush_streamed_assistant_message();
                     }
                     _ => {
@@ -11935,6 +12221,7 @@ impl App {
                     self.streaming_text.push_str(&text);
                     self.streaming_thinking.push_str(&thinking);
                     self.stream_paused = false;
+                    self.clear_paused_status_message();
                 }
                 self.flush_streamed_assistant_message();
                 // The flushed message was rebuilt from stream text and lost the
@@ -12237,34 +12524,48 @@ impl App {
                 if request_id != self.ollama_discovery_request_id {
                     return;
                 }
+                // Discovery state lives INSIDE the menu: the Servers row is
+                // the feedback surface while the dialog is open, so found
+                // servers are announced there — not via an out-of-menu status
+                // toast. The 60s background rescan only updates the row; it
+                // never yanks the phase (see auto_host_prompted below).
+                self.ollama_config_dialog.discovery_scanning = false;
+                self.ollama_config_dialog.discovery_checked = true;
                 if candidates.is_empty() {
-                    self.status_message = Some(format!(
-                        "Ollama discovery: no servers answered on the LAN ({scanned} hosts scanned). Manual entry remains available."
-                    ));
+                    self.ollama_config_dialog.set_discovered_hosts(Vec::new());
+                    // Closed-dialog edge (tests / future non-TUI callers)
+                    // still gets a status line.
+                    if !self.ollama_config_dialog.visible {
+                        self.status_message = Some(format!(
+                            "Ollama discovery: no servers answered on the LAN ({scanned} hosts scanned). Manual entry remains available."
+                        ));
+                    }
                     return;
                 }
-                let best = &candidates[0];
-                let listing = candidates
-                    .iter()
-                    .take(3)
-                    .map(|(host, latency, models)| format!("{host} ({models} models, {latency}ms)"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if self.ollama_config_dialog.host_url_input.trim().is_empty() {
-                    // Never choose silently (spec): prefill the screen with
-                    // the best candidate but say what happened.
-                    self.ollama_config_dialog.host_url_input = best.0.clone();
-                    self.status_message = Some(format!(
-                        "Ollama discovery found {0}: {1}. Review the host, then press Enter to connect.",
-                        candidates.len(),
-                        listing
-                    ));
-                } else {
-                    self.status_message = Some(format!(
-                        "Ollama discovery found {0}: {1}. Current host kept — edit the Host field to switch.",
-                        candidates.len(),
-                        listing
-                    ));
+                let hosts = candidates
+                    .into_iter()
+                    .map(|(host_url, latency_ms, model_count)| {
+                        crate::ollama_config_dialog::DiscoveredHost {
+                            host_url,
+                            latency_ms,
+                            model_count,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                self.ollama_config_dialog.set_discovered_hosts(hosts);
+                // Fresh setup (no host yet): land directly in the host picker
+                // once. Never when a host is configured, and never twice per
+                // dialog session — the periodic rescan must not re-open the
+                // picker after the user left it.
+                if self.ollama_config_dialog.visible
+                    && self.ollama_config_dialog.host_url_input.trim().is_empty()
+                    && !self.ollama_config_dialog.auto_host_prompted
+                    && self.ollama_config_dialog.phase
+                        == crate::ollama_config_dialog::OllamaConfigPhase::Default
+                {
+                    self.ollama_config_dialog.auto_host_prompted = true;
+                    self.ollama_config_dialog.phase =
+                        crate::ollama_config_dialog::OllamaConfigPhase::SelectHost;
                 }
             }
             QueryEvent::OllamaServerInfoPolled(polled) => {
@@ -12285,6 +12586,114 @@ impl App {
     // Main run loop
     // -------------------------------------------------------------------
 
+    /// Poll the background session-list and recent-sessions loads started by
+    /// [`App::session_list_pending`] / [`App::recent_sessions_pending`], and
+    /// spawn them when requested. Must be called once per UI frame by whatever
+    /// loop owns the terminal (the interactive CLI frame loop and
+    /// [`App::run`]). Without it the welcome screen's "Recent activity" list
+    /// and the `/session` browser stay permanently empty: the loads are
+    /// one-shot async tasks that only run while this is polled.
+    pub fn poll_background_loads(&mut self) {
+        // Drain background session-list results.
+        if let Some(ref mut rx) = self.session_list_rx {
+            match rx.try_recv() {
+                Ok(entries) => {
+                    self.session_browser.sessions = entries;
+                    self.session_browser.selected_idx = 0;
+                    self.session_list_rx = None;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    self.session_list_rx = None;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+
+        // Spawn async session-list load when requested.
+        // Uses project-scoped storage so the browser only shows sessions
+        // for the current working directory (matching the welcome screen).
+        if self.session_list_pending {
+            self.session_list_pending = false;
+            let root = self.project_root();
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            self.session_list_rx = Some(rx);
+            tokio::spawn(async move {
+                let summaries = clawde_core::session_storage::list_sessions(&root)
+                    .await
+                    .unwrap_or_default();
+                let entries: Vec<crate::session_browser::SessionEntry> = summaries
+                    .into_iter()
+                    .map(|s| {
+                        let last_updated = clawde_core::format_utils::format_relative_time(
+                            s.mtime
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
+                        );
+                        let title = s
+                            .title
+                            .or(s.ai_title)
+                            .unwrap_or_else(|| "(untitled)".to_string());
+                        let mut searchable_text = title.clone();
+                        if let Some(ref prompt) = s.last_prompt {
+                            searchable_text.push('\n');
+                            searchable_text.push_str(prompt);
+                        }
+                        crate::session_browser::SessionEntry {
+                            id: s.session_id,
+                            title,
+                            searchable_text,
+                            last_updated,
+                            message_count: s.message_count,
+                            cost_usd: 0.0,
+                        }
+                    })
+                    .collect();
+                let _ = tx.send(entries).await;
+            });
+        }
+
+        // Drain background recent-sessions results into the welcome screen.
+        if let Some(ref mut rx) = self.recent_sessions_rx {
+            match rx.try_recv() {
+                Ok(sessions) => {
+                    self.recent_sessions = sessions;
+                    self.recent_sessions_rx = None;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    self.recent_sessions_rx = None;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+
+        // Spawn the one-shot recent-sessions load when requested (startup).
+        if self.recent_sessions_pending {
+            self.recent_sessions_pending = false;
+            let root = self.project_root();
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            self.recent_sessions_rx = Some(rx);
+            tokio::spawn(async move {
+                // Show at most a handful; list_sessions is already newest-first.
+                const MAX_RECENT: usize = 5;
+                let summaries = clawde_core::session_storage::list_sessions(&root)
+                    .await
+                    .unwrap_or_default();
+                let recent: Vec<RecentSession> = summaries
+                    .into_iter()
+                    .take(MAX_RECENT)
+                    .map(|s| RecentSession {
+                        session_id: s.session_id,
+                        label: recent_session_label(s.title, s.ai_title, s.last_prompt),
+                        mtime: s.mtime,
+                        message_count: s.message_count,
+                    })
+                    .collect();
+                let _ = tx.send(recent).await;
+            });
+        }
+    }
+
     /// Run the TUI event loop. Returns `Some(input)` when the user submits
     /// a message, or `None` when the user quits.
     pub fn run(
@@ -12294,103 +12703,7 @@ impl App {
         loop {
             self.frame_count = self.frame_count.wrapping_add(1);
 
-            // Drain background session-list results.
-            if let Some(ref mut rx) = self.session_list_rx {
-                match rx.try_recv() {
-                    Ok(entries) => {
-                        self.session_browser.sessions = entries;
-                        self.session_browser.selected_idx = 0;
-                        self.session_list_rx = None;
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        self.session_list_rx = None;
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-                }
-            }
-
-            // Spawn async session-list load when requested.
-            // Uses project-scoped storage so the browser only shows sessions
-            // for the current working directory (matching the welcome screen).
-            if self.session_list_pending {
-                self.session_list_pending = false;
-                let root = self.project_root();
-                let (tx, rx) = tokio::sync::mpsc::channel(1);
-                self.session_list_rx = Some(rx);
-                tokio::spawn(async move {
-                    let summaries = clawde_core::session_storage::list_sessions(&root)
-                        .await
-                        .unwrap_or_default();
-                    let entries: Vec<crate::session_browser::SessionEntry> = summaries
-                        .into_iter()
-                        .map(|s| {
-                            let last_updated = clawde_core::format_utils::format_relative_time(
-                                s.mtime
-                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as u64,
-                            );
-                            let title = s
-                                .title
-                                .or(s.ai_title)
-                                .unwrap_or_else(|| "(untitled)".to_string());
-                            let mut searchable_text = title.clone();
-                            if let Some(ref prompt) = s.last_prompt {
-                                searchable_text.push('\n');
-                                searchable_text.push_str(prompt);
-                            }
-                            crate::session_browser::SessionEntry {
-                                id: s.session_id,
-                                title,
-                                searchable_text,
-                                last_updated,
-                                message_count: s.message_count,
-                                cost_usd: 0.0,
-                            }
-                        })
-                        .collect();
-                    let _ = tx.send(entries).await;
-                });
-            }
-
-            // Drain background recent-sessions results into the welcome screen.
-            if let Some(ref mut rx) = self.recent_sessions_rx {
-                match rx.try_recv() {
-                    Ok(sessions) => {
-                        self.recent_sessions = sessions;
-                        self.recent_sessions_rx = None;
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        self.recent_sessions_rx = None;
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-                }
-            }
-
-            // Spawn the one-shot recent-sessions load when requested (startup).
-            if self.recent_sessions_pending {
-                self.recent_sessions_pending = false;
-                let root = self.project_root();
-                let (tx, rx) = tokio::sync::mpsc::channel(1);
-                self.recent_sessions_rx = Some(rx);
-                tokio::spawn(async move {
-                    // Show at most a handful; list_sessions is already newest-first.
-                    const MAX_RECENT: usize = 5;
-                    let summaries = clawde_core::session_storage::list_sessions(&root)
-                        .await
-                        .unwrap_or_default();
-                    let recent: Vec<RecentSession> = summaries
-                        .into_iter()
-                        .take(MAX_RECENT)
-                        .map(|s| RecentSession {
-                            session_id: s.session_id,
-                            label: recent_session_label(s.title, s.ai_title, s.last_prompt),
-                            mtime: s.mtime,
-                        })
-                        .collect();
-                    let _ = tx.send(recent).await;
-                });
-            }
+            self.poll_background_loads();
 
             // Drain voice transcription events (non-blocking).
             // When the background recording/transcription task emits a
@@ -13306,16 +13619,141 @@ mod tests {
     }
 
     #[test]
-    fn esc_with_notification_shown_dismisses_first_and_pauses_second() {
-        // Precedence contract: notification dismissal runs before the
-        // streaming pause arm, so the first ESC goes to the toast.
+    fn esc_pauses_stream_even_with_notification_shown() {
+        // Regression: while a turn is streaming the first ESC must pause the
+        // transcript even when a banner is up — it must not be silently
+        // consumed dismissing the toast.
         let mut app = make_app();
         app.is_streaming = true;
         app.push_notification(NotificationKind::Info, "note".to_string(), Some(3));
         push_esc(&mut app);
-        assert!(!app.stream_paused, "first ESC dismisses the notification");
+        assert!(app.stream_paused, "first ESC pauses despite the banner");
+        assert!(!app.stream_cancel_requested, "first ESC must not cancel");
+        assert!(
+            !app.notifications.is_empty(),
+            "banner stays queued for dismissal once idle"
+        );
+    }
+
+    #[test]
+    fn esc_still_dismisses_notification_when_idle() {
+        // The banner-dismissal path is unchanged outside a stream: an idle
+        // ESC clears the toast rather than doing nothing.
+        let mut app = make_app();
+        app.push_notification(NotificationKind::Warning, "note".to_string(), Some(3));
         push_esc(&mut app);
-        assert!(app.stream_paused, "second ESC pauses");
+        assert!(!app.stream_paused);
+        assert!(
+            app.notifications.is_empty(),
+            "idle ESC dismisses the banner"
+        );
+    }
+
+    #[test]
+    fn esc_pauses_even_when_focus_is_transcript() {
+        // Regression: returning focus from the transcript pane must not eat
+        // the streaming pause — the first ESC both refocuses the input and
+        // pauses the live transcript.
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.focus = FocusTarget::Transcript;
+        push_esc(&mut app);
+        assert!(app.stream_paused, "first ESC pauses in transcript focus");
+        assert_eq!(app.focus, FocusTarget::Input, "focus returns to the input");
+        assert!(!app.stream_cancel_requested);
+    }
+
+    #[test]
+    fn resume_clears_paused_status_message() {
+        // The "Paused — still receiving…" status line must not linger over a
+        // live stream after the user resumes with a key.
+        let mut app = make_app();
+        app.is_streaming = true;
+        push_text_delta(&mut app, "before");
+        push_esc(&mut app);
+        assert_eq!(app.status_message.as_deref(), Some(PAUSED_STREAM_MESSAGE));
+        app.resume_stream();
+        assert!(!app.stream_paused);
+        assert!(
+            app.status_message.is_none(),
+            "resume clears the stale pause message"
+        );
+    }
+
+    #[test]
+    fn resume_restores_running_tool_status() {
+        // Pausing mid-tool clobbers the "Running Bash…" line; resuming while
+        // the tool is still in flight must re-derive it from the tool block so
+        // the status row does not pretend the tool vanished.
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.handle_query_event(QueryEvent::ToolStart {
+            tool_name: "Bash".to_string(),
+            tool_id: "t1".to_string(),
+            input_json: r#"{"command":"ls -la"}"#.to_string(),
+        });
+        assert_eq!(app.status_message.as_deref(), Some("Running Bash…"));
+        push_esc(&mut app);
+        assert_eq!(app.status_message.as_deref(), Some(PAUSED_STREAM_MESSAGE));
+        app.resume_stream();
+        assert!(!app.stream_paused);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Running Bash…"),
+            "resume restores the running tool's status line"
+        );
+    }
+
+    #[test]
+    fn tool_finishing_while_paused_keeps_resume_truthful() {
+        // If the tool ends while the transcript is paused, its completion
+        // (status cleared) is the current truth — resume must not resurrect a
+        // stale "Running …" line.
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.handle_query_event(QueryEvent::ToolStart {
+            tool_name: "Bash".to_string(),
+            tool_id: "t1".to_string(),
+            input_json: r#"{"command":"ls -la"}"#.to_string(),
+        });
+        push_esc(&mut app);
+        app.handle_query_event(QueryEvent::ToolEnd {
+            tool_name: "Bash".to_string(),
+            tool_id: "t1".to_string(),
+            result: "done".to_string(),
+            is_error: false,
+            error_code: None,
+        });
+        assert_eq!(app.status_message, None);
+        app.resume_stream();
+        assert!(!app.stream_paused);
+        assert_eq!(
+            app.status_message, None,
+            "no stale running-tool line after resume"
+        );
+        assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Done);
+    }
+
+    #[test]
+    fn turn_end_while_paused_clears_status_message() {
+        // If the model finishes while paused, the fold path must clear the
+        // pause message too (issue: stale "Paused" line after the turn).
+        let mut app = make_app();
+        app.is_streaming = true;
+        push_text_delta(&mut app, "before");
+        push_esc(&mut app);
+        assert_eq!(app.status_message.as_deref(), Some(PAUSED_STREAM_MESSAGE));
+        app.handle_query_event(QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".into(),
+            usage: None,
+            observability: None,
+        });
+        assert!(!app.stream_paused);
+        assert!(
+            app.status_message.is_none(),
+            "turn completion clears the pause message"
+        );
     }
 
     #[test]
@@ -15472,6 +15910,11 @@ mod tests {
         app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(
             app.ollama_config_dialog.active_field,
+            crate::ollama_config_dialog::OllamaConfigField::Servers
+        );
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            app.ollama_config_dialog.active_field,
             crate::ollama_config_dialog::OllamaConfigField::Model
         );
         app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -15483,6 +15926,11 @@ mod tests {
         assert_eq!(
             app.ollama_config_dialog.active_field,
             crate::ollama_config_dialog::OllamaConfigField::Model
+        );
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(
+            app.ollama_config_dialog.active_field,
+            crate::ollama_config_dialog::OllamaConfigField::Servers
         );
     }
 
@@ -15577,16 +16025,174 @@ mod tests {
     }
 
     #[test]
-    fn ollama_first_connect_requires_model_discovery() {
+    fn ollama_host_edit_confirm_persists_without_connect() {
+        // Confirming a Host edit must persist the host immediately — closing
+        // the dialog or exiting afterwards cannot discard it (regression:
+        // hosts were only saved inside the connect transaction).
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.ollama_config_dialog.open(None, None);
+        app.ollama_config_dialog.host_url_input = "http://gpu.example.test:11434".to_string();
+        app.ollama_config_dialog.start_edit(); // Host is the default field
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        let settings = Settings::load_sync().unwrap();
+        let ollama = settings
+            .config
+            .provider_configs
+            .get("ollama")
+            .expect("confirmed host edit must persist");
+        assert_eq!(
+            ollama.api_base.as_deref(),
+            Some("http://gpu.example.test:11434/v1")
+        );
+        assert_eq!(
+            ollama.options.get("default_host").and_then(|v| v.as_str()),
+            Some("http://gpu.example.test:11434")
+        );
+        // Mirrored into the live session config.
+        assert_eq!(
+            app.config
+                .provider_configs
+                .get("ollama")
+                .and_then(|c| c.api_base.as_deref()),
+            Some("http://gpu.example.test:11434/v1")
+        );
+        // Back on the default view, dialog still open (no connect fired).
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Default
+        );
+        assert!(app.ollama_config_dialog.visible);
+    }
+
+    #[test]
+    fn ollama_model_edit_confirm_persists_without_connect() {
+        let _home = TestHome::acquire();
         let mut app = make_app();
         app.ollama_config_dialog
             .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_config_dialog.active_field =
+            crate::ollama_config_dialog::OllamaConfigField::Model;
+        app.ollama_config_dialog.model_input = "qwen:test".to_string();
+        app.ollama_config_dialog.start_edit();
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        let settings = Settings::load_sync().unwrap();
+        let ollama = settings
+            .config
+            .provider_configs
+            .get("ollama")
+            .expect("confirmed model edit must persist");
+        assert_eq!(
+            ollama.options.get("model").and_then(|v| v.as_str()),
+            Some("qwen:test")
+        );
+        assert_eq!(
+            app.config
+                .provider_configs
+                .get("ollama")
+                .and_then(|c| c.options.get("model"))
+                .and_then(|v| v.as_str()),
+            Some("qwen:test")
+        );
+    }
+
+    #[test]
+    fn ollama_host_edit_confirm_invalid_host_does_not_persist() {
+        // Loopback is rejected by design; an invalid confirmed edit must
+        // surface the error and write nothing to settings.
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.ollama_config_dialog.open(None, None);
+        app.ollama_config_dialog.host_url_input = "http://127.0.0.1:11434".to_string();
+        app.ollama_config_dialog.start_edit();
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        let settings = Settings::load_sync().unwrap();
+        assert!(
+            !settings.config.provider_configs.contains_key("ollama"),
+            "invalid host must not be persisted"
+        );
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Ollama must run"),
+            "invalid host must surface an error"
+        );
+    }
+
+    #[test]
+    fn ollama_enter_on_host_row_opens_edit_mode() {
+        // Enter on the focused row is the row action: on Host it enters the
+        // text field (same as 'e') instead of firing a global connect.
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        assert_eq!(
+            app.ollama_config_dialog.active_field,
+            crate::ollama_config_dialog::OllamaConfigField::Host
+        );
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::EditField(
+                crate::ollama_config_dialog::OllamaConfigField::Host
+            )
+        );
+        assert!(!app.ollama_ping_pending);
+    }
+
+    #[test]
+    fn ollama_enter_on_options_row_advances_value() {
+        // Enter on an Options row advances that option (same as →); it must
+        // not fall through to a global connect.
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_config_dialog.active_field =
+            crate::ollama_config_dialog::OllamaConfigField::Options;
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.ollama_config_dialog.num_ctx_label, "2K");
+        // No connect fired, dialog stays open.
+        assert!(!app.ollama_ping_pending);
+        assert!(app.ollama_config_dialog.visible);
+        assert!(!app
+            .status_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Host URL"));
+    }
+
+    #[test]
+    fn ollama_enter_on_model_row_browses_remote_models() {
+        // Enter on the Model row pings the configured host and opens the
+        // model picker instead of falling through to the connect arm.
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_config_dialog.model_input = "qwen:test".to_string();
+        app.ollama_config_dialog.active_field =
+            crate::ollama_config_dialog::OllamaConfigField::Model;
         app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.ollama_ping_pending);
+        assert!(app.ollama_ping_for_models);
         assert_eq!(
             app.ollama_config_dialog.phase,
             crate::ollama_config_dialog::OllamaConfigPhase::Pinging
         );
+        // Dialog stays open — the picker replaces this view on success.
+        assert!(app.ollama_config_dialog.visible);
+    }
+
+    #[test]
+    fn ollama_enter_on_model_row_without_host_shows_error() {
+        let mut app = make_app();
+        app.ollama_config_dialog.open(None, None);
+        app.ollama_config_dialog.active_field =
+            crate::ollama_config_dialog::OllamaConfigField::Model;
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.ollama_ping_pending);
+        assert_eq!(app.status_message.as_deref(), Some("Host URL is required."));
     }
 
     #[test]
@@ -15898,6 +16504,7 @@ mod tests {
         app.ollama_config_dialog
             .open(Some("http://gpu.example.test:11434".to_string()), None);
         // Navigate to the Mode row and flip it in place.
+        app.ollama_config_dialog.move_next_field(); // Servers
         app.ollama_config_dialog.move_next_field(); // Model
         app.ollama_config_dialog.move_next_field(); // Mode
         app.handle_key_event(press_key(KeyCode::Right, KeyModifiers::NONE));
@@ -15910,6 +16517,151 @@ mod tests {
         // Screen stays open after the flip (no connect was triggered).
         assert!(app.ollama_config_dialog.visible);
         clawde_core::set_ollama_network_blocked(was_blocked);
+    }
+
+    #[test]
+    fn ollama_options_row_persists_immediately() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        // Navigate to the Options row: Host -> Servers -> Model -> Mode ->
+        // Options.
+        app.ollama_config_dialog.move_next_field(); // Servers
+        app.ollama_config_dialog.move_next_field(); // Model
+        app.ollama_config_dialog.move_next_field(); // Mode
+        app.ollama_config_dialog.move_next_field(); // Options
+                                                    // First option row (num_ctx) is focused; Right cycles unset -> "2K".
+        app.handle_key_event(press_key(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.ollama_config_dialog.num_ctx_label, "2K");
+        // Persisted to disk immediately, without a connect.
+        let settings = Settings::load_sync().unwrap();
+        let ollama = settings
+            .config
+            .provider_configs
+            .get("ollama")
+            .expect("options must persist without connecting");
+        assert_eq!(
+            ollama.options.get("num_ctx").and_then(|v| v.as_u64()),
+            Some(2_048)
+        );
+        // Mirrored into the live session config.
+        assert_eq!(
+            app.config
+                .provider_configs
+                .get("ollama")
+                .and_then(|c| c.options.get("num_ctx"))
+                .and_then(|v| v.as_u64()),
+            Some(2_048)
+        );
+        // Screen stays open after the cycle (no connect was triggered).
+        assert!(app.ollama_config_dialog.visible);
+    }
+
+    #[test]
+    fn ollama_options_cycled_back_to_unset_removes_key() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        // Seed a persisted num_ctx through the dialog, then cycle it back to
+        // unset: the key must disappear from settings, not linger stale.
+        app.ollama_config_dialog.num_ctx_label = "16K".to_string();
+        app.apply_ollama_options();
+        assert_eq!(
+            Settings::load_sync()
+                .unwrap()
+                .config
+                .provider_configs
+                .get("ollama")
+                .and_then(|c| c.options.get("num_ctx"))
+                .and_then(|v| v.as_u64()),
+            Some(16_384)
+        );
+        app.ollama_config_dialog.num_ctx_label = String::new();
+        app.apply_ollama_options();
+        let settings = Settings::load_sync().unwrap();
+        let ollama = settings.config.provider_configs.get("ollama").unwrap();
+        assert!(
+            !ollama.options.contains_key("num_ctx"),
+            "cycled-to-unset options must be removed from disk"
+        );
+        assert!(
+            !app.config
+                .provider_configs
+                .get("ollama")
+                .unwrap()
+                .options
+                .contains_key("num_ctx"),
+            "cycled-to-unset options must be removed from the live config"
+        );
+    }
+
+    #[test]
+    fn ollama_auto_poll_populates_picker_and_preserves_selection() {
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        let model = |name: &str| crate::ollama_config_dialog::OllamaModel {
+            name: name.to_string(),
+            size: 1,
+            quantization: "Q4".to_string(),
+            parameter_size: "1B".to_string(),
+        };
+        app.ollama_config_dialog
+            .ping_success(vec![model("a"), model("b"), model("c")]);
+        app.ollama_config_dialog.move_model_down(); // select b
+
+        // Auto-poll arrives with an updated list; the selection and phase
+        // survive in place.
+        app.apply_ollama_polled_models(Some(vec![
+            clawde_query::OllamaPingModel {
+                name: "a".to_string(),
+                size: 1,
+                quantization: "Q4".to_string(),
+                parameter_size: "1B".to_string(),
+            },
+            clawde_query::OllamaPingModel {
+                name: "b".to_string(),
+                size: 1,
+                quantization: "Q4".to_string(),
+                parameter_size: "1B".to_string(),
+            },
+            clawde_query::OllamaPingModel {
+                name: "c".to_string(),
+                size: 1,
+                quantization: "Q4".to_string(),
+                parameter_size: "1B".to_string(),
+            },
+            clawde_query::OllamaPingModel {
+                name: "d".to_string(),
+                size: 1,
+                quantization: "Q4".to_string(),
+                parameter_size: "1B".to_string(),
+            },
+        ]));
+        assert_eq!(app.ollama_config_dialog.models.len(), 4);
+        assert_eq!(app.ollama_config_dialog.selected_model().unwrap().name, "b");
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::SelectModel
+        );
+    }
+
+    #[test]
+    fn ollama_auto_poll_failure_marks_health_unhealthy() {
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        assert_eq!(
+            app.ollama_config_dialog.health,
+            crate::ollama_config_dialog::HealthStatus::Untested
+        );
+        app.apply_ollama_polled_models(None);
+        assert_eq!(
+            app.ollama_config_dialog.health,
+            crate::ollama_config_dialog::HealthStatus::Unhealthy
+        );
     }
 
     #[test]
@@ -15928,8 +16680,9 @@ mod tests {
             .unwrap_or_default()
             .contains("no servers answered"));
 
-        // Found candidates with no configured host: prefill + announce —
-        // never a silent switch (spec §Model/server behavior).
+        // Found candidates with no configured host: auto-open the host
+        // picker — never a silent switch (spec §Model/server behavior).
+        app.status_message = None;
         app.ollama_discovery_request_id = 6;
         app.ollama_config_dialog.open(None, None);
         app.handle_query_event(QueryEvent::OllamaDiscoveryResult {
@@ -15938,16 +16691,25 @@ mod tests {
             scanned: 254,
         });
         assert_eq!(
-            app.ollama_config_dialog.host_url_input,
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::SelectHost
+        );
+        assert_eq!(app.ollama_config_dialog.discovered_hosts.len(), 1);
+        assert_eq!(
+            app.ollama_config_dialog.discovered_hosts[0].host_url,
             "http://192.168.1.45:11434"
         );
-        assert!(app
-            .status_message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Review the host"));
+        // Nothing chosen silently — the field stays empty until the user
+        // picks from the picker.
+        assert_eq!(app.ollama_config_dialog.host_url_input, "");
+        // Discovery feedback lives inside the menu (the Servers row + the
+        // picker), not in the out-of-menu status line.
+        assert_eq!(app.status_message, None);
 
-        // An already-configured host is never overwritten.
+        // An already-configured host is never overwritten. (Back out of the
+        // auto-opened picker first — the realistic state when a later scan
+        // lands while the Default view is showing.)
+        app.ollama_config_dialog.back_to_default();
         app.ollama_discovery_request_id = 7;
         app.ollama_config_dialog.host_url_input = "http://gpu.example.test:11434".to_string();
         app.handle_query_event(QueryEvent::OllamaDiscoveryResult {
@@ -15959,6 +16721,110 @@ mod tests {
             app.ollama_config_dialog.host_url_input,
             "http://gpu.example.test:11434"
         );
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Default
+        );
+        // Found servers are announced in the Servers row instead.
+        assert!(app.status_message.is_none());
+        assert!(app.ollama_config_dialog.has_discovered_hosts());
+    }
+
+    #[test]
+    fn ollama_host_picker_enter_sets_and_persists_host() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.ollama_config_dialog.open(None, None);
+        app.ollama_config_dialog.set_discovered_hosts(vec![
+            crate::ollama_config_dialog::DiscoveredHost {
+                host_url: "http://192.168.1.45:11434".to_string(),
+                latency_ms: 12,
+                model_count: 2,
+            },
+        ]);
+        app.ollama_config_dialog.phase = crate::ollama_config_dialog::OllamaConfigPhase::SelectHost;
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.ollama_config_dialog.host_url_input,
+            "http://192.168.1.45:11434"
+        );
+        // No model set yet: the pick chains straight into browsing this
+        // server's models (picking one connects).
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Pinging
+        );
+        assert!(app.ollama_ping_pending);
+        assert!(app.ollama_ping_for_models);
+        // Persisted immediately (edit-confirm semantics) so the model
+        // auto-poll targets it.
+        let settings = Settings::load_sync().unwrap();
+        let ollama = settings
+            .config
+            .provider_configs
+            .get("ollama")
+            .expect("picked host must persist");
+        assert_eq!(
+            ollama.api_base.as_deref(),
+            Some("http://192.168.1.45:11434/v1")
+        );
+    }
+
+    #[test]
+    fn ollama_d_key_opens_host_picker_or_scans() {
+        let mut app = make_app();
+        app.ollama_config_dialog.open(None, None);
+        // No scan results yet: 'd' starts one.
+        app.handle_key_event(press_key(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(app.ollama_discovery_pending);
+        // The scan completes (results land; the row stops showing
+        // "scanning…").
+        app.ollama_discovery_pending = false;
+        app.ollama_config_dialog.discovery_scanning = false;
+        app.ollama_config_dialog.discovery_checked = true;
+
+        // Results in hand: 'd' opens the picker without scanning.
+        app.ollama_config_dialog.set_discovered_hosts(vec![
+            crate::ollama_config_dialog::DiscoveredHost {
+                host_url: "http://192.168.1.45:11434".to_string(),
+                latency_ms: 5,
+                model_count: 1,
+            },
+        ]);
+        app.handle_key_event(press_key(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::SelectHost
+        );
+        assert!(!app.ollama_discovery_pending);
+    }
+
+    #[test]
+    fn ollama_auto_scan_gate_screen_open_and_cadence() {
+        let mut app = make_app();
+        // Screen closed: never scan.
+        app.maybe_start_auto_ollama_scan();
+        assert!(!app.ollama_discovery_pending);
+
+        // Screen open + never scanned: immediate scan.
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.maybe_start_auto_ollama_scan();
+        assert!(app.ollama_discovery_pending);
+
+        // Just scanned: no repeat scan.
+        app.ollama_discovery_pending = false;
+        app.maybe_start_auto_ollama_scan();
+        assert!(!app.ollama_discovery_pending);
+
+        // Interval elapsed: due again.
+        app.ollama_discovery_last_result = Some(
+            std::time::Instant::now()
+                - App::OLLAMA_AUTO_SCAN_INTERVAL
+                - std::time::Duration::from_secs(1),
+        );
+        app.maybe_start_auto_ollama_scan();
+        assert!(app.ollama_discovery_pending);
     }
 
     #[test]

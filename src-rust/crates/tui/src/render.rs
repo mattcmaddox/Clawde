@@ -243,10 +243,12 @@ fn short_relative_secs(secs: u64) -> String {
 
 /// Build the body lines for the welcome box's "Recent activity" section.
 ///
-/// Renders up to five recent sessions as `<label> <relative-time>` (the label
-/// truncated to fit `width`), or a single dimmed "No recent activity" line when
-/// there are none. Split out from [`render_welcome_box`] so it can be unit
-/// tested from controlled state without the surrounding layout.
+/// Renders up to five recent sessions as
+/// `<label> · <N> msgs · <relative-time>` (the `N msgs` part is omitted for
+/// sessions with no counted messages, and the label is truncated to fit
+/// `width`), or a single dimmed "No recent activity" line when there are none.
+/// Split out from [`render_welcome_box`] so it can be unit tested from
+/// controlled state without the surrounding layout.
 /// Build the compact project-memory status line for the welcome screen
 /// (audit spec §15.3): `⚡ Mnemosyne: N files · updated <age>`, or `None`
 /// when the project has no memory files yet.
@@ -332,9 +334,15 @@ fn recent_activity_lines(
             } else {
                 short_relative_time(s.mtime)
             };
-            // Reserve room for the trailing " <time>" so the label truncates
+            // Trailing meta: "N msgs · <time>" (message count omitted when the
+            // session has none). Reserve room for it so the label truncates
             // instead of wrapping onto a second line.
-            let label_w = width.saturating_sub(when.chars().count() + 1);
+            let meta = if s.message_count > 0 {
+                format!("{} msgs · {}", s.message_count, when)
+            } else {
+                when.clone()
+            };
+            let label_w = width.saturating_sub(meta.chars().count() + 1);
             let label = truncate_end(&s.label, label_w.max(1));
             let label_style = if is_hovered {
                 Style::default()
@@ -343,7 +351,7 @@ fn recent_activity_lines(
             } else {
                 Style::default().fg(Color::Gray)
             };
-            let time_style = if is_hovered {
+            let meta_style = if is_hovered {
                 Style::default()
                     .fg(Color::Rgb(180, 180, 180))
                     .add_modifier(Modifier::UNDERLINED)
@@ -353,7 +361,7 @@ fn recent_activity_lines(
             Line::from(vec![
                 Span::styled(label, label_style),
                 Span::raw(" "),
-                Span::styled(when, time_style),
+                Span::styled(meta, meta_style),
             ])
         })
         .collect()
@@ -5748,6 +5756,14 @@ mod recent_activity_tests {
             session_id: "test-session".to_string(),
             label: label.to_string(),
             mtime: SystemTime::now() - Duration::from_secs(secs_ago),
+            message_count: 0,
+        }
+    }
+
+    fn recent_with_msgs(label: &str, secs_ago: u64, message_count: usize) -> RecentSession {
+        RecentSession {
+            message_count,
+            ..recent(label, secs_ago)
         }
     }
 
@@ -5802,6 +5818,33 @@ mod recent_activity_tests {
             !out.contains("No recent activity"),
             "no placeholder: {out:?}"
         );
+    }
+
+    #[test]
+    fn session_rows_show_message_count_as_msgs() {
+        let sessions = vec![
+            recent_with_msgs("Refactor the poller", 2 * 3_600, 34),
+            recent_with_msgs("Untitled few", 60, 3),
+        ];
+        let out = lines_text(&sessions, 60).join("\n");
+        assert!(out.contains("34 msgs"), "count present: {out:?}");
+        assert!(out.contains("3 msgs"), "count present: {out:?}");
+        // The count sits between the label and the relative time.
+        assert!(
+            out.contains("Refactor the poller 34 msgs · 2h ago"),
+            "row layout: {out:?}"
+        );
+    }
+
+    #[test]
+    fn sessions_without_messages_omit_the_count() {
+        // A session with no counted messages renders like before — label + time,
+        // no "0 msgs" noise.
+        let sessions = vec![recent("Fresh session", 60)];
+        let out = lines_text(&sessions, 40);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].contains("msgs"), "no count: {out:?}");
+        assert!(out[0].ends_with("1m ago"), "time preserved: {out:?}");
     }
 
     #[test]
