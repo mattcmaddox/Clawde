@@ -1071,9 +1071,28 @@ pub mod config {
     /// The work is scheduled on the current Tokio runtime when one exists.
     /// Calls made outside an async runtime get a small fallback runtime on a
     /// background thread instead of silently doing nothing.
+    ///
+    /// Failures are logged to stderr so an evicted model that fails to unload
+    /// (slow server, unreachable host, partial failure) is not silently
+    /// swallowed by the fire-and-forget contract. The caller does not wait
+    /// for the result.
     pub fn spawn_ollama_unload_for_config(config: Config, model: Option<String>) {
         let task = async move {
-            let _ = ollama_unload_models_for_config(&config, model.as_deref()).await;
+            match ollama_unload_models_for_config(&config, model.as_deref()).await {
+                Ok(0) => {
+                    // Nothing was loaded to begin with; not an error, but worth
+                    // a quiet note when a model name was explicitly given.
+                    if let Some(ref m) = model {
+                        eprintln!("[clawde] ollama unload: '{}' was not currently loaded", m);
+                    }
+                }
+                Ok(n) => {
+                    eprintln!("[clawde] ollama unload: unloaded {n} model(s) from VRAM");
+                }
+                Err(e) => {
+                    eprintln!("[clawde] ollama unload: failed to unload model(s): {e}");
+                }
+            }
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(task);
@@ -1291,6 +1310,54 @@ pub mod config {
         ollama_status_for_config(&config).await
     }
 
+    /// Split an Ollama model identifier into its base name and optional tag.
+    ///
+    /// Ollama model ids look like `qwen2.5-coder:7b` (base + explicit tag)
+    /// or `llama3` (base only, implicit `:latest`). The overload path needs
+    /// this decomposition so a caller can target a model by either form
+    /// without being tripped up by the server reporting a different tag.
+    #[allow(dead_code)]
+    fn model_base_and_tag(id: &str) -> (String, Option<String>) {
+        let (base, tag) = match id.rsplit_once(':') {
+            Some((b, t)) if !b.is_empty() => (b.to_string(), Some(t.to_string())),
+            _ => (id.to_string(), None),
+        };
+        (base, tag)
+    }
+
+    /// Return `true` when two Ollama model identifiers refer to the same
+    /// concrete model for the purposes of unload targeting.
+    ///
+    /// Exact equality is always a match. Additionally, when one identifier is
+    /// the other with a single trailing tag segment appended (e.g.
+    /// `qwen2.5-coder:7b` vs `qwen2.5-coder:7b:latest`), they are treated as
+    /// the same model because Ollama accepts the longer form as a synonym for
+    /// the shorter one in many workflows. This prevents a user typing
+    /// `/unload qwen2.5-coder:7b:latest` from being told "not currently
+    /// loaded" when the server is showing `qwen2.5-coder:7b`.
+    fn model_ids_resolve_to_same_model(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        // Check: a is b with an extra :tag appended
+        // (e.g. requested "qwen2.5-coder:7b:latest", loaded "qwen2.5-coder:7b")
+        if a.starts_with(b) && a.len() > b.len() {
+            let suffix = &a[b.len()..];
+            if suffix.starts_with(':') && suffix[1..].find(':').is_none() {
+                return true;
+            }
+        }
+        // Check: b is a with an extra :tag appended
+        // (e.g. loaded "qwen2.5-coder:7b:latest", requested "qwen2.5-coder:7b")
+        if b.starts_with(a) && b.len() > a.len() {
+            let suffix = &b[a.len()..];
+            if suffix.starts_with(':') && suffix[1..].find(':').is_none() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Send keep_alive=0 requests to unload loaded Ollama models.
     ///
     /// When `model` is `Some`, only that already-loaded model is targeted. An
@@ -1316,28 +1383,63 @@ pub mod config {
         base_url: &str,
         model: Option<&str>,
     ) -> Result<usize, String> {
-        let initial = ollama_status_at(client, base_url).await?;
-        let targets: Vec<String> = match model {
-            Some(model) => initial
-                .models
-                .iter()
-                .filter(|loaded| loaded.name == model || loaded.name == format!("{}:latest", model))
-                .map(|loaded| loaded.name.clone())
-                .collect(),
-            None => initial
-                .models
-                .iter()
-                .map(|loaded| loaded.name.clone())
-                .collect(),
+        let current = ollama_status_at(client, base_url).await?;
+
+        // Determine which loaded models (if any) match what the caller asked
+        // for. The matching is intentionally broader than exact equality:
+        //
+        // - `/unload qwen2.5-coder:7b` must find a server-reported
+        //   `qwen2.5-coder:7b` (exact match).
+        // - `/unload qwen2.5-coder:7b:latest` must also find
+        //   `qwen2.5-coder:7b` when that is the model the user actually
+        //   meant. Ollama accepts `ollama pull X:Y:latest` as a synonym for
+        //   `ollama pull X:Y` in many cases, so a user may type the longer
+        //   form while the server stored the shorter one. Matching only on
+        //   exact equality would make the unload silently do nothing.
+        //
+        // The rule: a loaded model matches the request when either the names
+        // are identical, or the requested id is the loaded name with an extra
+        // `:latest` (or other single-segment tag) appended, or the loaded name
+        // is the requested id with an extra tag appended.
+        let (matched_targets, unmatched_requested): (Vec<String>, Vec<String>) = match model {
+            Some(requested) => {
+                let mut matched = Vec::new();
+                let mut unmatched = Vec::new();
+                for loaded in &current.models {
+                    if model_ids_resolve_to_same_model(requested, &loaded.name) {
+                        matched.push(loaded.name.clone());
+                    } else {
+                        unmatched.push(loaded.name.clone());
+                    }
+                }
+                if matched.is_empty() {
+                    unmatched.push(requested.to_string());
+                }
+                (matched, unmatched)
+            }
+            None => (
+                current.models.iter().map(|m| m.name.clone()).collect(),
+                Vec::new(),
+            ),
         };
 
-        if targets.is_empty() {
-            return Ok(0);
+        // Nothing is loaded that we were asked to target. When a specific
+        // model was named, tell the caller; when unloading everything and the
+        // server is already empty, just report zero.
+        if matched_targets.is_empty() {
+            return if !unmatched_requested.is_empty() {
+                Err(format!(
+                    "Model '{}' is not currently loaded.",
+                    unmatched_requested[0]
+                ))
+            } else {
+                Ok(0)
+            };
         }
 
         let mut unloaded = 0usize;
         let mut failures = Vec::new();
-        for target in &targets {
+        for target in &matched_targets {
             let body = serde_json::json!({
                 "model": target,
                 "prompt": "",
@@ -1367,34 +1469,56 @@ pub mod config {
 
         if !failures.is_empty() {
             return Err(format!(
-                "Unloaded {unloaded}/{} model(s); {}",
-                targets.len(),
-                failures.join("; ")
+                "Unloaded {unloaded}/{total} model(s); {}",
+                failures.join("; "),
+                total = matched_targets.len(),
             ));
         }
 
-        // Ollama removes the model asynchronously. Poll briefly so callers do
-        // not report success while the model is still resident in VRAM.
-        for _ in 0..10 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Ollama removes the model asynchronously. Poll with a small backoff
+        // so callers do not report success while the model is still resident
+        // in VRAM. The first poll happens immediately after the generate calls
+        // so a fast synchronous unload still clears quickly, then the sleep
+        // grows to avoid hammering a slow/busy server.
+        let mut poll_delay = std::time::Duration::from_millis(50);
+        let max_polls = 20;
+        for _ in 0..max_polls {
             let remaining = ollama_status_at(client, base_url).await?.models;
             let still_loaded = match model {
                 Some(_) => remaining
                     .iter()
-                    .any(|loaded| targets.contains(&loaded.name)),
+                    .any(|loaded| matched_targets.contains(&loaded.name)),
                 None => !remaining.is_empty(),
             };
             if !still_loaded {
                 return Ok(unloaded);
             }
+            tokio::time::sleep(poll_delay).await;
+            poll_delay = std::time::Duration::from_millis(
+                poll_delay.as_millis().saturating_mul(2).clamp(50, 1000) as u64,
+            );
         }
 
+        // Re-check state once more for a descriptive error message. We only
+        // need names here, not timing, so a single fresh snapshot is enough.
+        let final_status = ollama_status_at(client, base_url).await?;
+        let still_loaded_names: Vec<_> = match model {
+            Some(_) => matched_targets
+                .iter()
+                .filter(|name| final_status.models.iter().any(|m| m.name == **name))
+                .map(|s| format!("'{}'", s))
+                .collect(),
+            None => final_status
+                .models
+                .iter()
+                .map(|m| format!("'{}'", m.name))
+                .collect(),
+        };
+
         Err(format!(
-            "Ollama accepted the unload request, but {} model(s) remain loaded.",
-            match model {
-                Some(_) => targets.len(),
-                None => initial.models.len(),
-            }
+            "Ollama accepted the unload request, but {} model(s) remain loaded: {}",
+            still_loaded_names.len(),
+            still_loaded_names.join(", ")
         ))
     }
 
@@ -3968,6 +4092,137 @@ pub mod config {
             assert!(server_result.is_ok());
             assert!(server_result.unwrap().is_ok());
             assert!(result.unwrap_err().contains("HTTP 500"));
+        }
+
+        #[tokio::test]
+        async fn ollama_unload_reports_not_loaded_for_missing_model() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                // Only one request: the initial /api/ps that lists a different
+                // model. The unload path must see that the requested model is
+                // absent and return "not currently loaded" without ever
+                // sending a /api/generate.
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.starts_with("GET /api/ps "));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    serde_json::json!({"models": [{"name": "llama3:8b"}]}).to_string().len(),
+                    serde_json::json!({"models": [{"name": "llama3:8b"}]}).to_string()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+
+            let client = reqwest::Client::new();
+            let result = ollama_unload_models_at(
+                &client,
+                &format!("http://{address}"),
+                Some("qwen2.5-coder:7b"),
+            )
+            .await;
+            let server_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+            assert!(server_result.is_ok());
+            assert!(server_result.unwrap().is_ok());
+            assert!(result.unwrap_err().contains("not currently loaded"));
+        }
+
+        #[tokio::test]
+        async fn ollama_unload_matches_tag_variant_without_sending_generate() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            // When the user asks to unload `qwen2.5-coder:7b:latest` but the
+            // server reports the model as `qwen2.5-coder:7b`, the unload path
+            // must recognize them as the same model and unload it — not report
+            // "not currently loaded" and not leave it resident.
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for step in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = vec![0_u8; 8192];
+                    let size = stream.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..size]);
+                    let body = match step {
+                        0 => {
+                            assert!(request.starts_with("GET /api/ps "));
+                            serde_json::json!({
+                                "models": [{"name": "qwen2.5-coder:7b"}]
+                            })
+                            .to_string()
+                        }
+                        1 => {
+                            assert!(request.starts_with("POST /api/generate "));
+                            assert!(request.contains("\"model\":\"qwen2.5-coder:7b\""));
+                            "{}".to_string()
+                        }
+                        _ => {
+                            assert!(request.starts_with("GET /api/ps "));
+                            serde_json::json!({"models": []}).to_string()
+                        }
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+
+            let client = reqwest::Client::new();
+            // Ask for the :latest variant; the server reports the bare tag.
+            let result = ollama_unload_models_at(
+                &client,
+                &format!("http://{address}"),
+                Some("qwen2.5-coder:7b:latest"),
+            )
+            .await;
+            let server_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+            assert!(server_result.is_ok());
+            assert!(server_result.unwrap().is_ok());
+            assert_eq!(result.unwrap(), 1);
+        }
+
+        #[tokio::test]
+        async fn ollama_unload_all_reports_zero_when_server_already_empty() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                // Only one request: the initial /api/ps must return an empty
+                // list. The unload path must return Ok(0) without sending
+                // any /api/generate requests.
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.starts_with("GET /api/ps "));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    serde_json::json!({"models": []}).to_string().len(),
+                    serde_json::json!({"models": []}).to_string()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+
+            let client = reqwest::Client::new();
+            let result = ollama_unload_models_at(&client, &format!("http://{address}"), None).await;
+            let server_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+            assert!(server_result.is_ok());
+            assert!(server_result.unwrap().is_ok());
+            assert_eq!(result.unwrap(), 0);
         }
 
         #[test]
