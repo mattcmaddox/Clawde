@@ -61,7 +61,7 @@ pub fn merge_card(project: &str, card_id: &str) -> Result<(), String> {
     board.set_status(card_id, CardStatus::Done);
     if let Some(c) = board.cards.iter_mut().find(|c| c.id == card_id) {
         c.result = Some(format!("merged {short}"));
-        c.updated_at = crate::guest::now_secs();
+        c.updated_at = crate::time::now_secs();
     }
     board::save_board(&board, project).map_err(|e| e.to_string())
 }

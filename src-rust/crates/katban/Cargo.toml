@@ -1,7 +1,7 @@
 [package]
 name = "clawde-katban"
 version.workspace = true
-description = "Katban: self-hosted web surface for Clawde — dev-site hosting + live reload (board + guest tiers to come)"
+description = "Katban development boards and hosted dev sites; Cat Chat sandbox modules"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

@@ -12,8 +12,8 @@
 //! - The surface only renders chat + the guest's own session; there are no
 //!   routes to boards, projects, settings, or host files (spec §7).
 
-use crate::chat::{ChatEngine, GuestSession};
-use crate::guest::{link_active, GuestStore, DEFAULT_MAX_CONCURRENT};
+use super::engine::{ChatEngine, GuestSession};
+use super::links::{link_active, GuestStore, DEFAULT_MAX_CONCURRENT};
 use axum::extract::{ConnectInfo, State};
 use axum::http::header::{CONTENT_TYPE, ORIGIN, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -84,7 +84,7 @@ pub struct GuestServer {
 
 impl GuestServer {
     pub fn new(engine: Arc<ChatEngine>, store: Arc<Mutex<GuestStore>>) -> Self {
-        let store_mtime = std::fs::metadata(crate::guest::links_path())
+        let store_mtime = std::fs::metadata(super::links::storage_path())
             .and_then(|metadata| metadata.modified())
             .ok();
         GuestServer {
@@ -107,7 +107,7 @@ impl GuestServer {
             .router()
             .into_make_service_with_connect_info::<SocketAddr>();
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!(%addr, "katban guest server listening");
+        tracing::info!(%addr, "Cat Chat sandbox server listening");
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await?;
@@ -156,7 +156,7 @@ struct GuestState {
 /// and this only runs on auth-touching requests. The server's own saves are
 /// idempotent re-reads, so this never fights itself.
 fn maybe_reload_store(state: &GuestState) {
-    let path = crate::guest::links_path();
+    let path = super::links::storage_path();
     let Ok(metadata) = std::fs::metadata(&path) else {
         return;
     };
@@ -170,7 +170,7 @@ fn maybe_reload_store(state: &GuestState) {
     if !changed {
         return;
     }
-    if let Ok(fresh) = crate::guest::load() {
+    if let Ok(fresh) = super::links::load() {
         *state.store.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
         *state.store_mtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(modified);
     }
@@ -386,7 +386,7 @@ async fn chat_page(
     if authenticated(&state, &headers).is_none() {
         return Ok(Redirect::to("/").into_response());
     }
-    Ok(Html(crate::guest_pages::chat_page_html()).into_response())
+    Ok(Html(crate::catchat::pages::chat_page_html()).into_response())
 }
 
 #[derive(Deserialize)]
@@ -434,12 +434,12 @@ async fn auth(
     let ip = client_ip(&headers, peer.0);
     let now = now_secs();
 
-    // Permanent block (third strike) is checked before anything else.
-    let permanently_blocked = {
+    // Cat Chat's 24-hour block (third strike) is checked before anything else.
+    let blocked = {
         let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-        store.is_permanently_blocked(&ip)
+        store.blocked_until(&ip, now).is_some()
     };
-    if permanently_blocked {
+    if blocked {
         return Err((
             StatusCode::FORBIDDEN,
             "l'épée de Damoclès — your lives are gone",
@@ -481,7 +481,7 @@ async fn auth(
             None => {
                 let result = store.record_failed_attempt(&ip);
                 persist_store(&store, &state);
-                if result == crate::guest::LockoutResult::Blocked {
+                if result == super::links::LockoutResult::Blocked {
                     return Err((
                         StatusCode::FORBIDDEN,
                         "l'épée de Damoclès — your lives are gone",
@@ -516,11 +516,11 @@ async fn auth(
 /// running server. The mtime is refreshed so the next reload doesn't re-read
 /// what we just wrote.
 fn persist_store(store: &GuestStore, state: &GuestState) {
-    if let Err(error) = crate::guest::save(store) {
+    if let Err(error) = super::links::save(store) {
         tracing::warn!("failed to persist guest store: {error:#}");
         return;
     }
-    if let Ok(metadata) = std::fs::metadata(crate::guest::links_path()) {
+    if let Ok(metadata) = std::fs::metadata(super::links::storage_path()) {
         if let Ok(modified) = metadata.modified() {
             *state.store_mtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(modified);
         }
@@ -688,11 +688,11 @@ async fn api_summary(
     }
 }
 
-// Login and chat pages live in `guest_pages.rs` so the markup stays readable
+// Login and chat pages live in `pages.rs` so the markup stays readable
 // next to the design-language comments. The login page is a plain const; the
 // chat page goes through `chat_page_html()` so the welcome title carries the
 // same version string the TUI prints.
-const LOGIN_PAGE: &str = crate::guest_pages::LOGIN_PAGE;
+const LOGIN_PAGE: &str = crate::catchat::pages::LOGIN_PAGE;
 
 #[cfg(test)]
 mod tests {
@@ -702,10 +702,10 @@ mod tests {
     // the test thread — this is a test-only pattern, not production code.
     #![allow(clippy::await_holding_lock)]
 
+    use super::super::engine::{ChatEngine, GuestBackend};
+    use super::super::links::save;
+    use super::super::search::GuestSearch;
     use super::*;
-    use crate::chat::{ChatEngine, GuestBackend};
-    use crate::guest::save;
-    use crate::search::GuestSearch;
     use axum::body::Body;
     use axum::http::header::CONTENT_TYPE;
     use axum::http::Request;
@@ -737,7 +737,7 @@ mod tests {
             async fn search(
                 &self,
                 _query: &str,
-            ) -> Result<Vec<crate::search::SearchResult>, String> {
+            ) -> Result<Vec<super::super::search::SearchResult>, String> {
                 Ok(Vec::new())
             }
         }
@@ -804,15 +804,15 @@ mod tests {
     /// constants: ACCENT_BUILD, panel/border/text/muted RGB values) so a
     /// future re-theme cannot silently regress to generic-web styling.
     #[test]
-    fn guest_pages_use_tui_design_language() {
-        let chat = crate::guest_pages::chat_page_html();
+    fn catchat_pages_use_tui_design_language() {
+        let chat = crate::catchat::pages::chat_page_html();
         // JetBrains Mono — the TUI's font.
-        assert!(crate::guest_pages::LOGIN_PAGE.contains("JetBrains Mono"));
+        assert!(crate::catchat::pages::LOGIN_PAGE.contains("JetBrains Mono"));
         assert!(chat.contains("JetBrains Mono"));
         // ACCENT_BUILD green (app.rs) — not the old generic blue.
-        assert!(crate::guest_pages::LOGIN_PAGE.contains("#39d353"));
+        assert!(crate::catchat::pages::LOGIN_PAGE.contains("#39d353"));
         assert!(chat.contains("#39d353"));
-        assert!(!crate::guest_pages::LOGIN_PAGE.contains("#4c6ef5"));
+        assert!(!crate::catchat::pages::LOGIN_PAGE.contains("#4c6ef5"));
         assert!(!chat.contains("#4c6ef5"));
         // Panel / border / text / muted from overlays.rs + messages/mod.rs.
         for color in ["#14141c", "#484850", "#ebebf0", "#8b8b99", "#17171f"] {
@@ -822,15 +822,15 @@ mod tests {
         assert!(chat.contains("\\203A"));
         assert!(chat.contains("\\25B8"));
         // Square corners — the TUI has no rounded cards.
-        assert!(!crate::guest_pages::LOGIN_PAGE.contains("border-radius:12px"));
+        assert!(!crate::catchat::pages::LOGIN_PAGE.contains("border-radius:12px"));
         assert!(!chat.contains("border-radius:10px"));
         // Cat-verb spinner verbs, straight from clawde-core's spinner pool.
         assert!(chat.contains("'Purring'"));
         assert!(chat.contains("'Loafing'"));
         // Paw favicon in the accent green on both pages.
-        assert!(crate::guest_pages::LOGIN_PAGE.contains("rel=\"icon\""));
+        assert!(crate::catchat::pages::LOGIN_PAGE.contains("rel=\"icon\""));
         assert!(chat.contains("rel=\"icon\""));
-        assert!(crate::guest_pages::LOGIN_PAGE.contains("%2339d353"));
+        assert!(crate::catchat::pages::LOGIN_PAGE.contains("%2339d353"));
         assert!(chat.contains("%2339d353"));
     }
 
@@ -841,7 +841,7 @@ mod tests {
     /// must survive any future re-theme.
     #[test]
     fn chat_page_carries_tui_startup_screen() {
-        let page = crate::guest_pages::chat_page_html();
+        let page = crate::catchat::pages::chat_page_html();
         // Version stamped into the welcome title (the TUI title's vX.Y.Z).
         assert!(page.contains(clawde_core::constants::APP_VERSION));
         assert!(
@@ -886,10 +886,10 @@ mod tests {
     /// traffic-light terminal dots, staggered fade-in entrances, and a
     /// blinking block cursor in the prompt field.
     #[test]
-    fn guest_pages_carry_retro_terminal_chrome() {
+    fn catchat_pages_carry_retro_terminal_chrome() {
         for (page, markup) in [
-            ("LOGIN_PAGE", crate::guest_pages::LOGIN_PAGE),
-            ("CHAT_PAGE", crate::guest_pages::chat_page_html()),
+            ("LOGIN_PAGE", crate::catchat::pages::LOGIN_PAGE),
+            ("CHAT_PAGE", crate::catchat::pages::chat_page_html()),
         ] {
             assert!(
                 markup.contains(".scanlines"),
@@ -918,8 +918,8 @@ mod tests {
         }
         // The paw lives only in the chat page's welcome-box title (the TUI's
         // "🐾 Clawde vX.Y" border title); the Cat Chat headers are paw-free.
-        assert!(crate::guest_pages::chat_page_html().contains('\u{1f43e}'));
-        assert!(!crate::guest_pages::LOGIN_PAGE.contains('\u{1f43e}'));
+        assert!(crate::catchat::pages::chat_page_html().contains('\u{1f43e}'));
+        assert!(!crate::catchat::pages::LOGIN_PAGE.contains('\u{1f43e}'));
     }
 
     #[tokio::test]
@@ -990,7 +990,7 @@ mod tests {
     async fn wrong_password_is_rejected_and_locks_out() {
         let (router, _, correct, _, _guard) = setup();
         let mut statuses = Vec::new();
-        for _ in 0..crate::guest::MAX_FAILED_ATTEMPTS {
+        for _ in 0..crate::catchat::links::MAX_FAILED_ATTEMPTS {
             let response = router
                 .clone()
                 .oneshot(
@@ -1163,16 +1163,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permanently_blocked_ip_is_refused() {
+    async fn blocked_ip_is_refused() {
         let (router, _, correct, store, _guard) = setup();
         // Simulate the third strike having already been served.
         store.lock().unwrap().failed_attempts.insert(
             "loopback".to_string(),
-            crate::guest::FailedAttempt {
+            crate::catchat::links::FailedAttempt {
                 count: 0,
                 locked_until: None,
                 strikes: 3,
-                blocked_until: Some(crate::guest::now_secs() + 3600),
+                blocked_until: Some(crate::catchat::links::now_secs() + 3600),
             },
         );
 

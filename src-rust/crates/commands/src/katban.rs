@@ -16,7 +16,7 @@
 
 use super::*;
 use async_trait::async_trait;
-use clawde_katban::guest::{self, GuestStore};
+use clawde_katban::admin_auth;
 
 pub struct KatbanCommand;
 
@@ -25,11 +25,6 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Read the live guest store from disk (empty store when absent).
-fn load_store() -> GuestStore {
-    guest::load().unwrap_or_default()
 }
 
 /// Pull `--project NAME` (or `--project=NAME`) out of the arg list, returning
@@ -162,6 +157,8 @@ impl SlashCommand for KatbanCommand {
                     ("card", "Card actions (add / set / remove)"),
                     ("link", "Make one card wait on another"),
                     ("ready", "Cards that can start now"),
+                    ("password", "Set or rotate the Katban admin password"),
+                    ("unblock", "Clear a Katban admin IP lockout"),
                 ] {
                     out.push(ArgCompletion {
                         value: format!("board{proj_seg} {tail}"),
@@ -174,6 +171,7 @@ impl SlashCommand for KatbanCommand {
                 for (tail, description) in [
                     ("add", "Add a card"),
                     ("set", "Set a card's status"),
+                    ("edit", "Replace a card's prompt"),
                     ("merge", "Merge a review card into the project"),
                     ("remove", "Remove a card"),
                     ("comment", "Note a diff-review comment"),
@@ -214,6 +212,7 @@ impl SlashCommand for KatbanCommand {
                 }
             }
             ["board", "card", "remove"]
+            | ["board", "card", "edit"]
             | ["board", "card", "show"]
             | ["board", "card", "merge"]
             | ["board", "card", "feedback"]
@@ -327,6 +326,18 @@ impl SlashCommand for KatbanCommand {
                     Err(message) => CommandResult::Error(message),
                 }
             }
+            ["board", "card", "edit", id, prompt @ ..] => {
+                let prompt = prompt.join(" ");
+                if prompt.trim().is_empty() {
+                    return CommandResult::Error(
+                        "board card edit needs a prompt: /katban board card edit <ID> <PROMPT>".to_string(),
+                    );
+                }
+                match board_edit_card(project, id, &prompt) {
+                    Ok(text) => CommandResult::Message(text),
+                    Err(message) => CommandResult::Error(message),
+                }
+            }
             ["board", "card", "merge", id] => {
                 // Option B — pin-commit flow: merge the review card's branch
                 // into the project and close it (dependents then unblock).
@@ -391,16 +402,60 @@ impl SlashCommand for KatbanCommand {
             ["board", "link"] | ["board", "unlink"] => CommandResult::Error(
                 "board link needs two card ids: /katban board link <A> <B> (B must finish before A starts)".to_string(),
             ),
+            ["board", "password"] => CommandResult::Error(
+                "board password needs a value: /katban board password <PASSWORD>".to_string(),
+            ),
+            ["board", "password", password @ ..] => {
+                let password = password.join(" ");
+                if password.trim().is_empty() {
+                    return CommandResult::Error(
+                        "board password needs a value: /katban board password <PASSWORD>".to_string(),
+                    );
+                }
+                if let Err(message) = admin_auth::validate_password(&password) {
+                    return CommandResult::Error(message);
+                }
+                let mut store = match admin_auth::load() {
+                    Ok(store) => store,
+                    Err(error) => {
+                        return CommandResult::Error(format!("could not load admin store: {error:#}"))
+                    }
+                };
+                store.set_password(&password);
+                if let Err(error) = admin_auth::save(&store) {
+                    return CommandResult::Error(format!("could not save admin store: {error:#}"));
+                }
+                CommandResult::Message(
+                    "Katban admin password set; existing failed-attempt lockouts were cleared."
+                        .to_string(),
+                )
+            }
+            ["board", "unblock", ip] => {
+                let mut store = match admin_auth::load() {
+                    Ok(store) => store,
+                    Err(error) => {
+                        return CommandResult::Error(format!("could not load admin store: {error:#}"))
+                    }
+                };
+                store.reset_failed_attempts(ip);
+                if let Err(error) = admin_auth::save(&store) {
+                    return CommandResult::Error(format!("could not save admin store: {error:#}"));
+                }
+                CommandResult::Message(format!("cleared Katban admin lockouts for '{ip}'"))
+            }
+            ["board", "unblock"] => CommandResult::Error(
+                "board unblock needs an IP: /katban board unblock <IP>".to_string(),
+            ),
             ["board"] => {
                 CommandResult::Message(
-                    "Usage: /katban board list | board ready | board card add <PROMPT> | board card set <ID> <status> | board card merge <ID> | board card remove <ID> | board card comment <ID> [--line N] <TEXT> | board card feedback <ID> | board link <A> <B> | board unlink <A> <B> — add --project NAME to target another board".to_string(),
+                    "Usage: /katban board list | board ready | board card add <PROMPT> | board card set <ID> <status> | board card edit <ID> <PROMPT> | board card merge <ID> | board card remove <ID> | board card comment <ID> [--line N] <TEXT> | board card feedback <ID> | board link <A> <B> | board unlink <A> <B> — add --project NAME to target another board".to_string(),
                 )
             }
             ["site"] => {
                 CommandResult::Message("Usage: /katban site list".to_string())
             }
             ["link", ..] | ["guest", ..] => CommandResult::Error(
-                "guest links moved to Cat Chat: /chat, /chat links, /chat create <NAME>, /chat unblock <IP>".to_string(),
+                "Cat Chat is separate from Katban: use /chat or `clawde catchat`. Katban only manages development boards, projects, and sites.".to_string(),
             ),
             _ => CommandResult::Error(
                 "Unknown /katban subcommand. Try /katban, /katban board list, or /katban help."
@@ -412,14 +467,9 @@ impl SlashCommand for KatbanCommand {
 
 fn status_text() -> String {
     let status = clawde_katban::status::status();
-    let store = load_store();
+    let admin = admin_auth::load().unwrap_or_default();
     let now = now_secs();
-    let active_links = store
-        .links
-        .iter()
-        .filter(|link| guest::link_active(link, now))
-        .count();
-    let blocked: Vec<&str> = store
+    let admin_locked: Vec<&str> = admin
         .failed_attempts
         .iter()
         .filter(|(_, attempt)| {
@@ -451,14 +501,19 @@ fn status_text() -> String {
         }
     ));
     out.push_str(&format!(
-        "guest links: {active_links} active (manage with /chat — Cat Chat)\n"
+        "admin auth:  {}\n",
+        if admin.is_configured() {
+            "configured"
+        } else {
+            "not configured — set with /katban board password <PASSWORD>"
+        }
     ));
     out.push_str(&format!(
-        "locked IPs:  {}\n",
-        if blocked.is_empty() {
+        "admin locks: {}\n",
+        if admin_locked.is_empty() {
             "none".to_string()
         } else {
-            blocked.join(", ")
+            admin_locked.join(", ")
         }
     ));
     out.push_str(&format!(
@@ -597,6 +652,13 @@ fn board_add_card(project: Option<&str>, prompt: &str) -> Result<String, String>
         format!("{id}  {prompt}")
     })?;
     Ok(out)
+}
+
+fn board_edit_card(project: Option<&str>, id: &str, prompt: &str) -> Result<String, String> {
+    if !with_board_lock(project, |board| board.update_prompt(id, prompt))? {
+        return Err(format!("no card with id '{id}'"));
+    }
+    Ok(format!("'{id}' prompt updated"))
 }
 
 fn board_set_status(project: Option<&str>, id: &str, status: &str) -> Result<String, String> {

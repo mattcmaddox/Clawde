@@ -70,18 +70,24 @@ The essentials. Type `/command` at the prompt. For everything else, type `/help`
 
 ## Self-hosting: Cat Chat & Katban
 
-Two separate surfaces: **Cat Chat** is the password-protected guest chat you share with friends; **Katban** is the agent Kanban board (cards, dependencies, hosted dev sites).
+Two separate products:
+
+- **Cat Chat** is a public-facing sandbox for guest conversations.
+- **Katban** is the real development feature for agent Kanban work, project repos, execution, review, verification, and dev sites.
+- **Katban attempts:N** — `clawde katban board attempts <N>` runs each card up to N times on different free-catalog model families; the verify gate promotes the first pass. `board attempts-upstreams [ids...]` pins the rotation (empty = auto). `board runtime incus` moves attempts into ephemeral Incus containers (in-container verify, FS-manifest scope gate via `board card scope <ID> <paths...>`); default `host`.
+
+They use separate state directories and separate password policies. See [docs/catchat.md](catchat.md) and [docs/katban.md](katban.md).
 
 | Command | What it does |
 |---------|--------------|
 | `/chat` | Open the Cat Chat link manager (popup) |
 | `/chat create <NAME>` | Create a guest link — prints the password once |
 | `/chat links` / `/chat show <ID>` | List links / link details |
-| `/chat password <ID>` | Rotate a link's password (`--set "PW"` to choose your own, 8+ chars) |
+| `/chat password <ID>` | Rotate a Cat Chat link password (`--set "PW"` chooses the exact guest password) |
 | `/chat revoke <ID>` | Delete a link (kicks its devices) |
 | `/chat unblock <IP>` | Clear login lockouts for an IP |
 | `/chat status` | Links, devices, exposure, lockouts |
-| `/katban ...` | Kanban boards: `board list`, `card add`, `project list`, `site list`. Attempts:N ladder — `board attempts <N>` runs each card up to N times on different free-catalog model families; `board attempts-upstreams [ids...]` pins the rotation; `board runtime incus` + `board card scope <ID> <paths...>` move attempts into ephemeral Incus containers with an FS-manifest scope gate |
+| `/katban ...` | Katban development: `board list`, `card add`, `project list`, `site list`, `board password` |
 | `Alt+G` | Katban controls menu (board quick actions) |
 
 Guest-link management lives under `/chat`, not `/katban` — old `/katban link ...` commands redirect there.
@@ -97,7 +103,7 @@ Guest-link management lives under `/chat`, not `/katban` — old `/katban link .
 | `clawde --cwd <dir>` | Start in a specific directory |
 | `clawde catchat serve` | Run the Cat Chat server (guest chat) |
 | `clawde catchat expose` | Put Cat Chat on a public domain via caddy |
-| `clawde catchat links ...` | Manage guest links from the shell |
+| `clawde catchat links ...` | Manage Cat Chat guest links from the shell |
 | `clawde catchat status` | Cat Chat overview (links, devices, exposure) |
 | `clawde katban ...` | Kanban board + site hosting from the shell |
 

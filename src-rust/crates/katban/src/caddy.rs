@@ -53,8 +53,8 @@ pub fn render_block(site: &SiteConfig, kind: &SiteKind) -> String {
     }
 }
 
-/// The guest chat server as a caddy block (spec §9/§10.1): a live proxy to
-/// the loopback guest server, so `chat.example.com` reaches it.
+/// The Cat Chat server as a caddy block: a live proxy to the sandbox
+/// server on loopback, so `chat.example.com` reaches it.
 pub fn render_guest_block(host: &str, port: u16) -> String {
     format!("{host} {{\n    encode gzip\n    reverse_proxy 127.0.0.1:{port}\n}}")
 }
@@ -67,9 +67,9 @@ pub fn render_board_block(host: &str, port: u16) -> String {
     format!("{host} {{\n    encode gzip\n    reverse_proxy 127.0.0.1:{port}\n}}")
 }
 
-/// Concatenate the managed blocks for every exposed site (plus the guest chat
-/// block when a public subdomain is configured, plus the admin board block
-/// when it has a public subdomain) inside the KATBAN-MANAGED markers.
+/// Concatenate the managed blocks for every exposed dev site, the optional
+/// Cat Chat block, and the optional Katban admin-board block inside the
+/// KATBAN-MANAGED markers.
 /// Idempotent: rendering the same set twice is equal.
 pub fn render_config(
     sites: &[(SiteConfig, SiteKind)],
@@ -142,26 +142,27 @@ ExecStart={reload_command}
     )
 }
 
-/// The always-on Katban service unit (spec §11 — systemd is the default
-/// runtime for this box because caddy is bare-metal; see the spec for why).
-/// Runs the guest chat server on loopback, restarts on failure, survives
-/// reboots, and logs to journalctl. `binary` is the resolved clawde binary
+/// The always-on Cat Chat service unit. Cat Chat is a sandboxed public-chat
+/// product and deliberately has its own systemd unit, `catchat.service`;
+/// Katban's development board uses `katban-board.service` instead. The unit
+/// runs the chat server on loopback, restarts on failure, survives reboots,
+/// and logs to journalctl. `binary` is the resolved clawde binary
 /// (`std::env::current_exe()` at render time) and `user` is the OS user that
 /// owns `~/.clawde` + `/etc/caddy/katban.conf` — never root.
 pub fn render_service_unit(binary: &str, user: &str, guest_port: u16) -> String {
     format!(
-        "# Installed by clawde katban expose — Katban's always-on service.
+        "# Installed by clawde catchat expose — Cat Chat's always-on service.
 # Rebuild the binary in place (e.g. `clawded`) and restart to update:
-#   sudo systemctl restart katban
+#   sudo systemctl restart catchat
 [Unit]
-Description=Katban guest chat server
+Description=Cat Chat sandbox server
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
 User={user}
-ExecStart={binary} katban guest serve --port {guest_port}
+ExecStart={binary} catchat serve --port {guest_port}
 Restart=always
 RestartSec=5
 PrivateTmp=true
@@ -241,16 +242,16 @@ pub fn valid_hostname(s: &str) -> bool {
 pub fn bootstrap_instructions(include_dir: &Path, caddy_dir: &Path) -> String {
     let managed = caddy_dir.join(DEFAULT_INCLUDE_NAME);
     format!(
-        "One-time bootstrap (approve once, then Katban handles everything):\n\
+        "One-time bootstrap (approve once, then Cat Chat and Katban manage their own routes):\n\
          \n\
          1. Add this line to /etc/caddy/Caddyfile (site-block area, top level):\n\
             import {}\n\
          \n\
-         2. Install Katban's always-on service (runs the guest chat server, \n\
+         2. Install Cat Chat's always-on service (runs the sandbox server, \n\
             restarts on failure, survives reboots):\n\
-            sudo install -m 644 {} /etc/systemd/system/katban.service\n\
+            sudo install -m 644 {} /etc/systemd/system/catchat.service\n\
             sudo systemctl daemon-reload\n\
-            sudo systemctl enable --now katban.service\n\
+            sudo systemctl enable --now catchat.service\n\
          \n\
          3. Install the auto-reload watcher so future config changes need no \n\
             manual reload:\n\
@@ -262,7 +263,31 @@ pub fn bootstrap_instructions(include_dir: &Path, caddy_dir: &Path) -> String {
          4. Apply the new routes once:\n\
             sudo systemctl reload caddy\n",
         managed.display(),
-        include_dir.join("katban.service").display(),
+        include_dir.join("catchat.service").display(),
+        include_dir.join("katban-reload.path").display(),
+        include_dir.join("katban-reload.service").display(),
+    )
+}
+
+/// Katban-only bootstrap: installs the shared Caddy reload watcher without
+/// creating or mentioning Cat Chat's service.
+pub fn katban_bootstrap_instructions(include_dir: &Path, caddy_dir: &Path) -> String {
+    let managed = caddy_dir.join(DEFAULT_INCLUDE_NAME);
+    format!(
+        "One-time Katban bootstrap (approve once):\n\\
+         \n\\
+         1. Add this line to /etc/caddy/Caddyfile (site-block area, top level):\n\\
+            import {}\n\\
+         \n\\
+         2. Install the shared Caddy auto-reload watcher:\n\\
+            sudo install -m 644 {} /etc/systemd/system/katban-reload.path\n\\
+            sudo install -m 644 {} /etc/systemd/system/katban-reload.service\n\\
+            sudo systemctl daemon-reload\n\\
+            sudo systemctl enable --now katban-reload.path\n\\
+         \n\\
+         3. Apply the new routes once:\n\\
+            sudo systemctl reload caddy\n",
+        managed.display(),
         include_dir.join("katban-reload.path").display(),
         include_dir.join("katban-reload.service").display(),
     )
@@ -376,13 +401,11 @@ mod tests {
     }
 
     #[test]
-    fn service_unit_runs_guest_serve_as_user_on_configured_port() {
+    fn service_unit_runs_catchat_as_user_on_configured_port() {
         let unit = render_service_unit("/home/user/.local/bin/clawde", "user", 9000);
-        assert!(unit.contains("Description=Katban guest chat server"));
+        assert!(unit.contains("Description=Cat Chat sandbox server"));
         assert!(unit.contains("User=user"));
-        assert!(
-            unit.contains("ExecStart=/home/user/.local/bin/clawde katban guest serve --port 9000")
-        );
+        assert!(unit.contains("ExecStart=/home/user/.local/bin/clawde catchat serve --port 9000"));
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=multi-user.target"));
         assert!(!unit.contains("User=root"));
@@ -422,11 +445,11 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_mentions_service_and_reloader() {
+    fn bootstrap_mentions_catchat_service_and_reloader() {
         let dir = Path::new("/tmp/katban-units");
         let instructions = bootstrap_instructions(dir, Path::new("/etc/caddy"));
-        assert!(instructions.contains("katban.service"));
-        assert!(instructions.contains("systemctl enable --now katban.service"));
+        assert!(instructions.contains("catchat.service"));
+        assert!(instructions.contains("systemctl enable --now catchat.service"));
         assert!(instructions.contains("katban-reload.path"));
         assert!(instructions.contains("systemctl reload caddy"));
     }
@@ -447,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_instructions_mention_import_and_reload() {
+    fn catchat_bootstrap_mentions_import_and_reload() {
         let instructions =
             bootstrap_instructions(Path::new("/tmp/katban-caddy"), Path::new("/etc/caddy"));
         assert!(instructions.contains("import /etc/caddy/katban.conf"));

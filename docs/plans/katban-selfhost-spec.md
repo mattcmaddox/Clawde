@@ -1,10 +1,12 @@
 # Katban — Self-Hosted Clawde Web + Hosting (Public / LAN / Private) — Feature Spec
 
-Status: Draft (post-structured interview: 5 discovery rounds + 4 audit rounds)
-Scope: New crate(s) + CLI entry point for self-hosting Clawde: a kanban board
-server ("Katban"), a dev-site hosting engine, and two access tiers (guest +
-admin) across three network modes (private / LAN / public). No code changed
-yet — this is the spec.
+Status: Historical design record; implementation has split into two products.
+Scope: This document records the original combined design. The current
+implementation keeps **Katban** as the production development feature and
+**Cat Chat** as a separate public-facing sandbox. For current commands,
+storage, and password policies, use [docs/katban.md](../katban.md) and
+[docs/catchat.md](../catchat.md). Do not use the pre-split `/katban link` or
+`clawde katban guest` examples below.
 
 Author: user + agent (agent as design engineer)
 

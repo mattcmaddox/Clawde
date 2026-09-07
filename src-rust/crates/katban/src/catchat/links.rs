@@ -1,7 +1,10 @@
 //! Guest links (spec §6/§8): the "share a URL with friends" surface.
 //!
 //! A guest link is a password-protected entry point to a dedicated guest chat
-//! server. The store persists to `~/.clawde/katban/links.json`:
+//! server. The store persists to `~/.clawde/catchat/links.json`:
+//! A read fallback accepts the pre-split `~/.clawde/katban/links.json`
+//! location so an existing Cat Chat deployment keeps its links; all subsequent
+//! writes go to the Cat Chat namespace.
 //! - Passwords are never stored — only a salted SHA-256 hash (plus the salt).
 //! - Device tokens (the "remember this device" cookie) are random 256-bit
 //!   values stored only as hashes; the plaintext is handed to the browser once.
@@ -100,24 +103,42 @@ pub struct GuestStore {
     #[serde(default)]
     pub failed_attempts: HashMap<String, FailedAttempt>,
     /// Public subdomain the guest chat is exposed at through caddy (e.g.
-    /// `chat.example.com`), set by `guest expose`.
+    /// `chat.example.com`), set by `catchat expose`.
     #[serde(default)]
     pub public_subdomain: Option<String>,
     /// Port the guest chat server binds on when the always-on unit runs it
-    /// (set by `guest expose --port`). Persisted so a later `site expose`
-    /// regenerates `katban.service` with the same port — otherwise the unit
+    /// (set by `catchat expose --port`). Persisted so a later expose command
+    /// regenerates `catchat.service` with the same port — otherwise the unit
     /// drifts back to the default while the caddy block still proxies the
     /// custom port.
     #[serde(default)]
     pub guest_port: Option<u16>,
 }
 
+/// Canonical Cat Chat data file. Katban board state never lives here.
 pub fn links_path() -> PathBuf {
+    crate::config::clawde_home()
+        .join("catchat")
+        .join("links.json")
+}
+
+/// Legacy location used before Cat Chat was split from Katban.
+pub fn legacy_links_path() -> PathBuf {
     crate::config::katban_data_dir().join("links.json")
 }
 
+/// The file currently used for reads and mtime watching. New deployments use
+/// the Cat Chat path; an existing legacy file is read until the first save.
+pub fn storage_path() -> PathBuf {
+    if links_path().exists() {
+        links_path()
+    } else {
+        legacy_links_path()
+    }
+}
+
 pub fn load() -> anyhow::Result<GuestStore> {
-    let path = links_path();
+    let path = storage_path();
     if !path.exists() {
         return Ok(GuestStore::default());
     }
@@ -150,8 +171,8 @@ pub(crate) fn random_hex(bytes: usize) -> String {
     hex::encode(&buf)
 }
 
-/// Salted SHA-256 of `value`. Shared by guest links and the admin board
-/// credential so passwords are never stored in plaintext on either surface.
+/// Salted SHA-256 of `value`. Cat Chat's link credentials are stored only as
+/// salted hashes; Katban admin credentials use their own module and policy.
 pub(crate) fn hash(salt: &str, value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(salt.as_bytes());
@@ -159,10 +180,8 @@ pub(crate) fn hash(salt: &str, value: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// The shared wrong-password lockout ladder (the user's policy: 4 wrong ->
-/// lock 3 min, 3 more -> lock 3 min, 3 more -> permanent). Used by both the
-/// guest store and the admin board store so both surfaces enforce the same
-/// ladder.
+/// Cat Chat's guest-only wrong-password ladder: 4 wrong -> lock 3 min,
+/// then 5 more -> lock 3 min, then 5 more -> a 24-hour block.
 pub(crate) fn apply_failed_attempt(entry: &mut FailedAttempt, now: u64) -> LockoutResult {
     // A served 24h block lapses into a fresh ladder (new lives).
     if let Some(until) = entry.blocked_until {
@@ -339,10 +358,10 @@ impl GuestStore {
             created_at: now,
             last_seen_at: now,
         });
-        if devices.len() > crate::guest_server::MAX_DEVICES_PER_LINK {
+        if devices.len() > crate::catchat::server::MAX_DEVICES_PER_LINK {
             // Tokens are pushed in time order, so the front of the list is
             // always the oldest — drop from there to keep the newest cap.
-            let excess = devices.len() - crate::guest_server::MAX_DEVICES_PER_LINK;
+            let excess = devices.len() - crate::catchat::server::MAX_DEVICES_PER_LINK;
             devices.drain(..excess);
         }
         Some(token)
@@ -384,9 +403,8 @@ impl GuestStore {
         self.devices.retain(|id, _| active_ids.contains(id));
     }
 
-    /// Record a wrong password from an IP. Lockout ladder (per the user's
-    /// policy): 4 wrong -> lock 3 min, then 5 more -> lock 3 min, then 5 more
-    /// -> permanent block.
+    /// Record a wrong Cat Chat password from an IP. The ladder is intentionally
+    /// independent from Katban's admin authentication policy.
     pub fn record_failed_attempt(&mut self, ip: &str) -> LockoutResult {
         let now = now_secs();
         let entry = self.failed_attempts.entry(ip.to_string()).or_default();
@@ -401,7 +419,7 @@ impl GuestStore {
     }
 
     /// True while the IP is serving its post-ladder 24h block.
-    pub fn is_permanently_blocked(&self, ip: &str) -> bool {
+    pub fn is_blocked(&self, ip: &str) -> bool {
         self.blocked_until(ip, now_secs()).is_some()
     }
 
@@ -414,8 +432,8 @@ impl GuestStore {
             .filter(|until| *until > now)
     }
 
-    /// Admin escape hatch: clear an IP's failed attempts and any permanent
-    /// block. `guest unblock <IP>`.
+    /// Cat Chat admin escape hatch: clear an IP's failed attempts and 24-hour
+    /// block. `catchat unblock <IP>`.
     pub fn reset_failed_attempts(&mut self, ip: &str) {
         self.failed_attempts.remove(ip);
     }
@@ -525,7 +543,7 @@ mod tests {
     fn device_list_is_capped_per_link() {
         let mut store = GuestStore::default();
         let id = store.create_link("friends", "pw", None, 2);
-        let cap = crate::guest_server::MAX_DEVICES_PER_LINK;
+        let cap = crate::catchat::server::MAX_DEVICES_PER_LINK;
         for _ in 0..cap + 5 {
             store.mint_device_token(&id, "device");
         }
@@ -561,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn lockout_ladder_5_then_3_then_3_then_permanent() {
+    fn lockout_ladder_4_then_5_then_5_then_24h_block() {
         let mut store = GuestStore::default();
         let ip = "203.0.113.7";
 
@@ -571,12 +589,12 @@ mod tests {
             result = store.record_failed_attempt(ip);
         }
         let LockoutResult::Temporary(until) = result else {
-            panic!("fifth attempt should lock out, got {result:?}");
+            panic!("fourth attempt should lock out, got {result:?}");
         };
         assert_eq!(store.locked_until(ip, now_secs()), Some(until));
         assert_eq!(until, now_secs() + LOCKOUT_SECS);
 
-        // Lock lapses; 3 more wrong attempts -> second 3-minute lock.
+        // Lock lapses; 5 more wrong attempts -> second 3-minute lock.
         lapse(&mut store, ip);
         for _ in 0..MAX_FAILED_ATTEMPTS_SUBSEQUENT {
             result = store.record_failed_attempt(ip);
@@ -592,7 +610,7 @@ mod tests {
             result = store.record_failed_attempt(ip);
         }
         assert_eq!(result, LockoutResult::Blocked);
-        assert!(store.is_permanently_blocked(ip));
+        assert!(store.is_blocked(ip));
         assert!(store.locked_until(ip, now_secs()).is_none());
 
         // While the block is served, every attempt is flatly refused.
@@ -600,7 +618,7 @@ mod tests {
 
         // Admin escape hatch clears everything.
         store.reset_failed_attempts(ip);
-        assert!(!store.is_permanently_blocked(ip));
+        assert!(!store.is_blocked(ip));
     }
 
     #[test]
@@ -622,13 +640,13 @@ mod tests {
             result = store.record_failed_attempt(ip);
         }
         assert_eq!(result, LockoutResult::Blocked);
-        assert!(store.is_permanently_blocked(ip));
+        assert!(store.is_blocked(ip));
 
         // Once the block lapses the ladder is fresh again: the IP gets its
         // lives back (4 wrong attempts before the first lockout).
         let entry = store.failed_attempts.get_mut(ip).unwrap();
         entry.blocked_until = Some(now_secs());
-        assert!(!store.is_permanently_blocked(ip));
+        assert!(!store.is_blocked(ip));
         let mut result = LockoutResult::None;
         for _ in 0..MAX_FAILED_ATTEMPTS {
             result = store.record_failed_attempt(ip);

@@ -1,4 +1,8 @@
-// `clawde katban` — the self-hosted web surface for Clawde.
+// `clawde katban` — the production Kanban development surface for Clawde.
+//
+// Katban owns development boards, project/repository registration, agent
+// execution, and hosted development sites. Cat Chat is a separate sandbox
+// command group implemented below as `clawde catchat`.
 //
 // Hosted-sites slice (spec §10): add/list/show/remove sites, serve a folder
 // (or a registered site by name) on loopback with live reload, and `expose`
@@ -10,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const USAGE: &str = r#"Usage: clawde katban <command> [OPTIONS]
 
-Self-hosted web surface for Clawde (v0: dev-site hosting with live reload).
+Katban development workspace: boards, agent execution, project repos,
+and hosted development sites.
 
 Commands:
   site add <DIR> [--name NAME] [--port N] [--public-subdomain HOST] [--locked]
@@ -25,12 +30,12 @@ Commands:
   status                                      Overview of sites, boards, caddy config
   help                                        Show this help
 
-The guest chat (Cat Chat) lives under its own command:
+Cat Chat is a separate public-facing sandbox:
   clawde catchat serve|expose|unblock|links ...
 
-Defaults: state lives in ~/.clawde/katban/ (CLAWDE_HOME overrides); sites
-and the guest server serve on 127.0.0.1. Binding a non-loopback address
-requires --allow-non-loopback.
+Katban state lives in ~/.clawde/katban/ and Cat Chat state lives in
+~/.clawde/catchat/ (CLAWDE_HOME overrides). Both servers default to
+127.0.0.1; binding beyond loopback requires --allow-non-loopback.
 "#;
 
 const SITE_USAGE: &str = r#"Usage: clawde katban site <command> [OPTIONS]
@@ -68,11 +73,6 @@ pub async fn run_command(args: &[String]) -> anyhow::Result<()> {
         "site" => run_site(&args[1..]).await,
         "board" => run_board(&args[1..]).await,
         "project" => run_project(&args[1..]),
-        // Legacy aliases: the guest-chat surface moved to `clawde catchat`.
-        // Kept so existing scripts and the generated systemd unit
-        // (`katban guest serve --port N`) keep working.
-        "link" => run_link(&args[1..]),
-        "guest" => run_guest(&args[1..]).await,
         "status" => run_status(),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
@@ -118,10 +118,10 @@ pub async fn run_catchat_command(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     };
     match command {
-        "serve" => run_guest(&args[1..]).await,
-        "expose" => run_guest_expose(&args[1..]).await,
+        "serve" => run_catchat_server(&args[1..]).await,
+        "expose" => run_catchat_expose(&args[1..]).await,
         "links" => run_link(&args[1..]),
-        "unblock" => run_guest_unblock(&args[1..]),
+        "unblock" => run_catchat_unblock(&args[1..]),
         "status" => catchat_status(),
         "help" | "--help" | "-h" => {
             print!("{CATCHAT_USAGE}");
@@ -133,14 +133,10 @@ pub async fn run_catchat_command(args: &[String]) -> anyhow::Result<()> {
 
 /// Cat Chat status overview: links, public exposure, lockout state.
 fn catchat_status() -> anyhow::Result<()> {
-    use clawde_katban::guest::{self, load};
+    use clawde_katban::catchat::links::{link_active, load};
     let store = load()?;
     let now = now_secs();
-    let active = store
-        .links
-        .iter()
-        .filter(|l| guest::link_active(l, now))
-        .count();
+    let active = store.links.iter().filter(|l| link_active(l, now)).count();
     let total = store.links.len();
     let devices: usize = store.devices.values().map(|d| d.len()).sum();
     println!("links:      {active} active / {total} total");
@@ -430,8 +426,10 @@ fn site_remove(opts: SiteOpts) -> anyhow::Result<()> {
             "note: the managed caddy config still lists removed sites — re-run 'clawde katban site expose {}' to regenerate it",
             site.name
         );
-    } else if clawde_katban::guest::load().is_ok_and(|store| store.public_subdomain.is_some()) {
-        println!("note: run 'clawde katban guest expose' to regenerate the managed caddy config without this site");
+    } else if clawde_katban::catchat::links::load()
+        .is_ok_and(|store| store.public_subdomain.is_some())
+    {
+        println!("note: run 'clawde catchat expose' to regenerate the managed caddy config without this site");
     }
     Ok(())
 }
@@ -489,7 +487,7 @@ async fn site_serve(opts: SiteOpts) -> anyhow::Result<()> {
 
 async fn site_expose(opts: SiteOpts) -> anyhow::Result<()> {
     use clawde_katban::caddy::{
-        bootstrap_instructions, render_config, site_kind, write_atomic, DEFAULT_INCLUDE_NAME,
+        katban_bootstrap_instructions, render_config, site_kind, write_atomic, DEFAULT_INCLUDE_NAME,
     };
     use clawde_katban::config::load;
 
@@ -576,18 +574,12 @@ async fn site_expose(opts: SiteOpts) -> anyhow::Result<()> {
 
     write_atomic(&managed_path, &text)?;
 
-    // Write the systemd units next to the data so the bootstrap can install
-    // them; the instructions reference these files. `katban.service` runs the
-    // always-on guest chat server (systemd is the default runtime, spec §11)
-    // on the guest port the store last recorded, so a custom `guest expose
-    // --port` keeps working after a later `site expose` regenerates the unit.
-    let guest_port = clawde_katban::guest::load()?
-        .guest_port
-        .unwrap_or(clawde_katban::guest_server::DEFAULT_GUEST_PORT);
-    let units_dir = write_systemd_units(&caddy_dir, guest_port, (&[], 0))?;
+    // Katban site exposure only writes the shared Caddy reload units. Cat
+    // Chat's service is created exclusively by `clawde catchat expose`.
+    let units_dir = write_systemd_units(&caddy_dir, None, (&[], 0))?;
 
     println!();
-    println!("{}", bootstrap_instructions(&units_dir, &caddy_dir));
+    println!("{}", katban_bootstrap_instructions(&units_dir, &caddy_dir));
 
     // Best-effort DuckDNS subdomain creation (spec C4): warn, never fail the
     // expose, so a missing token/dashboard entry is easy to recover from.
@@ -666,7 +658,7 @@ with auto-retry up to the board's cap).
 /// Run the admin board web UI, optionally with the card schedulers in the
 /// same process (`--run NAME,...` schedules those projects; `--run all`
 /// schedules every registered project now and live-joins new ones as they are
-/// registered — the always-on unit's command). Mirrors `guest serve`'s flag
+/// registered — the always-on unit's command). Mirrors `catchat serve`'s flag
 /// parsing and loopback guard; refuses non-loopback unless
 /// `--allow-non-loopback` (the board is admin-only).
 async fn board_serve(args: &[String]) -> anyhow::Result<()> {
@@ -797,25 +789,25 @@ async fn board_password(args: Vec<String>) -> anyhow::Result<()> {
     if password.is_empty() {
         anyhow::bail!("board password needs a password: board password <PASSWORD>");
     }
-    if password.len() < 8 {
-        anyhow::bail!("board password must be at least 8 characters");
-    }
-    let mut store = clawde_katban::board_admin::load().context("load admin store")?;
+    clawde_katban::admin_auth::validate_password(password)
+        .map_err(|message| anyhow::anyhow!(message))?;
+    let mut store = clawde_katban::admin_auth::load().context("load admin store")?;
     store.set_password(password);
-    clawde_katban::board_admin::save(&store).context("save admin store")?;
+    clawde_katban::admin_auth::save(&store).context("save admin store")?;
+
     println!(
         "admin board password set at {}",
-        clawde_katban::board_admin::admin_path().display()
+        clawde_katban::admin_auth::admin_path().display()
     );
     Ok(())
 }
 
 /// The admin board's caddy block target: `(subdomain, port)` when the board
 /// has been exposed (`board expose`), else `None`. Reads the AdminStore so
-/// every expose path (`site expose` / `guest expose` / `board expose`)
+/// every expose path (`site expose` / `catchat expose` / `board expose`)
 /// regenerates the managed config with the board block intact.
 fn admin_board_block() -> anyhow::Result<Option<(String, u16)>> {
-    let store = clawde_katban::board_admin::load().context("load admin store")?;
+    let store = clawde_katban::admin_auth::load().context("load admin store")?;
     let Some(subdomain) = store.public_subdomain else {
         return Ok(None);
     };
@@ -826,13 +818,13 @@ fn admin_board_block() -> anyhow::Result<Option<(String, u16)>> {
 }
 
 /// Publish the admin board behind caddy at an https subdomain, mirroring
-/// `guest expose`. Renders the board block into the managed caddy config,
+/// `catchat expose`. Renders the board block into the managed caddy config,
 /// writes the reloader units, prints the one-time bootstrap instructions, and
 /// optionally points DuckDNS at the subdomain.
 async fn board_expose(args: &[String]) -> anyhow::Result<()> {
     use clawde_katban::board_server::DEFAULT_BOARD_PORT;
     use clawde_katban::caddy::{
-        bootstrap_instructions, render_config, write_atomic, DEFAULT_INCLUDE_NAME,
+        katban_bootstrap_instructions, render_config, write_atomic, DEFAULT_INCLUDE_NAME,
     };
 
     let mut subdomain: Option<String> = None;
@@ -901,7 +893,7 @@ async fn board_expose(args: &[String]) -> anyhow::Result<()> {
     } else {
         Vec::new()
     };
-    let mut store = clawde_katban::board_admin::load().context("load admin store")?;
+    let mut store = clawde_katban::admin_auth::load().context("load admin store")?;
     if let Some(subdomain) = subdomain {
         store.public_subdomain = Some(subdomain);
     }
@@ -917,7 +909,7 @@ async fn board_expose(args: &[String]) -> anyhow::Result<()> {
     let runner_projects = store.runner_projects.clone();
     let runner_is_all = store.runner_projects.len() == 1 && store.runner_projects[0] == RUN_ALL;
     if !dry_run {
-        clawde_katban::board_admin::save(&store)?;
+        clawde_katban::admin_auth::save(&store)?;
     }
 
     // Regenerate the managed config with every exposed site + guest block +
@@ -932,13 +924,15 @@ async fn board_expose(args: &[String]) -> anyhow::Result<()> {
             (site.clone(), kind)
         })
         .collect();
-    let guest = clawde_katban::guest::load()?.public_subdomain.map(|host| {
-        let port = clawde_katban::guest::load()
-            .ok()
-            .and_then(|s| s.guest_port)
-            .unwrap_or(clawde_katban::guest_server::DEFAULT_GUEST_PORT);
-        (host, port)
-    });
+    let guest = clawde_katban::catchat::links::load()?
+        .public_subdomain
+        .map(|host| {
+            let port = clawde_katban::catchat::links::load()
+                .ok()
+                .and_then(|s| s.guest_port)
+                .unwrap_or(clawde_katban::catchat::server::DEFAULT_GUEST_PORT);
+            (host, port)
+        });
     let text = render_config(
         &exposed,
         guest.as_ref().map(|(h, p)| (h.as_str(), *p)),
@@ -981,16 +975,9 @@ async fn board_expose(args: &[String]) -> anyhow::Result<()> {
 
     // Reloader units watch the managed file; the board unit is rendered when
     // runner projects are configured (`--run <NAME,...>` / `--run all`).
-    let units_dir = write_systemd_units(
-        &caddy_dir,
-        guest
-            .as_ref()
-            .map(|(_, p)| *p)
-            .unwrap_or(clawde_katban::guest_server::DEFAULT_GUEST_PORT),
-        (&runner_projects, port),
-    )?;
+    let units_dir = write_systemd_units(&caddy_dir, None, (&runner_projects, port))?;
     println!();
-    println!("{}", bootstrap_instructions(&units_dir, &caddy_dir));
+    println!("{}", katban_bootstrap_instructions(&units_dir, &caddy_dir));
     let run_list = runner_projects.join(",");
     if !runner_projects.is_empty() {
         println!(
@@ -1396,6 +1383,27 @@ fn run_card(project: &str, args: &[String]) -> anyhow::Result<()> {
                 anyhow::bail!("no card with id '{}'", rest[0]);
             }
         }
+        "edit" => {
+            // `board card edit <ID> <PROMPT>` — replace the prompt, mirroring
+            // the web UI's edit action. The card keeps its id, status,
+            // reviews, dependencies and pinned branch.
+            if rest.len() < 2 {
+                anyhow::bail!("board card edit needs an id and a new prompt");
+            }
+            let prompt = rest[1..].join(" ").trim().to_string();
+            if prompt.is_empty() {
+                anyhow::bail!("board card edit prompt must not be empty");
+            }
+            let _guard = clawde_katban::board::BoardLock::acquire(project)?;
+            let mut board = load_board(project)?.unwrap_or_default();
+            if board.update_prompt(&rest[0], &prompt) {
+                save_board(&board, project)?;
+                println!("'{}' prompt updated", rest[0]);
+                Ok(())
+            } else {
+                anyhow::bail!("no card with id '{}'", rest[0]);
+            }
+        }
         "merge" => {
             if rest.is_empty() {
                 anyhow::bail!("board card merge needs an id");
@@ -1587,7 +1595,7 @@ fn validate_runner_project(project: &str) -> anyhow::Result<()> {
 /// Sentinel `--run all`: defined in the katban crate (shared with the board web
 /// server) and re-exported here so the CLI, its tests, and the web board all
 /// agree on the one value.
-pub use clawde_katban::board_admin::RUN_ALL;
+pub use clawde_katban::admin_auth::RUN_ALL;
 
 /// Resolve a `--run` value (a comma-separated project list, or `all`) to the
 /// concrete project names the scheduler should run. `all` means every project
@@ -1671,20 +1679,18 @@ fn unit_user() -> anyhow::Result<String> {
     )
 }
 
-/// Render + write `katban.service` (always-on guest chat server) and the
-/// caddy reloader units. Returns the directory the files were written to.
-/// The binary path is resolved from the currently running clawde, so the
-/// unit always starts the exact build the admin is using; rebuild in place
-/// (e.g. `clawded`) + `sudo systemctl restart katban` to update. `caddy_dir`
-/// is where the managed include lives (the reloader must watch that exact
-/// file) and `guest_port` is the port the service runs the guest server on.
-/// Write the systemd units the expose flow installs. `board` is the runner
-/// project list + board port when the board should be always-on (`board
-/// expose --run <NAME,...>` / `--run all`); an empty list keeps the units
-/// guest-only (board not always-on).
+/// Render + write `catchat.service` (Cat Chat's always-on sandbox server)
+/// and the shared caddy reloader units. Returns the directory the files were
+/// written to. The binary path is resolved from the currently running clawde,
+/// so the unit always starts the exact build the admin is using; rebuild in
+/// place and restart `catchat.service` to update. `caddy_dir` is where the
+/// managed include lives (the reloader must watch that exact file) and
+/// `guest_port` is the Cat Chat port. `board` is the independent Katban runner
+/// project list + board port when `katban-board.service` should be always-on;
+/// an empty list means no board unit is rendered.
 fn write_systemd_units(
     caddy_dir: &Path,
-    guest_port: u16,
+    catchat_port: Option<u16>,
     board: (&[String], u16),
 ) -> anyhow::Result<PathBuf> {
     let dir = units_dir();
@@ -1693,10 +1699,12 @@ fn write_systemd_units(
         .canonicalize()
         .unwrap_or_else(|_| std::env::current_exe().unwrap());
     let user = unit_user()?;
-    std::fs::write(
-        dir.join("katban.service"),
-        clawde_katban::caddy::render_service_unit(&binary.display().to_string(), &user, guest_port),
-    )?;
+    if let Some(port) = catchat_port {
+        std::fs::write(
+            dir.join("catchat.service"),
+            clawde_katban::caddy::render_service_unit(&binary.display().to_string(), &user, port),
+        )?;
+    }
     std::fs::write(
         dir.join("katban-reload.path"),
         clawde_katban::caddy::render_reloader_path_unit(
@@ -1765,19 +1773,19 @@ const LINK_USAGE: &str = r#"Usage: clawde catchat links <command>
                                              choice — the chosen one is not printed)
 "#;
 
-const GUEST_USAGE: &str = r#"Usage: clawde katban guest <command> [OPTIONS]
-(alias of: clawde catchat serve|expose|unblock)
+const GUEST_USAGE: &str = r#"Usage: clawde catchat <command> [OPTIONS]
+Public-facing Cat Chat sandbox commands.
 
   serve [--port N] [--host IP] [--allow-non-loopback]
-                                              Run the guest chat server
+                                              Run the Cat Chat sandbox server
   expose [--subdomain HOST] [--port N] [--dry-run] [--caddy-dir DIR]
          [--duckdns-token TOKEN]              Put the guest chat behind caddy
                                               (writes the managed katban.conf)
   unblock <IP>                                Clear an IP's lockouts / 24h block
 
-Runs the guest chat server: friends open the URL, type the shared password,
+Runs the Cat Chat sandbox server: friends open the URL, type the shared password,
 and chat with Clawde (chat + web search only — no files, no shell, nothing
-else). Guest chat rides the host's free/limited providers; if none are
+else). Cat Chat rides the host's free/limited providers; if none are
 configured the chat explains that politely.
 "#;
 
@@ -1789,7 +1797,7 @@ fn now_secs() -> u64 {
 }
 
 fn run_link(args: &[String]) -> anyhow::Result<()> {
-    use clawde_katban::guest::{generate_password, load, save};
+    use clawde_katban::catchat::links::{generate_password, load, save};
 
     let Some(subcommand) = args.first().map(|s| s.as_str()) else {
         print!("{LINK_USAGE}");
@@ -1798,7 +1806,7 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
     match subcommand {
         "create" => {
             // The name is everything before the first flag, so multi-word
-            // names work without shell quoting (mirrors `/katban link create`).
+            // names work without shell quoting (mirrors `/chat create`).
             let mut name_parts = Vec::new();
             let mut index = 1;
             while index < args.len() && !args[index].starts_with("--") {
@@ -1810,7 +1818,7 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
                 anyhow::bail!("link create needs a name: clawde catchat links create <NAME>");
             }
             let mut expires_at = None;
-            let mut max_concurrent = clawde_katban::guest::DEFAULT_MAX_CONCURRENT;
+            let mut max_concurrent = clawde_katban::catchat::links::DEFAULT_MAX_CONCURRENT;
             while index < args.len() {
                 match args[index].as_str() {
                     "--expires-in" => {
@@ -1871,7 +1879,7 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
             println!("created guest link '{name}' ({id})");
             println!(
                 "url:      http://127.0.0.1:{}/",
-                clawde_katban::guest_server::DEFAULT_GUEST_PORT
+                clawde_katban::catchat::server::DEFAULT_GUEST_PORT
             );
             println!("password: {password}");
             println!("expires:  {expiry_text}");
@@ -1929,7 +1937,7 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
             println!("max chat:    {}", link.max_concurrent);
             println!(
                 "url:         http://127.0.0.1:{}/",
-                clawde_katban::guest_server::DEFAULT_GUEST_PORT
+                clawde_katban::catchat::server::DEFAULT_GUEST_PORT
             );
             Ok(())
         }
@@ -1972,7 +1980,7 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
             }
             let password = match chosen {
                 Some(ref pw) => {
-                    if let Err(message) = clawde_katban::guest::validate_set_password(pw) {
+                    if let Err(message) = clawde_katban::catchat::links::validate_set_password(pw) {
                         anyhow::bail!("{message}");
                     }
                     pw.trim().to_string()
@@ -2004,15 +2012,15 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
     }
 }
 
-async fn run_guest(args: &[String]) -> anyhow::Result<()> {
+async fn run_catchat_server(args: &[String]) -> anyhow::Result<()> {
     let Some(subcommand) = args.first().map(|s| s.as_str()) else {
         print!("{GUEST_USAGE}");
         return Ok(());
     };
     match subcommand {
-        "serve" => guest_serve(&args[1..]).await,
-        "expose" => run_guest_expose(&args[1..]).await,
-        "unblock" => run_guest_unblock(&args[1..]),
+        "serve" => catchat_serve(&args[1..]).await,
+        "expose" => run_catchat_expose(&args[1..]).await,
+        "unblock" => run_catchat_unblock(&args[1..]),
         "help" | "--help" | "-h" => {
             print!("{GUEST_USAGE}");
             Ok(())
@@ -2021,8 +2029,8 @@ async fn run_guest(args: &[String]) -> anyhow::Result<()> {
     }
 }
 
-async fn guest_serve(args: &[String]) -> anyhow::Result<()> {
-    use clawde_katban::guest_server::{GuestServer, DEFAULT_GUEST_PORT};
+async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
+    use clawde_katban::catchat::server::{GuestServer, DEFAULT_GUEST_PORT};
     use std::sync::Arc;
 
     let mut port = DEFAULT_GUEST_PORT;
@@ -2067,7 +2075,7 @@ async fn guest_serve(args: &[String]) -> anyhow::Result<()> {
         );
     }
 
-    let mut store = clawde_katban::guest::load()?;
+    let mut store = clawde_katban::catchat::links::load()?;
     if store.links.is_empty() {
         println!(
             "WARNING: no guest links yet — create one with: clawde catchat links create <NAME>"
@@ -2076,23 +2084,26 @@ async fn guest_serve(args: &[String]) -> anyhow::Result<()> {
     let public_url = store.public_subdomain.clone();
     store.prune(now_secs());
     let store = Arc::new(std::sync::Mutex::new(store));
-    let search: Arc<dyn clawde_katban::search::GuestSearch> = Arc::new(
-        clawde_katban::search::SearxClient::new(clawde_katban::search::DEFAULT_ENDPOINT),
-    );
-    let backend: Arc<dyn clawde_katban::chat::GuestBackend> =
-        Arc::new(clawde_katban::chat::FreeBackend::new());
-    let engine = Arc::new(clawde_katban::chat::ChatEngine::new(backend, search));
+    let search: Arc<dyn clawde_katban::catchat::search::GuestSearch> =
+        Arc::new(clawde_katban::catchat::search::SearxClient::new(
+            clawde_katban::catchat::search::DEFAULT_ENDPOINT,
+        ));
+    let backend: Arc<dyn clawde_katban::catchat::engine::GuestBackend> =
+        Arc::new(clawde_katban::catchat::engine::FreeBackend::new());
+    let engine = Arc::new(clawde_katban::catchat::engine::ChatEngine::new(
+        backend, search,
+    ));
     let server = GuestServer::new(engine, store);
-    println!("guest chat serving at http://{addr}/  (Ctrl-C to stop)");
+    println!("Cat Chat serving at http://{addr}/  (Ctrl-C to stop)");
     if !clawde_katban::host::is_loopback(addr) {
         println!("WARNING: bound to {addr} — reachable by other machines; guests can chat but have no access to your system.");
     }
     if let Some(subdomain) = &public_url {
-        println!("public:      https://{subdomain} (via caddy — see: clawde katban guest expose)");
+        println!("public:      https://{subdomain} (via caddy — see: clawde catchat expose)");
     }
     println!(
         "guest search: local SearXNG at {}",
-        clawde_katban::search::DEFAULT_ENDPOINT
+        clawde_katban::catchat::search::DEFAULT_ENDPOINT
     );
     println!(
         "guests ride free/limited providers; chat degrades gracefully if none are configured."
@@ -2104,15 +2115,15 @@ async fn guest_serve(args: &[String]) -> anyhow::Result<()> {
 /// Put the guest chat behind caddy: writes the managed `katban.conf` (all
 /// exposed sites + the guest block), emits the reloader units, prints the
 /// one-time bootstrap, and best-effort updates the DuckDNS subdomain.
-async fn run_guest_expose(args: &[String]) -> anyhow::Result<()> {
+async fn run_catchat_expose(args: &[String]) -> anyhow::Result<()> {
     use clawde_katban::caddy::{
         bootstrap_instructions, render_config, write_atomic, DEFAULT_INCLUDE_NAME,
     };
+    use clawde_katban::catchat::links::{load, save};
     use clawde_katban::config::load as load_sites;
-    use clawde_katban::guest::{load, save};
 
     let mut subdomain: Option<String> = None;
-    let mut port = clawde_katban::guest_server::DEFAULT_GUEST_PORT;
+    let mut port = clawde_katban::catchat::server::DEFAULT_GUEST_PORT;
     let mut dry_run = false;
     let mut caddy_dir: Option<PathBuf> = None;
     let mut duckdns_token: Option<String> = None;
@@ -2170,7 +2181,7 @@ async fn run_guest_expose(args: &[String]) -> anyhow::Result<()> {
     }
 
     // The managed config holds every exposed site PLUS the guest block, so
-    // running `guest expose` never drops previously exposed sites.
+    // running `catchat expose` never drops previously exposed sites.
     let sites_config = load_sites()?;
     let exposed: Vec<_> = sites_config
         .sites
@@ -2190,7 +2201,7 @@ async fn run_guest_expose(args: &[String]) -> anyhow::Result<()> {
     let caddy_dir = caddy_dir.unwrap_or_else(|| PathBuf::from("/etc/caddy"));
     let managed_path = caddy_dir.join(DEFAULT_INCLUDE_NAME);
 
-    println!("exposing guest chat at https://{subdomain}");
+    println!("exposing Cat Chat at https://{subdomain}");
     println!(
         "Managed caddy block (written to {}):",
         managed_path.display()
@@ -2204,11 +2215,9 @@ async fn run_guest_expose(args: &[String]) -> anyhow::Result<()> {
 
     write_atomic(&managed_path, &text)?;
 
-    // Write the systemd units (service + reloader) so the bootstrap can
-    // install them; the instructions reference these files. The reloader
-    // watches the actual managed file (honoring --caddy-dir) and the service
-    // runs `guest serve` on the port just rendered.
-    let units_dir = write_systemd_units(&caddy_dir, port, (&[], 0))?;
+    // Write Cat Chat's own systemd unit plus the shared Caddy reloader. The
+    // service is only emitted from the Cat Chat expose path.
+    let units_dir = write_systemd_units(&caddy_dir, Some(port), (&[], 0))?;
     println!();
     println!("{}", bootstrap_instructions(&units_dir, &caddy_dir));
 
@@ -2232,8 +2241,8 @@ async fn run_guest_expose(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_guest_unblock(args: &[String]) -> anyhow::Result<()> {
-    use clawde_katban::guest::{load, save};
+fn run_catchat_unblock(args: &[String]) -> anyhow::Result<()> {
+    use clawde_katban::catchat::links::{load, save};
 
     let ip = args
         .first()
@@ -2332,11 +2341,11 @@ mod tests {
         std::env::set_var("CLAWDE_HOME", tmp.path());
         let result = (|| -> anyhow::Result<()> {
             let caddy_dir = tmp.path().join("custom-caddy");
-            let units = write_systemd_units(&caddy_dir, 9000, (&[], 0))?;
-            let service = std::fs::read_to_string(units.join("katban.service"))?;
+            let units = write_systemd_units(&caddy_dir, Some(9000), (&[], 0))?;
+            let service = std::fs::read_to_string(units.join("catchat.service"))?;
             assert!(
-                service.contains("katban guest serve --port 9000"),
-                "service unit must bind the rendered guest port"
+                service.contains("catchat serve --port 9000"),
+                "service unit must bind the rendered Cat Chat port"
             );
             let path_unit = std::fs::read_to_string(units.join("katban-reload.path"))?;
             assert!(
@@ -2367,7 +2376,7 @@ mod tests {
         let result = (|| -> anyhow::Result<()> {
             let caddy_dir = tmp.path().join("caddy");
             // Single project -> clean description + ExecStart.
-            let units = write_systemd_units(&caddy_dir, 9000, (&[String::from("demo")], 8790))?;
+            let units = write_systemd_units(&caddy_dir, None, (&[String::from("demo")], 8790))?;
             let board = std::fs::read_to_string(units.join("katban-board.service"))?;
             assert!(
                 board.contains("ExecStart=clawde katban board serve --port 8790 --run demo")
@@ -2375,8 +2384,9 @@ mod tests {
                 "board unit must serve the board port and run the project: {board}"
             );
             assert!(board.contains("Description=Katban admin board + runner (demo)"));
-            // The guest + reloader units are still written.
-            assert!(units.join("katban.service").exists());
+            // Katban expose writes only Katban/reloader artifacts; Cat Chat's
+            // service is emitted exclusively by `catchat expose`.
+            assert!(!units.join("catchat.service").exists());
             assert!(units.join("katban-reload.path").exists());
             Ok(())
         })();
@@ -2398,7 +2408,7 @@ mod tests {
             let caddy_dir = tmp.path().join("caddy");
             let units = write_systemd_units(
                 &caddy_dir,
-                9000,
+                None,
                 (&[String::from("app"), String::from("api")], 8790),
             )?;
             let board = std::fs::read_to_string(units.join("katban-board.service"))?;
@@ -2490,7 +2500,7 @@ mod tests {
         let exposed = rt.block_on(board_expose(&args));
         // Assert while CLAWDE_HOME still points at the sandbox -- the load()
         // and unit path resolve via the env at call time.
-        let store = clawde_katban::board_admin::load().unwrap();
+        let store = clawde_katban::admin_auth::load().unwrap();
         let unit_path = clawde_katban::config::katban_data_dir().join("caddy/katban-board.service");
         let unit = std::fs::read_to_string(unit_path).unwrap();
         match previous {
@@ -2520,14 +2530,14 @@ mod tests {
         std::env::set_var("CLAWDE_HOME", tmp.path());
         let result = (|| -> anyhow::Result<()> {
             // Not exposed yet -> None.
-            let store = clawde_katban::board_admin::load()?;
-            clawde_katban::board_admin::save(&store)?;
+            let store = clawde_katban::admin_auth::load()?;
+            clawde_katban::admin_auth::save(&store)?;
             assert!(admin_board_block()?.is_none());
             // Expose with a custom port -> Some((subdomain, port)).
-            let mut store = clawde_katban::board_admin::load()?;
+            let mut store = clawde_katban::admin_auth::load()?;
             store.public_subdomain = Some("board.example.com".to_string());
             store.board_port = Some(8891);
-            clawde_katban::board_admin::save(&store)?;
+            clawde_katban::admin_auth::save(&store)?;
             let block = admin_board_block()?.expect("exposed block");
             assert_eq!(block, ("board.example.com".to_string(), 8891));
             Ok(())

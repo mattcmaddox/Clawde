@@ -773,8 +773,8 @@ async fn main() -> anyhow::Result<()> {
         return clawde_acp::run_acp_server().await;
     }
 
-    // Fast-path: `clawde katban` — self-hosted web surface (v0: dev-site
-    // hosting with live reload; board + guest tiers to come).
+    // Fast-path: `clawde katban` — the production development surface
+    // (boards, agent execution, project repos, and hosted dev sites).
     if raw_args.get(1).map(|s| s.as_str()) == Some("katban") {
         if raw_args[2..]
             .iter()
@@ -786,8 +786,8 @@ async fn main() -> anyhow::Result<()> {
         return katban::run_command(&raw_args[2..]).await;
     }
 
-    // Fast-path: `clawde catchat` — the Cat Chat guest chat (server, public
-    // exposure, guest links, lockout unblocks). Split from `clawde katban`
+    // Fast-path: `clawde catchat` — the separate Cat Chat sandbox (server, public
+    // exposure, share links, and lockout unblocks). Split from `clawde katban`
     // so the Kanban board surface and the chat surface are separate.
     if raw_args.get(1).map(|s| s.as_str()) == Some("catchat") {
         if raw_args[2..]
@@ -9185,5 +9185,138 @@ mod session_swap_tests {
         assert!(session_swap_changes_sessions("session-a", "session-b"));
         // /new always generates a fresh id, so it always counts as a swap.
         assert!(session_swap_changes_sessions("", "session-c"));
+    }
+}
+
+#[cfg(test)]
+mod exit_ollama_unload_tests {
+    use super::*;
+
+    fn ollama_config(model: Option<&str>) -> Config {
+        Config {
+            provider: Some("ollama".to_string()),
+            model: model.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ollama_session_targets_its_model() {
+        // A session actively on Ollama must release its own model on exit,
+        // with the provider prefix stripped to the bare Ollama model name.
+        let config = ollama_config(Some("ollama/qwen2.5-coder:3b"));
+        assert_eq!(
+            exit_ollama_model_target(&config, "ollama/qwen2.5-coder:3b"),
+            Some("qwen2.5-coder:3b".to_string())
+        );
+    }
+
+    #[test]
+    fn ollama_session_bare_model_name() {
+        // Runtime model names may be bare (no provider prefix); the resolver
+        // must still return the model as-is.
+        let config = ollama_config(Some("qwen2.5-coder:3b"));
+        assert_eq!(
+            exit_ollama_model_target(&config, "qwen2.5-coder:3b"),
+            Some("qwen2.5-coder:3b".to_string())
+        );
+    }
+
+    #[test]
+    fn non_ollama_session_does_not_unload() {
+        // Free / hosted sessions must never touch a remote Ollama server.
+        let config = Config {
+            provider: Some("free".to_string()),
+            model: Some("free/auto".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(exit_ollama_model_target(&config, "free/auto"), None);
+    }
+    #[test]
+    fn empty_model_does_not_unload() {
+        let config = ollama_config(None);
+        assert_eq!(exit_ollama_model_target(&config, ""), None);
+        assert_eq!(exit_ollama_model_target(&config, "ollama/"), None);
+    }
+}
+
+#[cfg(test)]
+mod query_task_message_sync_tests {
+    use super::*;
+    use clawde_tui::app::App;
+    use std::sync::Arc;
+
+    /// After an Esc-cancel (or any in-flight cancel) the query task unwinds
+    /// and writes its partial messages into msgs_arc. The CLI loop must push
+    /// those new messages into the TUI transcript so the partial response is
+    /// not lost from the visible conversation.
+    #[tokio::test]
+    async fn task_unwind_surfaces_partial_response_in_transcript() {
+        let mut app = App::new(
+            Config {
+                model: Some("claude-sonnet-4-6".to_string()),
+                ..Default::default()
+            },
+            CostTracker::new(),
+        );
+
+        app.push_message(clawde_core::types::Message::user(String::from("hello")));
+
+        let partial_text = String::from("partial response from");
+        let task_messages: Vec<clawde_core::types::Message> = vec![
+            clawde_core::types::Message::user(String::from("hello")),
+            clawde_core::types::Message::assistant(partial_text.clone()),
+        ];
+        let msgs_arc = std::sync::Arc::new(tokio::sync::Mutex::new(task_messages));
+
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(
+            app.messages.last().unwrap().content,
+            clawde_core::types::MessageContent::Text(ref t)
+                if t == "hello"
+        ));
+
+        let messages = msgs_arc.lock().await.clone();
+        assert_eq!(messages.len(), 2);
+        let app_len = app.messages.len();
+        if messages.len() > app_len {
+            for msg in messages.iter().skip(app_len).cloned() {
+                app.push_message(msg);
+            }
+        }
+
+        assert_eq!(app.messages.len(), 2);
+        let last = app.messages.last().unwrap();
+        assert_eq!(last.role, clawde_core::types::Role::Assistant);
+        match &last.content {
+            clawde_core::types::MessageContent::Text(t) => assert_eq!(t, "partial response from"),
+            other => panic!("expected text content, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_unwind_with_no_new_messages_does_not_duplicate() {
+        let mut app = App::new(
+            Config {
+                model: Some("claude-sonnet-4-6".to_string()),
+                ..Default::default()
+            },
+            CostTracker::new(),
+        );
+        app.push_message(clawde_core::types::Message::user(String::from("hi")));
+        assert_eq!(app.messages.len(), 1);
+
+        let msgs_arc = std::sync::Arc::new(tokio::sync::Mutex::new(vec![
+            clawde_core::types::Message::user(String::from("hi")),
+        ]));
+        let messages = msgs_arc.lock().await.clone();
+        let app_len = app.messages.len();
+        if messages.len() > app_len {
+            for msg in messages.iter().skip(app_len).cloned() {
+                app.push_message(msg);
+            }
+        }
+
+        assert_eq!(app.messages.len(), 1);
     }
 }

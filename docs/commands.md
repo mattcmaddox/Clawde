@@ -284,7 +284,7 @@ While Clawde is streaming a response, `Esc` works in two stages:
 
 Any other key resumes: the buffered tail folds back into the live view and typing falls through into the prompt normally (so you can compose a follow-up while it catches up). If the model finishes while paused, the buffered text is flushed into the transcript — nothing is lost.
 
-Precedence note: while a notification banner or dialog is on screen, its keys are handled first — the first `Esc` dismisses the banner rather than pausing, and keys aimed at an open dialog neither pause nor resume. Pause/resume needs a clear screen.
+Precedence note: while a turn is streaming, the first `Esc` always pauses the transcript — transient banners (notifications, plugin hints, the memory-update notice) no longer steal it and are dismissed with `Esc` once the turn is idle (or expire on their own). An open dialog still owns its keys: `Esc` aimed at a dialog neither pauses nor resumes.
 
 ```
 Esc          # pause the live transcript (stream keeps buffering)
@@ -1551,7 +1551,17 @@ Copy the most recent assistant response to the system clipboard. Pass a number t
 
 ---
 
-## Self-Hosting & Katban
+## Self-Hosting: Cat Chat and Katban
+
+Clawde has two intentionally separate self-hosted products:
+
+- **Cat Chat** is a public-facing, sandboxed guest chat. It can use chat and web search, never host files, shells, boards, or development tools. Its links and guest lockouts live under `~/.clawde/catchat/`.
+- **Katban** is the serious development feature for agent Kanban boards, project/repository registration, execution, review, verification, and hosted dev sites. Its admin credential and state live under `~/.clawde/katban/`.
+
+The products share only low-level HTTP/caddy utilities. They do not share password policy, session stores, or guest/admin authorization.
+
+See [Cat Chat](catchat.md) and [Katban](katban.md) for setup and operating guidance.
+
 
 ### /chat
 
@@ -1568,8 +1578,8 @@ links directly. This is the chat-facing surface; the Kanban board stays under
 /chat show <ID>             — link details (devices, expiry)
 /chat revoke <ID>           — revoke a link (kicks its devices)
 /chat password <ID>         — rotate a link's password
-/chat password <ID> --set "PW" — set your own password (8+ chars, not printed)
-/chat unblock <IP>          — clear lockouts + permanent blocks
+/chat password <ID> --set "PW" — set your own memorable password (not printed)
+/chat unblock <IP>          — clear Cat Chat lockouts + 24-hour blocks
 ```
 
 The server itself is managed from the shell: `clawde catchat serve|expose`.
@@ -1592,6 +1602,7 @@ reachable from the Katban controls menu (`Alt+G` — see
 /katban board ready [--project NAME] — cards that can start now
 /katban board card add <PROMPT> [--project NAME]
 /katban board card set <ID> <STATUS> [--project NAME]
+/katban board card edit <ID> <PROMPT> [--project NAME] — replace a card's prompt
 /katban board card remove <ID> [--project NAME]
 /katban project list                 — board -> git repo registry
 /katban site list                    — hosted sites

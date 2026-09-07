@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use clawde_core::config::{Config, Settings, Theme};
 use clawde_core::cost::CostTracker;
 use clawde_core::types::{ContentBlock, Message};
-use clawde_katban::guest;
+use clawde_katban::catchat::links as chat_links;
 use std::collections::BTreeMap;
 #[allow(unused_imports)]
 use std::path::PathBuf;
@@ -2040,7 +2040,7 @@ fn chat_execute(args: &str) -> CommandResult {
         ["revoke", id] => {
             let mut store = chat_load_store();
             if store.revoke_link(id) {
-                if let Err(error) = guest::save(&store) {
+                if let Err(error) = chat_links::save(&store) {
                     return CommandResult::Error(format!("could not save: {error:#}"));
                 }
                 CommandResult::Message(format!(
@@ -2067,7 +2067,7 @@ fn chat_execute(args: &str) -> CommandResult {
         ["unblock", ip] => {
             let mut store = chat_load_store();
             store.reset_failed_attempts(ip);
-            if let Err(error) = guest::save(&store) {
+            if let Err(error) = chat_links::save(&store) {
                 return CommandResult::Error(format!("could not save: {error:#}"));
             }
             CommandResult::Message(format!(
@@ -2084,8 +2084,8 @@ fn chat_execute(args: &str) -> CommandResult {
 // ---- /chat helpers (Cat Chat guest-link operations) -----------------------
 
 /// Read the live guest store from disk (empty store when absent).
-fn chat_load_store() -> clawde_katban::guest::GuestStore {
-    guest::load().unwrap_or_default()
+fn chat_load_store() -> clawde_katban::catchat::links::GuestStore {
+    chat_links::load().unwrap_or_default()
 }
 
 fn chat_now_secs() -> u64 {
@@ -2102,7 +2102,7 @@ fn chat_status_text() -> String {
     let active = store
         .links
         .iter()
-        .filter(|l| guest::link_active(l, now))
+        .filter(|l| chat_links::link_active(l, now))
         .count();
     let devices: usize = store.devices.values().map(|d| d.len()).sum();
     let mut out = format!(
@@ -2158,11 +2158,11 @@ fn chat_link_list_text() -> String {
 }
 
 fn chat_create_link(name: &str) -> Result<String, String> {
-    let password = guest::generate_password();
+    let password = chat_links::generate_password();
     let mut store = chat_load_store();
     store.prune(chat_now_secs());
     let id = store.create_link(name, &password, None, 0);
-    guest::save(&store).map_err(|e| format!("could not save: {e:#}"))?;
+    chat_links::save(&store).map_err(|e| format!("could not save: {e:#}"))?;
     Ok(format!(
         "created guest link '{name}' ({id})\n\
          password: {password}\n\
@@ -2201,16 +2201,16 @@ fn chat_rotate_password(id: &str, chosen: Option<&str>) -> Result<String, String
     let password = match chosen {
         Some(pw) => {
             let pw = pw.trim();
-            guest::validate_set_password(pw)?;
+            chat_links::validate_set_password(pw)?;
             pw.to_string()
         }
-        None => guest::generate_password(),
+        None => chat_links::generate_password(),
     };
     let mut store = chat_load_store();
     if !store.set_password(id, &password) {
         return Err(format!("no guest link '{id}'"));
     }
-    guest::save(&store).map_err(|e| format!("could not save: {e:#}"))?;
+    chat_links::save(&store).map_err(|e| format!("could not save: {e:#}"))?;
     Ok(match chosen {
         Some(_) => format!(
             "rotated password for guest link '{id}'\n\
@@ -2537,12 +2537,27 @@ impl SlashCommand for UnloadCommand {
         });
         match clawde_core::ollama_unload_models_for_config(&ctx.config, requested.as_deref()).await
         {
-            Ok(0) if requested.is_some() => CommandResult::Message(format!(
-                "Model '{}' is not currently loaded.",
-                requested.unwrap_or_default()
-            )),
-            Ok(0) => CommandResult::Message("No models currently loaded in Ollama.".to_string()),
+            Ok(0) => {
+                if requested.is_some() {
+                    // The core function no longer returns Ok(0) for a named model
+                    // that is absent; it returns an Err with "not currently
+                    // loaded". This branch is kept for the explicit-empty case
+                    // (e.g. a future variant) and for defensive completeness.
+                    CommandResult::Message(format!(
+                        "Model '{}' is not currently loaded.",
+                        requested.unwrap_or_default()
+                    ))
+                } else {
+                    CommandResult::Message("No models currently loaded in Ollama.".to_string())
+                }
+            }
             Ok(n) => CommandResult::Message(format!("Unloaded {} model(s) from VRAM.", n)),
+            Err(e) if requested.is_some() && e.contains("not currently loaded") => {
+                CommandResult::Message(format!(
+                    "Model '{}' is not currently loaded.",
+                    requested.unwrap()
+                ))
+            }
             Err(e) => CommandResult::Error(e),
         }
     }
@@ -4088,7 +4103,7 @@ mod tests {
                     .unwrap()
                     .to_string();
                 assert_eq!(new_password.len(), 12);
-                let store = clawde_katban::guest::load().unwrap();
+                let store = clawde_katban::catchat::links::load().unwrap();
                 let link = store.link(&id).unwrap();
                 assert!(!store.verify_password(link, "anything-before"));
                 assert!(store.verify_password(link, &new_password));
@@ -4105,7 +4120,7 @@ mod tests {
                     "chosen password must not be echoed: {text}"
                 );
                 assert!(!text.contains("fuzzylampcat"));
-                let store = clawde_katban::guest::load().unwrap();
+                let store = clawde_katban::catchat::links::load().unwrap();
                 let link = store.link(&id).unwrap();
                 assert!(store.verify_password(link, "fuzzylampcat"));
                 assert!(!store.verify_password(link, &new_password));
@@ -4118,7 +4133,7 @@ mod tests {
                 assert!(text.contains(&id));
                 let result = cmd.execute(&format!("revoke {id}"), &mut ctx).await;
                 assert!(matches!(result, CommandResult::Message(_)));
-                let store = clawde_katban::guest::load().unwrap();
+                let store = clawde_katban::catchat::links::load().unwrap();
                 assert!(store.link(&id).unwrap().revoked);
             })
         })
@@ -4139,14 +4154,14 @@ mod tests {
                 assert!(text.contains("links:"));
 
                 // Lock out an IP, then clear it via /chat unblock.
-                let mut store = clawde_katban::guest::GuestStore::default();
+                let mut store = clawde_katban::catchat::links::GuestStore::default();
                 for _ in 0..5 {
                     store.record_failed_attempt("1.2.3.4");
                 }
-                clawde_katban::guest::save(&store).unwrap();
+                clawde_katban::catchat::links::save(&store).unwrap();
                 let result = cmd.execute("unblock 1.2.3.4", &mut ctx).await;
                 assert!(matches!(result, CommandResult::Message(_)));
-                let store = clawde_katban::guest::load().unwrap();
+                let store = clawde_katban::catchat::links::load().unwrap();
                 assert!(store.failed_attempts.is_empty());
             })
         })

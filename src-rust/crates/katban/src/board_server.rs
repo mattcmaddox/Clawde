@@ -6,10 +6,10 @@
 //! admin session auth, mirroring the guest server's hardening:
 //! - **Login**: `POST /api/login` accepts the admin password (set with
 //!   `clawde katban board password`) as JSON or form-encoded, verifies
-//!   against the salted hash in `board_admin::AdminStore`, mints a session
+//!   against the salted hash in `admin_auth::AdminStore`, mints a session
 //!   token and sets a HttpOnly+SameSite=Strict cookie.
-//! - **Wrong-password lockout**: per-IP, same ladder as the guest server
-//!   (5 -> 3 -> 3 -> permanent), via `apply_failed_attempt`.
+//! - **Wrong-password lockout**: an independent admin policy (5 failed
+//!   attempts per strike, three strikes, then a 24-hour block).
 //! - **Origin check**: write routes reject cross-origin requests (Cline
 //!   Kanban lesson, spec §3b), reusing `guest_server`'s helpers.
 //! - **Board lock**: every write holds `board::BoardLock` around load -> change
@@ -19,9 +19,9 @@
 //! Reads are lock-free because board saves are atomic (tmp + rename), so a
 //! reader always observes a consistent file.
 
+use crate::admin_auth::{AdminLockoutResult, AdminStore, ADMIN_COOKIE};
 use crate::board::{self, Board, CardStatus, Dependency, DiffSummary};
-use crate::board_admin::{AdminStore, ADMIN_COOKIE};
-use crate::guest_server::{client_ip, is_loopback_host, origin_parts, PeerAddr};
+use crate::http_security::{client_ip, is_loopback_host, origin_parts, PeerAddr};
 use anyhow::Context;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -53,7 +53,7 @@ pub struct BoardServer {
 
 impl BoardServer {
     pub fn new() -> Self {
-        let store_mtime = std::fs::metadata(crate::board_admin::admin_path())
+        let store_mtime = std::fs::metadata(crate::admin_auth::admin_path())
             .and_then(|metadata| metadata.modified())
             .ok();
         let (board_tx, _) = tokio::sync::broadcast::channel::<()>(16);
@@ -64,15 +64,15 @@ impl BoardServer {
         // store: the empty store has no password, so `is_configured()` gates
         // every save and the corrupt file is preserved for repair. Surface the
         // real cause loudly so an admin diagnosing "no password set" sees it.
-        let store = match crate::board_admin::load() {
+        let store = match crate::admin_auth::load() {
             Ok(store) => store,
             Err(error) => {
                 tracing::error!(
                     error = %error,
-                    path = %crate::board_admin::admin_path().display(),
+                    path = %crate::admin_auth::admin_path().display(),
                     "admin store is corrupt — login will report no password set until it is fixed or removed"
                 );
-                crate::board_admin::AdminStore::default()
+                crate::admin_auth::AdminStore::default()
             }
         };
         BoardServer {
@@ -116,6 +116,10 @@ impl BoardServer {
                 "/api/board/{project}/cards/{id}/status",
                 post(api_set_status),
             )
+            .route(
+                "/api/board/{project}/cards/{id}/edit",
+                post(api_edit_prompt),
+            )
             .route("/api/board/{project}/cards/{id}/advance", post(api_advance))
             .route("/api/board/{project}/cards/{id}/merge", post(api_merge))
             .route("/api/board/{project}/cards/{id}/archive", post(api_archive))
@@ -144,7 +148,7 @@ impl Default for BoardServer {
 /// Reload the admin store from disk when `admin.json` changed (a password
 /// rotation by the CLI applies to the running server without a restart).
 fn maybe_reload_store(state: &BoardState) {
-    let Ok(metadata) = std::fs::metadata(crate::board_admin::admin_path()) else {
+    let Ok(metadata) = std::fs::metadata(crate::admin_auth::admin_path()) else {
         return;
     };
     let Ok(modified) = metadata.modified() else {
@@ -157,7 +161,7 @@ fn maybe_reload_store(state: &BoardState) {
     if !changed {
         return;
     }
-    if let Ok(fresh) = crate::board_admin::load() {
+    if let Ok(fresh) = crate::admin_auth::load() {
         *state.store.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
         *state.store_mtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(modified);
     }
@@ -180,6 +184,10 @@ struct BoardApi {
     auto_retry: u32,
     auto_review: bool,
     verify: bool,
+    /// Per-card attempt count for the attempts:N ladder (spec §7).
+    attempts: u32,
+    /// Upstream ids attempts rotate over (empty = auto-derive from catalog).
+    attempt_upstreams: Vec<String>,
     /// ids that can start right now (deps met, not running/review/blocked/done).
     ready: Vec<String>,
 }
@@ -202,6 +210,10 @@ struct CardApi {
     commit: Option<String>,
     reviews: Vec<ReviewCommentApi>,
     followup_feedback: Option<String>,
+    /// Per-attempt matrix, order = attempt index (spec §5 "record, don't
+    /// discard"): the web UI renders it without new endpoints.
+    attempts: Vec<crate::board::AttemptOutcome>,
+    picked_attempt: Option<usize>,
     created_at: u64,
     updated_at: u64,
 }
@@ -273,7 +285,7 @@ async fn api_runner(
     }
     maybe_reload_store(&state);
     let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-    no_cache_nosniff((Json(crate::board_admin::runner_state(&store)),).into_response())
+    no_cache_nosniff((Json(crate::admin_auth::runner_state(&store)),).into_response())
 }
 
 async fn api_board(
@@ -374,7 +386,7 @@ fn admin_cookie(token: &str, secure: bool) -> HeaderValue {
     let secure_part = if secure { "; Secure" } else { "" };
     HeaderValue::from_str(&format!(
         "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure_part}",
-        crate::board_admin::ADMIN_SESSION_TTL_SECS
+        crate::admin_auth::ADMIN_SESSION_TTL_SECS
     ))
     .expect("cookie header is valid")
 }
@@ -394,7 +406,7 @@ fn authenticated(state: &BoardState, headers: &HeaderMap) -> Option<String> {
         })?
         .to_string();
     let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-    if !store.session_valid(&token) {
+    if !store.session_valid(&token, crate::time::now_secs()) {
         return None;
     }
     store.touch_session(&token);
@@ -469,13 +481,14 @@ async fn api_login(
     }
     maybe_reload_store(&state);
     let ip = client_ip(&headers, peer.0);
-    let now = crate::guest::now_secs();
+    let now = crate::time::now_secs();
 
     if state
         .store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .is_permanently_blocked(&ip)
+        .blocked_until(&ip, now)
+        .is_some()
     {
         return json_message(
             StatusCode::FORBIDDEN,
@@ -506,25 +519,25 @@ async fn api_login(
         if store.verify_password(&form.password) {
             store.reset_failed_attempts(&ip);
             let token = store.mint_session();
-            let _ = crate::board_admin::save(&store);
+            let _ = crate::admin_auth::save(&store);
             token
         } else {
-            let result = store.record_failed_attempt(&ip);
-            let _ = crate::board_admin::save(&store);
+            let result = store.record_failed_attempt(&ip, now);
+            let _ = crate::admin_auth::save(&store);
             match result {
-                crate::guest::LockoutResult::Blocked => {
+                AdminLockoutResult::Blocked => {
                     return json_message(
                         StatusCode::FORBIDDEN,
-                        "too many attempts — blocked for 24 hours",
+                        "Katban admin access blocked for 24 hours",
                     );
                 }
-                crate::guest::LockoutResult::Temporary(_) => {
+                AdminLockoutResult::Temporary(_) => {
                     return json_message(
                         StatusCode::TOO_MANY_REQUESTS,
-                        "too many attempts — locked for a few minutes",
+                        "Katban admin access locked for a few minutes",
                     );
                 }
-                crate::guest::LockoutResult::None => {
+                AdminLockoutResult::None => {
                     return json_message(StatusCode::UNAUTHORIZED, "wrong password");
                 }
             }
@@ -951,6 +964,42 @@ fn api_set_board_flag(
     write_board(&board, project)
 }
 
+#[derive(Deserialize)]
+struct EditPromptForm {
+    prompt: String,
+}
+
+/// Replace a card's prompt (`POST /api/board/{project}/cards/{id}/edit`).
+/// Auth-gated like every board write. The card keeps its id, status,
+/// reviews, dependencies and pinned branch — a typo fix no longer costs a
+/// round-trip through archive-and-recreate.
+async fn api_edit_prompt(
+    State(state): State<BoardState>,
+    Path((project, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<EditPromptForm>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return *response;
+    }
+    let prompt = body.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return json_message(StatusCode::BAD_REQUEST, "prompt must not be empty");
+    }
+    let _guard = match board::BoardLock::acquire(&project) {
+        Ok(guard) => guard,
+        Err(error) => return json_message(StatusCode::CONFLICT, &error.to_string()),
+    };
+    let mut board = match load_board_for_write(&project) {
+        Ok(board) => board,
+        Err(response) => return *response,
+    };
+    if !board.update_prompt(&id, &prompt) {
+        return json_message(StatusCode::NOT_FOUND, "no such card");
+    }
+    write_board(&board, &project)
+}
+
 /// Reload a saved board for a write-response (the lock was already held and
 /// released inside the op that saved it), mirroring `load_board_for_write`
 /// without re-acquiring `BoardLock`.
@@ -1004,6 +1053,8 @@ fn board_to_api(project: &str, board: &Board) -> BoardApi {
             commit: card.commit.clone(),
             reviews: card.reviews.iter().map(review_to_api).collect(),
             followup_feedback: card.followup_feedback.clone(),
+            attempts: card.attempts.clone(),
+            picked_attempt: card.picked_attempt,
             created_at: card.created_at,
             updated_at: card.updated_at,
         })
@@ -1016,6 +1067,8 @@ fn board_to_api(project: &str, board: &Board) -> BoardApi {
         auto_retry: board.auto_retry,
         auto_review: board.auto_review,
         verify: board.verify,
+        attempts: board.attempts,
+        attempt_upstreams: board.attempt_upstreams.clone(),
         ready,
     }
 }
@@ -1059,6 +1112,7 @@ const ADMIN_HTML: &str = r##"<!doctype html>
   .card .meta { font-size:12px; color:#8b96a5; }
   .card .badge { display:inline-block; font-size:11px; padding:1px 6px; border-radius:99px; margin-right:4px; }
   .card .badge.ready { background:#1f6f43; color:#b8e8c9; }
+  .card .badge.fb { background:#6f4a12; color:#ffd479; }
   .card .blocked { color:#ffb36b; font-size:12px; margin-top:4px; white-space:pre-wrap; }
   .card .deps { font-size:12px; color:#8b96a5; margin-top:4px; }
   .muted { color:#8b96a5; }
@@ -1170,7 +1224,7 @@ async function loadBoard(project) {
   const res = await fetch("/api/board/" + encodeURIComponent(project));
   if (!res.ok) { $("#board").innerHTML = '<span class="blocked">' + (await res.text()) + "</span>"; return; }
   const api = await res.json();
-  $("#meta").textContent = api.cards.length + " cards · cap " + api.parallelCap + " · retry " + api.autoRetry + (api.autoReview ? " · auto-review" : "") + " · verify " + (api.verify ? "on" : "off");
+  $("#meta").textContent = api.cards.length + " cards · cap " + api.parallelCap + " · retry " + api.autoRetry + (api.autoReview ? " · auto-review" : "") + " · verify " + (api.verify ? "on" : "off") + (api.attempts > 1 ? " · attempts " + api.attempts + (api.attemptUpstreams.length ? " (" + api.attemptUpstreams.join(",") + ")" : "") : "");
   // Keep the board-level toggle buttons truthful (and clickable when signed in).
   gateVerify = api.verify; gateAutoReview = api.autoReview;
   $("#toggleverify").textContent = "verify " + (gateVerify ? "on" : "off");
@@ -1178,7 +1232,11 @@ async function loadBoard(project) {
   const byStatus = {};
   COLS.forEach((c) => byStatus[c] = []);
   const waitMap = {};
-  api.dependencies.forEach((d) => (waitMap[d.from] ||= []).push(d.to));
+  const blocksMap = {};
+  api.dependencies.forEach((d) => {
+    (waitMap[d.from] ||= []).push(d.to);
+    (blocksMap[d.to] ||= []).push(d.from);
+  });
   const promptOf = {};
   api.cards.forEach((c) => promptOf[c.id] = c.prompt);
 
@@ -1199,11 +1257,23 @@ async function loadBoard(project) {
       card.className = "card " + c.status;
       let html = '<div class="prompt">' + esc(c.prompt) + "</div>";
       if (c.ready) html += '<span class="badge ready">ready</span>';
-      html += '<span class="meta">' + c.id.slice(0,8) + (c.retries ? " · retries " + c.retries : "") +
+      html += '<span class="meta">' + c.id.slice(0,8) + " · " + ageOf(c.updatedAt) +
+              (c.retries ? " · retries " + c.retries : "") +
               (c.commit ? " · " + c.commit.slice(0,8) : "") + "</span>";
       if (c.blockedReason) html += '<div class="blocked">' + esc(c.blockedReason) + "</div>";
       if (c.result) html += '<div class="blocked" title="last result">' + esc(c.result) + "</div>";
       if (c.status === "failed") html += '<div class="meta">failure: ' + esc(c.failureKind || "unknown") + '</div>';
+      // Per-attempt matrix (spec §5 "record, don't discard"): one line per
+      // rung — upstream, verdict, elapsed — with the picked rung marked.
+      if (c.attempts && c.attempts.length > 1) {
+        html += '<div class="deps">' + c.attempts.map((a, i) =>
+          (i === c.pickedAttempt ? "▶ " : (i + 1) + ": ") +
+          esc(a.upstream || "default") +
+          (a.verifyPassed === true ? " pass" : a.verifyPassed === false ? " FAIL" : " err") +
+          (a.elapsedMs ? " " + Math.round(a.elapsedMs / 1000) + "s" : "") +
+          (a.error ? " — " + esc(a.error) : "")
+        ).join(" · ") + "</div>";
+      }
       if (c.diff && !c.commit) html += '<div class="meta">diff only — no mergeable commit</div>';
       const deps = (waitMap[c.id] || []);
       if (deps.length) {
@@ -1214,19 +1284,28 @@ async function loadBoard(project) {
               : "")).join(", ") +
           "</div>";
       }
+      // Reverse view: what cannot start until this card finishes.
+      const blocks = (blocksMap[c.id] || []);
+      if (blocks.length) {
+        html += '<div class="deps">blocks: ' +
+          blocks.map((id) => esc(promptOf[id] || id)).join(", ") + "</div>";
+      }
       if (c.diff_summary) html += '<div class="meta">' + c.diff_summary.filesChanged + ' file(s) · +' + c.diff_summary.additions + ' · -' + c.diff_summary.deletions + '</div>';
       if (c.diff) html += '<details class="diff"><summary>diff (' + (c.diff.length) + ' ch)</summary><pre>' + esc(c.diff) + '</pre></details>';
       if (c.reviews && c.reviews.length) {
         html += '<div class="reviews">' + c.reviews.map((r) =>
-          '<div class="review" title="' + (r.createdAt ? "" : "") + '">' +
+          '<div class="review">' +
           esc((r.location ? "[L" + r.location + "] " : "") + r.text) + "</div>").join("") + "</div>";
       }
+      // A card requeued with reviewer feedback is not a fresh run — surface
+      // it so the admin knows the next execution is a follow-up.
+      if (c.followupFeedback) html += '<span class="badge fb" title="Reviewer feedback is attached — the next run addresses it">feedback pending</span>';
       if (authed && c.status === "review") {
         html += '<div class="rform">' +
                 '<input class="rline" data-rline="' + c.id + '" placeholder="line" title="Optional diff line this comment anchors to (e.g. 12 or 14-16)">' +
                 '<input class="rtext" data-rtext="' + c.id + '" placeholder="review comment — send to agent to request a follow-up">' +
                 '<button class="mini" data-comment="' + c.id + '">comment</button>' +
-                '<button class="mini" data-fb="' + c.id + '" title="Re-run this card's agent with its review comments as feedback">send to agent</button>' +
+                '<button class="mini" data-fb="' + c.id + '" title="Re-run this card with its review comments as feedback">send to agent</button>' +
                 "</div>";
       }
       if (authed && c.status !== "done") {
@@ -1237,6 +1316,8 @@ async function loadBoard(project) {
                   '<option value="' + s + '"' + (s === c.status ? " selected" : "") + ">" + s + "</option>"
                 ).join("") +
                 '</select>' +
+                // Prompt edit: keep the card, fix the words.
+                '<button data-edit="' + c.id + '" title="Edit the card prompt">edit</button>' +
                 (c.status === "review"
                   ? '<button data-mrg="' + c.id + '" style="border-color:#2fbf71;color:#2fbf71" title="Merge the pinned commit into the project & mark done">merge</button>'
                   : '') +
@@ -1260,6 +1341,16 @@ function esc(s) {
   const d = document.createElement("div");
   d.textContent = s;
   return d.innerHTML;
+}
+
+// Compact relative age for the card meta line (unix seconds in, e.g. "3m").
+function ageOf(unixSecs) {
+  if (!unixSecs) return "";
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - unixSecs);
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "d";
 }
 
 let authed = false;
@@ -1343,6 +1434,21 @@ async function mergeCard(id) {
   else alert((data && data.error) || "merge failed — see server log");
 }
 
+async function editCard(id) {
+  const current = promptOf[id] || "";
+  const next = prompt("Edit the card prompt:", current);
+  if (next === null) return;
+  const text = next.trim();
+  if (!text || text === current) return;
+  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/edit", {
+    method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: text })
+  });
+  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
+  if (res.ok) loadBoard($("#project").value); else alert((await res.json().catch(() => null))?.error || "could not edit card");
+}
+
 async function setStatus(id, status) {
   const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/status", {
     method: "POST", credentials: "same-origin",
@@ -1419,12 +1525,14 @@ $("#board").addEventListener("click", (e) => {
   const adv = e.target.closest("[data-adv]");
   const arc = e.target.closest("[data-arc]");
   const mrg = e.target.closest("[data-mrg]");
+  const edit = e.target.closest("[data-edit]");
   const link = e.target.closest("[data-link]");
   const unlink = e.target.closest("[data-unlink]");
   const cmt = e.target.closest("[data-comment]");
   const fb = e.target.closest("[data-fb]");
   if (fb && window.confirm("Re-run this card's agent with its review comments as feedback?")) sendFeedback(fb.dataset.fb);
   if (cmt) postComment(cmt.dataset.comment);
+  if (edit) editCard(edit.dataset.edit);
   if (mrg && window.confirm("Merge this card's commit into the project history?")) mergeCard(mrg.dataset.mrg);
   if (adv && window.confirm("Advance this card?")) advanceCard(adv.dataset.adv);
   if (arc && window.confirm("Archive this card (discards its pinned commit/branch)?")) archiveCard(arc.dataset.arc);
@@ -1510,7 +1618,7 @@ mod tests {
         if let Some(password) = admin_password {
             let mut admin = AdminStore::default();
             admin.set_password(password);
-            crate::board_admin::save(&admin).unwrap();
+            crate::admin_auth::save(&admin).unwrap();
         }
         (BoardServer::new().router(), guard)
     }
@@ -1593,7 +1701,7 @@ mod tests {
         {
             let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("CLAWDE_HOME", tmp.path());
-            crate::board_admin::save(&crate::board_admin::AdminStore::default()).unwrap();
+            crate::admin_auth::save(&crate::admin_auth::AdminStore::default()).unwrap();
         }
         let (app, _guard) = router_with_home(tmp.path(), None, None);
 
@@ -1622,9 +1730,9 @@ mod tests {
         // Configure --run all and reach the API again: maybe_reload_store
         // picks up the admin.json change, so the already-running BoardState
         // reports the new runner config without a restart.
-        let mut store = crate::board_admin::load().unwrap();
-        store.runner_projects = vec![crate::board_admin::RUN_ALL.to_string()];
-        crate::board_admin::save(&store).unwrap();
+        let mut store = crate::admin_auth::load().unwrap();
+        store.runner_projects = vec![crate::admin_auth::RUN_ALL.to_string()];
+        crate::admin_auth::save(&store).unwrap();
         let res = app
             .oneshot(
                 Request::builder()

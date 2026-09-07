@@ -17257,7 +17257,7 @@ mod tests {
 
     #[test]
     fn test_cat_chat_build_rows_and_skip_dead_link_actions() {
-        use clawde_katban::guest;
+        use clawde_katban::catchat::links as chat_links;
 
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::TEST_ENV_LOCK
@@ -17266,11 +17266,11 @@ mod tests {
         let previous = std::env::var("CLAWDE_HOME").ok();
         std::env::set_var("CLAWDE_HOME", tmp.path());
 
-        let mut store = guest::GuestStore::default();
+        let mut store = chat_links::GuestStore::default();
         let friends_id = store.create_link("friends", "pw", None, 2);
         let dead = store.create_link("old crew", "pw", None, 2);
         store.revoke_link(&dead);
-        guest::save(&store).unwrap();
+        chat_links::save(&store).unwrap();
 
         let items = crate::cat_chat::build_cat_chat_items();
         let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();

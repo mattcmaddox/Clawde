@@ -3,11 +3,11 @@
 // Opened by Alt+G (`openKatbanControls`, see app.rs): a compact popup listing
 // the Kanban/agent-board operations the user most often needs without leaving
 // the TUI — status overview, Kanban board control (list / ready / add /
-// per-card advance), and unblocking locked or permanently-blocked IPs.
+// per-card advance), and managing the independent Katban admin credential.
 // Guest-chat link management is NOT here: that surface is the chat-focused
 // Cat Chat popup, opened by `/chat` (see cat_chat.rs).
 //
-// The menu is built live from the guest + board stores each time it opens,
+// The menu is built live from the Katban admin + board stores each time it opens,
 // so it always reflects the real state: one row per card (with its status),
 // one row per locked/blocked IP, plus the fixed actions. Selecting a row
 // seeds the prompt with the matching `/katban ...` command; rows whose
@@ -18,7 +18,7 @@
 // This is the "living" surface: as Katban gains features, add a menu row that
 // maps to the new `/katban` subcommand and it shows up here automatically.
 
-use clawde_katban::guest;
+use clawde_katban::admin_auth;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -85,16 +85,16 @@ fn section(title: &str) -> KatbanControlItem {
     }
 }
 
-/// Build the menu from the live guest store. Empty (but still visible) when
-/// the store cannot be read, so the dialog degrades gracefully.
+/// Build the menu from Katban's admin and board stores. Cat Chat links and
+/// guest lockouts belong exclusively to the `/chat` popup.
 pub fn build_control_items() -> Vec<KatbanControlItem> {
-    let store = guest::load().unwrap_or_default();
+    let admin = admin_auth::load().unwrap_or_default();
     let now = now_secs();
     let mut items = vec![
         section("Status"),
         KatbanControlItem {
             title: "Katban overview".into(),
-            subtitle: "sites, boards, guest links, caddy".into(),
+            subtitle: "boards, projects, dev sites, admin access".into(),
             command: "/katban status".into(),
             complete: true,
         },
@@ -145,7 +145,18 @@ pub fn build_control_items() -> Vec<KatbanControlItem> {
         });
     }
 
-    let blocked: Vec<(&String, &guest::FailedAttempt)> = store
+    items.push(KatbanControlItem {
+        title: "Set or rotate admin password".into(),
+        subtitle: if admin.is_configured() {
+            "strong admin credential · resets admin lockouts".into()
+        } else {
+            "required for writes to an exposed board".into()
+        },
+        command: "/katban board password ".into(),
+        complete: false,
+    });
+
+    let blocked: Vec<(&String, &admin_auth::AdminFailedAttempt)> = admin
         .failed_attempts
         .iter()
         .filter(|(_, attempt)| {
@@ -167,7 +178,7 @@ pub fn build_control_items() -> Vec<KatbanControlItem> {
             items.push(KatbanControlItem {
                 title: format!("Unblock {ip}"),
                 subtitle,
-                command: format!("/chat unblock {ip}"),
+                command: format!("/katban board unblock {ip}"),
                 complete: true,
             });
         }

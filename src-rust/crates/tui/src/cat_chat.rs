@@ -2,7 +2,7 @@
 //
 // Opened by `/chat` in the TUI: a compact popup for managing the guest chat
 // ("Cat Chat") links without leaving the conversation. Lists every guest link
-// from the live store (`~/.clawde/katban/links.json`) with its state, expiry,
+// from the live Cat Chat store (`~/.clawde/catchat/links.json`) with its state,
 // and device count, plus fixed rows to generate a new link (which prints a
 // fresh password once) and to list full details.
 //
@@ -12,9 +12,9 @@
 // prompt and let the user finish.
 //
 // This is the chat-focused sibling of the Alt+G Katban controls menu: that
-// menu stays Kanban-centric, this one owns the chat links.
+// menu stays development-centric, this one owns the Cat Chat links.
 
-use clawde_katban::guest;
+use clawde_katban::catchat::links as chat_links;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -72,7 +72,7 @@ fn section(title: &str) -> CatChatItem {
 /// Build the popup rows from the live guest store. Always includes the fixed
 /// action rows so the popup is never empty, even on a cold store.
 pub fn build_cat_chat_items() -> Vec<CatChatItem> {
-    let store = guest::load().unwrap_or_default();
+    let store = chat_links::load().unwrap_or_default();
     let now = now_secs();
     let mut items = vec![
         section("Guest links"),
@@ -106,7 +106,7 @@ pub fn build_cat_chat_items() -> Vec<CatChatItem> {
             None => "never expires".to_string(),
         };
         let devices = store.devices.get(&link.id).map(|d| d.len()).unwrap_or(0);
-        let live = guest::link_active(link, now);
+        let live = chat_links::link_active(link, now);
         items.push(CatChatItem {
             title: format!("{} — {}", link.name, link.id),
             subtitle: format!("{state} · {expiry} · {devices} devices"),

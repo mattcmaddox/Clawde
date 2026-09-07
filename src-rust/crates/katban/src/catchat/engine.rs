@@ -14,7 +14,7 @@
 //! - The guest voice defaults to the Cathead persona (same prompt text as the
 //!   TUI's `/cathead`), composed behind the fixed guest contract.
 
-use crate::search::{GuestSearch, SearchResult};
+use super::search::{GuestSearch, SearchResult};
 use clawde_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -112,7 +112,7 @@ impl FreeBackend {
         let result = match provider {
             Some(provider) => Ok(provider),
             None => Err(
-                "no free providers configured — add free-tier keys (e.g. /keys) to enable guest chat"
+                "no free providers configured — add free-tier keys (e.g. /keys) to enable Cat Chat"
                     .to_string(),
             ),
         };
