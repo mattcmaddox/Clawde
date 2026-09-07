@@ -81,7 +81,9 @@ async fn reload_model_via_url(base: &str, model: &str) -> Result<(), String> {
     let resp = client
         .post(format!("{}/api/generate", base))
         .json(&body)
-        .timeout(std::time::Duration::from_secs(45))
+        // A cold load of a 7B model measured >45s on the LAN GPU box
+        // (page cache cold); allow a full load cycle.
+        .timeout(std::time::Duration::from_secs(300))
         .send()
         .await
         .map_err(|e| format!("generate request failed: {e}"))?;
