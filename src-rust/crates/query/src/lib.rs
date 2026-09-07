@@ -3262,7 +3262,18 @@ pub async fn run_query_loop(
                     // Priority order:
                     //   1. Explicit --tool-model (user-controlled tiered routing)
                     //   2. Reactive auto-discovery on the same provider
-                    if config.force_no_tools {
+                    //
+                    // FreeProvider (provider_id_str == "free") handles tool-capable
+                    // model selection internally — its dispatch loop falls through
+                    // to tool-capable upstreams when the first one can't serve the
+                    // request. The reactive switch here calls
+                    // best_tool_capable_model_for_provider("free") which returns None
+                    // (free isn't a real provider in the model registry), so the
+                    // switch is a no-op for free mode. Skip it and let the free
+                    // provider handle the fallback.
+                    if provider_id_str == "free" {
+                        // FreeProvider handles tool-capable model selection internally.
+                    } else if config.force_no_tools {
                         // Dev flag: skip auto-switch to test system prompt rebuild path
                     } else if (!caps.tool_calling || model_is_unreliable)
                         && !tools.is_empty()
