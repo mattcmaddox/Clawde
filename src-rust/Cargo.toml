@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "tmp/clawde_ollama_probe",
     "crates/core",
     "crates/api",
     "crates/tools",

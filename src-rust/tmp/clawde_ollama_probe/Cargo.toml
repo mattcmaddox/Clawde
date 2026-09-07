@@ -1,0 +1,11 @@
+[package]
+name = "clawde_ollama_probe"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+clawde-api = { path = "../../crates/api" }
+clawde-core = { path = "../../crates/core" }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", features = ["json"] }
