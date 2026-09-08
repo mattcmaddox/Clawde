@@ -462,6 +462,18 @@ impl LlmProvider for OllamaNativeProvider {
                     }
 
                     if let Some(calls) = message_obj.get("tool_calls").and_then(Value::as_array) {
+                        // A thinking block must be closed and advanced past
+                        // before emitting tool blocks — qwen3's shape is
+                        // thinking deltas -> empty content -> tool_calls, and
+                        // reusing the thinking block's index for the ToolUse
+                        // start made the consumer's per-index registration drop
+                        // the tool call entirely (silent end_turn with no
+                        // executed tools).
+                        if thinking_block_open {
+                            yield Ok(StreamEvent::ContentBlockStop { index: block_index });
+                            block_index += 1;
+                            thinking_block_open = false;
+                        }
                         if text_block_open {
                             yield Ok(StreamEvent::ContentBlockStop { index: block_index });
                             block_index += 1;

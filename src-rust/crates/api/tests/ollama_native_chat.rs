@@ -10,6 +10,7 @@ mod common;
 use clawde_api::provider::LlmProvider;
 use clawde_api::provider_types::{ProviderRequest, StreamEvent};
 use clawde_api::providers::{OllamaNativeProvider, OpenAiCompatProvider};
+use clawde_core::types::ContentBlock;
 use common::mock_provider::{MockServer, RequestRecord, ScriptedResponse};
 use futures::StreamExt;
 
@@ -78,6 +79,46 @@ fn chat_stream_frames() -> Vec<String> {
             "message": {
                 "role": "assistant",
                 "content": "Listing",
+                "thinking": "need the dir"
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "list_files",
+                        "arguments": "{\"path\":\".\"}"
+                    }
+                }]
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 120,
+            "eval_count": 34
+        })
+        .to_string(),
+    ]
+}
+
+/// NDJSON stream frames reproducing qwen3's real shape: a thinking-only
+/// delta frame, then a tool_calls frame with EMPTY content (qwen3 emits no
+/// text between thinking and the call). The second frame must close the
+/// still-open thinking block before starting the ToolUse block, or the
+/// consumer's per-index registration drops the tool call entirely.
+fn chat_stream_frames_thinking_then_tool_call() -> Vec<String> {
+    vec![
+        serde_json::json!({
+            "model": "qwen3:8b",
+            "created_at": "2026-09-03T00:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": "",
                 "thinking": "need the dir"
             }
         })
@@ -270,6 +311,54 @@ async fn stream_decodes_thinking_text_and_tool_call() {
         "string arguments decode to JSON"
     );
     assert!(saw_stop, "final MessageDelta carries the stop reason");
+}
+
+#[tokio::test]
+async fn stream_tool_call_after_open_thinking_block_gets_distinct_index() {
+    let server = MockServer::new(vec![ScriptedResponse::Json {
+        status: 200,
+        reason: "OK",
+        body: chat_stream_frames_thinking_then_tool_call().join("\n") + "\n",
+    }]);
+    let mut stream = provider_for(&server.base_url)
+        .create_message_stream(sample_request(serde_json::Value::Null))
+        .await
+        .expect("stream opened");
+
+    let mut tool_json = String::new();
+    let mut tool_start_index: Option<usize> = None;
+    let mut thinking_index: Option<usize> = None;
+    let mut saw_thinking = false;
+    while let Some(event) = stream.next().await {
+        match event.expect("event") {
+            StreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => match content_block {
+                ContentBlock::ToolUse { id, name, .. } => {
+                    tool_start_index = Some(index);
+                    assert_eq!(name, "list_files");
+                    assert!(!id.is_empty());
+                }
+                ContentBlock::Thinking { .. } => thinking_index = Some(index),
+                _ => {}
+            },
+            StreamEvent::ThinkingDelta { .. } => saw_thinking = true,
+            StreamEvent::InputJsonDelta { partial_json, .. } => tool_json.push_str(&partial_json),
+            _ => {}
+        }
+    }
+    assert!(saw_thinking, "thinking delta must be forwarded");
+    let ti = thinking_index.expect("thinking block start");
+    let xi = tool_start_index.expect("tool block start after thinking");
+    assert_ne!(
+        ti, xi,
+        "ToolUse must not reuse the still-open thinking block's index"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&tool_json).unwrap()["path"],
+        "."
+    );
 }
 
 #[tokio::test]
