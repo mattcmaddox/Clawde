@@ -1685,6 +1685,51 @@ fn build_task_context(messages: &[Message], instruction: &Option<String>) -> Str
     lines.join("\n")
 }
 
+/// No-data watchdog for provider streams, per provider class.
+///
+/// Cloud APIs: a silent 45s window almost always means a transient gateway or
+/// proxy failure, and abort-and-retry is the right move.
+///
+/// Ollama is the user's own LAN box, and aborting a silent local server is
+/// actively harmful: the abort discards prefill progress and — with Ollama's
+/// default single-slot request queue — the re-sent request queues BEHIND the
+/// generation the server may still be running, so every 45s retry cycle adds
+/// server-side work and the request can never converge (observed as minutes of
+/// spinner on a healthy warm model). Give Ollama one patient window instead;
+/// the user can always Esc, and a wedged server surfaces as a clear error at
+/// the end of the window rather than a silent retry storm.
+pub(crate) fn stall_timeout_for(provider_id: &str) -> std::time::Duration {
+    if provider_id == clawde_core::provider_id::ProviderId::OLLAMA {
+        std::time::Duration::from_secs(600)
+    } else {
+        std::time::Duration::from_secs(45)
+    }
+}
+
+#[cfg(test)]
+mod stall_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn ollama_gets_patient_watchdog() {
+        assert_eq!(
+            stall_timeout_for(clawde_core::provider_id::ProviderId::OLLAMA),
+            std::time::Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn cloud_providers_keep_fast_watchdog() {
+        for id in ["anthropic", "openai", "google", "free"] {
+            assert_eq!(
+                stall_timeout_for(id),
+                std::time::Duration::from_secs(45),
+                "provider {id} must keep the 45s watchdog"
+            );
+        }
+    }
+}
+
 /// Run the agentic query loop.
 ///
 /// This sends the conversation to the API, handles tool calls in a loop, and
@@ -1695,6 +1740,43 @@ fn build_task_context(messages: &[Message], instruction: &Option<String>) -> Str
 /// appended as a plain user message between turns.  Callers that do not need
 /// command queuing may pass `None` or an empty `Vec`.
 pub async fn run_query_loop(
+    client: &clawde_api::AnthropicClient,
+    messages: &mut Vec<Message>,
+    tools: &[Box<dyn Tool>],
+    tool_ctx: &ToolContext,
+    config: &QueryConfig,
+    cost_tracker: Arc<CostTracker>,
+    event_tx: Option<mpsc::UnboundedSender<QueryEvent>>,
+    cancel_token: tokio_util::sync::CancellationToken,
+    pending_messages: Option<&mut Vec<String>>,
+) -> QueryOutcome {
+    let outcome = run_query_loop_inner(
+        client,
+        messages,
+        tools,
+        tool_ctx,
+        config,
+        cost_tracker,
+        event_tx,
+        cancel_token,
+        pending_messages,
+    )
+    .await;
+    // A cancelled turn that never reached the model leaves the user's message
+    // dangling as the last history entry. If the next prompt is appended
+    // as-is, the request carries two consecutive user messages and small
+    // local models (Ollama) answer the STALE one — the reported "new question
+    // got the old question's answer" bug. Close the dangling turn with an
+    // explicit interrupted marker so the model sees the question was
+    // abandoned. The TUI picks the marker up via its post-task message sync;
+    // headless/ACP callers read the same mutated Vec.
+    if matches!(outcome, QueryOutcome::Cancelled) && sanitize::mark_dangling_user_turn(messages) {
+        debug!("Appended interrupted-turn marker after cancelled dangling user turn");
+    }
+    outcome
+}
+
+async fn run_query_loop_inner(
     client: &clawde_api::AnthropicClient,
     messages: &mut Vec<Message>,
     tools: &[Box<dyn Tool>],
@@ -3595,7 +3677,7 @@ pub async fn run_query_loop(
                     let mut actual_model = model_id_str.clone();
 
                     use futures::StreamExt as ProviderStreamExt;
-                    let provider_stall_timeout = std::time::Duration::from_secs(45);
+                    let provider_stall_timeout = stall_timeout_for(&provider_id_str);
                     let provider_stall = tokio::time::sleep(provider_stall_timeout);
                     tokio::pin!(provider_stall);
                     let mut provider_stream_stalled = false;
@@ -3826,7 +3908,29 @@ pub async fn run_query_loop(
                         }
                     }
 
-                    // If the stream stalled (no data for 45s), retry.
+                    // If the stream stalled (no data for the provider's
+                    // watchdog window), react per provider class.
+                    if provider_stream_stalled
+                        && provider_id_str == clawde_core::provider_id::ProviderId::OLLAMA
+                    {
+                        // Never retry a silent local server: the abort discards
+                        // prefill progress and re-queues behind the generation
+                        // the server may still be running (see
+                        // `stall_timeout_for`). Fail loudly instead so the
+                        // wedged box is visible rather than silently retried.
+                        error!(
+                            provider = %provider_id_str,
+                            model = %model_id_str,
+                            timeout_secs = provider_stall_timeout.as_secs(),
+                            "Ollama stream stalled with no data — not retrying"
+                        );
+                        return QueryOutcome::Error(ClaudeError::Api(format!(
+                            "Ollama sent no data for {}s (model '{}'). The server may be stuck — \
+                             check `ollama ps` and the Ollama logs on the box.",
+                            provider_stall_timeout.as_secs(),
+                            model_id_str
+                        )));
+                    }
                     if provider_stream_stalled && retries_left > 0 {
                         retries_left -= 1;
                         request_retries += 1;

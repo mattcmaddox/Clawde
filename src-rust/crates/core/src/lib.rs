@@ -115,8 +115,9 @@ pub use key_ring::{KeyRing, KeyStatus};
 // Re-export commonly used types at the crate root
 pub use config::{
     builtin_managed_agent_presets, default_agents, is_ollama_network_blocked,
-    network_isolation_enabled, ollama_status, ollama_status_for_config, ollama_unload_models,
-    ollama_unload_models_for_config, set_ollama_network_blocked, spawn_ollama_unload,
+    network_isolation_enabled, ollama_ctx_mismatch_warning_for_config, ollama_status,
+    ollama_status_for_config, ollama_unload_models, ollama_unload_models_for_config,
+    set_ollama_network_blocked, spawn_ollama_preload_for_config, spawn_ollama_unload,
     spawn_ollama_unload_for_config, strip_jsonc_comments, substitute_env_vars, AcpServerConfig,
     AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig, GatewayConfig,
     ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OllamaLoadedModel,
@@ -1112,6 +1113,321 @@ pub mod config {
     pub fn spawn_ollama_unload() {
         let config = Settings::load_sync().unwrap_or_default().effective_config();
         spawn_ollama_unload_for_config(config, None);
+    }
+
+    /// Fire-and-forget: preload (load into VRAM) the given Ollama model at
+    /// the configured host.
+    ///
+    /// Complements the exit-unload contract: when sessions unload on exit
+    /// (user preference), every new session would otherwise pay the full
+    /// multi-minute model load on its first question — measured 3.5 minutes
+    /// on the reference setup. Preloading at startup moves that cost to
+    /// while the user is still typing. An empty-prompt `/api/generate` makes
+    /// the server load the model and return; the persisted `keep_alive`
+    /// (when set) rides on the request so residency matches what chat
+    /// requests establish. A persisted `keep_alive` of 0 skips the preload
+    /// entirely — see [`ollama_preload_should_skip`].
+    pub fn spawn_ollama_preload_for_config(config: Config, model: String) {
+        // Gate before spawning: keep_alive=0 (unload-after-request) makes any
+        // load self-defeating — the model is evicted the moment the preload
+        // generate returns — so don't schedule the work at all.
+        if ollama_preload_should_skip(config.provider_configs.get("ollama").map(|pc| &pc.options)) {
+            tracing::info!(
+                model = %model,
+                "ollama preload skipped: keep_alive=0 (unload after request)"
+            );
+            return;
+        }
+        let task = async move {
+            // A cold load can exceed the server's own OLLAMA_LOAD_TIMEOUT
+            // (measured: a 5m44s attempt against a 5m limit), so a single
+            // attempt loses that race and the model never becomes resident.
+            // Retry patiently: each failed attempt still reads the whole
+            // model blob, warming the OS file cache, so the next attempt is
+            // faster.
+            for attempt in 1..=3 {
+                match ollama_preload_model_for_config(&config, &model).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            model = %model,
+                            attempt,
+                            "ollama preload: model loaded and resident"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            model = %model,
+                            attempt,
+                            error = %e,
+                            "ollama preload attempt failed"
+                        );
+                        if attempt < 3 {
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        }
+                    }
+                }
+            }
+            tracing::info!(model = %model, "ollama preload: giving up after 3 attempts");
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(task);
+        } else {
+            let _ = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Runtime::new() else {
+                    return;
+                };
+                runtime.block_on(task);
+            });
+        }
+    }
+
+    /// Load `model` into VRAM at the configured Ollama host (preload).
+    ///
+    /// The ollama provider's persisted options map
+    /// (`provider_configs["ollama"].options`) supplies the memory-relevant
+    /// options so the loaded runner matches the first chat's shape — options
+    /// that affect memory usage are part of the server's runner key, and a
+    /// mismatch means Ollama re-creates the runner anyway:
+    ///
+    /// - `num_ctx` → `options.num_ctx`: preloading with the server-default
+    ///   context and then chatting with a pinned context (e.g. 32K on an
+    ///   8GB card) re-triggers the full multi-minute load.
+    /// - `keep_alive` → top-level field: residency follows the same knob
+    ///   chat requests set instead of silently falling back to the server
+    ///   default. A pinned `0` never reaches the wire — this function
+    ///   refuses, loud and early (see [`ollama_preload_should_skip`]).
+    pub async fn ollama_preload_model_for_config(
+        config: &Config,
+        model: &str,
+    ) -> Result<(), String> {
+        if ollama_preload_should_skip(config.provider_configs.get("ollama").map(|pc| &pc.options)) {
+            return Err(
+                "preload skipped: ollama keep_alive is 0 (unload after request)".to_string(),
+            );
+        }
+        let Some(base_url) = config.resolve_provider_api_base("ollama") else {
+            return Err("no Ollama host configured".to_string());
+        };
+        let client = reqwest::Client::new();
+        ollama_preload_model_at(
+            &client,
+            &base_url,
+            model,
+            config.provider_configs.get("ollama").map(|pc| &pc.options),
+        )
+        .await
+    }
+
+    /// Preload transport, kept separate from URL validation so it can be
+    /// tested against an ephemeral loopback server without routing loopback
+    /// through the remote-only host resolver (same pattern as unload).
+    async fn ollama_preload_model_at(
+        client: &reqwest::Client,
+        base_url: &str,
+        model: &str,
+        provider_options: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    ) -> Result<(), String> {
+        let url = format!("{}/api/generate", base_url.trim_end_matches('/'));
+        let mut body = serde_json::json!({
+            "model": model,
+            "prompt": "",
+            "stream": false,
+        });
+        if let Some(opts) = provider_options {
+            // `num_ctx` is the runner-shaping option that matters for load
+            // reuse; the shared parser canonicalizes the way the chat
+            // transport does so hand-edited settings values reach the wire
+            // as numbers.
+            if let Some(n) = provider_options.and_then(ollama_num_ctx_value) {
+                body["options"] = serde_json::json!({ "num_ctx": n });
+            }
+            // keep_alive rides top-level, exactly as /api/chat carries it,
+            // canonicalized to seconds ("5m" → 300). Unparseable values (e.g.
+            // "forever") are dropped — same omit-unless-canonical rule the
+            // chat transport applies via `native_options_value`.
+            if let Some(secs) = opts
+                .get("keep_alive")
+                .filter(|v| !v.is_null())
+                .and_then(ollama_keep_alive_value_to_secs)
+            {
+                body["keep_alive"] = serde_json::json!(secs);
+            }
+        }
+        let response = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("preload request failed: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("preload failed: HTTP {status}: {text}"));
+        }
+        // The response is the generate result (empty content for an empty
+        // prompt); a successful parse implies the model finished loading.
+        let _: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("preload response parse failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Parse a keep_alive wire value: an integer (seconds) or a Go-style
+    /// duration string ("5m", "1h", "1h30m", "90s") as accepted by Ollama.
+    /// Lives in core (re-exported by clawde-api's `ollama_options`) so the
+    /// preload/unload lifecycle and the chat transport share one parser.
+    pub fn ollama_keep_alive_value_to_secs(value: &serde_json::Value) -> Option<i64> {
+        match value {
+            serde_json::Value::Number(n) => n
+                .as_i64()
+                .or_else(|| n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64)),
+            serde_json::Value::String(s) => ollama_parse_keep_alive_str(s),
+            _ => None,
+        }
+    }
+
+    /// Parse a Go-style Ollama duration string ("5m", "1h30m", "90s") or a
+    /// bare integer into seconds. Negative values keep their sign (-1 =
+    /// keep forever).
+    pub fn ollama_parse_keep_alive_str(raw: &str) -> Option<i64> {
+        let s = raw.trim();
+        if s.is_empty() {
+            return None;
+        }
+        if let Ok(n) = s.parse::<i64>() {
+            return Some(n);
+        }
+        // Compound Go-style duration: one or more <n>{h,m,s} components.
+        let mut total: i64 = 0;
+        let mut rest = s;
+        while !rest.is_empty() {
+            let digits_end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if digits_end == 0 {
+                return None;
+            }
+            let n: i64 = rest[..digits_end].parse().ok()?;
+            rest = &rest[digits_end..];
+            let (multiplier, unit_len) = match rest.as_bytes().first() {
+                Some(b'h') => (3_600, 1),
+                Some(b'm') => (60, 1),
+                Some(b's') => (1, 1),
+                _ => return None,
+            };
+            total = total.checked_add(n.checked_mul(multiplier)?)?;
+            rest = &rest[unit_len..];
+        }
+        Some(total)
+    }
+
+    /// Preload skip decision for the ollama provider's persisted options.
+    ///
+    /// `keep_alive: 0` (unload-after-request) makes every preload
+    /// self-defeating: the model is loaded into VRAM only to be evicted the
+    /// moment the preload generate returns, and the next request reloads it.
+    /// When this returns `true` the caller must not preload at all. Any
+    /// other keep_alive value — unset (server default), a positive duration,
+    /// or forever — is preload-compatible.
+    pub fn ollama_preload_should_skip(
+        provider_options: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    ) -> bool {
+        provider_options
+            .and_then(|opts| opts.get("keep_alive"))
+            .filter(|v| !v.is_null())
+            .and_then(ollama_keep_alive_value_to_secs)
+            == Some(0)
+    }
+
+    /// Parse the persisted `num_ctx` option: an integer or a numeric string
+    /// ("16384"). `None` for unset, null, zero, or unparseable values — all
+    /// of which mean "the server default governs", i.e. nothing to compare
+    /// against a loaded runner. Shared by the preload body and the
+    /// startup context-mismatch check so both read the setting identically.
+    pub fn ollama_num_ctx_value(
+        provider_options: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Option<u64> {
+        let v = provider_options.get("num_ctx")?;
+        let n = v
+            .as_u64()
+            .or_else(|| {
+                v.as_f64()
+                    .filter(|f| *f >= 0.0 && f.fract() == 0.0)
+                    .map(|f| f as u64)
+            })
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
+        if n == 0 {
+            None
+        } else {
+            Some(n)
+        }
+    }
+
+    /// Startup consistency check: warn when Clawde's pinned `num_ctx`
+    /// disagrees with the context of a matching runner already loaded on the
+    /// Ollama box.
+    ///
+    /// Ollama keys runners on memory-affecting options, so a loaded runner at
+    /// a different context than the request's `num_ctx` forces a full
+    /// runner re-creation on the first chat — a multi-minute stall on a
+    /// cold GPU host. The check probes `/api/ps` once and returns a short
+    /// human-readable warning, or `None` when:
+    /// - Ollama is not the active provider / no `num_ctx` is pinned,
+    /// - the box is unreachable or the probe times out (startup must not
+    ///   block or nag on a probe failure),
+    /// - no runner for the session's model is loaded (nothing to compare),
+    /// - the server did not report `context_length` (older Ollama),
+    /// - the contexts agree.
+    pub async fn ollama_ctx_mismatch_warning_for_config(
+        config: &Config,
+        model: &str,
+    ) -> Option<String> {
+        let base_url = config.resolve_provider_api_base("ollama")?;
+        let requested_num_ctx = config
+            .provider_configs
+            .get("ollama")
+            .and_then(|pc| ollama_num_ctx_value(&pc.options))?;
+        let client = reqwest::Client::new();
+        // Hard bound: the transport has its own 3s timeout, and this outer
+        // budget guarantees startup waits at most ~4s even if the connection
+        // stalls. Any failure is silently dropped — warn-only by design.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            ollama_ctx_mismatch_at(&client, &base_url, requested_num_ctx, model),
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Mismatch-check transport, kept separate from URL validation so it can
+    /// be tested against an ephemeral loopback server without routing
+    /// loopback through the remote-only host resolver (same pattern as
+    /// preload/unload).
+    async fn ollama_ctx_mismatch_at(
+        client: &reqwest::Client,
+        base_url: &str,
+        requested_num_ctx: u64,
+        model: &str,
+    ) -> Option<String> {
+        let status = ollama_status_at(client, base_url).await.ok()?;
+        let bare = model.strip_prefix("ollama/").unwrap_or(model);
+        let loaded = status
+            .models
+            .iter()
+            .find(|m| model_ids_resolve_to_same_model(bare, &m.name))?;
+        let server_ctx = loaded.context_length.filter(|c| *c > 0)?;
+        if server_ctx == requested_num_ctx {
+            return None;
+        }
+        Some(format!(
+            "Ollama: runner '{}' is loaded with context {} but Clawde pins \
+             num_ctx={} — the next request reloads the model. Align num_ctx \
+             in settings or run /unload.",
+            loaded.name, server_ctx, requested_num_ctx
+        ))
     }
 
     /// Resolve the Ollama host URL from settings/env.
@@ -4111,10 +4427,11 @@ pub mod config {
                 let _ = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request);
                 assert!(request.starts_with("GET /api/ps "));
+                let body = serde_json::json!({"models": [{"name": "llama3:8b"}]}).to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    serde_json::json!({"models": [{"name": "llama3:8b"}]}).to_string().len(),
-                    serde_json::json!({"models": [{"name": "llama3:8b"}]}).to_string()
+                    body.len(),
+                    body
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
             });
@@ -4131,6 +4448,406 @@ pub mod config {
             assert!(server_result.is_ok());
             assert!(server_result.unwrap().is_ok());
             assert!(result.unwrap_err().contains("not currently loaded"));
+        }
+
+        #[tokio::test]
+        async fn ollama_preload_sends_empty_generate_without_options() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let n = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                assert!(request.starts_with("POST /api/generate "));
+                assert!(request.contains("\"model\":\"qwen2.5-coder:7b\""));
+                assert!(request.contains("\"prompt\":\"\""));
+                // No persisted options → no `options` object and no
+                // keep_alive pin: the server default governs residency.
+                assert!(!request.contains("keep_alive"));
+                assert!(!request.contains("num_ctx"));
+                let body = "{}".to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+
+            let client = reqwest::Client::new();
+            let result = ollama_preload_model_at(
+                &client,
+                &format!("http://{address}"),
+                "qwen2.5-coder:7b",
+                None,
+            )
+            .await;
+            let server_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+            assert!(server_result.is_ok());
+            assert!(server_result.unwrap().is_ok());
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn ollama_preload_forwards_num_ctx_and_keep_alive() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let n = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                assert!(request.starts_with("POST /api/generate "));
+                // The runner-shaping option must match the first chat's
+                // shape or Ollama re-creates the runner anyway.
+                assert!(request.contains("\"options\":{\"num_ctx\":32768}"));
+                // keep_alive rides top-level, canonicalized to seconds.
+                assert!(request.contains("\"keep_alive\":1800"));
+                let body = "{}".to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+
+            let mut options = std::collections::HashMap::new();
+            options.insert("num_ctx".to_string(), serde_json::json!(32768));
+            // A hand-edited duration string must be canonicalized like the
+            // chat transport canonicalizes it.
+            options.insert("keep_alive".to_string(), serde_json::json!("30m"));
+            let client = reqwest::Client::new();
+            let result = ollama_preload_model_at(
+                &client,
+                &format!("http://{address}"),
+                "qwen2.5-coder:7b",
+                Some(&options),
+            )
+            .await;
+            let server_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+            assert!(server_result.is_ok());
+            assert!(server_result.unwrap().is_ok());
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn ollama_preload_canonicalizes_string_num_ctx_and_drops_unparseable() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let n = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                // Numeric-string num_ctx is accepted (hand-edited settings).
+                assert!(request.contains("\"num_ctx\":4096"));
+                // An unparseable keep_alive ("forever") is dropped rather
+                // than sent raw — omit-unless-canonical, matching
+                // `native_options_value` on the chat path.
+                assert!(!request.contains("keep_alive"));
+                let body = "{}".to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+
+            let mut options = std::collections::HashMap::new();
+            options.insert("num_ctx".to_string(), serde_json::json!("4096"));
+            options.insert("keep_alive".to_string(), serde_json::json!("forever"));
+            let client = reqwest::Client::new();
+            let result = ollama_preload_model_at(
+                &client,
+                &format!("http://{address}"),
+                "qwen2.5-coder:7b",
+                Some(&options),
+            )
+            .await;
+            let server_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+            assert!(server_result.is_ok());
+            assert!(server_result.unwrap().is_ok());
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn ollama_preload_skip_decision() {
+            let opts = |pairs: &[(&str, serde_json::Value)]| {
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect::<std::collections::HashMap<String, serde_json::Value>>()
+            };
+            let zero = opts(&[("keep_alive", serde_json::json!(0))]);
+            let zero_str = opts(&[("keep_alive", serde_json::json!("0"))]);
+            let zero_dur = opts(&[("keep_alive", serde_json::json!("0m"))]);
+            let five_min = opts(&[("keep_alive", serde_json::json!("5m"))]);
+            let forever = opts(&[("keep_alive", serde_json::json!(-1))]);
+            let unparsable = opts(&[("keep_alive", serde_json::json!("forever"))]);
+            let other_keys = opts(&[("num_ctx", serde_json::json!(8192))]);
+
+            assert!(ollama_preload_should_skip(Some(&zero)));
+            assert!(ollama_preload_should_skip(Some(&zero_str)));
+            assert!(ollama_preload_should_skip(Some(&zero_dur)));
+            assert!(!ollama_preload_should_skip(Some(&five_min)));
+            assert!(!ollama_preload_should_skip(Some(&forever)));
+            // Unparsable / unset / unrelated options fall back to the server
+            // default residency, which is preload-compatible.
+            assert!(!ollama_preload_should_skip(Some(&unparsable)));
+            assert!(!ollama_preload_should_skip(Some(&other_keys)));
+            assert!(!ollama_preload_should_skip(None));
+        }
+
+        #[test]
+        fn ollama_preload_skip_reads_effective_config_options() {
+            // Top-level `providers["ollama"].options` (the documented write
+            // location) must gate the spawn too — the skip decision runs on
+            // the merged effective config, not just the nested one.
+            let mut settings = Settings::default();
+            let mut provider = crate::config::ProviderConfig::default();
+            provider
+                .options
+                .insert("keep_alive".to_string(), serde_json::json!(0));
+            settings.providers.insert("ollama".to_string(), provider);
+            let config = settings.effective_config();
+            let options = config.provider_configs.get("ollama").map(|pc| &pc.options);
+            assert!(ollama_preload_should_skip(options));
+        }
+
+        #[tokio::test]
+        async fn ollama_preload_model_for_config_refuses_keep_alive_zero() {
+            // The skip gate runs before host resolution, so the loopback
+            // api_base here is never contacted; the refusal is about the
+            // self-defeating load, not the endpoint.
+            let mut config = Config::default();
+            let provider = config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default();
+            provider.api_base = Some("http://192.0.2.1:11434".to_string());
+            provider
+                .options
+                .insert("keep_alive".to_string(), serde_json::json!(0));
+
+            let err = ollama_preload_model_for_config(&config, "qwen2.5-coder:7b")
+                .await
+                .unwrap_err();
+            assert!(err.contains("keep_alive is 0"), "unexpected error: {err}");
+        }
+
+        // ---- num_ctx parser + context-mismatch check -------------------------
+
+        #[test]
+        fn ollama_num_ctx_value_accepts_numbers_and_numeric_strings() {
+            let mut opts = std::collections::HashMap::new();
+            assert_eq!(ollama_num_ctx_value(&opts), None, "unset → server default");
+            opts.insert("num_ctx".to_string(), serde_json::json!(16384));
+            assert_eq!(ollama_num_ctx_value(&opts), Some(16_384));
+            opts.insert("num_ctx".to_string(), serde_json::json!("32768"));
+            assert_eq!(ollama_num_ctx_value(&opts), Some(32_768));
+            opts.insert("num_ctx".to_string(), serde_json::json!(16384.0));
+            assert_eq!(ollama_num_ctx_value(&opts), Some(16_384));
+            // Zero means "server default governs" — never a comparison target.
+            opts.insert("num_ctx".to_string(), serde_json::json!(0));
+            assert_eq!(ollama_num_ctx_value(&opts), None);
+            opts.insert("num_ctx".to_string(), serde_json::json!("auto"));
+            assert_eq!(ollama_num_ctx_value(&opts), None);
+            opts.insert("num_ctx".to_string(), serde_json::json!(null));
+            assert_eq!(ollama_num_ctx_value(&opts), None);
+        }
+
+        /// One-shot mock Ollama server answering a single GET /api/ps with
+        /// `models`. Returns the bound address.
+        async fn spawn_ps_mock(models: serde_json::Value) -> std::net::SocketAddr {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 8192];
+                let size = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(request.starts_with("GET /api/ps "));
+                let body = models.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            address
+        }
+
+        #[tokio::test]
+        async fn ollama_ctx_mismatch_warns_on_disagreement() {
+            let address = spawn_ps_mock(serde_json::json!({
+                "models": [{
+                    "name": "qwen2.5-coder:7b",
+                    "context_length": 4096
+                }]
+            }))
+            .await;
+            let client = reqwest::Client::new();
+            let warning = ollama_ctx_mismatch_at(
+                &client,
+                &format!("http://{address}"),
+                16_384,
+                "qwen2.5-coder:7b",
+            )
+            .await
+            .expect("mismatch must produce a warning");
+            assert!(warning.contains("4096"), "names server context: {warning}");
+            assert!(warning.contains("16384"), "names pinned context: {warning}");
+        }
+
+        #[tokio::test]
+        async fn ollama_ctx_mismatch_accepts_tag_variants_and_agreement() {
+            // Server reports the bare name; the session model carries a tag.
+            // (One mock per call: spawn_ps_mock answers a single connection.)
+            let address = spawn_ps_mock(serde_json::json!({
+                "models": [{
+                    "name": "qwen3:8b",
+                    "context_length": 16384
+                }]
+            }))
+            .await;
+            let client = reqwest::Client::new();
+            let base = format!("http://{address}");
+            assert_eq!(
+                ollama_ctx_mismatch_at(&client, &base, 16_384, "qwen3:8b:latest").await,
+                None,
+                "agreeing contexts (via tag-variant match) → no warning"
+            );
+
+            let address = spawn_ps_mock(serde_json::json!({
+                "models": [{
+                    "name": "qwen3:8b",
+                    "context_length": 16384
+                }]
+            }))
+            .await;
+            let base = format!("http://{address}");
+            assert!(
+                ollama_ctx_mismatch_at(&client, &base, 8_192, "qwen3:8b:latest")
+                    .await
+                    .is_some(),
+                "disagreeing contexts → warning"
+            );
+        }
+
+        #[tokio::test]
+        async fn ollama_ctx_mismatch_silent_when_no_runner_or_no_field() {
+            // Nothing loaded for the session model.
+            let address = spawn_ps_mock(serde_json::json!({
+                "models": [{"name": "llama3:8b", "context_length": 8192}]
+            }))
+            .await;
+            let client = reqwest::Client::new();
+            let base = format!("http://{address}");
+            assert_eq!(
+                ollama_ctx_mismatch_at(&client, &base, 16_384, "qwen2.5-coder:7b").await,
+                None,
+                "no matching runner → no warning"
+            );
+
+            // Runner loaded but server (older Ollama) omits context_length.
+            let address = spawn_ps_mock(serde_json::json!({
+                "models": [{"name": "qwen2.5-coder:7b"}]
+            }))
+            .await;
+            let base = format!("http://{address}");
+            assert_eq!(
+                ollama_ctx_mismatch_at(&client, &base, 16_384, "qwen2.5-coder:7b").await,
+                None,
+                "missing context_length → no warning"
+            );
+        }
+
+        #[tokio::test]
+        async fn ollama_ctx_mismatch_warning_for_config_requires_pinned_num_ctx() {
+            // No num_ctx pinned: the check must return None without any HTTP
+            // traffic (the unreachable api_base proves no request was made).
+            let mut config = Config::default();
+            {
+                let provider = config
+                    .provider_configs
+                    .entry("ollama".to_string())
+                    .or_default();
+                provider.api_base = Some("http://192.0.2.1:11434".to_string());
+            }
+            assert_eq!(
+                ollama_ctx_mismatch_warning_for_config(&config, "qwen2.5-coder:7b").await,
+                None
+            );
+
+            // Pinned num_ctx: the request fires, the unreachable host fails
+            // the probe, and the failure must stay silent (warn-only design).
+            {
+                let provider = config
+                    .provider_configs
+                    .get_mut("ollama")
+                    .expect("ollama config");
+                provider
+                    .options
+                    .insert("num_ctx".to_string(), serde_json::json!(16_384));
+            }
+            assert_eq!(
+                ollama_ctx_mismatch_warning_for_config(&config, "qwen2.5-coder:7b").await,
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn ollama_preload_reports_http_failures() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request).await.unwrap();
+                let body = "backend failed".to_string();
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+
+            let client = reqwest::Client::new();
+            let result = ollama_preload_model_at(
+                &client,
+                &format!("http://{address}"),
+                "qwen2.5-coder:7b",
+                None,
+            )
+            .await;
+            let server_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+            assert!(server_result.is_ok());
+            assert!(server_result.unwrap().is_ok());
+            assert!(result.unwrap_err().contains("HTTP 500"));
         }
 
         #[tokio::test]
@@ -4208,10 +4925,11 @@ pub mod config {
                 let _ = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request);
                 assert!(request.starts_with("GET /api/ps "));
+                let body = serde_json::json!({"models": []}).to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    serde_json::json!({"models": []}).to_string().len(),
-                    serde_json::json!({"models": []}).to_string()
+                    body.len(),
+                    body
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
             });

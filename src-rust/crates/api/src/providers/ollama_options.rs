@@ -20,6 +20,15 @@
 
 use serde_json::{json, Value};
 
+// The Go-style duration parser lives in clawde-core so the lifecycle
+// machinery (preload/unload) can read the persisted `keep_alive` without a
+// dependency on this crate (core has no clawde-api dependency). This module
+// re-exports it as the single user-facing conversion point.
+pub use clawde_core::config::{
+    ollama_keep_alive_value_to_secs as keep_alive_value_to_secs,
+    ollama_parse_keep_alive_str as parse_keep_alive_str,
+};
+
 // ---------------------------------------------------------------------------
 // Preset tables (single source for the TUI screens)
 // ---------------------------------------------------------------------------
@@ -115,49 +124,9 @@ pub const COMMON_OPTION_KEYS: &[&str] = &[
     "top_p",
 ];
 
-/// Parse a keep-alive value: an integer (seconds) or a Go-style duration
-/// string ("5m", "1h", "1h30m", "90s") as accepted by Ollama's wire format.
-pub fn keep_alive_value_to_secs(value: &Value) -> Option<i64> {
-    match value {
-        Value::Number(n) => n
-            .as_i64()
-            .or_else(|| n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64)),
-        Value::String(s) => parse_keep_alive_str(s),
-        _ => None,
-    }
-}
-
-fn parse_keep_alive_str(raw: &str) -> Option<i64> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if let Ok(n) = s.parse::<i64>() {
-        return Some(n);
-    }
-    // Compound Go-style duration: one or more <n>{h,m,s} components.
-    let mut total: i64 = 0;
-    let mut rest = s;
-    while !rest.is_empty() {
-        let digits_end = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        if digits_end == 0 {
-            return None;
-        }
-        let n: i64 = rest[..digits_end].parse().ok()?;
-        rest = &rest[digits_end..];
-        let (multiplier, unit_len) = match rest.as_bytes().first() {
-            Some(b'h') => (3_600, 1),
-            Some(b'm') => (60, 1),
-            Some(b's') => (1, 1),
-            _ => return None,
-        };
-        total = total.checked_add(n.checked_mul(multiplier)?)?;
-        rest = &rest[unit_len..];
-    }
-    Some(total)
-}
+// keep_alive parsing moved to `clawde_core::config` (re-exported above) so
+// the preload/unload lifecycle in core shares the exact same wire-format
+// semantics as the chat transport.
 
 /// Human label for a raw num_ctx value, or `"Ollama/model default"` when
 /// unset/zero.

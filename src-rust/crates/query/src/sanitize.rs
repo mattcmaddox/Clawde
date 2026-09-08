@@ -28,6 +28,38 @@ use clawde_core::types::{ContentBlock, Message, MessageContent, Role, ToolResult
 /// genuine result.
 const UNAVAILABLE_RESULT_MSG: &str = "[tool result unavailable]";
 
+/// Synthetic assistant turn appended when a query is cancelled before the
+/// model produced any output. Without it the cancelled question stays in the
+/// history as a dangling user turn; the next request then contains two
+/// consecutive user messages and small models answer the STALE one (or all of
+/// them in sequence), which surfaces as "my new question got the old
+/// question's answer".
+pub const INTERRUPTED_TURN_MARKER: &str = "[Request interrupted by user]";
+
+/// Close a cancelled turn whose user message never got an assistant reply.
+///
+/// If `messages` currently ends on a user message, append a synthetic
+/// [`INTERRUPTED_TURN_MARKER`] assistant message so the next dispatch reads:
+///
+/// `user <cancelled question>` / `assistant [Request interrupted by user]` /
+/// `user <new question>`.
+///
+/// The marker keeps the question in the transcript (the user did ask it) while
+/// telling the model the turn was abandoned — it must not be answered later.
+/// No-op (returns `false`) when the history already ends assistant-side: a
+/// partial streamed reply, a tool_use awaiting sanitize's synthesized result,
+/// or an earlier marker.
+///
+/// Idempotent by construction: after appending, the trailing message is an
+/// assistant message, so a second call appends nothing.
+pub fn mark_dangling_user_turn(messages: &mut Vec<Message>) -> bool {
+    let dangling = messages.last().is_some_and(|m| m.role == Role::User);
+    if dangling {
+        messages.push(Message::assistant(INTERRUPTED_TURN_MARKER));
+    }
+    dangling
+}
+
 /// Enforce the provider-API message invariants on `messages`, returning a
 /// repaired copy with balanced `tool_use` ↔ `tool_result` pairing.
 ///
@@ -526,5 +558,54 @@ mod tests {
     #[test]
     fn empty_history_is_noop() {
         assert!(sanitize_history(Vec::new()).is_empty());
+    }
+
+    /// A cancelled turn leaves the user's question dangling as the last
+    /// history entry. The marker must close it so the NEXT dispatch does not
+    /// carry two consecutive user messages (small models then answer the
+    /// stale one).
+    #[test]
+    fn dangling_user_turn_gets_interrupted_marker() {
+        let mut messages = vec![
+            Message::user("2 + 2"),
+            Message::assistant("2 + 2 equals 4."),
+            Message::user("why is the sky blue"), // cancelled before any output
+        ];
+
+        assert!(mark_dangling_user_turn(&mut messages));
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[3].role, Role::Assistant);
+        assert_eq!(messages[3].get_text(), Some(INTERRUPTED_TURN_MARKER));
+        // The repaired shape must also pass the pairing sanitizer untouched.
+        let out = sanitize_history(messages.clone());
+        assert_eq!(out.len(), 4);
+        assert_balanced(&out);
+    }
+
+    /// Idempotence: once the marker is in place the trailing message is
+    /// assistant-side, so a second call must not append another marker.
+    #[test]
+    fn mark_dangling_user_turn_is_idempotent() {
+        let mut messages = vec![Message::user("2 + 2")];
+        assert!(mark_dangling_user_turn(&mut messages));
+        assert!(!mark_dangling_user_turn(&mut messages));
+        assert_eq!(messages.len(), 2);
+    }
+
+    /// A turn that produced partial output (or a pending tool_use) ends
+    /// assistant-side — no marker is appended there.
+    #[test]
+    fn assistant_trailing_history_is_untouched() {
+        let mut partial = vec![Message::user("2 + 2"), Message::assistant("2 +")];
+        assert!(!mark_dangling_user_turn(&mut partial));
+        assert_eq!(partial.len(), 2);
+
+        let mut tool_turn = vec![
+            Message::user("list files"),
+            Message::assistant_blocks(vec![tool_use("t1")]),
+        ];
+        assert!(!mark_dangling_user_turn(&mut tool_turn));
+        assert_eq!(tool_turn.len(), 2);
     }
 }
