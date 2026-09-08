@@ -1,0 +1,34 @@
+# Gitleaks configuration for Clawde.
+#
+# Extends gitleaks' default rules with an allowlist for this repo's
+# intentionally fake test fixtures and doc placeholders. These literals trip
+# the generic-api-key rule but are not secrets (they live in unit tests that
+# exercise the auth-store / key-rotation plumbing).
+#
+# Policy: add entries only for obviously fake placeholders (word + digits).
+# Never allowlist a value that could authenticate anywhere. When the hook
+# blocks a commit, fix the leak or add an exact-literal entry here.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Clawde fake fixture keys and doc placeholders"
+regexes = [
+  # Test fixtures in auth-store / key-ring / provider tests.
+  '''zen-key-12345678''',
+  '''sk-ok-12345678''',
+  '''my-secret-key''',
+  '''test-groq-key-1234567890''',
+  '''nv-legacy-12345678''',
+  '''legacy-firecrawl-key-123456''',
+  '''gsk-stale-12345678''',
+  '''gsk-initial-12345678''',
+  '''gsk-existing-12345678''',
+  '''gsk-env-1234567890''',
+  '''fc-secret-key-123456789''',
+  '''AbC123dEf456GhIj789KLMnopQrstUvWxYz_ab''',
+  # Documentation placeholders.
+  '''YOUR_API_KEY''',
+  # Anthropic's public API beta header name (history only; not a secret).
+  '''ccr-triggers-2026-01-30''',
+]

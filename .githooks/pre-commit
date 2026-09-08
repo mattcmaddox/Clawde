@@ -2,6 +2,11 @@
 # Clawde pre-commit hook (enable once per clone: git config core.hooksPath .githooks).
 #
 # Fast, read-only checks that run before a commit is created:
+#   0. Secret scan (gitleaks, `gitleaks.toml` baseline) — blocks commits that
+#      introduce credentials in ANY staged file type. Scans the staged
+#      snapshot, not the whole history (CI/history stays covered by
+#      `gitleaks detect` runs and the baseline config). Self-skips when the
+#      binary is not on PATH; bypass via CLAWDE_HOOK_SKIP_GITLEAKS=1.
 #   1. rustfmt drift (`cargo fmt --all --check`) — instant.
 #   2. TUI test-target compile (`cargo check -p clawde-tui --tests`) — catches
 #      test-code compile breaks that plain `cargo check --workspace` skips
@@ -19,6 +24,8 @@
 #      configured; exit 2 (provider error / timeout) warns without blocking.
 #
 # Skip for a single commit:  SKIP_CLAWDE_HOOK=1 git commit ...
+# Skip the secret scan (gitleaks):
+#   CLAWDE_HOOK_SKIP_GITLEAKS=1 git commit ...
 # Skip only the slower cargo check + probe (keep the instant fmt check):
 #   CLAWDE_HOOK_SKIP_TESTS=1 git commit ...
 # Skip only the idle-CPU probe:
@@ -38,6 +45,34 @@ cd "$ROOT" || exit 0
 # (+N commit-count suffix, derived at build time in cli/build.rs). Source
 # keeps a clean X.Y.Z that only moves when a release is cut deliberately via
 # scripts/build.sh. Local builds are made unique by the +N suffix.
+
+# ---- Secret scan (gitleaks) ----------------------------------------------
+# Runs on every commit regardless of file type: keys leak through docs,
+# configs, and fixtures as easily as through source. `--staged` scans the
+# exact snapshot being committed (including new files), and `--redact`
+# keeps any finding out of hook output. Blocking by design — a secret that
+# reaches a commit reaches every future clone. If gitleaks is not installed,
+# skip with a one-time hint rather than nagging on every commit.
+if [ "${CLAWDE_HOOK_SKIP_GITLEAKS:-0}" = "1" ]; then
+    exit 0
+fi
+if command -v gitleaks >/dev/null 2>&1; then
+    if ! gitleaks protect --staged --config "$ROOT/gitleaks.toml" \
+        --no-banner --redact >/dev/null 2>&1; then
+        echo "pre-commit: gitleaks found a secret in the staged changes."
+        echo "  Inspect what tripped:  git diff --staged"
+        echo "  Re-scan with details:   gitleaks protect --staged --config gitleaks.toml -v"
+        echo "  Real secret?  Remove it, rotate the credential, then re-commit."
+        echo "  False positive? Add an exact-literal allowlist entry to gitleaks.toml"
+        echo "  (placeholders only — never a value that could authenticate anywhere)."
+        echo "  One-commit bypass: CLAWDE_HOOK_SKIP_GITLEAKS=1 git commit ..."
+        exit 1
+    fi
+elif [ -z "${CLAWDE_GITLEAKS_HINT_SHOWN:-}" ]; then
+    echo "pre-commit: gitleaks not found — secret scan skipped (install:"
+    echo "  https://github.com/gitleaks/gitleaks#installing) to enable check 0."
+    CLAWDE_GITLEAKS_HINT_SHOWN=1
+fi
 
 # Only relevant when Rust sources are staged.
 if ! git diff --cached --name-only | grep -q '^src-rust/.*\.rs$'; then

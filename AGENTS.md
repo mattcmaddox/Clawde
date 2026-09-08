@@ -111,7 +111,7 @@ cargo check -p clawde-tui --tests
 
 ### Pre-commit hook
 
-`.githooks/pre-commit` runs rustfmt + the TUI test-target check + an idle-CPU
+`.githooks/pre-commit` runs gitleaks + rustfmt + the TUI test-target check + an idle-CPU
 smoke probe (skipped when the debug binary is missing/stale) before commits
 (see the script header). Enable once per clone:
 
@@ -120,6 +120,13 @@ git config core.hooksPath .githooks
 ```
 
 Opt out of a single commit: `SKIP_CLAWDE_HOOK=1 git commit ...`
+Skip the secret scan only: `CLAWDE_HOOK_SKIP_GITLEAKS=1 git commit ...`
+
+The secret scan (check 0) blocks any commit staging credentials in any file
+type, via `gitleaks protect --staged` with the repo baseline `gitleaks.toml`
+(allowlists only obviously-fake fixture placeholders — add exact literals
+there for new false positives, never real values). Gitleaks is skipped with
+a hint when the binary is absent: <https://github.com/gitleaks/gitleaks#installing>.
 
 ### Parallel-safe tests (env mutations)
 
