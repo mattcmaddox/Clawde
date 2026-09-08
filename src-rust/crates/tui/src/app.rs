@@ -1363,6 +1363,16 @@ pub struct App {
     /// followup completion attribution.
     pub assistant_output_received: bool,
     pub status_message: Option<String>,
+    /// Whether the terminal window currently has input focus, as reported by
+    /// DECSET 1004 focus events (crossterm `Event::FocusGained`/`FocusLost`).
+    /// Starts `true` (focused) so a terminal that never sends focus events —
+    /// tmux without `focus-events on`, screen, older terminals — behaves as
+    /// today: no desktop notification on completion.
+    pub terminal_focused: bool,
+    /// the context-mismatch probe spawned when the connect dialog saves).
+    /// Drained non-blockingly each loop iteration; `None` when no check has
+    /// been spawned yet.
+    pub ctx_warning_rx: Option<tokio::sync::mpsc::Receiver<String>>,
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
     pub spinner_verb: Option<String>,
     pub should_exit: bool,
@@ -2187,6 +2197,8 @@ impl App {
             compact_cancel_requested: false,
             stream_paused: false,
             stream_cancel_requested: false,
+            ctx_warning_rx: None,
+            terminal_focused: true,
             input: String::new(),
             prompt_input: PromptInputState::new(),
             input_history: Vec::new(),
@@ -3528,6 +3540,33 @@ impl App {
                 .insert("ollama".to_string(), saved.clone());
         }
         self.auth_store.reload();
+        // Warm the GPU box now: with unload-on-exit, every session starts
+        // cold, so start the (potentially multi-minute) model load right
+        // away instead of on the user's first question.
+        if !model.is_empty() {
+            clawde_core::spawn_ollama_preload_for_config(self.config.clone(), model.to_string());
+            // Bounded (<=4s) warn-only probe: a runner already loaded at a
+            // different context than the pinned num_ctx would be re-created
+            // by the first chat. The dialog just closed, so surfacing this
+            // as a status message is timely and non-disruptive.
+            let ctx_config = self.config.clone();
+            let ctx_model = model.to_string();
+            let (ctx_warning_tx, ctx_warning_rx) = tokio::sync::mpsc::channel::<String>(1);
+            self.ctx_warning_rx = Some(ctx_warning_rx);
+            tokio::spawn(async move {
+                if let Some(warning) =
+                    clawde_core::ollama_ctx_mismatch_warning_for_config(&ctx_config, &ctx_model)
+                        .await
+                {
+                    tracing::warn!(
+                        model = %ctx_model,
+                        warning = %warning,
+                        "ollama context mismatch"
+                    );
+                    ctx_warning_tx.send(warning).await.ok();
+                }
+            });
+        }
         Ok(())
     }
 

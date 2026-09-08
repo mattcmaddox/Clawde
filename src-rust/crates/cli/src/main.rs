@@ -124,6 +124,42 @@ fn outcome_notification_class(
     }
 }
 
+/// Whether a turn-end desktop notification should fire: the existing
+/// `notifications` setting (default true) master-gates it, and the window
+/// must currently be unfocused — while the user is watching, the TUI toast
+/// is enough.
+fn notify_on_unfocused_turn_end(app: &clawde_tui::App) -> bool {
+    !app.terminal_focused
+        && clawde_core::config::Settings::load_sync()
+            .map(|s| s.notifications)
+            .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod notify_gate_tests {
+    use super::*;
+    use clawde_tui::App;
+
+    #[test]
+    fn focused_window_never_notifies() {
+        let mut app = App::new(clawde_core::Config::default(), Default::default());
+        app.terminal_focused = true;
+        assert!(!notify_on_unfocused_turn_end(&app));
+    }
+
+    #[test]
+    fn unfocused_window_notifies_when_setting_default() {
+        let mut app = App::new(clawde_core::Config::default(), Default::default());
+        app.terminal_focused = false;
+        // Settings on this machine gate the positive path; the invariant
+        // under test is the focus condition.
+        let setting_allows = clawde_core::config::Settings::load_sync()
+            .map(|s| s.notifications)
+            .unwrap_or(true);
+        assert_eq!(notify_on_unfocused_turn_end(&app), setting_allows);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CLI argument definition (matches TypeScript main.tsx flags)
 // ---------------------------------------------------------------------------
@@ -3740,6 +3776,39 @@ async fn run_interactive(
     // Start the embedded ACP TCP server if enabled in settings.
     let _acp_cancel = clawde_acp::start_embedded_acp_server(&settings.acp_server);
 
+    // Preload the Ollama model in the background so the session's first
+    // question does not pay the multi-minute model load. Complements the
+    // unload-on-exit contract: VRAM is wiped at exit by user preference, so
+    // the load cost lands here — while the user is still typing — instead of
+    // after Enter.
+    // Warnings from the async Ollama startup checks surface through this
+    // channel once they resolve; the TUI loop drains it non-blockingly.
+    let (ctx_warning_tx, mut ctx_warning_rx) = tokio::sync::mpsc::channel::<String>(1);
+    if app.config.selected_provider_id() == "ollama" {
+        let bare = app
+            .model_name
+            .strip_prefix("ollama/")
+            .unwrap_or(&app.model_name)
+            .to_string();
+        if !bare.is_empty() {
+            clawde_core::spawn_ollama_preload_for_config(app.config.clone(), bare.clone());
+        }
+        // Warn (never block) when a runner already loaded on the box has a
+        // different context than the pinned num_ctx — Ollama would re-create
+        // the runner on the first chat, a multi-minute stall the user can
+        // avoid by aligning the setting or unloading first.
+        let ctx_config = app.config.clone();
+        let ctx_model = bare.clone();
+        tokio::spawn(async move {
+            if let Some(warning) =
+                clawde_core::ollama_ctx_mismatch_warning_for_config(&ctx_config, &ctx_model).await
+            {
+                tracing::warn!(model = %ctx_model, warning = %warning, "ollama context mismatch");
+                ctx_warning_tx.send(warning).await.ok();
+            }
+        });
+    }
+
     // Gate input shift-normalization on whether the terminal speaks the kitty
     // keyboard protocol (detected in setup_terminal). On terminals that don't —
     // Windows conhost / CMD / legacy PowerShell, etc. — printable keys already
@@ -4289,6 +4358,22 @@ async fn run_interactive(
     }
 
     'main: loop {
+        // Non-blocking pickup of late-arriving Ollama startup warnings (e.g.
+        // the context-mismatch probe). Shown once, without displacing a
+        // message already on screen. Covers both the CLI-startup probe and
+        // probes spawned later by the Ollama connect dialog.
+        if let Ok(warning) = ctx_warning_rx.try_recv() {
+            if app.status_message.is_none() {
+                app.status_message = Some(warning);
+            }
+        }
+        if let Some(rx) = app.ctx_warning_rx.as_mut() {
+            if let Ok(warning) = rx.try_recv() {
+                if app.status_message.is_none() {
+                    app.status_message = Some(warning);
+                }
+            }
+        }
         // Check for SIGTERM (kill from outside the process) on every iteration,
         // NOT only when a key event arrives — otherwise an idle session ignores
         // `kill` until the user presses a key and can never be stopped cleanly.
@@ -6037,10 +6122,15 @@ async fn run_interactive(
                 Event::Mouse(mouse) => {
                     app.handle_mouse_event(mouse);
                 }
+                Event::FocusGained => {
+                    app.terminal_focused = true;
+                }
+                Event::FocusLost => {
+                    app.terminal_focused = false;
+                }
                 Event::Resize(_, _) => {
                     // Terminal resize - will be handled on next draw
                 }
-                _ => {}
             }
         } else {
             // Idle poll ticked with no event: a held chord-prefix key (e.g.
@@ -7329,11 +7419,12 @@ async fn run_interactive(
         if task_finished {
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
-                if let Ok(QueryOutcome::Error(err)) = handle.await {
+                let query_outcome = handle.await;
+                if let Ok(QueryOutcome::Error(err)) = &query_outcome {
                     while app.notifications.current_is_error() {
                         app.notifications.dismiss_current();
                     }
-                    let (kind, duration) = outcome_notification_class(&err);
+                    let (kind, duration) = outcome_notification_class(err);
                     app.notifications.push(kind, err.to_string(), duration);
                 }
                 // Sync the updated conversation back to our local vector
@@ -7360,6 +7451,19 @@ async fn run_interactive(
                 // The query task has fully unwound — re-enable normal event
                 // handling after a second-Esc cancel.
                 app.stream_cancel_requested = false;
+                // Desktop notification when the window is not focused (the
+                // user has switched away and can't see the spinner stop).
+                // Master gate is the existing `notifications` setting; error
+                // outcomes already surfaced a toast above and Cancelled is
+                // not a completion, so notify only on success paths.
+                if notify_on_unfocused_turn_end(&app)
+                    && !matches!(
+                        query_outcome,
+                        Ok(QueryOutcome::Error(_)) | Ok(QueryOutcome::Cancelled) | Err(_)
+                    )
+                {
+                    clawde_tui::emit_desktop_notification("Clawde: task complete");
+                }
                 // Drain one queued message into the prompt and request an
                 // auto-submit on the next loop iteration (issue #149).
                 if let Some(next) = app.queued_messages.pop_front() {
@@ -7748,6 +7852,10 @@ async fn run_interactive(
     // the session's own model is targeted (never every model on a shared
     // server). Uses the live app config so /ollama host/model edits made this
     // session are respected.
+    //
+    // Unconditional by user preference: releasing the model on exit keeps the
+    // remote GPU box free for other work, at the cost of a full model load on
+    // the next session's first question (measured 3.5min cold on this setup).
     if let Some(model) = exit_ollama_model_target(&app.config, &app.model_name) {
         match tokio::time::timeout(
             std::time::Duration::from_secs(8),
@@ -9244,7 +9352,6 @@ mod exit_ollama_unload_tests {
 mod query_task_message_sync_tests {
     use super::*;
     use clawde_tui::app::App;
-    use std::sync::Arc;
 
     /// After an Esc-cancel (or any in-flight cancel) the query task unwinds
     /// and writes its partial messages into msgs_arc. The CLI loop must push
