@@ -314,6 +314,36 @@ fn missing_file_call() -> ScriptedTurn {
 
 /// Strip volatile fields (response/event ids, timestamps) so a golden
 /// comparison pins the deterministic event stream.
+/// Windows resolves a leading-`/` tool path against the current drive, so the
+/// Read tool's error echoes e.g. `D:/nonexistent/...` where the fixture says
+/// `/nonexistent/...`. Strip any single drive-letter prefix so the golden
+/// transcript comparison is platform-neutral (no-op elsewhere).
+fn normalize_drive_paths(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            let bytes = s.as_bytes();
+            if bytes.len() > 2
+                && bytes[1] == b':'
+                && bytes[2] == b'/'
+                && bytes[0].is_ascii_alphabetic()
+            {
+                *s = s[2..].to_string();
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_drive_paths(item);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                normalize_drive_paths(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn strip_volatile(ev: &Value) -> Value {
     let mut ev = ev.clone();
     if let Value::Object(map) = &mut ev {
@@ -324,6 +354,7 @@ fn strip_volatile(ev: &Value) -> Value {
             resp.remove("created_at");
         }
     }
+    normalize_drive_paths(&mut ev);
     ev
 }
 
