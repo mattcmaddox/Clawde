@@ -170,7 +170,7 @@ clawde --version
 A successful installation prints the version string, for example:
 
 ```
-clawde 0.3.1
+clawde 0.3.2
 ```
 
 To confirm the binary is the one you installed:

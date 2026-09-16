@@ -755,7 +755,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clawde-acp"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-api"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-bridge"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-buddy"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-commands"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-gateway"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-katban"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-mcp"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-plugins"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-query"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-tools"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-tui"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "clawde_ollama_probe"
-version = "0.0.0"
+version = "0.3.2"
 dependencies = [
  "clawde-api",
  "clawde-core",
