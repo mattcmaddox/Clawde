@@ -5478,18 +5478,23 @@ impl App {
             // cadence while paused so it stays live.
             || self.stream_paused
             || self.effort_picker.wants_animation()
+            // Permission and question dialogs use the animated snowflake
+            // spinner while the model is waiting for the user's response.
+            || self.permission_request.is_some()
+            || self.ask_user_dialog.visible
+            || self.mcp_approval.visible
+            || self.elicitation.visible
             // A held chord-prefix key (Tab) waits for a follow-up keystroke
             // within a short window; poll fast so the timeout fires promptly
             // instead of up to 250 ms late.
             || self.keybindings.has_pending_chord()
         // Intentionally NOT including `any_modal_open()` here.  Most modals
         // are static forms (onboarding, settings, connect, model picker, …)
-        // that don't need 60fps.  The effort picker is the one exception and
-        // already has its own `wants_animation()` guard that only fires for
-        // Max/Ultracode.  Including all modals forced the idle-CPU probe to
-        // fail on any first-run session (onboarding modal open → 16ms poll →
-        // ~15% CPU burn), because the probe launches a bare binary that hits
-        // the onboarding dialog before a config exists.
+        // that don't need 60fps.  Only the dialogs with animated status
+        // indicators are listed above. Including all modals forced the
+        // idle-CPU probe to fail on any first-run session (onboarding modal
+        // open → 16ms poll → ~15% CPU burn), because the probe launches a
+        // bare binary that hits the onboarding dialog before a config exists.
     }
 
     fn dismiss_error_notifications(&mut self) {
@@ -13490,6 +13495,13 @@ mod tests {
         let mut app = make_app();
         app.model_picker.visible = true;
         assert!(!app.needs_fast_repaint());
+    }
+
+    #[test]
+    fn attention_dialog_needs_fast_repaint() {
+        let mut app = make_app();
+        app.ask_user_dialog.visible = true;
+        assert!(app.needs_fast_repaint());
     }
 
     #[test]

@@ -3277,6 +3277,26 @@ async fn run_headless(
                 });
                 println!("{}", out);
             }
+            QueryOutcome::MaxTokens {
+                partial_message,
+                usage,
+            } => {
+                let out = serde_json::json!({
+                    "type": "result",
+                    "result": partial_message.get_all_text(),
+                    "incomplete": true,
+                    "stop_reason": "max_tokens",
+                    "usage": {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    },
+                    "cost_usd": cost_tracker.total_cost_usd(),
+                    "status": status_messages,
+                });
+                println!("{}", out);
+            }
             QueryOutcome::Error(e) => {
                 let out = serde_json::json!({ "type": "error", "error": e.to_string() });
                 eprintln!("{}", out);
@@ -3303,6 +3323,23 @@ async fn run_headless(
                         "model": turn_observability.as_ref().map(|o| o.model.clone()),
                         "retries": turn_observability.as_ref().map(|o| o.retries),
                         "fallback_used": turn_observability.as_ref().map(|o| o.fallback_used),
+                    });
+                    println!("{}", out);
+                }
+                QueryOutcome::MaxTokens {
+                    partial_message,
+                    usage,
+                } => {
+                    let out = serde_json::json!({
+                        "type": "result",
+                        "result": partial_message.get_all_text(),
+                        "incomplete": true,
+                        "stop_reason": "max_tokens",
+                        "usage": {
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                        },
+                        "cost_usd": cost_tracker.total_cost_usd(),
                     });
                     println!("{}", out);
                 }
@@ -3341,6 +3378,14 @@ async fn run_headless(
                 eprintln!("{}", summary);
             }
             match outcome {
+                QueryOutcome::MaxTokens {
+                    partial_message, ..
+                } => {
+                    if full_text.is_empty() {
+                        println!("{}", partial_message.get_all_text());
+                    }
+                    eprintln!("Output token limit reached; partial work was preserved.");
+                }
                 QueryOutcome::Error(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);

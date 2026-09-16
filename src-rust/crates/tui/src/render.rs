@@ -85,9 +85,19 @@ const SPINNER: &[char] = &[
 
 // Attention-grabbing snowflake spinner, used when a modal dialog needs
 // the user's response (permission requests, AskUser questions, etc.).
-// Deliberately more eye-catching than the subtle braille dots.
+// These frames mirror Claurst's forward-and-reverse pulse sequence.
+// Frame glyphs must all be text-presentation: U+2733 (✳) is excluded because
+// terminals with an emoji font render it as color-emoji with a filled cell
+// background, which flashes as a solid block twice per cycle.
+#[cfg(target_os = "windows")]
 const SPINNER_SNOWFLAKE: &[char] = &[
-    '\u{00b7}', '\u{2722}', '\u{273b}', '\u{273d}', '\u{273d}', '\u{273b}', '\u{2722}', '\u{00b7}',
+    '\u{00b7}', '\u{2722}', '*', '\u{2736}', '\u{273b}', '\u{273d}', '\u{273d}', '\u{273b}',
+    '\u{2736}', '*', '\u{2722}', '\u{00b7}',
+];
+#[cfg(not(target_os = "windows"))]
+const SPINNER_SNOWFLAKE: &[char] = &[
+    '\u{00b7}', '\u{2722}', '\u{273b}', '\u{2736}', '\u{273b}', '\u{273d}', '\u{273d}', '\u{273b}',
+    '\u{2736}', '\u{273b}', '\u{2722}', '\u{00b7}',
 ];
 const CLAUDE_ORANGE: Color = crate::app::ACCENT_BUILD;
 const WELCOME_BOX_HEIGHT: u16 = 12;
@@ -3591,8 +3601,11 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         let rate = if needs_attention { 1 } else { 3 };
         let spinner = spinner_set[((app.frame_count as usize) / rate) % spinner_set.len()];
 
+        // Both spinner sets share the same ` glyph␣label` layout so the
+        // glyph and text columns stay put when switching between normal
+        // streaming (braille) and attention dialogs (snowflake).
         let mut s = vec![Span::styled(
-            spinner.to_string(),
+            format!(" {spinner}"),
             Style::default()
                 .fg(spinner_color(app))
                 .add_modifier(Modifier::BOLD),
@@ -6000,6 +6013,58 @@ mod status_row_badge_tests {
             "'PLAN' mode badge should appear. Output: {:?}",
             out
         );
+    }
+
+    #[test]
+    fn attention_dialog_shows_snowflake_with_trailing_space_and_animation() {
+        // Snowflake rendering invariants during attention dialogs:
+        //   1. the glyph renders (the dialog forces fast repaint, so
+        //      frame_count advances — see app.rs needs_fast_repaint),
+        //   2. there is a space between the glyph and the verb
+        //      (rendered as a separate Span so it can't be trimmed),
+        //   3. the frame advances: two different frame_counts produce two
+        //      different snowflake glyphs (12-frame pulse sequence).
+        let glyph_of = |frame: u64| {
+            let mut app = App::new(Config::default(), CostTracker::new());
+            app.is_streaming = true;
+            // Attention state picks the snowflake set; the status message
+            // (instead of the modal itself) keeps the status row visible —
+            // the Question modal overlays it in an 80x24 TestBackend.
+            app.ask_user_dialog.visible = true;
+            app.status_message = Some("Meowing".to_string());
+            app.frame_count = frame;
+            let out = render_screen(&app);
+            // Locate the snowflake: the glyph immediately followed by
+            // " Meowing" (space comes from the separate raw Span).
+            let mut found = None;
+            for (i, ch) in out.char_indices() {
+                if SPINNER_SNOWFLAKE.contains(&ch) {
+                    let rest: String = out[i..].chars().skip(1).take(10).collect();
+                    if rest.starts_with(" Meowing") {
+                        found = Some(ch);
+                        break;
+                    }
+                }
+            }
+            found.unwrap_or_else(|| {
+                panic!(
+                    "snowflake glyph followed by ' Meowing' not found. Output: {:?}",
+                    out
+                )
+            })
+        };
+
+        let g0 = glyph_of(0);
+        // Frame 0 → first glyph; frame 1 → second glyph (rate = 1 for
+        // attention dialogs). Different frames MUST yield different glyphs,
+        // proving the sequence animates.
+        assert_ne!(
+            g0,
+            glyph_of(1),
+            "snowflake must advance every frame during attention dialogs"
+        );
+        // And it pulses: frame 12 wraps back to the first glyph.
+        assert_eq!(g0, glyph_of(12), "12-frame sequence must wrap");
     }
 
     #[test]
