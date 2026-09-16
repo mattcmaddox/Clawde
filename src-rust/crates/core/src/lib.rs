@@ -1095,16 +1095,7 @@ pub mod config {
                 }
             }
         };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(task);
-        } else {
-            let _ = std::thread::spawn(move || {
-                let Ok(runtime) = tokio::runtime::Runtime::new() else {
-                    return;
-                };
-                runtime.block_on(task);
-            });
-        }
+        spawn_task_or_dedicated_thread(task);
     }
 
     /// Fire-and-forget unload using the persisted effective configuration.
@@ -1127,6 +1118,28 @@ pub mod config {
     /// (when set) rides on the request so residency matches what chat
     /// requests establish. A persisted `keep_alive` of 0 skips the preload
     /// entirely — see [`ollama_preload_should_skip`].
+    /// Spawn a fire-and-forget task on the current tokio runtime when one is
+    /// running, else on a dedicated thread with its own single-purpose
+    /// runtime. Fire-and-forget helpers in this crate are callable from both
+    /// async contexts (the TUI/REPL event loop) and sync contexts (tests,
+    /// startup hooks); a bare `tokio::spawn` panics in the latter, so every
+    /// such spawn must go through here.
+    fn spawn_task_or_dedicated_thread<F>(task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(task);
+        } else {
+            let _ = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Runtime::new() else {
+                    return;
+                };
+                runtime.block_on(task);
+            });
+        }
+    }
+
     pub fn spawn_ollama_preload_for_config(config: Config, model: String) {
         // Gate before spawning: keep_alive=0 (unload-after-request) makes any
         // load self-defeating — the model is evicted the moment the preload
@@ -1170,16 +1183,7 @@ pub mod config {
             }
             tracing::info!(model = %model, "ollama preload: giving up after 3 attempts");
         };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(task);
-        } else {
-            let _ = std::thread::spawn(move || {
-                let Ok(runtime) = tokio::runtime::Runtime::new() else {
-                    return;
-                };
-                runtime.block_on(task);
-            });
-        }
+        spawn_task_or_dedicated_thread(task);
     }
 
     /// Load `model` into VRAM at the configured Ollama host (preload).
@@ -1400,6 +1404,29 @@ pub mod config {
         .await
         .ok()
         .flatten()
+    }
+
+    /// Fire-and-forget context-mismatch probe after an Ollama config persist.
+    /// Runs `ollama_ctx_mismatch_warning_for_config` and forwards a warning
+    /// (if any) into `tx`. Spawned via [`Self::spawn_task_or_dedicated_thread`]
+    /// so sync callers — including tests without a tokio reactor — never hit
+    /// `tokio::spawn`'s "no reactor running" panic.
+    pub fn spawn_ollama_ctx_mismatch_probe(
+        config: Config,
+        model: String,
+        tx: tokio::sync::mpsc::Sender<String>,
+    ) {
+        let task = async move {
+            if let Some(warning) = ollama_ctx_mismatch_warning_for_config(&config, &model).await {
+                tracing::warn!(
+                    model = %model,
+                    warning = %warning,
+                    "ollama context mismatch"
+                );
+                tx.send(warning).await.ok();
+            }
+        };
+        spawn_task_or_dedicated_thread(task);
     }
 
     /// Mismatch-check transport, kept separate from URL validation so it can

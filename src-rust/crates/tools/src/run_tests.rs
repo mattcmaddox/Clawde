@@ -54,6 +54,11 @@ fn is_network_isolated(ctx: &ToolContext) -> bool {
     clawde_core::network_isolation_enabled(&ctx.config)
 }
 
+// Linux-only: both variants are constructed and matched only inside
+// `#[cfg(target_os = "linux")]` blocks (probe + execution), so on other
+// platforms the enum does not exist at all rather than sitting around as
+// dead code that fails `-D warnings` builds.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 enum NetworkIsolationBackend {
     Bubblewrap(std::path::PathBuf),
@@ -66,34 +71,32 @@ enum NetworkIsolationBackend {
 /// denied to unprivileged processes. The probe must agree with execution so we
 /// never report a sandbox as available and then silently fall through to an
 /// unsandboxed command.
+#[cfg(target_os = "linux")]
 fn network_isolation_backend() -> Option<NetworkIsolationBackend> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(bwrap) = which::which("bwrap") {
-            let usable = std::process::Command::new(&bwrap)
-                .args([
-                    "--die-with-parent",
-                    "--unshare-net",
-                    "--ro-bind",
-                    "/",
-                    "/",
-                    "--",
-                    "true",
-                ])
-                .status()
-                .is_ok_and(|status| status.success());
-            if usable {
-                return Some(NetworkIsolationBackend::Bubblewrap(bwrap));
-            }
+    if let Ok(bwrap) = which::which("bwrap") {
+        let usable = std::process::Command::new(&bwrap)
+            .args([
+                "--die-with-parent",
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "--",
+                "true",
+            ])
+            .status()
+            .is_ok_and(|status| status.success());
+        if usable {
+            return Some(NetworkIsolationBackend::Bubblewrap(bwrap));
         }
-        if let Ok(unshare) = which::which("unshare") {
-            let usable = std::process::Command::new(&unshare)
-                .args(["--net", "--", "true"])
-                .status()
-                .is_ok_and(|status| status.success());
-            if usable {
-                return Some(NetworkIsolationBackend::Unshare(unshare));
-            }
+    }
+    if let Ok(unshare) = which::which("unshare") {
+        let usable = std::process::Command::new(&unshare)
+            .args(["--net", "--", "true"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if usable {
+            return Some(NetworkIsolationBackend::Unshare(unshare));
         }
     }
     None
@@ -102,8 +105,18 @@ fn network_isolation_backend() -> Option<NetworkIsolationBackend> {
 /// Whether this host has a supported, usable network namespace backend.
 /// Isolated test execution fails closed when neither backend is usable;
 /// silently falling back to the host network would defeat Ollama isolation.
+/// Linux-only because both backends are Linux namespace features — on any
+/// other platform this reports unavailable (isolated execution then fails
+/// closed with the platform message, never silently using host network).
+#[cfg(target_os = "linux")]
 pub fn network_isolation_available() -> bool {
     network_isolation_backend().is_some()
+}
+
+/// Non-Linux counterpart: always unavailable (no namespace backends exist).
+#[cfg(not(target_os = "linux"))]
+pub fn network_isolation_available() -> bool {
+    false
 }
 
 /// Split a shell-style command line into program + args, honouring single

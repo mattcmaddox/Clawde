@@ -725,7 +725,14 @@ pub fn board_lock_path(project: &str) -> PathBuf {
 /// `flock` has no portable std equivalent, so the guard is still held (and
 /// serializing within a process) but does not advise other processes.
 pub struct BoardLock {
+    /// Held flock on Unix. On other platforms the guard is in-process only
+    /// (see the type docs), so this field does not exist there — the type
+    /// `nix::fcntl::Flock` is Unix-only and must not be named outside a
+    /// `#[cfg(unix)]` item.
+    #[cfg(unix)]
     _guard: Option<nix::fcntl::Flock<std::fs::File>>,
+    #[cfg(not(unix))]
+    _guard: (),
 }
 
 impl BoardLock {
@@ -745,7 +752,7 @@ impl BoardLock {
         #[cfg(not(unix))]
         {
             let _ = project;
-            Ok(BoardLock { _guard: None })
+            Ok(BoardLock { _guard: () })
         }
     }
 
@@ -767,7 +774,7 @@ impl BoardLock {
         #[cfg(not(unix))]
         {
             let _ = project;
-            Ok(Some(BoardLock { _guard: None }))
+            Ok(Some(BoardLock { _guard: () }))
         }
     }
 

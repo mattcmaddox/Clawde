@@ -3553,19 +3553,14 @@ impl App {
             let ctx_model = model.to_string();
             let (ctx_warning_tx, ctx_warning_rx) = tokio::sync::mpsc::channel::<String>(1);
             self.ctx_warning_rx = Some(ctx_warning_rx);
-            tokio::spawn(async move {
-                if let Some(warning) =
-                    clawde_core::ollama_ctx_mismatch_warning_for_config(&ctx_config, &ctx_model)
-                        .await
-                {
-                    tracing::warn!(
-                        model = %ctx_model,
-                        warning = %warning,
-                        "ollama context mismatch"
-                    );
-                    ctx_warning_tx.send(warning).await.ok();
-                }
-            });
+            // Spawn via core's runtime-tolerant probe: this persist path is
+            // also exercised by sync tests with no tokio reactor, where a
+            // bare `tokio::spawn` panics ("there is no reactor running").
+            clawde_core::config::spawn_ollama_ctx_mismatch_probe(
+                ctx_config,
+                ctx_model,
+                ctx_warning_tx,
+            );
         }
         Ok(())
     }
