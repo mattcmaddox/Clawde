@@ -1,6 +1,9 @@
 [package]
 name = "clawde_ollama_probe"
-version = "0.0.0"
+# Inherit the workspace version: bump-version.py stamps this crate's
+# Cargo.lock entry on release, so the declared version must match the
+# workspace version or the lockfile regenerates as stale under --locked.
+version.workspace = true
 edition = "2021"
 
 [dependencies]
