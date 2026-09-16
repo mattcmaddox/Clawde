@@ -409,10 +409,18 @@ fn format_spec_message(spec: &clawde_core::spec::Spec, path: &std::path::Path) -
         out.push_str(&format!("- {e}\n"));
     }
 
+    // Repo-relative artifact paths are displayed with forward slashes on
+    // every platform so docs and messages read consistently (Windows accepts
+    // '/' in its file APIs; `path` itself is used for any I/O).
+    let display_path = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
     out.push_str(&format!(
         "\n---\nSaved to `{}`.\n\n*Next: implement against this spec, then verify \
          the acceptance tests (Verify loop).*",
-        path.display()
+        display_path
     ));
     out
 }

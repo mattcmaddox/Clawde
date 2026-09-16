@@ -174,10 +174,19 @@ fn collect_md_files(base: &Path, current_dir: &Path, out: &mut Vec<MemoryFileMet
                 MemoryFrontmatter::default()
             };
 
-            // Relative path from the memory dir root.
+            // Relative path from the memory dir root. Rendered with forward
+            // slashes on every platform so status output, index entries, and
+            // supersession map keys are platform-independent (Windows accepts
+            // '/' in its file APIs, and `path` below carries the native form
+            // for all I/O).
             let relative = path
                 .strip_prefix(base)
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| {
+                    p.components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
                 .unwrap_or_else(|_| file_name.clone());
 
             out.push(MemoryFileMeta {
