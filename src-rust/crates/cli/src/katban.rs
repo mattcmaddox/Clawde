@@ -2332,6 +2332,10 @@ mod tests {
         assert!(find_site(&config, "other").is_none());
     }
 
+    // systemd exposure is a Linux-only surface: the unit renderer checks the
+    // invoking user's identity and the unit exec paths, none of which exist
+    // on Windows runners.
+    #[cfg(target_os = "linux")]
     #[test]
     fn systemd_units_follow_caddy_dir_and_guest_port() {
         // Serialize CLAWDE_HOME mutation on the binary-wide lock (repo rule).
@@ -2366,6 +2370,7 @@ mod tests {
         result.unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn systemd_units_render_board_unit_when_runner_project_set() {
         // Serialize CLAWDE_HOME mutation on the binary-wide lock (repo rule).
@@ -2397,6 +2402,7 @@ mod tests {
         result.unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn systemd_units_render_board_unit_for_multiple_projects() {
         // Serialize CLAWDE_HOME mutation on the binary-wide lock (repo rule).
@@ -2475,6 +2481,9 @@ mod tests {
         }
     }
 
+    // Persists a systemd refresh sentinel via the expose path — same Linux
+    // surface as the systemd unit tests.
+    #[cfg(target_os = "linux")]
     #[test]
     fn board_expose_run_all_persists_the_refresh_sentinel() {
         // `board expose --run all` must store the `all` sentinel (not a baked
