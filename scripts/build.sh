@@ -121,6 +121,7 @@ if [[ "$LEG_ID" == "linux-aarch64" ]]; then
     dpkg --add-architecture arm64
     apt-get update -qq
     apt_install pkg-config gcc-aarch64-linux-gnu libasound2-dev:arm64 cmake golang-go ninja-build libclang-dev
+    rustup target add "$TRIPLE"
     export CARGO_TARGET_DIR=/clawde/target/container-$LEG_ID
     export PKG_CONFIG_ALLOW_CROSS=1
     export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
