@@ -2583,17 +2583,30 @@ mod tests {
                 .current_dir(repo.path())
                 .output()
                 .unwrap();
+            // Repo-local identity: CI runners have no global git user, so the
+            // init commit below would fail and leave the fixture without HEAD
+            // (create_worktree then panics on "invalid reference: HEAD").
+            for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+                let cfg = std::process::Command::new("git")
+                    .args(["config", k, v])
+                    .current_dir(repo.path())
+                    .output()
+                    .unwrap();
+                assert!(cfg.status.success(), "git config {k} failed: {cfg:?}");
+            }
             std::fs::write(repo.path().join("README.md"), "# demo\n").unwrap();
-            std::process::Command::new("git")
+            let add = std::process::Command::new("git")
                 .args(["add", "."])
                 .current_dir(repo.path())
                 .output()
                 .unwrap();
-            std::process::Command::new("git")
+            assert!(add.status.success(), "git add failed: {add:?}");
+            let commit = std::process::Command::new("git")
                 .args(["commit", "-q", "-m", "init"])
                 .current_dir(repo.path())
                 .output()
                 .unwrap();
+            assert!(commit.status.success(), "git commit failed: {commit:?}");
 
             clawde_katban::projects::set_repo_root("default", repo.path())?;
             let mut board = clawde_katban::board::Board::new();

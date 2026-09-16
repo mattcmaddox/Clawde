@@ -351,6 +351,16 @@ mod tests {
             .current_dir(dir)
             .output();
         assert!(out.is_ok(), "git not available? {out:?}");
+        // Repo-local identity: CI runners have no global git user, so the
+        // init commit below would fail and leave the fixture without HEAD.
+        for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+            let cfg = std::process::Command::new("git")
+                .args(["config", k, v])
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(cfg.status.success(), "git config {k} failed: {cfg:?}");
+        }
         std::fs::write(dir.join("README.md"), "# demo\n").unwrap();
         let add = std::process::Command::new("git")
             .args(["add", "."])
@@ -446,6 +456,16 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(init.status.success());
+            // Repo-local identity: CI runners have no global git user, so the
+            // init commit below would fail and leave the fixture without HEAD.
+            for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+                let cfg = std::process::Command::new("git")
+                    .args(["config", k, v])
+                    .current_dir(repo.path())
+                    .output()
+                    .unwrap();
+                assert!(cfg.status.success(), "git config {k} failed: {cfg:?}");
+            }
             std::fs::create_dir_all(repo.path().join("src/__pycache__")).unwrap();
             std::fs::write(repo.path().join("src/__pycache__/demo.pyc"), "stale blob").unwrap();
             std::fs::write(repo.path().join("src/demo.py"), "orig\n").unwrap();
