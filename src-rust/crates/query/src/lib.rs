@@ -4323,9 +4323,17 @@ async fn run_query_loop_inner(
                     // so the user always sees *some* assistant output and
                     // knows the turn really ended.
                     if content_blocks.is_empty() {
+                        // Attribute the placeholder to the upstream that
+                        // actually served (and failed) the turn — free/auto
+                        // sweeps fall through several upstreams internally, so
+                        // the requested model id is not who went silent.
+                        let shown_provider = actual_upstream_id
+                            .as_deref()
+                            .unwrap_or(&provider_id_str)
+                            .to_string();
                         let placeholder = format!(
                             "(no response from {}/{} — model ended the turn with stop_reason \"{}\")",
-                            provider_id_str, model_id_str, stop_str
+                            shown_provider, actual_model, stop_str
                         );
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::Stream(

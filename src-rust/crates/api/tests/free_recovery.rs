@@ -62,6 +62,10 @@ impl Chain {
             entries,
             RoutingConfig {
                 strategy: RoutingStrategy::Sequential,
+                // These tests assert FALL-THROUGH attempt counts; the default
+                // same-upstream retry (1) would add a backoff attempt on the
+                // failing first upstream before it falls through.
+                fallback_retries: 0,
                 ..Default::default()
             },
             false,

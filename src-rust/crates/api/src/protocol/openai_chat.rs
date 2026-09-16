@@ -225,27 +225,35 @@ impl OpenAiChatDecoder {
             }
             for tc in tool_calls {
                 let tc_index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let block_index = 1 + tc_index;
+                // A fragment carrying `id` opens the tool block — but only
+                // for a NEW slot. OpenAI sends the id only on the first
+                // fragment, yet some compat providers (poolside) repeat the
+                // full id on every chunk. Re-inserting on a repeat would
+                // wipe the accumulated argument buffer and emit a duplicate
+                // ContentBlockStart, truncating arguments to the last
+                // fragment ("malformed or truncated JSON" downstream).
                 if let Some(tc_id) = tc.get("id").and_then(|v| v.as_str()) {
-                    let name = crate::tool_name::sanitize_tool_name(
-                        tc.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(""),
-                    );
-                    let block_index = 1 + tc_index;
-                    self.tool_call_buffers.insert(
-                        block_index,
-                        (tc_id.to_string(), name.clone(), String::new()),
-                    );
-                    out.push(StreamEvent::ContentBlockStart {
-                        index: block_index,
-                        content_block: ContentBlock::ToolUse {
-                            id: tc_id.to_string(),
-                            name,
-                            input: json!({}),
-                            thought_signature: None,
-                        },
-                    });
+                    if let std::collections::hash_map::Entry::Vacant(slot) =
+                        self.tool_call_buffers.entry(block_index)
+                    {
+                        let name = crate::tool_name::sanitize_tool_name(
+                            tc.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(""),
+                        );
+                        slot.insert((tc_id.to_string(), name.clone(), String::new()));
+                        out.push(StreamEvent::ContentBlockStart {
+                            index: block_index,
+                            content_block: ContentBlock::ToolUse {
+                                id: tc_id.to_string(),
+                                name,
+                                input: json!({}),
+                                thought_signature: None,
+                            },
+                        });
+                    }
                 }
                 if let Some(args_frag) = tc
                     .get("function")
@@ -253,7 +261,6 @@ impl OpenAiChatDecoder {
                     .and_then(|v| v.as_str())
                 {
                     if !args_frag.is_empty() {
-                        let block_index = 1 + tc_index;
                         if let Some((_, _, buf)) = self.tool_call_buffers.get_mut(&block_index) {
                             buf.push_str(args_frag);
                         }
@@ -473,6 +480,51 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 1 })));
+    }
+
+    #[test]
+    fn repeated_tool_call_id_does_not_reset_argument_buffer() {
+        // Poolside (and possibly other compat upstreams) repeat the full
+        // tool-call `id` on EVERY argument fragment, unlike OpenAI which
+        // sends it only on the first. Re-opening the block per fragment
+        // wiped the accumulated buffer, so arguments truncated to the last
+        // fragment and downstream JSON parsing failed with "malformed or
+        // truncated JSON" (pre-commit eval gate, 2026-09-16).
+        let mut d = OpenAiChatDecoder::new(None);
+        let (events, _done) = drain(
+            &mut d,
+            &[
+                // First fragment: id + name + empty args (poolside shape).
+                r#"data: {"id":"c","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}],"role":"assistant"}}]}"#,
+                // Subsequent fragments REPEAT the id (poolside quirk).
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"arguments":"{\"path\": "}}]}}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"arguments":"\"/tmp/x.rs\""}}]}}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"arguments":"}"}}]}}]}"#,
+                r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ],
+        );
+
+        // Exactly ONE ContentBlockStart despite four id-bearing fragments.
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ContentBlockStart { index: 1, .. }))
+            .count();
+        assert_eq!(starts, 1, "repeated id must not re-open the tool block");
+
+        // Fragments concatenate to the FULL arguments, not just the last one.
+        let args: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::InputJsonDelta {
+                    index: 1,
+                    partial_json,
+                } => Some(partial_json.clone()),
+                _ => None,
+            })
+            .collect();
+        let parsed: Value =
+            serde_json::from_str(&args).expect("assembled tool args must be valid JSON");
+        assert_eq!(parsed["path"], "/tmp/x.rs");
     }
 
     #[test]

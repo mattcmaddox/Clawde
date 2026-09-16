@@ -148,6 +148,10 @@ async fn chat_completion_falls_through_free_upstream_and_returns_openai_response
         ],
         RoutingConfig {
             strategy: RoutingStrategy::Sequential,
+            // This test asserts exact per-upstream call counts for
+            // fall-through; the default same-upstream retry (1) would call
+            // the failing first upstream twice before advancing.
+            fallback_retries: 0,
             ..RoutingConfig::default()
         },
         false,

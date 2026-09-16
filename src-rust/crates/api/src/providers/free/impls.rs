@@ -345,6 +345,26 @@ impl FreeProvider {
                     && (rest == "free" || rest == "auto" || rest.is_empty())
                 {
                     "openrouter/free".to_string()
+                } else if !rest.contains('/') {
+                    // Aggregator upstreams expose vendor-prefixed wire ids
+                    // (poolside wants `poolside/laguna-s-2.1`, cline wants
+                    // `deepseek/deepseek-v4-flash`, groq wants
+                    // `openai/gpt-oss-120b`). A pin written as
+                    // `<upstream>/<bare-model>` stripped to the bare tail
+                    // here and 404'd on the wire (`Model not found: unknown`)
+                    // even though the key was fine. Re-attach the canonical
+                    // prefix from the upstream's own model list when the bare
+                    // tail matches one of its known ids.
+                    let mut known = entry
+                        .effective_model
+                        .iter()
+                        .map(|m| m.as_str())
+                        .chain(std::iter::once(entry.upstream.default_model))
+                        .chain(entry.upstream.fallback_models.iter().copied());
+                    known
+                        .find(|m| m.rsplit('/').next() == Some(rest))
+                        .unwrap_or(rest)
+                        .to_string()
                 } else {
                     rest.to_string()
                 };
@@ -2063,6 +2083,52 @@ impl Stream for RetryingFreeStream {
                     // the empty-completion re-dispatch path when polled to
                     // `None`, and otherwise remain uncounted.
                     if matches!(evt, StreamEvent::MessageStop) {
+                        // Interactive consumers (the query loop) break on
+                        // MessageStop and drop the stream — they never poll to
+                        // `None`, which is where the empty-completion
+                        // re-dispatch used to live. An empty attempt must
+                        // therefore re-dispatch HERE: swallow the stop, record
+                        // the empty, and fall through to the next attempt so
+                        // the caller never sees a dead turn (spec §6.2).
+                        if self.is_empty_attempt() {
+                            self.current = None;
+                            let uid = self.chain[self.current_idx].upstream.id;
+                            let model = self.current_model.clone();
+                            let has_next = self.advance_after_empty();
+                            tracing::debug!(
+                                upstream = %uid,
+                                model = %model,
+                                has_next,
+                                "free-mode upstream returned an empty completion (at MessageStop)"
+                            );
+                            if has_next {
+                                // A same-upstream retry schedules a backoff; a
+                                // plan advance spawns the next stream. Both
+                                // re-enter the loop with nothing exposed, so
+                                // replaying is safe.
+                                continue;
+                            }
+                            // Every plan entry is exhausted or cooled. The
+                            // query loop's recovery budget (decide_recover)
+                            // classifies a retryable ServerError as
+                            // rate-limit-class and performs a bounded re-sweep
+                            // instead of surfacing a dead turn. Retryable (not
+                            // hard-fail) because a fully empty sweep is a flake,
+                            // not a persistent condition.
+                            tracing::warn!(
+                                "free-mode upstreams exhausted on empty completions: {}",
+                                join_capped_upstream_errors(&self.upstream_errors)
+                            );
+                            return Poll::Ready(Some(Err(ProviderError::ServerError {
+                                provider: ProviderId::new("free"),
+                                status: None,
+                                message: format!(
+                                    "free-mode upstreams exhausted: {}",
+                                    join_capped_upstream_errors(&self.upstream_errors)
+                                ),
+                                is_retryable: true,
+                            })));
+                        }
                         self.maybe_record_success();
                         // Telemetry for the thinking inspector: which upstream
                         // served this stream, with what model and usage. Empty
@@ -2155,16 +2221,23 @@ impl Stream for RetryingFreeStream {
                             // the next attempt remains the out-of-band signal.
                             continue;
                         }
-                        // All exhausted.
-                        let msg = format!(
-                            "free-mode upstreams exhausted: {}",
+                        // All exhausted (drained-to-None consumers only — the
+                        // MessageStop path above handles interactive ones).
+                        // Retryable for the same reason: a fully empty sweep is
+                        // a flake, so the query loop's recovery budget performs
+                        // one bounded re-sweep.
+                        tracing::warn!(
+                            "free-mode upstreams exhausted on empty completions: {}",
                             join_capped_upstream_errors(&self.upstream_errors)
                         );
                         return Poll::Ready(Some(Err(ProviderError::ServerError {
                             provider: ProviderId::new("free"),
                             status: None,
-                            message: msg,
-                            is_retryable: false,
+                            message: format!(
+                                "free-mode upstreams exhausted: {}",
+                                join_capped_upstream_errors(&self.upstream_errors)
+                            ),
+                            is_retryable: true,
                         })));
                     }
 
@@ -4262,6 +4335,54 @@ mod tests {
     }
 
     #[test]
+    fn bare_tail_pin_canonicalizes_to_vendor_prefixed_wire_id() {
+        // Aggregator upstreams (poolside, cline, groq, nvidia) expect
+        // vendor-prefixed wire ids. A pin written `poolside/laguna-s-2.1`
+        // strips the upstream prefix here and previously dispatched the bare
+        // tail, which 404'd (`Model not found`) despite a valid key — the
+        // chain then silently fell through to the next upstream. The bare
+        // tail must re-attach the canonical prefix from the upstream's known
+        // ids; genuinely bare-id upstreams (sambanova, zen) pass through.
+        let provider = FreeProvider::new(vec![entry("poolside", true), entry("sambanova", true)]);
+        match provider.resolve_route("poolside/laguna-s-2.1") {
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
+                assert_eq!(start_idx, 0);
+                assert_eq!(pinned_model, "poolside/laguna-s-2.1");
+            }
+            other => panic!("expected pinned, got {:?}", other),
+        }
+        // groq's catalog default is `openai/gpt-oss-120b` — the bare tail
+        // must resolve to the full wire id.
+        let provider = FreeProvider::new(vec![entry("groq", true)]);
+        match provider.resolve_route("groq/gpt-oss-120b") {
+            Route::Pinned { pinned_model, .. } => {
+                assert_eq!(pinned_model, "openai/gpt-oss-120b");
+            }
+            other => panic!("expected pinned, got {:?}", other),
+        }
+        // sambanova's wire id is bare — a matching-tail pin stays bare.
+        let provider = FreeProvider::new(vec![entry("sambanova", true)]);
+        match provider.resolve_route("sambanova/Meta-Llama-3.3-70B-Instruct") {
+            Route::Pinned { pinned_model, .. } => {
+                assert_eq!(pinned_model, "Meta-Llama-3.3-70B-Instruct");
+            }
+            other => panic!("expected pinned, got {:?}", other),
+        }
+        // An unknown bare tail is passed through untouched (upstream 404s,
+        // chain falls through — unchanged behavior).
+        let provider = FreeProvider::new(vec![entry("poolside", true)]);
+        match provider.resolve_route("poolside/not-a-real-model") {
+            Route::Pinned { pinned_model, .. } => {
+                assert_eq!(pinned_model, "not-a-real-model");
+            }
+            other => panic!("expected pinned, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn free_provider_prefix_pins_specific_upstream() {
         // The Alt+J/K popup pins a model hosted by exactly one upstream as
         // `free/<provider>/<model>`; it must resolve to that exact upstream +
@@ -4567,7 +4688,7 @@ mod tests {
         let json = serde_json::to_string(&rng).unwrap();
         assert_eq!(
             json,
-            r#"{"strategy":"random_failover","upstream_timeout_secs":30,"upstream_5xx_cooldown_secs":45}"#
+            r#"{"strategy":"random_failover","upstream_timeout_secs":30,"upstream_5xx_cooldown_secs":45,"fallback_retries":1}"#
         );
         let deserialized: RoutingConfig = serde_json::from_str(&json).unwrap();
         assert!(matches!(
@@ -4872,6 +4993,10 @@ mod tests {
             ],
             RoutingConfig {
                 strategy: RoutingStrategy::Sequential,
+                // Same-upstream empty retry disabled so the sequence is exactly
+                // poolside → cerebras; the default (1 same-upstream retry) is
+                // covered by empty_attempt_retries_same_upstream_then_advances.
+                fallback_retries: 0,
                 ..Default::default()
             },
             false,
@@ -4910,6 +5035,49 @@ mod tests {
                     catalog_entry("cerebras").unwrap().default_model.to_string(),
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_attempt_retries_same_upstream_then_advances() {
+        use futures::StreamExt;
+
+        // Default same-upstream retry count (1): an empty completion gets
+        // ONE backoff retry on the same upstream before the chain advances —
+        // most free-tier empty flakes clear on the second attempt. Sequential
+        // so the plan is exactly poolside → cerebras (Auto would prefer the
+        // non-empty cerebras and never exercise the empty path).
+        let provider = FreeProvider::with_routing(
+            vec![
+                stream_entry("poolside", true, None),
+                stream_entry("cerebras", true, Some("fallback answer")),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+
+        let mut attributions: Vec<(String, String, String)> = Vec::new();
+        while let Some(Ok(event)) = stream.next().await {
+            if let StreamEvent::ProviderAttribution { upstream_id, .. } = event {
+                attributions.push(("free".into(), upstream_id, String::new()));
+            }
+        }
+
+        let ids: Vec<&str> = attributions
+            .iter()
+            .map(|(_, upstream, _)| upstream.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["poolside", "poolside", "cerebras"],
+            "empty attempt retried once on the same upstream, then advanced"
         );
     }
 
@@ -5048,8 +5216,9 @@ mod tests {
 
         // A streaming win is only credited when the attempt produced content.
         // An empty completion (no text, no tools) must NOT bump the success
-        // counter at MessageStop — it stays uncounted so the empty-completion
-        // re-dispatch path remains the authority for empty attempts.
+        // counter — it is recorded as a FAILURE through the re-dispatch path
+        // (same-upstream retry, then exhaustion) instead of staying uncounted:
+        // the attempt really did fail to serve the request.
         let provider = FreeProvider::with_routing(
             vec![stream_entry("poolside", true, None)],
             RoutingConfig {
@@ -5063,9 +5232,18 @@ mod tests {
             .await
             .expect("stream should start");
 
-        while let Some(Ok(event)) = stream.next().await {
-            if matches!(event, StreamEvent::MessageStop) {
-                break;
+        // Consume exactly like the query loop does (break on MessageStop); the
+        // empty-completion re-dispatch swallows the stop and ends the stream
+        // with the retryable exhaustion error.
+        let mut exhaustion: Option<ProviderError> = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::MessageStop) => break,
+                Err(e) => {
+                    exhaustion = Some(e);
+                    break;
+                }
+                _ => {}
             }
         }
         drop(stream);
@@ -5073,7 +5251,28 @@ mod tests {
         let rates = provider.upstream_success_rates();
         assert_eq!(rates.len(), 1);
         assert_eq!(rates[0].0, "poolside");
-        assert_eq!(rates[0].1, None, "empty attempts must not be credited");
+        assert_eq!(
+            rates[0].1,
+            Some(0.0),
+            "empty attempts must be recorded as failures, never credited as wins"
+        );
+        // The exhausted sweep is retryable: a fully-empty chain is a flake, so
+        // the query loop's recovery budget performs one bounded re-sweep.
+        let err = exhaustion.expect("empty sweep must surface the exhaustion error");
+        assert!(
+            matches!(
+                err,
+                ProviderError::ServerError {
+                    is_retryable: true,
+                    ..
+                }
+            ),
+            "exhaustion after empty sweep must be retryable, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("free-mode upstreams exhausted"),
+            "exhaustion error must be descriptive, got {err}"
+        );
     }
 
     #[tokio::test]
@@ -5113,6 +5312,10 @@ mod tests {
             chain,
             RoutingConfig {
                 strategy: RoutingStrategy::TaskBased,
+                // Pin the retry count so the attempt log is exactly one entry
+                // per upstream; the default (1) would re-log the same-upstream
+                // retries this test does not exercise.
+                fallback_retries: 0,
                 ..Default::default()
             },
             false,
@@ -5145,6 +5348,9 @@ mod tests {
             chain,
             RoutingConfig {
                 strategy: RoutingStrategy::TaskBased,
+                // Pin the retry count so the attempt log is exactly one entry
+                // per upstream (see the sibling test above).
+                fallback_retries: 0,
                 ..Default::default()
             },
             false,

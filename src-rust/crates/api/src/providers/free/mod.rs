@@ -886,7 +886,11 @@ const fn default_poll_interval() -> u64 {
 }
 
 const fn default_fallback_retries() -> u32 {
-    0
+    // One same-upstream retry (500ms backoff) before the chain advances.
+    // Empty-completion flakes — the dominant free-tier failure — usually clear
+    // on a second attempt; without this the query loop burned a whole turn on
+    // a single flaky upstream (docs/free-model-routing.md §6.2).
+    1
 }
 
 impl Default for RoutingConfig {

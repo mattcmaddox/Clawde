@@ -1113,32 +1113,37 @@ impl LlmProvider for OpenAiProvider {
                                 .get("index")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0) as usize;
-                            // OpenAI sends id/name only on the first chunk for each tool call.
+                            // OpenAI tool calls sit after the text block.
+                            // Use index 1 + tc_index.
+                            let block_index = 1 + tc_index;
+                            // OpenAI sends id/name only on the first chunk for
+                            // each tool call — but some compat upstreams repeat
+                            // the full id on every chunk. Only a NEW slot opens
+                            // the block; re-inserting on a repeat would wipe the
+                            // accumulated argument buffer ("malformed JSON").
                             if let Some(tc_id) =
                                 tc.get("id").and_then(|v| v.as_str())
                             {
-                                let name = crate::tool_name::sanitize_tool_name(
-                                    tc.get("function")
-                                        .and_then(|f| f.get("name"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or(""),
-                                );
-                                // OpenAI tool calls sit after the text block.
-                                // Use index 1 + tc_index.
-                                let block_index = 1 + tc_index;
-                                tool_call_buffers.insert(
-                                    block_index,
-                                    (tc_id.to_string(), name.clone(), String::new()),
-                                );
-                                yield Ok(StreamEvent::ContentBlockStart {
-                                    index: block_index,
-                                    content_block: ContentBlock::ToolUse {
-                                        id: tc_id.to_string(),
-                                        name,
-                                        input: json!({}),
-                                        thought_signature: None,
-                                    },
-                                });
+                                if let std::collections::hash_map::Entry::Vacant(slot) =
+                                    tool_call_buffers.entry(block_index)
+                                {
+                                    let name = crate::tool_name::sanitize_tool_name(
+                                        tc.get("function")
+                                            .and_then(|f| f.get("name"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or(""),
+                                    );
+                                    slot.insert((tc_id.to_string(), name.clone(), String::new()));
+                                    yield Ok(StreamEvent::ContentBlockStart {
+                                        index: block_index,
+                                        content_block: ContentBlock::ToolUse {
+                                            id: tc_id.to_string(),
+                                            name,
+                                            input: json!({}),
+                                            thought_signature: None,
+                                        },
+                                    });
+                                }
                             }
                             // Argument fragment
                             if let Some(args_frag) = tc
