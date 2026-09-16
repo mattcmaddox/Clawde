@@ -370,6 +370,10 @@ fn authenticated(state: &GuestState, headers: &HeaderMap) -> Option<(String, Str
 // Pages
 // ---------------------------------------------------------------------------
 
+// The axum handlers below return Result<Response, Response> by design: the
+// Err variant IS the HTTP error response (status + body), not an error type
+// needing boxing. Silence the size lint rather than contorting the handlers.
+#[allow(clippy::result_large_err)]
 async fn index(State(state): State<GuestState>, headers: HeaderMap) -> Result<Response, Response> {
     check_origin(&headers, &state).map_err(IntoResponse::into_response)?;
     if authenticated(&state, &headers).is_some() {
@@ -378,6 +382,7 @@ async fn index(State(state): State<GuestState>, headers: HeaderMap) -> Result<Re
     Ok(Html(LOGIN_PAGE).into_response())
 }
 
+#[allow(clippy::result_large_err)]
 async fn chat_page(
     State(state): State<GuestState>,
     headers: HeaderMap,
@@ -423,6 +428,7 @@ where
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn auth(
     State(state): State<GuestState>,
     headers: HeaderMap,
@@ -565,6 +571,7 @@ fn sweep_sessions(sessions: &mut HashMap<String, LiveSession>, now: u64) {
     sessions.retain(|_, session| now.saturating_sub(session.last_used) <= SESSION_TTL_SECS);
 }
 
+#[allow(clippy::result_large_err)]
 async fn api_chat(
     State(state): State<GuestState>,
     headers: HeaderMap,
@@ -643,6 +650,7 @@ struct SummaryReply {
     summary: String,
 }
 
+#[allow(clippy::result_large_err)]
 async fn api_summary(
     State(state): State<GuestState>,
     headers: HeaderMap,

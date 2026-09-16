@@ -471,7 +471,7 @@ pub fn fetch_openrouter_free_models(openrouter_api_key: &str) -> Option<Vec<Stri
 
     // Sort by context window descending — the largest-context free model is
     // the default pick, everything else follows it.
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
 
     if candidates.is_empty() {
         tracing::warn!("fetch_openrouter_free_models: no free tool-capable models found");

@@ -1471,7 +1471,8 @@ mod tests {
         let find = |key: &str, ctrl: bool, alt: bool| {
             bindings
                 .iter()
-                .filter(|b| {
+                .rev()
+                .find(|b| {
                     b.context == KeyContext::Chat
                         && b.chord.len() == 1
                         && b.chord[0].key == key
@@ -1479,7 +1480,6 @@ mod tests {
                         && b.chord[0].alt == alt
                         && !b.chord[0].shift
                 })
-                .next_back()
                 .and_then(|b| b.action.as_deref())
         };
         assert_eq!(find("b", true, false), Some("moveCharBackward"));
@@ -1493,13 +1493,13 @@ mod tests {
         // Ctrl+K kill-line must override the stock openCommandPalette.
         let ctrl_k = bindings
             .iter()
-            .filter(|b| {
+            .rev()
+            .find(|b| {
                 b.context == KeyContext::Chat
                     && b.chord.len() == 1
                     && b.chord[0].key == "k"
                     && b.chord[0].ctrl
             })
-            .next_back()
             .expect("emacs ctrl+k")
             .action
             .as_deref()
@@ -1508,14 +1508,14 @@ mod tests {
         // Command palette stays reachable via ctrl+shift+p.
         let ctrl_shift_p = bindings
             .iter()
-            .filter(|b| {
+            .rev()
+            .find(|b| {
                 b.context == KeyContext::Chat
                     && b.chord.len() == 1
                     && b.chord[0].key == "p"
                     && b.chord[0].ctrl
                     && b.chord[0].shift
             })
-            .next_back()
             .expect("emacs ctrl+shift+p")
             .action
             .as_deref()

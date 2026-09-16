@@ -587,8 +587,8 @@ pub fn render_spec_picker(frame: &mut Frame, state: &SpecReviewState, size: Rect
         .saturating_sub(visible)
         .min(count.saturating_sub(visible));
     let shown = count.min(visible);
-    let mut row = inner.y;
-    for i in 0..shown {
+    for (i, row) in (0..shown as u16).zip(inner.y..) {
+        let i = i as usize;
         let path = &state.available[scroll + i];
         let selected = i == state.picked;
         let name = path
@@ -640,7 +640,6 @@ pub fn render_spec_picker(frame: &mut Frame, state: &SpecReviewState, size: Rect
                 .set_symbol(&ch.to_string())
                 .set_style(dim_style);
         }
-        row += 1;
     }
 
     let hint_y = area.y + area.height - 2;

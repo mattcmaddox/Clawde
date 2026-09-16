@@ -104,7 +104,7 @@ fn fetch_modelsdev_free_ids_blocking() -> HashMap<String, Vec<String>> {
                 candidates.push((model_id, context));
             }
 
-            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+            candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
             let ids: Vec<String> = candidates
                 .into_iter()
                 .map(|(id, _)| id.to_string())
@@ -231,7 +231,7 @@ fn fetch_modelsdev_defaults_blocking() -> HashMap<String, String> {
             }
 
             // Sort by context window descending, pick the best
-            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+            candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
 
             if let Some((model_id, _ctx)) = candidates.first() {
                 let prev = result.insert(upstream.id.to_string(), (*model_id).to_string());

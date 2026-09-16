@@ -749,12 +749,10 @@ pub fn expandable_block_hashes(msg: &Message) -> Vec<u64> {
             ContentBlock::Thinking { thinking, .. } => hashes.push(thinking_block_hash(&thinking)),
             ContentBlock::ToolResult {
                 content, is_error, ..
-            } => {
-                if !is_error.unwrap_or(false) {
-                    let text = tool_result_text(&content);
-                    if parse_lsp_diagnostics(&text).is_some() {
-                        hashes.push(diagnostics_block_hash(&text));
-                    }
+            } if !is_error.unwrap_or(false) => {
+                let text = tool_result_text(&content);
+                if parse_lsp_diagnostics(&text).is_some() {
+                    hashes.push(diagnostics_block_hash(&text));
                 }
             }
             _ => {}

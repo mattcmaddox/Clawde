@@ -786,7 +786,7 @@ fn render_summary(agg: &Aggregated, ctx: &CommandContext) -> String {
                 "─".repeat(8),
             ));
             let mut entries: Vec<_> = snap.iter().collect();
-            entries.sort_by(|a, b| b.1.attempts.cmp(&a.1.attempts));
+            entries.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.attempts));
             for (key, stats) in &entries {
                 let model_label = format!("{}/{}", key.provider, key.model);
                 let rate_str = format!("{:.0}%", stats.ema_rate * 100.0);

@@ -998,6 +998,9 @@ impl Drop for CancelOnDrop {
     }
 }
 
+// The Err variant IS the HTTP error response (gateway error rendered via
+// into_response), not an error type needing boxing.
+#[allow(clippy::result_large_err)]
 async fn provider_call_with_timeout<T>(
     future: impl std::future::Future<Output = T>,
     timeout_secs: u64,

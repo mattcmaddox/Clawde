@@ -716,12 +716,10 @@ fn cmd_health(
     }
 
     if provider_ids.is_empty() {
-        let msg = if provider_filter.is_some() {
+        let msg = if let Some(filter) = provider_filter {
             format!(
-                "No keys found for '{}'.\n\
-                 Use /keys set {} <key> to configure.",
-                provider_filter.unwrap(),
-                provider_filter.unwrap(),
+                "No keys found for '{filter}'.\n\
+                 Use /keys set {filter} <key> to configure.",
             )
         } else {
             "No API keys configured yet.\n\
@@ -1104,12 +1102,10 @@ fn cmd_list(provider_filter: Option<&str>) -> CommandResult {
     }
 
     if entries.is_empty() && credential_only.is_empty() {
-        let msg = if provider_filter.is_some() {
+        let msg = if let Some(filter) = provider_filter {
             format!(
-                "No keys found for '{}'.\n\
-                 Use /keys set {} <key> to add keys for key rotation.",
-                provider_filter.unwrap(),
-                provider_filter.unwrap(),
+                "No keys found for '{filter}'.\n\
+                 Use /keys set {filter} <key> to add keys for key rotation.",
             )
         } else {
             "No API keys configured yet.\n\

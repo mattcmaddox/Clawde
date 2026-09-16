@@ -1399,10 +1399,8 @@ impl LlmProvider for OpenAiCompatProvider {
                             | StreamEvent::ReasoningDelta { reasoning: text, .. }
                             | StreamEvent::InputJsonDelta {
                                 partial_json: text, ..
-                            } => {
-                                if !text.is_empty() {
-                                    partial_response.push_str(text);
-                                }
+                            } if !text.is_empty() => {
+                                partial_response.push_str(text);
                             }
                             _ => {}
                         }
