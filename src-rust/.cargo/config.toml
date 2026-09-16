@@ -1,0 +1,13 @@
+# Windows defaults to a 1 MiB main-thread stack reserve; the headless query
+# loop's debug-build stack depth overflows it (STATUS_STACK_OVERFLOW,
+# 0xC00000FD = exit status -1073741571) while Linux's 8 MiB default is fine.
+# Raise the Windows main-thread reserve to match Linux's headroom. Applies to
+# MSVC and GNU linkers; other platforms are unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
