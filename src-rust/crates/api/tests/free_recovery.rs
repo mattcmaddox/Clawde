@@ -25,6 +25,23 @@ use common::mock_provider::{
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;
 
+/// All tests in this binary dispatch through FreeProvider, and every
+/// successful dispatch writes to the process-global last-route telemetry
+/// slot. Run them one at a time so a test's store→take window can never be
+/// interleaved with another test's store — CI flaked exactly that way: our
+/// `upstream_id == "poolside"` guard matched a *foreign* poolside route
+/// (zero reasoning tokens) stored by a concurrent test between our dispatch
+/// and our `take_free_last_route()`.
+///
+/// A tokio Mutex (not std) because the guard is intentionally held across
+/// the test's await points; the `#[tokio::test]` runtimes here are
+/// current-thread, so the critical sections still cannot interleave.
+static CHAIN_DISPATCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn dispatch_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    CHAIN_DISPATCH_LOCK.lock().await
+}
+
 // ---------------------------------------------------------------------------
 // Construction helpers
 // ---------------------------------------------------------------------------
@@ -164,6 +181,7 @@ fn json_response(status: u16, reason: &'static str, body: &str) -> ScriptedRespo
 
 #[tokio::test]
 async fn server_error_before_first_byte_falls_through() {
+    let _dispatch = dispatch_guard().await;
     let chain = Chain::new(
         vec![json_response(
             500,
@@ -195,6 +213,7 @@ async fn server_error_before_first_byte_falls_through() {
 
 #[tokio::test]
 async fn rate_limit_before_first_byte_falls_through() {
+    let _dispatch = dispatch_guard().await;
     let chain = Chain::new(
         vec![json_response(
             429,
@@ -221,6 +240,7 @@ async fn rate_limit_before_first_byte_falls_through() {
 
 #[tokio::test]
 async fn auth_failure_before_first_byte_falls_through() {
+    let _dispatch = dispatch_guard().await;
     // A dead key on one upstream must not block later upstreams, each of which
     // carries its own credential.
     let chain = Chain::new(
@@ -248,6 +268,7 @@ async fn auth_failure_before_first_byte_falls_through() {
 
 #[tokio::test]
 async fn context_overflow_before_first_byte_falls_through() {
+    let _dispatch = dispatch_guard().await;
     let chain = Chain::new(
         vec![json_response(
             413,
@@ -277,6 +298,7 @@ async fn context_overflow_before_first_byte_falls_through() {
 
 #[tokio::test]
 async fn malformed_request_is_surfaced_without_fallback() {
+    let _dispatch = dispatch_guard().await;
     // `invalid_request_error` maps to RecoveryClass::MalformedRequest, which
     // must never be retried on another upstream: it would fail identically
     // everywhere. The second (healthy) upstream must not be contacted.
@@ -311,6 +333,7 @@ async fn malformed_request_is_surfaced_without_fallback() {
 
 #[tokio::test]
 async fn mid_stream_truncation_surfaces_error_without_replay() {
+    let _dispatch = dispatch_guard().await;
     // The first upstream emits partial visible text, then the connection dies
     // before the declared Content-Length is satisfied. Replaying the request
     // on the second upstream would duplicate visible output, so the error must
@@ -367,6 +390,7 @@ async fn mid_stream_truncation_surfaces_error_without_replay() {
 
 #[tokio::test]
 async fn non_streaming_server_error_falls_through() {
+    let _dispatch = dispatch_guard().await;
     let chain = Chain::new(
         vec![json_response(
             500,
@@ -417,6 +441,7 @@ async fn non_streaming_server_error_falls_through() {
 
 #[tokio::test]
 async fn streaming_success_records_last_route_telemetry() {
+    let _dispatch = dispatch_guard().await;
     // A stream whose final usage-carrying delta reports reasoning tokens, so
     // the streaming hook records the same telemetry as the non-streaming path.
     let usage_frame = format!(
