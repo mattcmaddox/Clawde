@@ -255,7 +255,7 @@ impl Spec {
         }
         // Newest first, dropping anything that fails to parse so every
         // returned path opens cleanly in the review dialog.
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
         candidates
             .into_iter()
             .filter_map(|(path, _)| {

@@ -898,12 +898,12 @@ impl KeybindingResolver {
     ) -> Option<KeybindingResult> {
         self.bindings
             .iter()
-            .filter(|binding| {
+            .rev()
+            .find(|binding| {
                 (binding.context == *context || binding.context == KeyContext::Global)
                     && binding.chord.len() == 1
                     && binding.chord[0] == *keystroke
             })
-            .next_back()
             .map(|binding| match &binding.action {
                 Some(action) => KeybindingResult::Action(action.clone()),
                 None => KeybindingResult::Unbound,
