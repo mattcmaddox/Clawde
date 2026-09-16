@@ -383,17 +383,29 @@ mod tests {
     use agent_client_protocol_schema as acp;
     use std::path::Path;
 
+    /// Platform-aware absolute path fixture: on Windows an absolute path
+    /// needs a drive prefix (`C:\...`), so `/workspace` would incorrectly
+    /// fail `is_absolute()` there.
+    fn abs_path(rel: &str) -> std::path::PathBuf {
+        let p = Path::new(rel);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else if cfg!(windows) {
+            Path::new("C:\\prog").join(rel)
+        } else {
+            Path::new("/").join(rel)
+        }
+    }
+
     #[test]
     fn session_directories_require_absolute_paths() {
-        assert!(validate_session_directories(Path::new("/workspace"), &[]).is_ok());
-        assert!(validate_session_directories(
-            Path::new("/workspace"),
-            &[Path::new("/shared").to_path_buf()]
-        )
-        .is_ok());
+        assert!(validate_session_directories(&abs_path("workspace"), &[]).is_ok());
+        assert!(
+            validate_session_directories(&abs_path("workspace"), &[abs_path("shared")]).is_ok()
+        );
         assert!(validate_session_directories(Path::new("workspace"), &[]).is_err());
         assert!(validate_session_directories(
-            Path::new("/workspace"),
+            &abs_path("workspace"),
             &[Path::new("shared").to_path_buf()]
         )
         .is_err());
@@ -445,12 +457,14 @@ mod tests {
         assert_eq!(configs[0].server_type, "sse");
         assert_eq!(configs[0].url.as_deref(), Some("https://example.test/sse"));
 
-        // Stdio: valid config accepted
-        let stdio = acp::McpServer::Stdio(acp::McpServerStdio::new("local", "/bin/server"));
+        // Stdio: valid config accepted (absolute path, platform-aware)
+        let server_abs = abs_path("bin/server");
+        let server_abs_str = server_abs.to_string_lossy().to_string();
+        let stdio = acp::McpServer::Stdio(acp::McpServerStdio::new("local", &server_abs_str));
         let configs = validate_session_mcp_servers(std::slice::from_ref(&stdio)).unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].server_type, "stdio");
-        assert_eq!(configs[0].command.as_deref(), Some("/bin/server"));
+        assert_eq!(configs[0].command.as_deref(), Some(server_abs_str.as_str()));
 
         // Mixed: stdio + http accepted
         let mixed = validate_session_mcp_servers(&[stdio, http]).unwrap();
