@@ -19,11 +19,22 @@
 #   ./build.sh clean               remove build artifacts
 #
 # Platform legs:
-#   linux-x86_64   native cargo              (this machine)
-#   linux-aarch64  cross (Docker)            (this machine)
+#   linux-x86_64   container (rust:1.98-bullseye)  (this machine)
+#   linux-aarch64  container + gcc-aarch64 cross   (this machine)
 #   windows-x86_64 needs a Windows box (MSVC; BoringSSL build needs NASM, so
 #                  cross-building the GNU target from Linux is not viable)
 # (macOS legs intentionally not built — no Apple hardware in the release flow)
+#
+# Why the container: Linux builds must bind old GLIBC symbol versions. Host
+# (Ubuntu 24.04, glibc 2.39) and cross's :main image (also 24.04) emit
+# GLIBC_2.38/2.39 versioned refs (`__isoc23_*` from C deps, pidfd_spawnp from
+# rustc 1.91's std) that make the binary refuse to load on anything older
+# than 24.04 — e.g. Raspberry Pi OS Bookworm (2.36). Building inside Debian
+# bookworm (glibc 2.36) binds only <=2.36 versions: runs on Pi OS Bookworm,
+# Debian 12+, Ubuntu 22.04+. (bullseye would give a 2.31 floor but hit LTS
+# end-of-life in 2026-08; its security pool 404s mid-migration to the
+# archive, so it is no longer a reliable build base.) rustc must be >=1.98:
+# older std unconditionally references pidfd_spawnp@GLIBC_2.39 (1.91 does).
 
 set -euo pipefail
 
@@ -37,6 +48,7 @@ PKG="clawde-cli"          # cargo package (its only binary is named `clawde`)
 BIN_NAME="clawde"         # binary name inside archives
 DIST_DIR="$REPO_ROOT/dist"
 INSTALL_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
+LINUX_BUILD_IMAGE="rust:1.98-bookworm"  # glibc 2.36 floor; see header note
 
 # id -> (rust triple | builder-for-this-machine)
 # builder: native | cross | manual
@@ -63,16 +75,75 @@ native_here() {  # $1 = triple — can this machine natively build it?
     esac
 }
 
-builder_for() {  # $1 = id → native | cross | manual
+builder_for() {  # $1 = id → container | cross | manual
     local id="$1" triple
     triple="$(target_info "$id")" || return 1
-    if native_here "$triple"; then
-        echo "native"
-    elif [[ "$id" == "linux-aarch64" ]] && [[ "$(uname -s)" == "Linux" ]]; then
-        echo "cross"
-    else
-        echo "manual"
-    fi
+    case "$id" in
+        linux-x86_64|linux-aarch64) echo "container" ;;
+        *)
+            if native_here "$triple"; then
+                echo "native"
+            else
+                echo "manual"
+            fi
+            ;;
+    esac
+}
+
+# Build one Linux leg inside the pinned old-glibc image. x86_64 compiles
+# natively in the container; aarch64 cross-compiles with the Debian cross
+# toolchain (no QEMU — a full emulated build would take hours). Artifacts
+# are copied into the conventional target/<triple>/release layout so
+# package()/find_binary() need no special-casing.
+container_build_leg() {  # $1 = leg id
+    local id="$1" triple ctarget
+    triple="$(target_info "$id")"
+    ctarget="$SRC_DIR/target/container-$id"
+    echo ":: Building $id ($triple) in $LINUX_BUILD_IMAGE (glibc 2.36 floor) ..."
+    rm -f "$SRC_DIR/target/$triple/release/clawde"
+    docker run --rm -i --platform linux/amd64 \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+        -e PKG="$PKG" -e LEG_ID="$id" -e TRIPLE="$triple" \
+        -v "$SRC_DIR:/clawde" -w /clawde \
+        -v clawde-cargo-registry:/usr/local/cargo/registry \
+        -v clawde-cargo-git:/usr/local/cargo/git \
+        "$LINUX_BUILD_IMAGE" bash -se <<'EOS'
+set -e
+# bullseye is near LTS EOL and its security pool occasionally 404s mid-fetch;
+# retry the install once after a fresh update before giving up.
+apt_install() {
+    apt-get install -y -qq --no-install-recommends \
+        -o Acquire::Retries=5 "$@" >/dev/null \
+        || { apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+                 -o Acquire::Retries=5 "$@" >/dev/null; }
+}
+if [[ "$LEG_ID" == "linux-aarch64" ]]; then
+    dpkg --add-architecture arm64
+    apt-get update -qq
+    apt_install pkg-config gcc-aarch64-linux-gnu libasound2-dev:arm64 cmake golang-go ninja-build libclang-dev
+    export CARGO_TARGET_DIR=/clawde/target/container-$LEG_ID
+    export PKG_CONFIG_ALLOW_CROSS=1
+    export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+    export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+    export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+    export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+    TARGET_FLAG="--target $TRIPLE"
+else
+    apt-get update -qq
+    apt_install pkg-config libasound2-dev cmake golang-go ninja-build libclang-dev
+    export CARGO_TARGET_DIR=/clawde/target/container-$LEG_ID
+    TARGET_FLAG=""
+fi
+cargo build --release --locked --package "$PKG" $TARGET_FLAG
+chown -R "$HOST_UID:$HOST_GID" "$CARGO_TARGET_DIR" || true
+BIN_PATH="$CARGO_TARGET_DIR/$TRIPLE/release/clawde"
+[[ "$LEG_ID" == "linux-x86_64" ]] && BIN_PATH="$CARGO_TARGET_DIR/release/clawde"
+mkdir -p "/clawde/target/$TRIPLE/release"
+cp "$BIN_PATH" "/clawde/target/$TRIPLE/release/clawde"
+EOS
+    [[ -f "$SRC_DIR/target/$triple/release/clawde" ]] \
+        || die "container build produced no binary for $id"
 }
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -147,6 +218,9 @@ build_one() {  # $1 = id (or a raw rust triple)
     fi
 
     case "$builder" in
+        container)
+            container_build_leg "$id"
+            ;;
         native)
             echo ":: Building $id ($triple, native) ..."
             (cd "$SRC_DIR" && cargo build --release --locked --package "$PKG" --target "$triple")
@@ -371,9 +445,8 @@ show_targets() {
         printf "  %-16s %-35s %s\n" "$id" "$(target_info "$id")" "$(builder_for "$id")"
     done
     echo ""
-    echo "Cross tools:"
-    echo "  cross:  $(command -v cross >/dev/null 2>&1 && echo ready || echo 'not installed (needed for linux-aarch64 / windows via cross)')"
-    echo "  docker: $(docker info >/dev/null 2>&1 && echo running || echo 'not running (needed for cross)')"
+    echo "Container builder: $LINUX_BUILD_IMAGE (glibc 2.36 floor for Linux legs)"
+    echo "  docker: $(docker info >/dev/null 2>&1 && echo running || echo 'not running (required)')"
     echo "  zip:    $(command -v zip >/dev/null 2>&1 && echo ready || echo 'not installed (falls back to python3)')"
 }
 

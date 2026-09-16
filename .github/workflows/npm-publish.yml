@@ -10,6 +10,10 @@ on:
 
 permissions:
   contents: read
+  # Required by `npm publish --provenance` for build attestation only.
+  # Publish auth itself uses the NPM_TOKEN secret: trusted publishing
+  # (OIDC) was never configured on the npm side, and every run relying
+  # on it failed with ENEEDAUTH.
   id-token: write
 
 # Dispatched by `scripts/build.sh release` (via `gh workflow run`) after the
@@ -33,6 +37,9 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
+          # Writes ~/.npmrc with an ${NODE_AUTH_TOKEN} placeholder that the
+          # publish step's env fills in.
+          registry-url: 'https://registry.npmjs.org/'
 
       - name: Set up npm
         run: |
@@ -64,32 +71,25 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release view "${{ steps.version.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null
 
-      - name: Verify trusted publisher identity
+      - name: Verify repository URL for provenance
         working-directory: npm
         run: |
           set -euo pipefail
           node <<'NODE'
           const fs = require('fs');
-          const path = require('path');
 
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
           const repo = process.env.GITHUB_REPOSITORY;
-          const [owner, repoName] = repo.split('/');
-          const workflowRef = process.env.GITHUB_WORKFLOW_REF || '';
-          const workflowFile = path.basename(workflowRef.split('@')[0]);
           const repositoryUrl = typeof pkg.repository === 'string'
             ? pkg.repository
             : pkg.repository && pkg.repository.url;
           const expectedRepositoryUrl = `git+https://github.com/${repo}.git`;
 
-          console.log('Expected npm Trusted Publisher configuration:');
-          console.log(`  Organization or user: ${owner}`);
-          console.log(`  Repository: ${repoName}`);
-          console.log(`  Workflow filename: ${workflowFile}`);
-          console.log('  Environment name: (empty)');
+          console.log('Repository URL npm will bind to the provenance attestation:');
+          console.log(`  ${expectedRepositoryUrl}`);
 
           if (repositoryUrl !== expectedRepositoryUrl) {
-            console.error(`::error::npm/package.json repository.url must be ${expectedRepositoryUrl} for trusted publishing; found ${repositoryUrl || '(missing)'}`);
+            console.error(`::error::npm/package.json repository.url must be ${expectedRepositoryUrl} to match the provenance attestation; found ${repositoryUrl || '(missing)'}`);
             process.exit(1);
           }
           NODE
@@ -108,6 +108,5 @@ jobs:
       - name: Publish to npm
         working-directory: npm
         env:
-          NODE_AUTH_TOKEN: ''
-          NPM_TOKEN: ''
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance
