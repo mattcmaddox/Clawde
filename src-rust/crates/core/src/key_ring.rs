@@ -24,6 +24,12 @@ struct KeyRingEntry {
     key: String,
     /// `None` = usable now. `Some(instant)` = exhausted until this time.
     cooldown_until: Option<Instant>,
+    /// Scope of the cooldown. `None` = global (the key is benched for every
+    /// model — quota exhaustion, auth failure, per-key rate limits).
+    /// `Some(model)` = the cooldown applies only to requests for that model
+    /// (providers like Groq and Gemini enforce TPM/RPD limits per model, so
+    /// the key stays usable for every other model).
+    cooldown_model: Option<String>,
     /// Human-readable description of the last exhaustion reason, if any.
     last_error: Option<String>,
 }
@@ -42,6 +48,9 @@ pub struct KeyStatus {
     pub active: bool,
     /// When this key's cooldown expires, if exhausted.
     pub exhausted_until: Option<Instant>,
+    /// The model this cooldown applies to, when the cooldown is model-scoped
+    /// (per-model rate limits). `None` = global cooldown affecting all models.
+    pub cooldown_model: Option<String>,
     /// Seconds remaining until this key becomes usable again, if in cooldown.
     pub cooldown_remaining_secs: Option<u64>,
     /// The error message from the last exhaustion, if any.
@@ -78,6 +87,7 @@ impl KeyRing {
                 .map(|key| KeyRingEntry {
                     key,
                     cooldown_until: None,
+                    cooldown_model: None,
                     last_error: None,
                 })
                 .collect(),
@@ -119,6 +129,7 @@ impl KeyRing {
             if let Some(cooldown_until) = entry.cooldown_until {
                 if now >= cooldown_until {
                     entry.cooldown_until = None;
+                    entry.cooldown_model = None;
                     entry.last_error = None;
                 }
             }
@@ -128,10 +139,83 @@ impl KeyRing {
     /// Get the next available (non-exhausted) key, round-robining through
     /// the ring. Calls [`prune_expired`](Self::prune_expired) first.
     ///
+    /// A key is considered exhausted here if it has ANY cooldown, including
+    /// a model-scoped one — this is the conservative selection used by
+    /// key-identity consumers (health probes, model discovery, capability
+    /// queries). Request dispatch uses
+    /// [`next_available_for_model`](Self::next_available_for_model) instead.
+    ///
     /// Returns `Some((index, key_str))` if any key is available, or `None`
     /// if all keys are in cooldown.
     pub fn next_available(&mut self) -> Option<(usize, &str)> {
         self.next_available_by(|_| 0)
+    }
+
+    /// Whether `entry`'s current cooldown blocks requests for `model`.
+    /// Global cooldowns (no model) block every model; model-scoped cooldowns
+    /// block only their own model.
+    fn blocks_model(entry: &KeyRingEntry, model: &str) -> bool {
+        entry.cooldown_until.is_some()
+            && entry
+                .cooldown_model
+                .as_deref()
+                .is_none_or(|cooled| cooled == model)
+    }
+
+    /// Get the next key available for a request to `model`, round-robining
+    /// through the ring. Calls [`prune_expired`](Self::prune_expired) first.
+    ///
+    /// Model-aware selection: a key in a GLOBAL cooldown is skipped for every
+    /// model, but a key cooled only for a DIFFERENT model is still eligible.
+    /// Fully-active keys are always preferred over partially-cooled ones so a
+    /// per-model cooldown never makes a fresh key look less attractive. The
+    /// caller-supplied `rank` (e.g. capacity observation) is a secondary sort
+    /// after this active/partially-cooled tiering.
+    ///
+    /// Returns `Some((index, key_str))` or `None` when every key is blocked
+    /// for this model (global cooldowns everywhere, or model cooldowns that
+    /// all match `model`).
+    pub fn next_available_for_model_by<F>(
+        &mut self,
+        model: &str,
+        mut rank: F,
+    ) -> Option<(usize, &str)>
+    where
+        F: FnMut(usize) -> u8,
+    {
+        self.prune_expired();
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        let n = self.entries.len();
+        let mut selected: Option<(usize, u8, u8)> = None; // (idx, tier, caller_rank)
+        for offset in 0..n {
+            let idx = (self.cursor + offset) % n;
+            let entry = &self.entries[idx];
+            let tier = if entry.cooldown_until.is_none() {
+                0 // fully active
+            } else if Self::blocks_model(entry, model) {
+                continue; // blocked for this model
+            } else {
+                1 // usable for this model, cooled for another
+            };
+            let caller_rank = rank(idx);
+            if selected.is_none_or(|(_, best_tier, best_rank)| {
+                tier < best_tier || (tier == best_tier && caller_rank < best_rank)
+            }) {
+                selected = Some((idx, tier, caller_rank));
+            }
+        }
+        let (idx, _, _) = selected?;
+        self.cursor = (idx + 1) % n;
+        Some((idx, self.entries[idx].key.as_str()))
+    }
+
+    /// Convenience wrapper over [`next_available_for_model_by`](Self::next_available_for_model_by)
+    /// without a caller rank.
+    pub fn next_available_for_model(&mut self, model: &str) -> Option<(usize, &str)> {
+        self.next_available_for_model_by(model, |_| 0)
     }
 
     /// Get the available key with the lowest caller-provided rank.
@@ -183,11 +267,28 @@ impl KeyRing {
         cooldown_secs: u64,
         error_message: Option<String>,
     ) -> bool {
+        self.mark_exhausted_for_model(index, cooldown_secs, error_message, None)
+    }
+
+    /// Mark the key at `index` as exhausted for `cooldown_secs` seconds,
+    /// scoped to `model` when given. `None` marks a GLOBAL cooldown (the key
+    /// is benched for every model); `Some(model)` benches the key only for
+    /// requests to that model (per-model rate limits).
+    ///
+    /// Returns `false` if `index` is out of bounds.
+    pub fn mark_exhausted_for_model(
+        &mut self,
+        index: usize,
+        cooldown_secs: u64,
+        error_message: Option<String>,
+        model: Option<&str>,
+    ) -> bool {
         if let Some(entry) = self.entries.get_mut(index) {
             // Floor cooldown at 1s to prevent prune_expired from immediately
             // re-activating the key (which would create an infinite retry loop).
             let clamped = cooldown_secs.max(1);
             entry.cooldown_until = Some(Instant::now() + std::time::Duration::from_secs(clamped));
+            entry.cooldown_model = model.map(|m| m.to_string());
             entry.last_error = error_message;
             true
         } else {
@@ -217,6 +318,13 @@ impl KeyRing {
         self.entries.iter().all(|e| e.cooldown_until.is_some())
     }
 
+    /// Returns `true` when every key in the ring is blocked for `model` —
+    /// either globally cooled or cooled specifically for that model. Keys
+    /// cooled for OTHER models do not count.
+    pub fn all_exhausted_for_model(&self, model: &str) -> bool {
+        self.entries.iter().all(|e| Self::blocks_model(e, model))
+    }
+
     /// The earliest [`Instant`] at which *any* exhausted key becomes usable
     /// again. Returns `None` if no keys are exhausted.
     pub fn earliest_retry(&self) -> Option<Instant> {
@@ -231,6 +339,22 @@ impl KeyRing {
             let d = t.saturating_duration_since(now);
             d.as_secs().max(1)
         })
+    }
+
+    /// Seconds until the earliest key blocked for `model` becomes usable
+    /// again. Cooldowns scoped to other models are ignored. Returns `None`
+    /// when no key is blocked for this model.
+    pub fn earliest_retry_secs_for_model(&self, model: &str) -> Option<u64> {
+        let now = Instant::now();
+        self.entries
+            .iter()
+            .filter(|e| Self::blocks_model(e, model))
+            .filter_map(|e| e.cooldown_until)
+            .min()
+            .map(|t| {
+                let d = t.saturating_duration_since(now);
+                d.as_secs().max(1)
+            })
     }
 
     /// Number of keys that are currently active (not in cooldown).
@@ -279,6 +403,7 @@ impl KeyRing {
                     active,
                     exhausted_until: entry.cooldown_until,
                     cooldown_remaining_secs: cooldown_remaining,
+                    cooldown_model: entry.cooldown_model.clone(),
                     last_error: entry.last_error.clone(),
                 }
             })
@@ -298,6 +423,11 @@ pub struct KeyRingEntrySnapshot {
     /// Remaining cooldown seconds at snapshot time. 0 means active.
     #[serde(default)]
     pub cooldown_remaining_secs: u64,
+    /// The model this cooldown is scoped to, when model-scoped (per-model
+    /// rate limits). `None`/absent = global cooldown. Old snapshots without
+    /// this field load as global, which matches their original semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_model: Option<String>,
     /// Last error message, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -411,6 +541,7 @@ impl KeyRing {
                     KeyRingEntrySnapshot {
                         key: e.key.clone(),
                         cooldown_remaining_secs: remaining,
+                        cooldown_model: e.cooldown_model.clone(),
                         last_error: e.last_error.clone(),
                     }
                 })
@@ -449,6 +580,7 @@ impl KeyRing {
                 };
                 if adjusted > 0 {
                     entry.cooldown_until = Some(now + std::time::Duration::from_secs(adjusted));
+                    entry.cooldown_model = saved.cooldown_model.clone();
                     entry.last_error = saved.last_error.clone();
                 }
                 // If adjusted ≤ 0, the cooldown already expired while the app
@@ -814,11 +946,13 @@ mod tests {
                 KeyRingEntrySnapshot {
                     key: "k1".into(),
                     cooldown_remaining_secs: 0,
+                    cooldown_model: None,
                     last_error: None,
                 },
                 KeyRingEntrySnapshot {
                     key: "k-ghost".into(),
                     cooldown_remaining_secs: 60,
+                    cooldown_model: None,
                     last_error: Some("deleted key".into()),
                 },
             ],
@@ -841,6 +975,7 @@ mod tests {
             entries: vec![KeyRingEntrySnapshot {
                 key: "k1".into(),
                 cooldown_remaining_secs: 60,
+                cooldown_model: None,
                 last_error: Some("rate limited".into()),
             }],
             saved_at_unix: None,
@@ -923,6 +1058,7 @@ mod tests {
             entries: vec![KeyRingEntrySnapshot {
                 key: "k1".into(),
                 cooldown_remaining_secs: 0, // expired
+                cooldown_model: None,
                 last_error: Some("rate limited".into()),
             }],
             saved_at_unix: None,
@@ -958,6 +1094,7 @@ mod tests {
             entries: vec![KeyRingEntrySnapshot {
                 key: "k1".into(),
                 cooldown_remaining_secs: 300,
+                cooldown_model: None,
                 last_error: Some("rate limited".into()),
             }],
             saved_at_unix: Some(saved_at),
@@ -1004,6 +1141,7 @@ mod tests {
             entries: vec![KeyRingEntrySnapshot {
                 key: "k1".into(),
                 cooldown_remaining_secs: 60, // less than elapsed
+                cooldown_model: None,
                 last_error: Some("rate limited".into()),
             }],
             saved_at_unix: Some(saved_at),
@@ -1023,5 +1161,187 @@ mod tests {
             statuses[0].last_error.is_none(),
             "last_error should be None for active key"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Model-scoped cooldowns (per-model rate limits)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn model_scoped_cooldown_blocks_only_that_model() {
+        let mut ring = make_ring(&["k1", "k2"]);
+        ring.mark_exhausted_for_model(0, 60, Some("TPM limit".into()), Some("llama-70b"));
+
+        // Same model: blocked, falls to k2.
+        let (idx, key) = ring
+            .next_available_for_model("llama-70b")
+            .expect("k2 usable for llama-70b");
+        assert_eq!((idx, key), (1, "k2"));
+        assert!(
+            !ring.all_exhausted_for_model("llama-70b"),
+            "k2 is still active"
+        );
+
+        // Different model: k1 is still eligible (rank 1, after fully-active
+        // k2), so k2 wins as rank 0.
+        let (idx, _) = ring
+            .next_available_for_model("gpt-oss-120b")
+            .expect("k2 active for gpt-oss");
+        assert_eq!(idx, 1, "fully-active key is preferred");
+
+        // k1 alone is still selectable for the other model.
+        let mut solo = make_ring(&["k1"]);
+        solo.mark_exhausted_for_model(0, 60, None, Some("llama-70b"));
+        let (idx, key) = solo
+            .next_available_for_model("gpt-oss-120b")
+            .expect("model-scoped cooldown must not block other models");
+        assert_eq!((idx, key), (0, "k1"));
+        assert!(!solo.all_exhausted_for_model("gpt-oss-120b"));
+    }
+
+    #[test]
+    fn global_cooldown_blocks_all_models() {
+        let mut ring = make_ring(&["k1"]);
+        ring.mark_exhausted_for_model(0, 60, Some("quota".into()), None);
+
+        assert!(ring.next_available_for_model("any-model").is_none());
+        assert!(ring.all_exhausted_for_model("any-model"));
+    }
+
+    #[test]
+    fn model_scoped_earliest_retry_ignores_other_models() {
+        let mut ring = make_ring(&["k1", "k2"]);
+        ring.mark_exhausted_for_model(0, 600, None, Some("model-a"));
+        ring.mark_exhausted_for_model(1, 60, None, Some("model-b"));
+
+        // Global view sees both.
+        assert_eq!(ring.exhausted_count(), 2);
+        // For model-a, only k1 is blocked (~600s); k2's 60s is for model-b.
+        let secs = ring
+            .earliest_retry_secs_for_model("model-a")
+            .expect("k1 blocked for model-a");
+        assert!(
+            (590..=600).contains(&secs),
+            "expected ~600s for model-a, got {}s",
+            secs
+        );
+        assert!(ring.earliest_retry_secs_for_model("model-c").is_none());
+    }
+
+    #[test]
+    fn model_scoped_cooldown_snapshot_round_trips() {
+        let mut ring = make_ring(&["k1", "k2"]);
+        ring.mark_exhausted_for_model(0, 120, Some("TPM".into()), Some("llama-70b"));
+        ring.mark_exhausted(1, 60, Some("quota".into()));
+
+        let snapshot = ring.to_snapshot();
+        assert_eq!(
+            snapshot.entries[0].cooldown_model.as_deref(),
+            Some("llama-70b")
+        );
+        assert_eq!(snapshot.entries[1].cooldown_model, None);
+
+        let mut fresh = make_ring(&["k1", "k2"]);
+        fresh.apply_snapshot(&snapshot);
+
+        // k1: model-scoped — blocked for llama-70b. k2: global — blocked for
+        // everything, so k1 is the only key eligible for "other-model".
+        assert!(fresh
+            .next_available_for_model("llama-70b")
+            .is_none_or(|(i, _)| i != 0));
+        let (idx, _) = fresh
+            .next_available_for_model("other-model")
+            .expect("k1 eligible for other-model (k2 globally cooled)");
+        assert_eq!(idx, 0, "model-scoped k1 outranks nothing; k2 is blocked");
+
+        // k2: global — blocked everywhere.
+        assert!(
+            fresh.all_exhausted_for_model("k2-only-model")
+                || fresh.entries[1].cooldown_until.is_some()
+        );
+    }
+
+    #[test]
+    fn old_snapshot_without_model_field_loads_as_global() {
+        // Old-format snapshots (no cooldown_model field) must load as global
+        // cooldowns, preserving their original semantics.
+        let mut ring = make_ring(&["k1"]);
+        ring.mark_exhausted(0, 60, Some("rate limited".into()));
+        let snapshot = ring.to_snapshot();
+
+        let mut fresh = make_ring(&["k1"]);
+        fresh.apply_snapshot(&snapshot);
+        assert!(fresh.next_available_for_model("any-model").is_none());
+    }
+
+    #[test]
+    fn model_aware_selection_tiers_active_above_partially_cooled_with_rank() {
+        // k1: cooled for model-a (tier 1 for model-b); k2: fully active.
+        // For model-a, k1 is blocked entirely and k2 (tier 0) serves.
+        // For model-b, k2 is tier 0 and must beat k1's tier 1 even though
+        // k1 has the better caller rank.
+        let mut ring = make_ring(&["k1", "k2"]);
+        ring.mark_exhausted_for_model(0, 60, None, Some("model-a"));
+
+        let ranks = [0u8, 3];
+        let (idx_a, _) = ring
+            .next_available_for_model_by("model-a", |idx| ranks[idx])
+            .expect("k2 usable for model-a");
+        assert_eq!(idx_a, 1, "active tier beats caller rank");
+
+        let (idx_b, _) = ring
+            .next_available_for_model_by("model-b", |idx| ranks[idx])
+            .expect("both usable for model-b");
+        assert_eq!(idx_b, 1, "tier 0 beats tier 1 regardless of caller rank");
+    }
+
+    #[test]
+    fn model_aware_selection_uses_caller_rank_within_same_tier() {
+        // Both keys fully active (same tier): caller rank decides.
+        let mut ring = make_ring(&["k1", "k2"]);
+        let ranks = [3u8, 0];
+        let (idx, _) = ring
+            .next_available_for_model_by("any-model", |idx| ranks[idx])
+            .expect("both active");
+        assert_eq!(idx, 1, "lower caller rank wins within a tier");
+    }
+
+    #[test]
+    fn statuses_surface_cooldown_model() {
+        let mut ring = make_ring(&["k1", "k2"]);
+        ring.mark_exhausted_for_model(0, 60, Some("TPM".into()), Some("llama-70b"));
+        ring.mark_exhausted(1, 60, Some("quota".into()));
+
+        let statuses = ring.statuses();
+        assert_eq!(statuses[0].cooldown_model.as_deref(), Some("llama-70b"));
+        assert_eq!(statuses[1].cooldown_model, None);
+    }
+
+    #[test]
+    fn prune_clears_model_scope_with_cooldown() {
+        let mut ring = make_ring(&["k1"]);
+        ring.mark_exhausted_for_model(0, 1, Some("TPM".into()), Some("llama-70b"));
+        assert_eq!(
+            ring.statuses()[0].cooldown_model.as_deref(),
+            Some("llama-70b")
+        );
+
+        // Can't wait 1s in a unit test; force-expire by directly moving the
+        // deadline into the past via a fresh 0-duration mark is clamped, so
+        // instead verify prune only via the snapshot path (adjusted ≤ 0).
+        let snapshot = ring.to_snapshot();
+        let expired = ProviderKeyRingSnapshot {
+            entries: vec![KeyRingEntrySnapshot {
+                key: "k1".into(),
+                cooldown_remaining_secs: 0,
+                cooldown_model: Some("llama-70b".into()),
+                last_error: Some("TPM".into()),
+            }],
+            saved_at_unix: snapshot.saved_at_unix,
+        };
+        let mut fresh = make_ring(&["k1"]);
+        fresh.apply_snapshot(&expired);
+        assert!(fresh.statuses()[0].active);
+        assert_eq!(fresh.statuses()[0].cooldown_model, None);
     }
 }

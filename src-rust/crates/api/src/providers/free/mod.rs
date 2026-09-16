@@ -2833,6 +2833,12 @@ pub struct ProviderCooldownProfile {
     pub max_cooldown_secs: u64,
     /// Whether this provider returns Retry-After headers
     pub respects_retry_after: bool,
+    /// Scope of the provider's rate limits: `"per-key"` (default) means a
+    /// rate limit benches the key for every model; `"per-model"` means the
+    /// provider enforces TPM/RPM buckets per model (Groq, Gemini), so a rate
+    /// limit only benches the key for the model it was hit on.
+    #[serde(default)]
+    pub limit_scope: String,
     /// Optional notes about this provider's limits
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
@@ -2845,6 +2851,7 @@ impl Default for ProviderCooldownProfile {
             server_error_cooldown_secs: 60,
             max_cooldown_secs: 600,
             respects_retry_after: false,
+            limit_scope: "per-key".to_string(),
             notes: None,
         }
     }

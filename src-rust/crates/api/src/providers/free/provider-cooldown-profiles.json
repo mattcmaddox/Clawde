@@ -7,7 +7,8 @@
       "server_error_cooldown_secs": 30,
       "max_cooldown_secs": 300,
       "respects_retry_after": true,
-      "notes": "RPM: 30-60, TPM: 6K-30K. Resets quickly. Returns x-ratelimit-reset-tokens header."
+      "limit_scope": "per-model",
+      "notes": "RPM: 30-60, TPM: 6K-30K, per-model. Resets quickly. Returns x-ratelimit-reset-tokens header."
     },
     "nvidia": {
       "rate_limit_cooldown_secs": 90,
@@ -49,7 +50,8 @@
       "server_error_cooldown_secs": 30,
       "max_cooldown_secs": 300,
       "respects_retry_after": true,
-      "notes": "RPM: 5-15, TPM: 250K. Model-specific. Returns RESOURCE_EXHAUSTED."
+      "limit_scope": "per-model",
+      "notes": "RPM: 5-15, TPM: 250K, quotas per model. Returns RESOURCE_EXHAUSTED."
     },
     "cohere": {
       "rate_limit_cooldown_secs": 60,

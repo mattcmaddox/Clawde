@@ -780,8 +780,14 @@ fn cmd_health(
                     Some(s) => {
                         let remaining = s.cooldown_remaining_secs.unwrap_or(0);
                         let error_info = s.last_error.as_deref().unwrap_or("unknown");
+                        // Model-scoped cooldowns (per-model rate limits) only
+                        // bench the key for that model — say so explicitly.
+                        let scope = match &s.cooldown_model {
+                            Some(model) => format!(" — {model} only"),
+                            None => String::new(),
+                        };
                         format!(
-                            "    [{}] {}  EXHAUSTED ({} remaining — {})",
+                            "    [{}] {}  EXHAUSTED ({} remaining{scope} — {})",
                             i + 1,
                             preview,
                             format_duration(remaining),

@@ -34,6 +34,7 @@ use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, RateLimitObservation,
     StreamEvent, SystemPromptStyle,
 };
+use crate::providers::free::ProviderProfiles;
 use crate::time_extract::estimate_cooldown;
 
 // ---------------------------------------------------------------------------
@@ -90,6 +91,14 @@ fn default_cooldown_for_signal(signal: ExhaustSignal) -> u64 {
         ExhaustSignal::RateLimit => 60,
         ExhaustSignal::Auth => 300, // 5 min — key won't be retried immediately
     }
+}
+
+/// Whether this provider enforces its rate limits per model (TPM/RPM buckets
+/// keyed by model id) rather than per key. When true, a RateLimited error
+/// benches the key only for the model it was hit on — the key stays usable
+/// for every other model. Global signals (quota, auth) are never model-scoped.
+fn limit_scope_is_per_model(provider_id: &str, profiles: &ProviderProfiles) -> bool {
+    profiles.profile_for(provider_id).limit_scope == "per-model"
 }
 
 /// When ALL keys are exhausted and the shortest cooldown is at most this
@@ -232,6 +241,9 @@ pub struct KeyRotatingProvider {
     /// providers don't waste time waiting for cooldowns — the FreeProvider
     /// handles fallback at a higher level.
     skip_recovery_loop: bool,
+    /// Cooldown profiles used to decide whether a rate-limit exhaustion is
+    /// model-scoped (per-model TPM/RPM buckets) or global to the key.
+    profiles: ProviderProfiles,
 }
 
 impl KeyRotatingProvider {
@@ -256,6 +268,7 @@ impl KeyRotatingProvider {
             build_provider: Arc::new(build_provider),
             state_path: None,
             skip_recovery_loop: false,
+            profiles: ProviderProfiles::load(),
         }
     }
 
@@ -287,6 +300,7 @@ impl KeyRotatingProvider {
             build_provider: Arc::new(build_provider),
             state_path: Some(state_path),
             skip_recovery_loop: false,
+            profiles: ProviderProfiles::load(),
         }
     }
 
@@ -324,7 +338,13 @@ impl KeyRotatingProvider {
     // Core retry loop
     // -----------------------------------------------------------------------
 
-    fn next_available_provider(&self) -> Option<(usize, Arc<dyn LlmProvider>)> {
+    /// Model-aware key selection: keys cooled only for a different model
+    /// remain eligible. An empty `model` degrades to the conservative
+    /// any-model selection (any cooldown blocks).
+    fn next_available_provider_for_model(
+        &self,
+        model: &str,
+    ) -> Option<(usize, Arc<dyn LlmProvider>)> {
         let ranks = self
             .key_capacity
             .lock()
@@ -335,8 +355,12 @@ impl KeyRotatingProvider {
             })
             .unwrap_or_default();
         let mut ring = self.ring.lock().ok()?;
-        ring.next_available_by(|idx| ranks.get(idx).copied().unwrap_or(0))
-            .map(|(idx, key)| (idx, (self.build_provider)(key)))
+        let selection = if model.is_empty() {
+            ring.next_available_by(|idx| ranks.get(idx).copied().unwrap_or(0))
+        } else {
+            ring.next_available_for_model_by(model, |idx| ranks.get(idx).copied().unwrap_or(0))
+        };
+        selection.map(|(idx, key)| (idx, (self.build_provider)(key)))
     }
 
     /// Get the next available key, build a provider, and call `try_provider`.
@@ -344,7 +368,15 @@ impl KeyRotatingProvider {
     /// errors, returns immediately. When all keys are exhausted, returns
     /// the last exhaustible provider error, preserving quota/credits and auth
     /// failures instead of masking them as a synthetic rate limit.
-    async fn try_with_rotation<F, Fut, T>(&self, try_provider: F) -> Result<T, ProviderError>
+    ///
+    /// `model` enables model-scoped cooldowns: on per-model providers, a
+    /// rate-limit exhaustion only benches the key for this model, and the
+    /// all-exhausted wait loop consults model-scoped retry times.
+    async fn try_with_rotation<F, Fut, T>(
+        &self,
+        model: &str,
+        try_provider: F,
+    ) -> Result<T, ProviderError>
     where
         F: Fn(usize, Arc<dyn LlmProvider>) -> Fut,
         Fut: std::future::Future<Output = Result<T, ProviderError>>,
@@ -354,21 +386,31 @@ impl KeyRotatingProvider {
 
         loop {
             // Get the next available key (lock scope ends before any .await).
-            let provider = self.next_available_provider();
+            let provider = self.next_available_provider_for_model(model);
 
             let (active_idx, provider) = match provider {
                 Some(selection) => selection,
                 None => {
-                    // All keys exhausted. Read the current shortest cooldown
-                    // fresh from the key ring each cycle (cooldowns can change
-                    // between cycles if different keys are exhausted with
-                    // different durations by concurrent requests).
+                    // All keys exhausted (for this model). Read the current
+                    // shortest cooldown fresh from the key ring each cycle
+                    // (cooldowns can change between cycles if different keys
+                    // are exhausted with different durations by concurrent
+                    // requests).
                     let (should_wait, retry_secs) = {
                         let ring = self.ring.lock().unwrap();
                         if ring.is_empty() {
                             (false, 60)
-                        } else {
+                        } else if model.is_empty() {
                             let s = ring.earliest_retry_secs().unwrap_or(60);
+                            (s <= MAX_COOLDOWN_WAIT, s)
+                        } else {
+                            let s = ring
+                                .earliest_retry_secs_for_model(model)
+                                // Keys cooled for other models can still serve
+                                // this one; the ring only returns None above
+                                // when every key is blocked here, so this
+                                // fallback exists for the empty-ring edge.
+                                .unwrap_or(60);
                             (s <= MAX_COOLDOWN_WAIT, s)
                         }
                     };
@@ -448,12 +490,30 @@ impl KeyRotatingProvider {
                             extracted.or_secs(cooldown)
                         });
 
+                        // Scope the cooldown: on per-model providers a rate
+                        // limit only benches this key for the model it was hit
+                        // on; quota and auth are always global (they reflect
+                        // the account/key itself, not a model bucket).
+                        let scope_model = match signal {
+                            ExhaustSignal::RateLimit
+                                if limit_scope_is_per_model(&self.provider_id, &self.profiles) =>
+                            {
+                                Some(model)
+                            }
+                            _ => None,
+                        };
+
                         // Mark the exact slot selected before the await. A
                         // concurrent request may have advanced or changed the
                         // ring while this provider call was in flight; picking
                         // the first currently-active slot would exhaust the
                         // wrong credential.
-                        ring.mark_exhausted(active_idx, final_cooldown, Some(msg.to_string()));
+                        ring.mark_exhausted_for_model(
+                            active_idx,
+                            final_cooldown,
+                            Some(msg.to_string()),
+                            scope_model,
+                        );
 
                         // Persist cooldown state immediately so a 12-hour
                         // cooldown survives an app restart 10 hours in.
@@ -491,7 +551,8 @@ impl LlmProvider for KeyRotatingProvider {
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
         let key_capacity = Arc::clone(&self.key_capacity);
-        self.try_with_rotation(|key_idx, provider| {
+        let model = request.model.clone();
+        self.try_with_rotation(&model, |key_idx, provider| {
             let req = request.clone();
             let key_capacity = Arc::clone(&key_capacity);
             async move {
@@ -515,7 +576,8 @@ impl LlmProvider for KeyRotatingProvider {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
         let key_capacity = Arc::clone(&self.key_capacity);
-        self.try_with_rotation(|key_idx, provider| {
+        let model = request.model.clone();
+        self.try_with_rotation(&model, |key_idx, provider| {
             let req = request.clone();
             let key_capacity = Arc::clone(&key_capacity);
             async move {
@@ -728,6 +790,9 @@ mod tests {
         id: ProviderId,
         name: String,
         fail_with: Option<ProviderError>,
+        /// When set, `fail_with` only applies to requests for this model;
+        /// other models succeed.
+        fail_on_model: Option<String>,
         call_count: Arc<AtomicUsize>,
         delay: Duration,
         rate_limit: Option<RateLimitObservation>,
@@ -751,7 +816,13 @@ mod tests {
                 tokio::time::sleep(self.delay).await;
             }
             if let Some(ref err) = self.fail_with {
-                return Err(err.clone());
+                if self
+                    .fail_on_model
+                    .as_deref()
+                    .is_none_or(|m| m == request.model)
+                {
+                    return Err(err.clone());
+                }
             }
             Ok(ProviderResponse {
                 id: "mock".into(),
@@ -867,6 +938,7 @@ mod tests {
             id: ProviderId::new("mock"),
             name: format!("mock-{}", key),
             fail_with: fail,
+            fail_on_model: None,
             call_count: counter,
             delay: Duration::ZERO,
             rate_limit,
@@ -1412,6 +1484,7 @@ mod tests {
             id: ProviderId::new("mock"),
             name: format!("mock-{}", key),
             fail_with: fail,
+            fail_on_model: None,
             call_count: counter,
             delay,
             rate_limit: None,
@@ -1745,6 +1818,224 @@ mod tests {
                 remaining
             );
         }
+    }
+
+    #[tokio::test]
+    async fn per_model_rate_limit_scopes_cooldown_to_model() {
+        // The "groq" profile is limit_scope=per-model: a RateLimited error
+        // must bench the key for the model it was hit on ONLY. The key stays
+        // selectable for a different model, and the scope survives a snapshot
+        // round-trip.
+        let counters = Arc::new(vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ]);
+
+        let key0_fail = ProviderError::RateLimited {
+            provider: ProviderId::new("groq"),
+            retry_after: Some(300),
+        };
+
+        let build = {
+            let c = counters.clone();
+            move |key: &str| {
+                let fail = if key == "key0" {
+                    Some(key0_fail.clone())
+                } else {
+                    None
+                };
+                build_mock_provider(key, fail, &c)
+            }
+        };
+
+        let provider =
+            KeyRotatingProvider::new("groq", "Groq", vec!["key0".into(), "key1".into()], build);
+
+        let mut req = dummy_request();
+        req.model = "llama-3.3-70b-versatile".into();
+        let result = provider.create_message(req).await;
+        assert!(result.is_ok(), "should succeed on key1");
+
+        let statuses = provider.key_statuses();
+        assert!(!statuses[0].active, "key0 benched for llama-3.3-70b");
+        assert_eq!(
+            statuses[0].cooldown_model.as_deref(),
+            Some("llama-3.3-70b-versatile"),
+            "rate-limit cooldown must be model-scoped on groq"
+        );
+        assert!(statuses[1].active);
+
+        // Cooldown persists with its model scope.
+        let snapshot = provider.ring().lock().unwrap().to_snapshot();
+        assert_eq!(
+            snapshot.entries[0].cooldown_model.as_deref(),
+            Some("llama-3.3-70b-versatile")
+        );
+    }
+
+    #[tokio::test]
+    async fn per_key_rate_limit_keeps_global_cooldown() {
+        // The "nvidia" profile is limit_scope=per-key (default): the same
+        // RateLimited error must bench the key globally.
+        let counters = Arc::new(vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ]);
+
+        let key0_fail = ProviderError::RateLimited {
+            provider: ProviderId::new("nvidia"),
+            retry_after: Some(300),
+        };
+
+        let build = {
+            let c = counters.clone();
+            move |key: &str| {
+                let fail = if key == "key0" {
+                    Some(key0_fail.clone())
+                } else {
+                    None
+                };
+                build_mock_provider(key, fail, &c)
+            }
+        };
+
+        let provider = KeyRotatingProvider::new(
+            "nvidia",
+            "NVIDIA",
+            vec!["key0".into(), "key1".into()],
+            build,
+        );
+
+        let mut req = dummy_request();
+        req.model = "some-model".into();
+        let result = provider.create_message(req).await;
+        assert!(result.is_ok(), "should succeed on key1");
+
+        let statuses = provider.key_statuses();
+        assert!(!statuses[0].active);
+        assert_eq!(
+            statuses[0].cooldown_model, None,
+            "per-key provider cooldown must stay global"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_and_auth_are_never_model_scoped() {
+        // Even on a per-model provider (groq), quota and auth failures are
+        // properties of the account/key, not a model bucket.
+        for (name, err) in [
+            (
+                "quota",
+                ProviderError::QuotaExceeded {
+                    provider: ProviderId::new("groq"),
+                    message: "daily limit".into(),
+                },
+            ),
+            (
+                "auth",
+                ProviderError::AuthFailed {
+                    provider: ProviderId::new("groq"),
+                    message: "invalid key".into(),
+                },
+            ),
+        ] {
+            let counters = Arc::new(vec![Arc::new(AtomicUsize::new(0))]);
+            let build = {
+                let err = err.clone();
+                let c = counters.clone();
+                move |_key: &str| build_mock_provider("key", Some(err.clone()), &c)
+            };
+            let provider = KeyRotatingProvider::new("groq", "Groq", vec!["key0".into()], build);
+
+            let mut req = dummy_request();
+            req.model = "llama-3.3-70b-versatile".into();
+            let _ = provider.create_message(req).await;
+
+            let statuses = provider.key_statuses();
+            assert!(!statuses[0].active, "{name} must bench the key");
+            assert_eq!(
+                statuses[0].cooldown_model, None,
+                "{name} must be a global cooldown even on groq"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_scoped_cooldown_keeps_key_usable_for_other_models() {
+        // The decisive behavioral test: on groq, key0 is rate-limited on
+        // model-a. A request for model-b must still be able to use key0.
+        let counters = Arc::new(vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ]);
+
+        let build = {
+            let c = counters.clone();
+            move |key: &str| {
+                let (fail, fail_on_model) = if key == "key0" {
+                    (
+                        Some(ProviderError::RateLimited {
+                            provider: ProviderId::new("groq"),
+                            retry_after: Some(300),
+                        }),
+                        Some("model-a".to_string()),
+                    )
+                } else {
+                    (None, None)
+                };
+                let idx: usize = key
+                    .chars()
+                    .last()
+                    .and_then(|c| c.to_digit(10))
+                    .map(|d| d as usize)
+                    .unwrap_or(0);
+                let counter = c
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+                Arc::new(MockProvider {
+                    id: ProviderId::new("mock"),
+                    name: format!("mock-{}", key),
+                    fail_with: fail,
+                    fail_on_model,
+                    call_count: counter,
+                    delay: Duration::ZERO,
+                    rate_limit: None,
+                }) as Arc<dyn LlmProvider>
+            }
+        };
+
+        let provider =
+            KeyRotatingProvider::new("groq", "Groq", vec!["key0".into(), "key1".into()], build);
+
+        // key0 gets benched for model-a (fails there, succeeds elsewhere).
+        let mut req_a = dummy_request();
+        req_a.model = "model-a".into();
+        let _ = provider.create_message(req_a).await;
+        assert_eq!(counters[0].load(Ordering::SeqCst), 1);
+        assert_eq!(counters[1].load(Ordering::SeqCst), 1);
+
+        // A model-b request: key0 is cooled for model-a only, and fully-active
+        // key1 is preferred — but if key1 were also cooled, key0 must remain
+        // eligible. Simulate that by exhausting key1 globally via quota.
+        provider
+            .ring()
+            .lock()
+            .unwrap()
+            .mark_exhausted(1, 300, Some("quota".into()));
+
+        let mut req_b = dummy_request();
+        req_b.model = "model-b".into();
+        let result = provider.create_message(req_b).await;
+        assert!(
+            result.is_ok(),
+            "key0 (cooled for model-a only) must serve model-b"
+        );
+        assert_eq!(
+            counters[0].load(Ordering::SeqCst),
+            2,
+            "key0 should have been re-selected for model-b"
+        );
     }
 
     #[tokio::test]
