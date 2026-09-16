@@ -646,10 +646,19 @@ const MAX_TOKENS_RECOVERY_MSG: &str =
      you were doing. Pick up mid-thought if that is where the cut happened. \
      Break remaining work into smaller pieces.";
 
-/// Injected as the final user turn when `effective_max_turns` is reached. That
-/// turn runs with tools DISABLED (graceful degradation, mirroring opencode's
-/// max-steps `toolChoice:"none"` behaviour), so the model produces a plain-text
-/// wrap-up instead of the loop returning cold.
+/// Injected when `effective_max_turns` is reached so a bounded continuation can
+/// resume the same task with tools enabled. This is intentionally a user-role
+/// message: it survives compaction and gives the next provider/model an explicit
+/// handoff instead of silently ending the run.
+const MAX_STEPS_CONTINUATION_MSG: &str =
+    "The previous agent run reached its step budget before the task was complete. \
+     Continue the same task from the existing evidence and tool results. Do not \
+     restart completed work; use tools to finish the user's request, then respond \
+     normally when the work is actually complete.";
+
+/// Injected as the final user turn after bounded continuations are exhausted.
+/// That turn runs with tools DISABLED so the model produces a plain-text handoff
+/// instead of the loop returning cold.
 const MAX_STEPS_DEGRADATION_MSG: &str =
     "You have reached the maximum number of steps for this run, so tools are now \
      disabled — do not attempt to call any tools. In plain text, briefly \
@@ -1970,6 +1979,9 @@ async fn run_query_loop_inner(
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
+    // One bounded model fallback is allowed after the primary model repeatedly
+    // exhausts its output budget; otherwise surface the partial response.
+    let mut max_tokens_fallback_used = false;
     // Active model — may switch to fallback on overloaded errors.
     // Agent model override takes priority over the session model when set.
     let mut effective_model = if let Some(ref agent) = config.agent_definition {
@@ -1986,9 +1998,12 @@ async fn run_query_loop_inner(
     let mut used_fallback = false;
     // How many automatic retries remain when a stream stalls (no data for 45s).
     let mut retries_left: u32 = 2;
-    // Max-steps graceful degradation (issue #230 / MI-3): set once the final
-    // tool-less summary turn has been dispatched so it can never re-trigger
-    // (anti-recursion guard).
+    // Max-steps recovery: allow bounded continuation windows with tools before
+    // falling back to the tool-less handoff summary. The continuation reuses the
+    // same transcript, so provider/key rotation and fallback-model selection can
+    // resume the exact task rather than discarding the partial run.
+    const MAX_STEP_CONTINUATIONS: u32 = 2;
+    let mut max_step_continuations = 0u32;
     let mut degradation_done = false;
     // Automatic retries for the current logical completion. This survives
     // stall/error retries and is reset after a completed turn is emitted.
@@ -2147,13 +2162,60 @@ async fn run_query_loop_inner(
                 "Checking for file changes...".to_string(),
             ));
         }
-        // Max-steps graceful degradation (issue #230 / MI-3). Rather than
-        // returning cold when the turn cap is hit, run ONE final turn with tools
-        // disabled that asks the model to summarize progress and its stopping
-        // point (mirrors opencode's max-steps `toolChoice:"none"` fallback).
-        // `degradation_done` is the anti-recursion guard: the summary turn is
-        // dispatched exactly once, and re-exceeding the cap afterwards returns
-        // cold. Applies to both goal and non-goal runs.
+        // Before the final summary fallback, spend a bounded continuation window
+        // with tools enabled so the same task can resume on the configured
+        // fallback model or the provider's next available key/upstream.
+        if turn > effective_max_turns && max_step_continuations < MAX_STEP_CONTINUATIONS {
+            max_step_continuations += 1;
+            let switched_model = config
+                .fallback_model
+                .as_deref()
+                .filter(|fallback| *fallback != effective_model)
+                .map(str::to_string);
+            if let Some(fallback) = switched_model {
+                warn!(
+                    previous_model = %effective_model,
+                    fallback_model = %fallback,
+                    continuation = max_step_continuations,
+                    "Max steps reached — continuing on fallback model"
+                );
+                effective_model = fallback.clone();
+                used_fallback = true;
+                sanitize_thinking_from_trajectory(messages);
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status(format!(
+                        "Step limit reached — continuing on fallback model {} (attempt {}/{})…",
+                        fallback, max_step_continuations, MAX_STEP_CONTINUATIONS
+                    )));
+                }
+            } else if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::Status(format!(
+                    "Step limit reached — continuing with the next available key/provider (attempt {}/{})…",
+                    max_step_continuations, MAX_STEP_CONTINUATIONS
+                )));
+            }
+            messages.push(Message::user(MAX_STEPS_CONTINUATION_MSG));
+            // Preserve run-level write/diff evidence across the automatic
+            // handoff so the final review remains authoritative.
+            turn_state.clear_turn();
+            repeat_detector.reset();
+            // Keep the original run snapshot so the eventual final review can
+            // still see changes made before the step-limit boundary. Per-turn
+            // counters are reset above; the change baseline is intentionally
+            // run-scoped for this automatic handoff.
+            turn = 0;
+            max_tokens_recovery_count = 0;
+            max_tokens_fallback_used = false;
+            retries_left = 2;
+            request_retries = 0;
+            last_recovery_error = None;
+            goal_turn_start = std::time::Instant::now();
+            observability_started_at = std::time::Instant::now();
+            turn_started_wall = clawde_core::types::now_rfc3339_ms();
+            turn_start_cost = cost_tracker.total_cost_usd();
+            continue;
+        }
+
         let degradation_turn = if turn > effective_max_turns {
             if degradation_done {
                 info!(
@@ -2616,6 +2678,7 @@ async fn run_query_loop_inner(
                         // one-loop-per-goal-turn design.
                         turn = 0;
                         max_tokens_recovery_count = 0;
+                        max_tokens_fallback_used = false;
                         retries_left = 2;
                         request_retries = 0;
                         last_recovery_error = None;
@@ -3236,12 +3299,14 @@ async fn run_query_loop_inner(
                 if let Some(mut provider) = provider {
                     debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
 
-                    // Notify TUI that we're calling the provider using a random spinner verb
+                    // Notify TUI that we're calling the provider using a random
+                    // spinner verb. The TUI prepends its own spinner glyph —
+                    // embedding one here produces a doubled "⠸ ✳ Basking…".
                     if let Some(ref tx) = event_tx {
                         use clawde_core::sample_spinner_verb;
                         let seed = provider_id_str.len() ^ model_id_str.len();
                         let verb = sample_spinner_verb(seed);
-                        let _ = tx.send(QueryEvent::Status(format!("✳ {}…", verb)));
+                        let _ = tx.send(QueryEvent::Status(format!("{}…", verb)));
                     }
 
                     // Build ProviderRequest from the already-assembled request data.
@@ -3633,6 +3698,40 @@ async fn run_query_loop_inner(
                                         );
                                     }
                                     turn -= 1; // don't count this attempt
+                                    continue;
+                                }
+                            }
+                            // Provider-path failures used to terminate the whole
+                            // run even when a configured fallback model could
+                            // safely replay the request. Rotate once for
+                            // credential, quota, model-availability, and
+                            // transient-provider failures; visible partial
+                            // streams and malformed/content-filtered requests
+                            // remain terminal because replay could duplicate or
+                            // corrupt user-visible output.
+                            if !used_fallback && e.may_fallback() {
+                                if let Some(fallback) = config
+                                    .fallback_model
+                                    .as_deref()
+                                    .filter(|fallback| *fallback != effective_model)
+                                {
+                                    warn!(
+                                        provider = %provider_id_str,
+                                        previous_model = %effective_model,
+                                        fallback_model = %fallback,
+                                        "Provider request failed — switching to fallback model"
+                                    );
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx.send(QueryEvent::Status(format!(
+                                            "Provider unavailable — continuing on fallback model {}…",
+                                            fallback
+                                        )));
+                                    }
+                                    effective_model = fallback.to_string();
+                                    used_fallback = true;
+                                    sanitize_thinking_from_trajectory(messages);
+                                    request_retries += 1;
+                                    turn -= 1;
                                     continue;
                                 }
                             }
@@ -5201,7 +5300,36 @@ async fn run_query_loop_inner(
                         messages.push(Message::user(MAX_TOKENS_RECOVERY_MSG));
                         continue;
                     }
-                    // Recovery exhausted — surface the partial response.
+                    // Recovery exhausted on this model. Give a configured
+                    // fallback one chance to continue the same conversation
+                    // before surfacing the partial response to the caller.
+                    if !max_tokens_fallback_used {
+                        if let Some(fallback) = config
+                            .fallback_model
+                            .as_deref()
+                            .filter(|fallback| *fallback != effective_model)
+                        {
+                            max_tokens_fallback_used = true;
+                            warn!(
+                                previous_model = %effective_model,
+                                fallback_model = %fallback,
+                                "max_tokens recovery exhausted — switching to fallback model"
+                            );
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::Status(format!(
+                                    "Output limit reached — continuing on fallback model {}…",
+                                    fallback
+                                )));
+                            }
+                            effective_model = fallback.to_string();
+                            used_fallback = true;
+                            sanitize_thinking_from_trajectory(messages);
+                            messages.push(Message::user(MAX_TOKENS_RECOVERY_MSG));
+                            max_tokens_recovery_count = 0;
+                            turn -= 1;
+                            continue;
+                        }
+                    }
                     warn!(
                         "max_tokens recovery exhausted after {} attempts",
                         MAX_TOKENS_RECOVERY_LIMIT
@@ -6644,10 +6772,10 @@ mod tests {
         );
     }
 
-    // ---- Issue #230 (MI-3): in-loop continuation + max-steps degradation -----
+    // ---- Issue #230 (MI-3): in-loop continuation + max-steps recovery -----
 
     /// A provider double that records, per request, whether the tool set was
-    /// empty (i.e. tools were disabled — the max-steps degradation turn) and
+    /// empty (i.e. tools were disabled — the final max-steps handoff) and
     /// replays a scripted response. Drives `run_query_loop` end-to-end.
     struct RecordingProvider {
         id: clawde_core::provider_id::ProviderId,
@@ -7506,13 +7634,14 @@ mod tests {
         );
     }
 
-    /// (c) Hitting `effective_max_turns` runs ONE final turn with tools disabled
-    /// (graceful degradation) rather than returning cold: the last request has
-    /// an empty tool set and the loop then ends.
+    /// (c) Hitting `effective_max_turns` gets bounded tool-enabled continuation
+    /// windows before the final tool-less summary, preserving the task instead
+    /// of returning cold at the first cap.
     #[tokio::test]
-    async fn max_steps_runs_tool_less_summary_turn_then_ends() {
-        // max_turns = 2: turns 1 & 2 are tool_use turns, turn 3 exceeds the cap
-        // and triggers the tool-less summary turn.
+    async fn max_steps_continues_before_tool_less_summary() {
+        // max_turns = 2: each of the two continuation windows gets two tool
+        // turns, then the final capped request is the tool-less handoff.
+
         let (outcome, recorded, msgs) = drive_loop_with_mock(
             false,
             2,
@@ -7527,8 +7656,8 @@ mod tests {
         );
         assert_eq!(
             recorded.len(),
-            3,
-            "expected 2 tool turns + 1 degradation turn, got {:?}",
+            7,
+            "expected 6 tool turns + 1 degradation turn, got {:?}",
             recorded
         );
         assert!(
@@ -7538,7 +7667,7 @@ mod tests {
         );
         assert!(
             recorded[..recorded.len() - 1].iter().all(|&empty| !empty),
-            "only the degradation turn disables tools: {:?}",
+            "continuation windows must retain tools; only degradation disables them: {:?}",
             recorded
         );
         assert!(
@@ -8914,8 +9043,8 @@ mod tests {
             Box::pin(async { Ok(r#"{"verdict":"pass","summary":"final review"}"#.to_string()) })
         });
 
-        // Turn 1 writes the note, turn 2 is a noop tool round, turn 3 exceeds
-        // max_turns=2 and triggers the tool-less summary turn (the review).
+        // The run writes the note, exhausts its bounded tool windows, then
+        // triggers the final tool-less summary turn (the review).
         let mut tools: Vec<Box<dyn Tool>> = noop_tools();
         tools.push(Box::new(clawde_tools::FileWriteTool));
         let recorded_tools = Arc::new(StdMutex::new(Vec::new()));
