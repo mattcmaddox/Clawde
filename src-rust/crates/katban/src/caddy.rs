@@ -469,6 +469,9 @@ mod tests {
         assert!(service_unit.contains("ExecStart=systemctl reload caddy"));
     }
 
+    // The bootstrap text references /etc/caddy and systemctl — a Linux
+    // server surface.
+    #[cfg(target_os = "linux")]
     #[test]
     fn catchat_bootstrap_mentions_import_and_reload() {
         let instructions =

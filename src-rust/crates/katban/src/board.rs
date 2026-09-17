@@ -1292,6 +1292,10 @@ mod tests {
         });
     }
 
+    // Cross-process flock exclusion is the Unix contract; on Windows the
+    // lock is a documented in-process no-op, so the second opener cannot
+    // contend there.
+    #[cfg(unix)]
     #[test]
     fn board_lock_is_exclusive_across_openers() {
         let tmp = tempfile::tempdir().unwrap();

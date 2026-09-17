@@ -28,7 +28,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Windows support dropped (issue #2): the platform cannot be
+        # reproduced on the Linux dev box and every change cost a
+        # push-and-wait CI cycle to surface Windows-only failures.
+        os: [ubuntu-latest, macos-latest]
 
     runs-on: ${{ matrix.os }}
     name: Test (${{ matrix.os }})

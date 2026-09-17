@@ -549,6 +549,8 @@ mod tests {
         );
     }
 
+    // The gate drives npm/cargo through Unix shell semantics.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn gate_fails_when_the_test_command_fails() {
         if !node_available() {
@@ -701,6 +703,7 @@ mod tests {
         assert!(!result.skipped, "install must not skip: {}", result.detail);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn gate_skips_when_dependency_install_fails() {
         // #4 — an install that cannot complete (lockfile out of sync with

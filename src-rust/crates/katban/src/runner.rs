@@ -2279,6 +2279,8 @@ mod tests {
         }
     }
 
+    // The gate drives npm/cargo through Unix shell semantics.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn gate_failure_fails_the_card() {
