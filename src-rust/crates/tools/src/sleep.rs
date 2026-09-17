@@ -16,7 +16,13 @@ pub struct SleepTool;
 #[derive(Debug, Deserialize)]
 struct SleepInput {
     /// Duration in milliseconds (capped at 300_000 = 5 minutes).
-    #[serde(alias = "ms", alias = "duration_ms")]
+    // Lenient when present (models emit `500.0`/`"500"`); still a required
+    // argument — missing `ms` errors (see missing_ms_errors test).
+    #[serde(
+        alias = "ms",
+        alias = "duration_ms",
+        deserialize_with = "crate::lenient_num::u64_or_1000"
+    )]
     ms: u64,
 }
 

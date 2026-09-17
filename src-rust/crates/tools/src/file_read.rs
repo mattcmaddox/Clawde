@@ -11,9 +11,9 @@ pub struct FileReadTool;
 #[derive(Debug, Deserialize)]
 struct FileReadInput {
     file_path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::lenient_num::opt_usize")]
     offset: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::lenient_num::opt_usize")]
     limit: Option<usize>,
 }
 

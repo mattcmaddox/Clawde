@@ -19,12 +19,12 @@ pub struct ToolSearchTool;
 #[derive(Debug, Deserialize)]
 struct ToolSearchInput {
     query: String,
-    #[serde(default = "default_max")]
+    // Lenient: models emit `5.0`/`"5"` here (see crate::lenient_num).
+    #[serde(
+        default = "crate::lenient_num::default_5",
+        deserialize_with = "crate::lenient_num::usize_or_5"
+    )]
     max_results: usize,
-}
-
-fn default_max() -> usize {
-    5
 }
 
 /// A catalog entry describing one searchable tool.

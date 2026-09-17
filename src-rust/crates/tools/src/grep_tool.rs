@@ -22,13 +22,13 @@ struct GrepInput {
     glob: Option<String>,
     #[serde(default = "default_output_mode")]
     output_mode: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::lenient_num::opt_usize")]
     context: Option<usize>,
     #[serde(default, rename = "-i")]
     case_insensitive: bool,
     #[serde(default, rename = "-n")]
     show_line_numbers: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::lenient_num::opt_usize")]
     head_limit: Option<usize>,
     #[serde(default)]
     multiline: bool,

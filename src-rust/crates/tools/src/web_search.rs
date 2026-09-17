@@ -376,12 +376,14 @@ pub fn collect_firecrawl_keys() -> Vec<String> {
 #[derive(Debug, Deserialize)]
 struct WebSearchInput {
     query: String,
-    #[serde(default = "default_num_results")]
+    // Models emit `5.0`/`"5"` for this constantly — be lenient (see
+    // lenient_num) instead of failing the whole call with
+    // `invalid type: floating point \`5.0\`, expected usize`.
+    #[serde(
+        default = "crate::lenient_num::default_5",
+        deserialize_with = "crate::lenient_num::usize_or_5"
+    )]
     num_results: usize,
-}
-
-fn default_num_results() -> usize {
-    5
 }
 
 #[async_trait]
@@ -1013,6 +1015,39 @@ mod tests {
             Ok(requests)
         });
         (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn input_parsing_is_lenient_to_float_and_string_numbers() {
+        // Regression: models routinely emit `"num_results": 5.0` (a JSON
+        // float), which a strict usize field rejected with
+        // `invalid type: floating point \`5.0\`, expected usize`, failing
+        // every search that passed an explicit count.
+        let p: WebSearchInput = serde_json::from_value(json!({ "query": "q", "num_results": 5.0 }))
+            .expect("5.0 must parse");
+        assert_eq!(p.num_results, 5);
+
+        let p: WebSearchInput = serde_json::from_value(json!({ "query": "q", "num_results": "8" }))
+            .expect("numeric string must parse");
+        assert_eq!(p.num_results, 8);
+
+        let p: WebSearchInput = serde_json::from_value(json!({ "query": "q", "num_results": 4.7 }))
+            .expect("float rounds");
+        assert_eq!(p.num_results, 5);
+
+        let p: WebSearchInput =
+            serde_json::from_value(json!({ "query": "q" })).expect("missing uses default");
+        assert_eq!(p.num_results, 5);
+
+        let p: WebSearchInput =
+            serde_json::from_value(json!({ "query": "q", "num_results": null }))
+                .expect("null uses default");
+        assert_eq!(p.num_results, 5);
+
+        let p: WebSearchInput =
+            serde_json::from_value(json!({ "query": "q", "num_results": "several" }))
+                .expect("garbage falls back");
+        assert_eq!(p.num_results, 5);
     }
 
     #[test]
