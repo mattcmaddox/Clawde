@@ -315,20 +315,31 @@ fn missing_file_call() -> ScriptedTurn {
 /// Strip volatile fields (response/event ids, timestamps) so a golden
 /// comparison pins the deterministic event stream.
 /// Windows resolves a leading-`/` tool path against the current drive, so the
-/// Read tool's error echoes e.g. `D:/nonexistent/...` where the fixture says
-/// `/nonexistent/...`. Strip any single drive-letter prefix so the golden
-/// transcript comparison is platform-neutral (no-op elsewhere).
+/// Read tool's error echoes e.g. "File not found: D:/nonexistent/..." where
+/// the fixture says "/nonexistent/...". Strip `X:` drive prefixes wherever
+/// they appear after a non-alphanumeric character (start, space, punctuation)
+/// so the golden transcript comparison is platform-neutral. The preceding-char
+/// guard keeps legitimate schemes like `https://` untouched.
 fn normalize_drive_paths(v: &mut Value) {
     match v {
         Value::String(s) => {
-            let bytes = s.as_bytes();
-            if bytes.len() > 2
-                && bytes[1] == b':'
-                && bytes[2] == b'/'
-                && bytes[0].is_ascii_alphabetic()
-            {
-                *s = s[2..].to_string();
+            let chars: Vec<char> = s.chars().collect();
+            let mut out = String::with_capacity(s.len());
+            let mut i = 0;
+            while i < chars.len() {
+                let drive_here = i + 2 < chars.len()
+                    && chars[i + 1] == ':'
+                    && chars[i + 2] == '/'
+                    && chars[i].is_ascii_alphabetic()
+                    && (i == 0 || !chars[i - 1].is_ascii_alphanumeric());
+                if drive_here {
+                    i += 2; // drop "X:", keep "/..."
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
             }
+            *s = out;
         }
         Value::Array(items) => {
             for item in items {
