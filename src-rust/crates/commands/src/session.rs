@@ -608,6 +608,10 @@ mod tests {
 
     #[tokio::test]
     async fn session_delete_removes_session() {
+        // save/load_session resolve through CLAWDE_HOME (or the real home on
+        // a bare CI runner, where ~/.clawde does not exist yet) — sandbox both
+        // the writes and the assertions in a temp home.
+        let _home = crate::keys::tests::TestHome::new();
         let mut session = clawde_core::history::ConversationSession::new("test-model".to_string());
         session.title = Some("to-delete".to_string());
         let id = session.id.clone();
