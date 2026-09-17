@@ -130,6 +130,9 @@ if [[ -f /opt/clawde-prebaked ]]; then
     [[ "$LEG_ID" == "linux-x86_64" ]] && BIN_PATH="$CARGO_TARGET_DIR/release/clawde"
     mkdir -p "/clawde/target/$TRIPLE/release"
     cp "$BIN_PATH" "/clawde/target/$TRIPLE/release/clawde"
+    # cp reruns as root after the recursive chown — fix the final artifact so
+    # the next leg's `rm` doesn't fail with Permission denied.
+    chown "$HOST_UID:$HOST_GID" "/clawde/target/$TRIPLE/release/clawde" || true
     exit 0
 fi
 # bullseye is near LTS EOL and its security pool occasionally 404s mid-fetch;
@@ -165,6 +168,9 @@ BIN_PATH="$CARGO_TARGET_DIR/$TRIPLE/release/clawde"
 [[ "$LEG_ID" == "linux-x86_64" ]] && BIN_PATH="$CARGO_TARGET_DIR/release/clawde"
 mkdir -p "/clawde/target/$TRIPLE/release"
 cp "$BIN_PATH" "/clawde/target/$TRIPLE/release/clawde"
+# cp reruns as root after the recursive chown — fix the final artifact so
+# the next leg's `rm` doesn't fail with Permission denied.
+chown "$HOST_UID:$HOST_GID" "/clawde/target/$TRIPLE/release/clawde" || true
 EOS
     [[ -f "$SRC_DIR/target/$triple/release/clawde" ]] \
         || die "container build produced no binary for $id"
