@@ -4850,6 +4850,12 @@ impl App {
             return true;
         }
 
+        // `/history <id>` keeps the text command (project transcript list);
+        // bare `/history` is intercepted below as the interactive browser.
+        if cmd == "history" && !args.trim().is_empty() {
+            return false;
+        }
+
         self.intercept_slash_command(cmd)
     }
 
@@ -4992,6 +4998,16 @@ impl App {
                 true
             }
             "session" | "resume" => {
+                self.session_browser.open(vec![]);
+                self.session_list_pending = true;
+                true
+            }
+            // `/history` opens the same interactive browser as `/session`:
+            // the commands layer keeps a text-only /history, but a bare
+            // /history in the TUI should let you jump into a past session
+            // (opencode-style), not just print a list. `history <id>` args
+            // still fall through to the text command via the args handler.
+            "history" => {
                 self.session_browser.open(vec![]);
                 self.session_list_pending = true;
                 true
@@ -6318,10 +6334,16 @@ impl App {
             return false;
         }
 
-        // Dismiss error modal with Esc. While a turn is streaming this is
-        // deferred so the first Esc always pauses the transcript; the banner
-        // is dismissible once the turn is idle.
-        if !self.is_streaming && key.code == KeyCode::Esc && self.notifications.current_is_error() {
+        // Dismiss the error modal with Esc, unconditionally and before the
+        // pause/cancel paths. The modal renders above everything (render.rs
+        // returns early when it is up), so a modal visible while `is_streaming`
+        // must still be dismissible — gating on `!is_streaming` here made a
+        // provider-failure modal that arrived mid-turn undismissable: the
+        // first Esc paused the (hidden) transcript, the second armed the
+        // cancel prompt, and the modal stayed up. Any error text worth keeping
+        // is already mirrored into the transcript (QueryEvent::Error pushes an
+        // assistant message), so dismissing the modal never loses information.
+        if key.code == KeyCode::Esc && self.notifications.current_is_error() {
             self.dismiss_error_notifications();
             return false;
         }
@@ -8694,9 +8716,11 @@ impl App {
             return false;
         }
 
-        // Notification dismiss. Deferred while streaming: the first Esc must
-        // pause the transcript, not silently eat a banner — the toast expires
-        // on its own or is dismissible once the turn is idle.
+        // Ordinary (non-error) notification dismiss. Still deferred while
+        // streaming so the first Esc pauses the transcript rather than
+        // silently eating a banner — the toast expires on its own or is
+        // dismissible once the turn is idle. Error toasts are handled above
+        // and always dismissible.
         if !self.is_streaming && key.code == KeyCode::Esc && !self.notifications.is_empty() {
             self.notifications.dismiss_current();
             return false;
@@ -13696,6 +13720,36 @@ mod tests {
     }
 
     #[test]
+    fn esc_dismisses_error_modal_even_while_streaming() {
+        // Regression: the error modal renders above everything, so when a
+        // provider failure lands mid-turn the modal is visible while
+        // `is_streaming` is still true. Esc must dismiss it instead of being
+        // eaten by the pause/cancel paths — the modal previously could not be
+        // dismissed until the turn ended, and a wedged stream left it up
+        // forever.
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.push_notification(
+            NotificationKind::Error,
+            "Error: provider down".to_string(),
+            None,
+        );
+        push_esc(&mut app);
+        assert!(
+            !app.notifications.current_is_error(),
+            "ESC dismisses the error modal even while streaming"
+        );
+        assert!(
+            !app.stream_paused,
+            "dismissal must not pause the transcript"
+        );
+        assert!(
+            !app.stream_cancel_requested,
+            "dismissal must not arm the cancel prompt"
+        );
+    }
+
+    #[test]
     fn esc_pauses_even_when_focus_is_transcript() {
         // Regression: returning focus from the transcript pane must not eat
         // the streaming pause — the first ESC both refocuses the input and
@@ -14705,6 +14759,29 @@ mod tests {
         assert!(!app.session_browser.visible);
         assert!(app.intercept_slash_command_with_args("history", ""));
         assert!(app.session_browser.visible);
+    }
+
+    #[test]
+    fn test_bare_history_opens_session_browser() {
+        // Bare /history opens the interactive session browser (opencode-style
+        // jump-into-past-session); /history <id> keeps the text command.
+        let mut app = make_app();
+        assert!(!app.session_browser.visible);
+        assert!(app.intercept_slash_command_with_args("history", ""));
+        assert!(
+            app.session_browser.visible,
+            "bare /history opens the browser"
+        );
+    }
+
+    #[test]
+    fn test_history_with_args_falls_through_to_text_command() {
+        let mut app = make_app();
+        assert!(!app.intercept_slash_command_with_args("history", "abc123"));
+        assert!(
+            !app.session_browser.visible,
+            "arg form must not open the browser"
+        );
     }
 
     #[test]

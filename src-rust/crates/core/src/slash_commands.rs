@@ -76,6 +76,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "managed-agents", description: "Configure manager-executor managed agent system", category: "Commands", tui_only: false },
     PromptCommand { name: "mcp", description: "Browse configured MCP servers", category: "Workspace", tui_only: false },
     PromptCommand { name: "memory", description: "Browse and open AGENTS.md memory files", category: "Tools", tui_only: false },
+    PromptCommand { name: "auto", description: "Switch to the free auto-rotating model chain (free/auto)", category: "Model & Provider", tui_only: false },
     PromptCommand { name: "model", description: "Change the AI model", category: "Model & Provider", tui_only: false },
     PromptCommand { name: "models", description: "Browse free upstream models", category: "Model & Provider", tui_only: false },
     PromptCommand { name: "task", description: "Set free-model sort: /task <name> (all/coding/reasoning/creative/fast/multimodal/long-context)", category: "Model & Provider", tui_only: false },

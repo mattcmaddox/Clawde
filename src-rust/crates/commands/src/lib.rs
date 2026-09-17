@@ -789,7 +789,7 @@ fn command_category(name: &str) -> &'static str {
     match name {
         "clear" | "new" | "compact" | "rewind" | "summary" | "export" | "rename" | "branch"
         | "fork" => "Conversation",
-        "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort" | "voice"
+        "model" | "auto" | "config" | "theme" | "color" | "vim" | "fast" | "effort" | "voice"
         | "statusline" | "output-style" | "keybindings" | "privacy-settings"
         | "rate-limit-options" | "sandbox-toggle" => "Settings",
         "cost" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
@@ -1605,6 +1605,42 @@ impl SlashCommand for ModelCommand {
             new_config.provider = Some(provider.to_string());
         }
         CommandResult::ConfigChangeMessage(new_config, confirmation)
+    }
+}
+
+// ---- /auto ---------------------------------------------------------------
+
+/// `/auto` — switch to the free chain's rotating-auto route (`free/auto`).
+///
+/// The auto route tries every configured free upstream in catalog order and
+/// round-robins keys per upstream, so this is the one-word shortcut for
+/// "just use the free rotating models". Equivalent to `/model free/auto`.
+pub struct AutoCommand;
+
+#[async_trait]
+impl SlashCommand for AutoCommand {
+    fn name(&self) -> &str {
+        "auto"
+    }
+    fn description(&self) -> &str {
+        "Switch to the free auto-rotating model chain (free/auto)"
+    }
+    fn help(&self) -> &str {
+        "Usage: /auto\n\n\
+         Switches the model to free/auto \u{2014} the free chain's rotating route.\n\
+         Every request tries the configured free upstreams in priority order\n\
+         and rotates API keys per upstream on cooldown/exhaustion.\n\n\
+         Equivalent to: /model free/auto"
+    }
+
+    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let mut new_config = ctx.config.clone();
+        new_config.model = Some("free/auto".to_string());
+        new_config.provider = Some("free".to_string());
+        CommandResult::ConfigChangeMessage(
+            new_config,
+            "Switched to free/auto (rotating chain)".to_string(),
+        )
     }
 }
 
@@ -2576,6 +2612,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(CostCommand),
         Box::new(ExitCommand),
         Box::new(ModelCommand),
+        Box::new(AutoCommand),
         Box::new(ConfigCommand),
         Box::new(ColorCommand),
         Box::new(PluginCommand),
@@ -3885,6 +3922,29 @@ mod tests {
                 msg
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_auto_command_switches_to_free_auto() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("auto").expect("/auto must be registered");
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::ConfigChangeMessage(cfg, msg) => {
+                assert_eq!(cfg.model.as_deref(), Some("free/auto"));
+                assert_eq!(cfg.provider.as_deref(), Some("free"));
+                assert!(
+                    msg.contains("free/auto"),
+                    "confirmation names the route: {msg}"
+                );
+            }
+            other => panic!("expected ConfigChangeMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_auto_command_registered() {
+        assert!(find_command("auto").is_some());
     }
 
     #[tokio::test]
