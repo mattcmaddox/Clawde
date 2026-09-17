@@ -130,9 +130,11 @@ if [[ -f /opt/clawde-prebaked ]]; then
     [[ "$LEG_ID" == "linux-x86_64" ]] && BIN_PATH="$CARGO_TARGET_DIR/release/clawde"
     mkdir -p "/clawde/target/$TRIPLE/release"
     cp "$BIN_PATH" "/clawde/target/$TRIPLE/release/clawde"
-    # cp reruns as root after the recursive chown — fix the final artifact so
-    # the next leg's `rm` doesn't fail with Permission denied.
-    chown "$HOST_UID:$HOST_GID" "/clawde/target/$TRIPLE/release/clawde" || true
+    # mkdir/cp run as root inside the container — hand everything they created
+    # in the mounted tree (the conventional output dirs and the artifact) back
+    # to the host user, or worktree cleanup and the next leg's `rm` fail with
+    # Permission denied.
+    chown -R "$HOST_UID:$HOST_GID" "/clawde/target/$TRIPLE" || true
     exit 0
 fi
 # bullseye is near LTS EOL and its security pool occasionally 404s mid-fetch;
@@ -168,9 +170,11 @@ BIN_PATH="$CARGO_TARGET_DIR/$TRIPLE/release/clawde"
 [[ "$LEG_ID" == "linux-x86_64" ]] && BIN_PATH="$CARGO_TARGET_DIR/release/clawde"
 mkdir -p "/clawde/target/$TRIPLE/release"
 cp "$BIN_PATH" "/clawde/target/$TRIPLE/release/clawde"
-# cp reruns as root after the recursive chown — fix the final artifact so
-# the next leg's `rm` doesn't fail with Permission denied.
-chown "$HOST_UID:$HOST_GID" "/clawde/target/$TRIPLE/release/clawde" || true
+# mkdir/cp run as root inside the container — hand everything they created
+# in the mounted tree (the conventional output dirs and the artifact) back
+# to the host user, or worktree cleanup and the next leg's `rm` fail with
+# Permission denied.
+chown -R "$HOST_UID:$HOST_GID" "/clawde/target/$TRIPLE" || true
 EOS
     [[ -f "$SRC_DIR/target/$triple/release/clawde" ]] \
         || die "container build produced no binary for $id"
