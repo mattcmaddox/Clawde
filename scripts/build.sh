@@ -47,7 +47,9 @@ PKG="clawde-cli"          # cargo package (its only binary is named `clawde`)
 BIN_NAME="clawde"         # binary name inside archives
 DIST_DIR="$REPO_ROOT/dist"
 INSTALL_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
-LINUX_BUILD_IMAGE="rust:1.98-bookworm"  # glibc 2.36 floor; see header note
+LINUX_BUILD_IMAGE="${LINUX_BUILD_IMAGE:-rust:1.98-bookworm}"  # glibc 2.36 floor; see header note
+# Override with the prebaked image (apt layer + aarch64 target baked in) to
+# skip per-leg package installs:  LINUX_BUILD_IMAGE=clawde-build:latest
 
 # id -> (rust triple | builder-for-this-machine)
 # builder: native | cross | manual
@@ -106,6 +108,30 @@ container_build_leg() {  # $1 = leg id
         -v clawde-cargo-git:/usr/local/cargo/git \
         "$LINUX_BUILD_IMAGE" bash -se <<'EOS'
 set -e
+# Prebaked images (clawde-build:*) already contain the apt layer and the
+# aarch64 toolchain — skip straight to cargo. The marker file is written by
+# scripts/docker/clawde-build.Dockerfile.
+if [[ -f /opt/clawde-prebaked ]]; then
+    export CARGO_TARGET_DIR=/clawde/target/container-$LEG_ID
+    if [[ "$LEG_ID" == "linux-aarch64" ]]; then
+        export PKG_CONFIG_ALLOW_CROSS=1
+        export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+        export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+        export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+        export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+        TARGET_FLAG="--target $TRIPLE"
+    else
+        TARGET_FLAG=""
+    fi
+    cargo build --release --locked --package "$PKG" $TARGET_FLAG
+    chown -R "$HOST_UID:$HOST_GID" "$CARGO_TARGET_DIR" || true
+    BIN_PATH="$CARGO_TARGET_DIR/$TRIPLE/release/clawde"
+    [[ "$LEG_ID" == "linux-x86_64" ]] && BIN_PATH="$CARGO_TARGET_DIR/release/clawde"
+    mkdir -p "/clawde/target/$TRIPLE/release"
+    cp "$BIN_PATH" "/clawde/target/$TRIPLE/release/clawde"
+    exit 0
+fi
 # bullseye is near LTS EOL and its security pool occasionally 404s mid-fetch;
 # retry the install once after a fresh update before giving up.
 apt_install() {
