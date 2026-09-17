@@ -740,8 +740,12 @@ async fn main() -> anyhow::Result<()> {
         return diagnostics::run(&raw_args[2..]).await;
     }
 
-    // Fast-path: `clawde upgrade [--version <v>] [--force]` — self-update.
-    if raw_args.get(1).map(|s| s.as_str()) == Some("upgrade") {
+    // Fast-path: `clawde upgrade` (alias `update`) — self-update. `update`
+    // must be caught here: falling through to clap would treat it as the
+    // positional prompt and launch a headless run instead.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("upgrade")
+        || raw_args.get(1).map(|s| s.as_str()) == Some("update")
+    {
         return upgrade::run_upgrade(&raw_args[2..]).await;
     }
 

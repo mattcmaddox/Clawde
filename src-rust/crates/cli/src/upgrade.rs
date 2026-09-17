@@ -132,6 +132,7 @@ pub async fn run_upgrade(args: &[String]) -> Result<()> {
 fn print_help() {
     println!(
         "Usage: clawde upgrade [options]\n\n\
+         Alias: clawde update\n\n\
          Options:\n\
            -v, --version <v>   Install a specific version (default: latest)\n\
            -f, --force         Reinstall even if already up to date\n\
