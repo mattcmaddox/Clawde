@@ -19,11 +19,10 @@
 #   ./build.sh clean               remove build artifacts
 #
 # Platform legs:
-#   linux-x86_64   container (rust:1.98-bullseye)  (this machine)
+#   linux-x86_64   container (rust:1.98-bookworm)  (this machine)
 #   linux-aarch64  container + gcc-aarch64 cross   (this machine)
-#   windows-x86_64 needs a Windows box (MSVC; BoringSSL build needs NASM, so
-#                  cross-building the GNU target from Linux is not viable)
-# (macOS legs intentionally not built — no Apple hardware in the release flow)
+# Windows and macOS legs were dropped (see docs/decisions/drop-windows-support.md
+# and the macOS note in the release runbook).
 #
 # Why the container: Linux builds must bind old GLIBC symbol versions. Host
 # (Ubuntu 24.04, glibc 2.39) and cross's :main image (also 24.04) emit
@@ -56,13 +55,12 @@ target_info() {  # $1 = id; echoes "triple"
     case "$1" in
         linux-x86_64)   echo "x86_64-unknown-linux-gnu" ;;
         linux-aarch64)  echo "aarch64-unknown-linux-gnu" ;;
-        windows-x86_64) echo "x86_64-pc-windows-msvc" ;;
         *) return 1 ;;
     esac
 }
 
 target_ids() {
-    echo "linux-x86_64 linux-aarch64 windows-x86_64"
+    echo "linux-x86_64 linux-aarch64"
 }
 
 native_here() {  # $1 = triple — can this machine natively build it?
@@ -70,7 +68,6 @@ native_here() {  # $1 = triple — can this machine natively build it?
     case "$triple" in
         x86_64-unknown-linux-gnu)  [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] ;;
         aarch64-unknown-linux-gnu) [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]] ;;
-        x86_64-pc-windows-msvc)    [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]] ;;
         *) false ;;
     esac
 }
@@ -162,22 +159,14 @@ require_cross() {
 }
 
 archive_name() {  # $1 = id → e.g. clawde-linux-x86_64.tar.gz
-    local id="$1" ext="tar.gz"
-    [[ "$id" == windows-* ]] && ext="zip"
-    echo "$BIN_NAME-$id.$ext"
+    echo "$BIN_NAME-$1.tar.gz"
 }
 
 find_binary() {  # $1 = id → prints absolute path if a build exists, else nothing
-    local id="$1" triple ext="" p
+    local id="$1" triple p
     triple="$(target_info "$id")" || return 1
-    [[ "$id" == windows-* ]] && ext=".exe"
-    p="$SRC_DIR/target/$triple/release/$BIN_NAME$ext"
-    [[ -f "$p" ]] && { echo "$p"; return; }
-    # A manually-built GNU-target exe is still a valid windows x86_64 artifact.
-    if [[ "$id" == "windows-x86_64" ]]; then
-        p="$SRC_DIR/target/x86_64-pc-windows-gnu/release/$BIN_NAME.exe"
-        [[ -f "$p" ]] && echo "$p"
-    fi
+    p="$SRC_DIR/target/$triple/release/$BIN_NAME"
+    [[ -f "$p" ]] && echo "$p"
 }
 
 # ── Build subcommands ───────────────────────────────────────────────────
@@ -276,18 +265,9 @@ package() {
         stage="$DIST_DIR/.stage-$id"
         rm -rf "$stage"
         mkdir -p "$stage"
-        if [[ "$os" == "windows" ]]; then
-            cp "$bin" "$stage/$BIN_NAME.exe"
-            if command -v zip >/dev/null 2>&1; then
-                (cd "$stage" && zip -q "$out" "$BIN_NAME.exe")
-            else
-                (cd "$stage" && python3 -m zipfile -c "$out" "$BIN_NAME.exe")
-            fi
-        else
-            cp "$bin" "$stage/$BIN_NAME"
-            chmod +x "$stage/$BIN_NAME"
-            tar -czf "$out" -C "$stage" "$BIN_NAME"
-        fi
+        cp "$bin" "$stage/$BIN_NAME"
+        chmod +x "$stage/$BIN_NAME"
+        tar -czf "$out" -C "$stage" "$BIN_NAME"
         rm -rf "$stage"
         echo ":: Packaged $(archive_name "$id")"
         found=$((found + 1))
@@ -295,7 +275,6 @@ package() {
 
     if (( found > 0 )); then
         [[ -f "$REPO_ROOT/install.sh" ]] && cp "$REPO_ROOT/install.sh" "$DIST_DIR/install.sh"
-        [[ -f "$REPO_ROOT/install.ps1" ]] && cp "$REPO_ROOT/install.ps1" "$DIST_DIR/install.ps1"
         # Hash into a temp name first so SHA256SUMS never hashes itself.
         (cd "$DIST_DIR" && sha256sum * > .SHA256SUMS.tmp && mv .SHA256SUMS.tmp SHA256SUMS)
         echo ":: SHA256SUMS written"
@@ -479,9 +458,6 @@ case "$cmd" in
     release)
         release "$@"
         ;;
-    windows|win)
-        build_one windows-x86_64
-        ;;
     linux-arm|arm|aarch64)
         build_one linux-aarch64
         ;;
@@ -495,7 +471,7 @@ case "$cmd" in
         ;;
     *)
         echo "Unknown command: $cmd"
-        echo "Usage: ./build.sh [install|debug|run|build-one|build-all|package|release|windows|linux-arm|targets|clean]"
+        echo "Usage: ./build.sh [install|debug|run|build-one|build-all|package|release|linux-arm|targets|clean]"
         exit 1
         ;;
 esac
