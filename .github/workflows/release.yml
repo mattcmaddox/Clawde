@@ -176,46 +176,12 @@ jobs:
           path: src-rust/target/aarch64-unknown-linux-gnu/release/clawde
           retention-days: 1
 
-  build-windows-x86_64:
-    runs-on: windows-latest
-    name: Build Windows x86_64
-    needs: prepare
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-
-      - name: Install Rust toolchain (MSVC)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-rust/target
-          key: release-windows-x86_64-${{ hashFiles('src-rust/Cargo.lock') }}
-
-      - name: Build
-        shell: bash
-        working-directory: src-rust
-        run: bash ../scripts/build.sh build-one windows-x86_64
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-x86_64
-          path: src-rust/target/x86_64-pc-windows-msvc/release/clawde.exe
-          retention-days: 1
-
   # ── Step 3: package + create release ─────────────────────────────────
+  # Windows leg removed — see docs/decisions/drop-windows-support.md.
   release:
     runs-on: ubuntu-latest
     name: Create release
-    needs: [prepare, build-linux-x86_64, build-linux-aarch64, build-windows-x86_64]
+    needs: [prepare, build-linux-x86_64, build-linux-aarch64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -254,16 +220,8 @@ jobs:
           tar -czf "dist/${BIN_NAME}-linux-aarch64.tar.gz" -C "$STAGE" "$BIN_NAME"
           rm -rf "$STAGE"
 
-          # Windows x86_64
-          STAGE="dist/.stage-windows-x86_64"
-          mkdir -p "$STAGE"
-          cp dist/artifacts/windows-x86_64/clawde.exe "$STAGE/$BIN_NAME.exe"
-          (cd "$STAGE" && zip -q "../${BIN_NAME}-windows-x86_64.zip" "$BIN_NAME.exe")
-          rm -rf "$STAGE"
-
           # Install scripts (from repo root)
           [[ -f install.sh ]] && cp install.sh dist/
-          [[ -f install.ps1 ]] && cp install.ps1 dist/
 
           # SHA256 checksums (exclude the artifacts staging dir and .stage-* dirs)
           (cd dist && find . -maxdepth 1 -type f ! -name 'RELEASE_NOTES.md' ! -name '.SHA256SUMS*' | sort | xargs sha256sum > .SHA256SUMS.tmp && mv .SHA256SUMS.tmp SHA256SUMS)

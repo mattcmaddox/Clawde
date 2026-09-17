@@ -2,8 +2,7 @@
 
 Clawde is a Rust reimplementation of the Claude Code CLI. The fastest way
 to install it is via the one-liner installers below. They drop the binary
-into `~/.clawde/bin` (or `%USERPROFILE%\.clawde\bin` on Windows) and add
-that directory to your `PATH` automatically.
+into `~/.clawde/bin` and add that directory to your `PATH` automatically.
 
 ---
 
@@ -11,7 +10,6 @@ that directory to your `PATH` automatically.
 
 | Platform | Architecture | Minimum OS |
 |----------|-------------|------------|
-| Windows  | x86_64      | Windows 10 / Server 2019 |
 | Linux    | x86_64      | glibc 2.17+ (most distros from 2014 onward) |
 | Linux    | aarch64     | glibc 2.17+ (Raspberry Pi 4, AWS Graviton, etc.) |
 | macOS    | x86_64      | macOS 11 Big Sur |
@@ -30,20 +28,14 @@ possible; on Linux it links against the system glibc.
 curl -fsSL https://github.com/mattcmaddox/Clawde/releases/latest/download/install.sh | bash
 ```
 
-### Windows (PowerShell)
+The installer:
 
-```powershell
-irm https://github.com/mattcmaddox/Clawde/releases/latest/download/install.ps1 | iex
-```
-
-Both installers:
-
-1. Detect your platform and architecture.
-2. Download the matching archive from the latest GitHub release.
-3. Extract `clawde` into `~/.clawde/bin/` (Windows: `%USERPROFILE%\.clawde\bin\`).
-4. Append that directory to your shell config (`.bashrc`, `.zshrc`,
-   `.config/fish/config.fish`) or to your Windows user `PATH`.
-5. On macOS, strip the quarantine attribute so Gatekeeper does not block the
+1. Detects your architecture.
+2. Downloads the matching archive from the latest GitHub release.
+3. Extracts `clawde` into `~/.clawde/bin/`.
+4. Appends that directory to your shell config (`.bashrc`, `.zshrc`,
+   `.config/fish/config.fish`).
+5. On macOS, strips the quarantine attribute so Gatekeeper does not block the
    unsigned binary.
 
 Open a new terminal afterwards (or `source` the modified shell config) so
@@ -51,15 +43,13 @@ the updated `PATH` takes effect, then run `clawde --version` to verify.
 
 ### Installer flags
 
-Both scripts accept the same flags:
-
-| Flag (sh) | Flag (ps1) | Effect |
-|---|---|---|
-| `--version 0.1.0` | `-Version 0.1.0` | Install a specific version |
-| `--binary <path>` | `-Binary <path>` | Install from a local file (skip download) |
-| `--install-dir <path>` | `-InstallDir <path>` | Override the install directory |
-| `--no-modify-path` | `-NoModifyPath` | Don't touch shell config / user PATH |
-| `--help` | `-Help` | Show usage |
+| Flag | Effect |
+|---|---|
+| `--version 0.1.0` | Install a specific version |
+| `--binary <path>` | Install from a local file (skip download) |
+| `--install-dir <path>` | Override the install directory |
+| `--no-modify-path` | Don't touch shell config |
+| `--help` | Show usage |
 
 Example: `curl -fsSL https://.../install.sh | bash -s -- --version 0.1.0`
 
@@ -94,7 +84,6 @@ bunx clawde         # via bun
 |----------|-------------|
 | Linux    | x86_64, aarch64 |
 | macOS    | x86_64 (Intel), aarch64 (Apple Silicon) |
-| Windows  | x86_64 |
 
 ---
 
@@ -121,13 +110,12 @@ If you'd rather not run an install script, grab archives directly from
 
 | Archive | Platform |
 |---------|----------|
-| `clawde-windows-x86_64.zip` | Windows 64-bit |
 | `clawde-linux-x86_64.tar.gz` | Linux x86_64 |
 | `clawde-linux-aarch64.tar.gz` | Linux ARM64 |
 | `clawde-macos-x86_64.tar.gz` | macOS Intel |
 | `clawde-macos-aarch64.tar.gz` | macOS Apple Silicon |
 
-Every archive contains a single binary named `clawde` (or `clawde.exe`).
+Every archive contains a single binary named `clawde`.
 Extract it and put it somewhere on your `PATH`. For example on Linux:
 
 ```bash
@@ -143,10 +131,6 @@ binary:
 ```bash
 xattr -rd com.apple.quarantine /usr/local/bin/clawde
 ```
-
-On Windows, extract the zip and add the folder containing `clawde.exe`
-to your user `PATH` via **Settings → System → Advanced system settings →
-Environment Variables**.
 
 ### User-local install without sudo
 
@@ -177,7 +161,6 @@ To confirm the binary is the one you installed:
 
 ```bash
 which clawde          # Linux / macOS
-where clawde          # Windows (Command Prompt)
 ```
 
 ---
@@ -217,8 +200,7 @@ cargo build --release --package clawde-cli
 The release binary is placed at:
 
 ```
-src-rust/target/release/clawde        # Linux / macOS
-src-rust/target\release\clawde.exe   # Windows
+src-rust/target/release/clawde
 ```
 
 Copy it to a directory on your `PATH` as described above.
@@ -310,8 +292,6 @@ If you used the install script, remove the install directory:
 
 ```bash
 rm -rf ~/.clawde/bin                    # Linux / macOS
-# Windows (PowerShell):
-Remove-Item -Recurse -Force "$env:USERPROFILE\.clawde\bin"
 ```
 
 For manual installs:

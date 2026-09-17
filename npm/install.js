@@ -18,9 +18,8 @@ function getPlatform() {
   const platform = process.platform;
   const arch = process.arch;
 
-  if (platform === 'win32' && arch === 'x64') {
-    return { artifact: 'clawde-windows-x86_64', ext: '.exe', archive: '.zip' };
-  }
+  // Windows is not built or published (see docs/decisions/drop-windows-support.md);
+  // win32 falls through to the unsupported-platform error below.
   if (platform === 'linux' && arch === 'x64') {
     return { artifact: 'clawde-linux-x86_64', ext: '', archive: '.tar.gz' };
   }
