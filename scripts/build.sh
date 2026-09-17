@@ -375,7 +375,14 @@ release() {
         echo ":: Stamping $version across all sources (was $cargo_ver) ..."
         python3 "$REPO_ROOT/scripts/bump-version.py" "$version"
         if (( ! no_commit )); then
-            git -C "$REPO_ROOT" add -A
+            # Stage ONLY the files bump-version.py stamps. `git add -A` here
+            # would sweep unrelated uncommitted work (this repo runs parallel
+            # agents in the same checkout) into the release commit.
+            git -C "$REPO_ROOT" add \
+                src-rust/Cargo.toml \
+                src-rust/Cargo.lock \
+                npm/package.json \
+                README.md
             git -C "$REPO_ROOT" commit -m "chore(release): stamp $version"
             git -C "$REPO_ROOT" push origin main
             echo ":: Version bump committed and pushed."

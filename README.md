@@ -87,10 +87,27 @@ npx clawde
 bunx clawde
 ```
 
+> **npm ≥ 11.6 — install-scripts gate:** newer npm refuses to run `postinstall`
+> scripts from packages not on your allowlist. Clawde's postinstall downloads
+> the native binary, so without allowing it the package installs but `clawde`
+> itself is missing. Either allow it per-install (the package name at the end
+> is required — the flag alone is not a complete command):
+>
+> ```bash
+> npm install -g --allow-scripts=clawde clawde
+> ```
+>
+> or allow it for all future installs, then install normally:
+>
+> ```bash
+> npm config set allow-scripts=clawde --location=user
+> npm install -g clawde
+> ```
+
 To upgrade later, run:
 
 ```bash
-clawde upgrade
+clawde upgrade        # `clawde update` works too
 ```
 
 > Pin a specific version with `--version 0.1.0` on either installer, or `clawde upgrade --version 0.1.0`.
