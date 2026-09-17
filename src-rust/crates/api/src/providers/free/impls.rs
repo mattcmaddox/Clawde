@@ -32,6 +32,16 @@ use super::*;
 /// request budget — fall through instead of stalling the stream.
 const MAX_RETRY_AFTER_WAIT_SECS: u64 = 120;
 
+/// Upper bound for how long the refusal-buffer may hide an in-progress
+/// attempt (seconds). Must stay well under the query loop's stream-stall
+/// watchdog for `free` (45s), which only resets when an event actually leaves
+/// this stream. While buffering we intentionally withhold events, so an
+/// over-long silent hold would look like a stalled provider and get
+/// spuriously aborted + re-issued. Bounded hiding keeps the silent window
+/// safely under the watchdog while still fully hiding the (short) refusals
+/// this feature targets.
+const BUFFER_CAP_SECS: u64 = 25;
+
 /// Exponential backoff delay for same-upstream retries (500ms base, 2x,
 /// capped at 8s). Mirrors sub2api's `sameAccountRetryDelayFor` pattern:
 /// transient errors get a short backoff on the same upstream before the
@@ -1152,6 +1162,97 @@ fn event_commits_output(event: &StreamEvent) -> bool {
     }
 }
 
+/// Whether an event builds the content of the current message (block starts /
+/// stops plus incremental text/thinking/tool-arg). These are the only events
+/// the refusal-buffer withholds while `waiting_refusal` — metadata
+/// (MessageDelta, RateLimitHeaders, MessageStart) and the tool-use trigger flow
+/// live even while buffering. `ContentBlockStart::ToolUse` is excluded: it is
+/// the flush trigger that commits the attempt (the model is doing real work).
+fn should_defer_while_waiting(event: &StreamEvent) -> bool {
+    if matches!(
+        event,
+        StreamEvent::ContentBlockStart {
+            content_block: ContentBlock::ToolUse { .. },
+            ..
+        }
+    ) {
+        return false;
+    }
+    matches!(
+        event,
+        StreamEvent::ContentBlockStart { .. }
+            | StreamEvent::ContentBlockStop { .. }
+            | StreamEvent::TextDelta { .. }
+            | StreamEvent::ThinkingDelta { .. }
+            | StreamEvent::ReasoningDelta { .. }
+            | StreamEvent::InputJsonDelta { .. }
+    )
+}
+
+/// Heuristic: did a model *complete* a response that is a tool-availability
+/// refusal / capability decline, when the request actually offered tools?
+///
+/// Gating (caller enforces): the request is tool-bearing AND the attempt made
+/// zero tool calls. Without that gate this would misfire on ordinary answers.
+///
+/// This catches the recurring free-tier failure where a model with declared
+/// tool support still answers "The Bash tool is currently inactive, so I
+/// cannot directly execute the SSH commands… I need to either: 1. Have the
+/// Bash tool enabled…" instead of calling the tool. Kept deliberately narrow:
+/// the text must be short, offer no solution, and contain a capability-excuse
+/// signature — so legitimate helpful answers (including "I can't reach your
+/// network, but here's the command to run") are not discarded.
+fn is_tool_refusal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let n = lower.chars().count();
+    // Refusals are short and purely declarative. A long text or one that also
+    // hands over a runnable solution is a real answer, not a decline.
+    if !(16..=2000).contains(&n) {
+        return false;
+    }
+    if lower.contains("```")
+        || lower.contains(" here is ")
+        || lower.contains("here's the command")
+        || lower.contains("here is the command")
+        || lower.contains("you can run")
+        || lower.contains("you could run")
+    {
+        return false;
+    }
+    // Capability-excuse / hallucinated-constraint signatures, most specific
+    // first. These cover the exact reported failure plus the surrounding
+    // decline phrase family. `no ...` style checks are are kept out to avoid
+    // matching normal negative answers.
+    if lower.contains("bash tool is currently inactive")
+        || lower.contains("tool is currently inactive")
+        || lower.contains("bash tool is inactive")
+        || lower.contains("tool is inactive")
+        || lower.contains("tool is currently disabled")
+        || lower.contains("the bash tool is")
+        || lower.contains("shell is inactive")
+        || lower.contains("happy to help but")
+        || lower.contains("cannot directly execute")
+        || lower.contains("can't directly execute")
+        || lower.contains("i am unable to directly")
+        || lower.contains("i'm unable to directly")
+        || lower.contains("i am unable to execute")
+        || lower.contains("without the ability to")
+        || lower.contains("without access to a terminal")
+        || lower.contains("without a bash tool")
+        || lower.contains("no bash tool is available")
+        || lower.contains("i don't have access to a bash")
+        || lower.contains("i do not have access to a bash")
+        || lower.contains("please enable the bash tool")
+        || lower.contains("please enable the terminal")
+        || lower.contains("i need to either")
+        || lower.contains("i would need either")
+        || lower.contains("enable the bash tool in this session")
+    {
+        return true;
+    }
+    false
+}
+
 fn join_capped_upstream_errors(errors: &[String]) -> String {
     const MAX_LISTED: usize = 5;
     let mut deduped: Vec<&str> = errors.iter().map(String::as_str).collect();
@@ -1226,6 +1327,23 @@ struct RetryingFreeStream {
     attempt_thinking: String,
     attempt_tool_count: usize,
     attempt_stop_reason: Option<String>,
+    /// Refusal-buffer state: when true we with hold Text/Thinking/Reasoning/JSON
+    /// deltas until the attempt completes, so a tool-decline refusal (e.g. "The
+    /// Bash tool is currently inactive…") can be discarded and the request
+    /// transparently re-dispatched to the next model instead of surfacing a
+    /// dead turn. Active only for tool-bearing requests that still have a
+    /// fallback model.
+    waiting_refusal: bool,
+    /// Withheld delta events awaiting a refusal verdict — replayed if the
+    /// attempt is kept, discarded if the attempt is a refusal.
+    deferred_deltas: VecDeque<StreamEvent>,
+    /// The head event (a mid-stream tool-use start, or the final MessageStop)
+    /// that must follow the replayed deltas once the attempt is committed.
+    deferred_head: Option<StreamEvent>,
+    /// When the current refusal-buffer hold began (set alongside
+    /// `waiting_refusal`). Used to bound hiding (`BUFFER_CAP_SECS`) so the
+    /// query loop's stream-stall watchdog is never starved.
+    buffering_since: Option<Instant>,
     attempt_start: Option<Instant>,
     first_byte_received: bool,
     upstream_errors: Vec<String>,
@@ -1276,6 +1394,9 @@ impl RetryingFreeStream {
         upstream_errors: Vec<String>,
     ) -> Self {
         let task = classify_request(&request);
+        // Compute before the struct literal below moves `request`/`remaining_plan`.
+        let initial_waiting_refusal =
+            FreeProvider::request_has_tools(&request) && !remaining_plan.is_empty();
         Self {
             chain,
             cooldown,
@@ -1301,6 +1422,14 @@ impl RetryingFreeStream {
             attempt_thinking: String::new(),
             attempt_tool_count: 0,
             attempt_stop_reason: None,
+            waiting_refusal: initial_waiting_refusal,
+            buffering_since: if initial_waiting_refusal {
+                Some(Instant::now())
+            } else {
+                None
+            },
+            deferred_deltas: VecDeque::new(),
+            deferred_head: None,
             attempt_start: Some(Instant::now()),
             first_byte_received: false,
             // Seed with failures from the pre-stream dispatch loop so the
@@ -1367,6 +1496,11 @@ impl RetryingFreeStream {
     /// Check if hedge should be started based on timing.
     fn should_start_hedge(&self) -> bool {
         if !self.profiles.parallel.hedging.enabled {
+            return false;
+        }
+        // A hedge would race the refusal-buffer: stealing `current` mid-deferral
+        // would orphan the withheld text. Suppressed while buffering.
+        if self.waiting_refusal {
             return false;
         }
         if self.hedge_state.hedge_in_flight {
@@ -1651,6 +1785,49 @@ impl RetryingFreeStream {
         self.attempt_start = Some(Instant::now());
         self.first_byte_received = false;
         self.final_usage = None;
+        self.deferred_deltas.clear();
+        self.deferred_head = None;
+        self.waiting_refusal =
+            FreeProvider::request_has_tools(&self.request) && !self.remaining_plan.is_empty();
+        self.buffering_since = if self.waiting_refusal {
+            Some(Instant::now())
+        } else {
+            None
+        };
+    }
+
+    /// Discard any withheld refusal-buffer output. Called whenever an attempt
+    /// is abandoned without a completed turn (mid-stream error, empty
+    /// completion). Withheld events are uncommitted, so they must never be
+    /// replayed after re-dispatch — clearing them here prevents a partial /
+    /// whitespace leak ahead of a same-upstream retry or the next plan entry.
+    fn discard_deferred(&mut self) {
+        self.deferred_deltas.clear();
+        self.deferred_head = None;
+        self.waiting_refusal = false;
+        self.buffering_since = None;
+    }
+
+    /// Record first-visible-output (TTFT) for routing, exactly once, the first
+    /// time a committed-output event leaves this stream — whether live or after
+    /// a refusal-buffer flush. Must NOT run while withholding deltas, else an
+    /// error that arrives before any committed output could no longer safely
+    /// re-dispatch to the next upstream.
+    fn mark_output_emitted(&mut self) {
+        if self.first_byte_received {
+            return;
+        }
+        self.first_byte_received = true;
+        if let Some(start) = self.attempt_start {
+            let max_samples = self.routing.latency.as_ref().map_or(0, |l| l.max_samples);
+            if max_samples > 0 {
+                let ttft = start.elapsed().as_secs_f64();
+                self.latencies
+                    .lock()
+                    .unwrap()
+                    .record_ttft(self.current_idx, ttft, max_samples);
+            }
+        }
     }
 
     fn is_empty_attempt(&self) -> bool {
@@ -1735,6 +1912,9 @@ impl RetryingFreeStream {
 
     fn advance_after_empty(&mut self) -> bool {
         let prev_chain_idx = self.current_idx;
+        // Empty completions discard the attempt: drop any withheld whitespace
+        // so it cannot leak before the retry or next plan entry.
+        self.discard_deferred();
         self.record_failure(prev_chain_idx);
         let _cooled = self.record_empty(prev_chain_idx);
         let uid = self.chain[prev_chain_idx].upstream.id;
@@ -1760,19 +1940,40 @@ impl Stream for RetryingFreeStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            // Drain refusal-buffered output (see `waiting_refusal`). Placed at
+            // the very top so a committed attempt's withheld deltas + head are
+            // fully flushed before any hedge/retry/start logic can interfere.
+            // Gated on `!waiting_refusal`: while still buffering we must NOT
+            // pop and emit withheld events (that would defeat the hold).
+            if !self.waiting_refusal {
+                if let Some(evt) = self.deferred_deltas.pop_front() {
+                    if event_commits_output(&evt) {
+                        self.mark_output_emitted();
+                    }
+                    return Poll::Ready(Some(Ok(evt)));
+                }
+                if let Some(evt) = self.deferred_head.take() {
+                    if event_commits_output(&evt) {
+                        self.mark_output_emitted();
+                    }
+                    return Poll::Ready(Some(Ok(evt)));
+                }
+            }
             // Check for hedge response first (hedged requests pattern).
             // Runs even during retry backoff — a hedge to a different
             // upstream is strictly better than waiting for the same one.
-            if let Some(hedge_stream) = self.poll_hedge() {
-                self.current = Some(hedge_stream);
-                self.pending_attribution = true;
-                // Cancel any in-flight hedge
-                self.cancel_hedge();
-                // Cancel pending same-upstream retry — the hedge
-                // provides a better upstream immediately.
-                self.retry_sleep = None;
-                self.retry_target = None;
-                continue;
+            if !self.waiting_refusal {
+                if let Some(hedge_stream) = self.poll_hedge() {
+                    self.current = Some(hedge_stream);
+                    self.pending_attribution = true;
+                    // Cancel any in-flight hedge
+                    self.cancel_hedge();
+                    // Cancel pending same-upstream retry — the hedge
+                    // provides a better upstream immediately.
+                    self.retry_sleep = None;
+                    self.retry_target = None;
+                    continue;
+                }
             }
 
             // Same-upstream retry backoff: when a retry is scheduled, poll
@@ -2011,21 +2212,31 @@ impl Stream for RetryingFreeStream {
 
             match current.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(evt))) => {
-                    if !self.first_byte_received && event_commits_output(&evt) {
-                        self.first_byte_received = true;
-                        // Record time-to-first-token for routing.
-                        if let Some(start) = self.attempt_start {
-                            let max_samples =
-                                self.routing.latency.as_ref().map_or(0, |l| l.max_samples);
-                            if max_samples > 0 {
-                                let ttft = start.elapsed().as_secs_f64();
-                                self.latencies.lock().unwrap().record_ttft(
-                                    self.current_idx,
-                                    ttft,
-                                    max_samples,
-                                );
+                    // Tool-decline refusal buffering: while `waiting_refusal`
+                    // all content-block events are withheld (see below) so a
+                    // completed refusal is never committed to the session.
+                    if self.waiting_refusal
+                        && matches!(
+                            &evt,
+                            StreamEvent::ContentBlockStart {
+                                content_block: ContentBlock::ToolUse { .. },
+                                ..
                             }
-                        }
+                        )
+                    {
+                        // The model is doing real work: commit the withheld
+                        // preamble, then the tool call. Stop buffering.
+                        self.attempt_tool_count += 1;
+                        self.waiting_refusal = false;
+                        self.buffering_since = None;
+                        self.deferred_head = Some(evt);
+                        continue; // drain withheld content, then this tool-start head
+                    }
+                    let withholding = self.waiting_refusal && should_defer_while_waiting(&evt);
+                    // Record TTFT only for output that actually leaves this
+                    // stream; withheld events must not mark first-byte.
+                    if !withholding && event_commits_output(&evt) {
+                        self.mark_output_emitted();
                     }
                     match &evt {
                         StreamEvent::TextDelta { text, .. } => {
@@ -2129,6 +2340,83 @@ impl Stream for RetryingFreeStream {
                                 is_retryable: true,
                             })));
                         }
+                        // Tool-decline refusal: the attempt completed with text
+                        // but never called a tool, and the text is a refusal /
+                        // capability decline (e.g. "The Bash tool is currently
+                        // inactive…"). Discard it and transparently re-dispatch
+                        // to the next model instead of surfacing the dead turn.
+                        if self.waiting_refusal && is_tool_refusal(self.attempt_text.as_str()) {
+                            let uid = self.chain[self.current_idx].upstream.id;
+                            let model = self.current_model.clone();
+                            self.record_failure(self.current_idx);
+                            let reason = format!("{}: refused task (declined to use tools)", uid);
+                            self.latencies
+                                .lock()
+                                .unwrap()
+                                .record_failure_reason(self.current_idx, reason.clone());
+                            self.upstream_errors.push(reason);
+                            // A hedge must not resurrect this declined attempt.
+                            self.cancel_hedge();
+                            self.current = None;
+                            // NOTE: deferred content is intentionally NOT
+                            // discarded yet. If a fallback exists,
+                            // start_next_plan_entry -> reset_attempt clears it;
+                            // if none exists, the buffered refusal is replayed
+                            // below so the user sees why the chain gave up.
+                            let has_next = self.start_next_plan_entry();
+                            tracing::debug!(
+                                upstream = %uid,
+                                model = %model,
+                                has_next,
+                                "free-mode model refused to use tools — switching"
+                            );
+                            if has_next {
+                                // reset_attempt recomputed deferral for the new
+                                // attempt and cleared the withheld buffer; its
+                                // attribution will lead.
+                                continue;
+                            }
+                            // No fallback left (all remaining in cooldown):
+                            // replay the withheld refusal text instead of
+                            // surfacing an empty message — the user should see
+                            // why the chain gave up.
+                            self.waiting_refusal = false;
+                            self.buffering_since = None;
+                            self.deferred_head = Some(evt);
+                            self.maybe_record_success();
+                            if !self.is_empty_attempt() {
+                                store_free_last_route(FreeLastRoute {
+                                    upstream_id: self.chain[self.current_idx]
+                                        .upstream
+                                        .id
+                                        .to_string(),
+                                    model: self.current_model.clone(),
+                                    usage: self.final_usage.clone().unwrap_or_default(),
+                                    stop_reason: self.attempt_stop_reason.clone(),
+                                });
+                            }
+                            continue;
+                        }
+                        if self.waiting_refusal {
+                            // Kept attempt: replay the withheld deltas, then the
+                            // stop. `deferred_head` holds the stop to emit last.
+                            self.waiting_refusal = false;
+                            self.buffering_since = None;
+                            self.deferred_head = Some(evt);
+                            self.maybe_record_success();
+                            if !self.is_empty_attempt() {
+                                store_free_last_route(FreeLastRoute {
+                                    upstream_id: self.chain[self.current_idx]
+                                        .upstream
+                                        .id
+                                        .to_string(),
+                                    model: self.current_model.clone(),
+                                    usage: self.final_usage.clone().unwrap_or_default(),
+                                    stop_reason: self.attempt_stop_reason.clone(),
+                                });
+                            }
+                            continue;
+                        }
                         self.maybe_record_success();
                         // Telemetry for the thinking inspector: which upstream
                         // served this stream, with what model and usage. Empty
@@ -2142,6 +2430,12 @@ impl Stream for RetryingFreeStream {
                                 stop_reason: self.attempt_stop_reason.clone(),
                             });
                         }
+                    }
+                    if withholding {
+                        // Hold the event; it is replayed if the attempt is kept,
+                        // discarded if the attempt turns out to be a refusal.
+                        self.deferred_deltas.push_back(evt);
+                        continue;
                     }
                     return Poll::Ready(Some(Ok(evt)));
                 }
@@ -2168,6 +2462,9 @@ impl Stream for RetryingFreeStream {
                         // Same-upstream retry before advancing: no content
                         // was exposed, so replaying is safe. Don't push to
                         // upstream_errors yet — only when abandoned.
+                        // Discard any withheld (uncommitted) partial output so a
+                        // same-upstream retry never replays half a message.
+                        self.discard_deferred();
                         if self.can_retry_same_upstream(self.current_idx)
                             && err.recovery_class().may_retry_same_provider()
                         {
@@ -2249,9 +2546,65 @@ impl Stream for RetryingFreeStream {
                             self.record_success(self.current_idx, elapsed);
                         }
                     }
+                    // A provider may end its stream (`None`) without a prior
+                    // MessageStop. If we were still buffering, run the refusal
+                    // verdict now and flush any withheld content so a finished
+                    // answer is never lost for consumers that drain to the end.
+                    if self.waiting_refusal {
+                        if is_tool_refusal(self.attempt_text.as_str())
+                            && !self.remaining_plan.is_empty()
+                        {
+                            self.record_failure(self.current_idx);
+                            let uid = self.chain[self.current_idx].upstream.id;
+                            let reason = format!("{}: refused task (declined to use tools)", uid);
+                            self.latencies
+                                .lock()
+                                .unwrap()
+                                .record_failure_reason(self.current_idx, reason.clone());
+                            self.upstream_errors.push(reason);
+                            self.cancel_hedge();
+                            if self.start_next_plan_entry() {
+                                // reset_attempt recomputed deferral for the new
+                                // attempt; its attribution will lead.
+                                continue;
+                            }
+                            // No fallback left: surface the refusal below.
+                        }
+                        self.waiting_refusal = false;
+                        self.buffering_since = None;
+                    }
+                    if let Some(evt) = self.deferred_deltas.pop_front() {
+                        if event_commits_output(&evt) {
+                            self.mark_output_emitted();
+                        }
+                        return Poll::Ready(Some(Ok(evt)));
+                    }
+                    if let Some(evt) = self.deferred_head.take() {
+                        if event_commits_output(&evt) {
+                            self.mark_output_emitted();
+                        }
+                        return Poll::Ready(Some(Ok(evt)));
+                    }
                     return Poll::Ready(None);
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // Bounded hiding: cap how long the refusal-buffer may hold
+                    // events while the underlying provider is silent (waiting
+                    // for more bytes). Exceeding the cap stops hiding and
+                    // streams live, so the consumer's stream-stall watchdog
+                    // (free = 45s) always sees events and never spuriously
+                    // aborts a healthy-but-slow model mid-buffer.
+                    if self.waiting_refusal {
+                        if let Some(t0) = self.buffering_since {
+                            if t0.elapsed() >= std::time::Duration::from_secs(BUFFER_CAP_SECS) {
+                                self.waiting_refusal = false;
+                                self.buffering_since = None;
+                                continue;
+                            }
+                        }
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -7311,5 +7664,107 @@ mod hedge_tests {
 
         // With delay_ms = 100, hedge should not start immediately
         assert!(elapsed < 100);
+    }
+
+    #[test]
+    fn is_tool_refusal_matches_bash_inactive_excuse() {
+        // The exact failure class reported: the model claims the Bash tool is
+        // inactive instead of calling it.
+        let text = "The Bash tool is currently inactive, which means I cannot directly execute the SSH commands needed to verify TheHive's setup for remote builds. The output you provided shows a successful *local* build process, not a remote one on TheHive. To proceed with verifying TheHive's setup, I need to either: 1. Have the Bash tool enabled in this session. 2. Receive the output of the verification commands from you (the user) directly. Please let me know how you'd like to proceed.";
+        assert!(
+            is_tool_refusal(text),
+            "exact reported failure must classify as a refusal"
+        );
+    }
+
+    #[test]
+    fn is_tool_refusal_matches_capability_decline_variants() {
+        assert!(
+            is_tool_refusal(
+                "The bash tool is disabled on this session, so I cannot execute the commands."
+            ),
+            "disabled-tool variant"
+        );
+        assert!(
+            is_tool_refusal("I am unable to directly run any commands because I don't have access to a bash tool."),
+            "no-access variant"
+        );
+        assert!(
+            is_tool_refusal("Please enable the bash tool so I can run the verification for you."),
+            "request-tool variant"
+        );
+        assert!(
+            is_tool_refusal(
+                "I would need either a Bash tool enabled or your direct input to verify TheHive."
+            ),
+            "enumerate-choice variant"
+        );
+    }
+
+    #[test]
+    fn is_tool_refusal_rejects_helpful_answers() {
+        // A legitimate answer that cannot reach the user's machine but still
+        // hands over a runnable command is NOT a refusal.
+        assert!(
+            !is_tool_refusal("I cannot reach your LAN from this sandbox, but here's the command to run: ssh host check.sh"),
+            "helpful answer that also offers a command"
+        );
+        assert!(
+            !is_tool_refusal("The repo builds fine here. Here is the output as requested."),
+            "plain completion"
+        );
+        assert!(!is_tool_refusal("yes"), "too short");
+        // Long, substantive help must never be discarded.
+        assert!(
+            !is_tool_refusal("Let me explain step by step. First you need to configure the remote build host, then wire the CI, then deploy. This is a very long and detailed answer that keeps going well past the short-refusal length so it is clearly real work, not a decline."),
+            "long substantive answer"
+        );
+    }
+
+    #[test]
+    fn should_defer_while_waiting_classifies_content_vs_structure() {
+        // Incremental content is withheld while buffering…
+        assert!(should_defer_while_waiting(&StreamEvent::TextDelta {
+            index: 0,
+            text: "hi".into(),
+        }));
+        assert!(should_defer_while_waiting(&StreamEvent::ThinkingDelta {
+            index: 0,
+            thinking: "hmm".into(),
+        }));
+        // …including block starts/stops (so a dropped attempt cannot leak a
+        // half-built block)…
+        assert!(should_defer_while_waiting(
+            &StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::Text { text: "x".into() },
+            }
+        ));
+        assert!(should_defer_while_waiting(&StreamEvent::ContentBlockStop {
+            index: 0
+        }));
+        // …but the tool-use trigger flushes the attempt and is NOT withheld,
+        // and structural/metadata events pass through live.
+        assert!(!should_defer_while_waiting(
+            &StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    input: serde_json::Value::Null,
+                    thought_signature: None,
+                },
+            }
+        ));
+        assert!(!should_defer_while_waiting(&StreamEvent::MessageStop));
+        assert!(!should_defer_while_waiting(&StreamEvent::MessageStart {
+            id: "m".into(),
+            model: "x".into(),
+            usage: Default::default(),
+        }));
+        assert!(!should_defer_while_waiting(&StreamEvent::MessageDelta {
+            stop_reason: None,
+            usage: None,
+        }));
     }
 }
