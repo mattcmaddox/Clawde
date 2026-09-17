@@ -7496,25 +7496,31 @@ async fn run_interactive(
                 // The query task has fully unwound — re-enable normal event
                 // handling after a second-Esc cancel.
                 app.stream_cancel_requested = false;
+                // Drain one queued message into the prompt and request an
+                // auto-submit on the next loop iteration (issue #149).
+                let mut queued_chain_continues = false;
+                if let Some(next) = app.queued_messages.pop_front() {
+                    app.prompt_input.text = next;
+                    app.prompt_input.cursor = app.prompt_input.text.len();
+                    app.pending_auto_submit = true;
+                    queued_chain_continues = true;
+                }
                 // Desktop notification when the window is not focused (the
                 // user has switched away and can't see the spinner stop).
                 // Master gate is the existing `notifications` setting; error
                 // outcomes already surfaced a toast above and Cancelled is
-                // not a completion, so notify only on success paths.
-                if notify_on_unfocused_turn_end(&app)
+                // not a completion, so notify only on success paths. A queued
+                // follow-up suppresses the bell — the chain is still running,
+                // and the final turn (empty queue) rings once for the whole
+                // task instead of once per intermediate turn.
+                if !queued_chain_continues
+                    && notify_on_unfocused_turn_end(&app)
                     && !matches!(
                         query_outcome,
                         Ok(QueryOutcome::Error(_)) | Ok(QueryOutcome::Cancelled) | Err(_)
                     )
                 {
                     clawde_tui::emit_desktop_notification("Clawde: task complete");
-                }
-                // Drain one queued message into the prompt and request an
-                // auto-submit on the next loop iteration (issue #149).
-                if let Some(next) = app.queued_messages.pop_front() {
-                    app.prompt_input.text = next;
-                    app.prompt_input.cursor = app.prompt_input.text.len();
-                    app.pending_auto_submit = true;
                 }
                 if app.auto_compact_running {
                     app.auto_compact_running = false;

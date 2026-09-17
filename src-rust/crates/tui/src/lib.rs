@@ -478,39 +478,49 @@ pub fn set_terminal_progress(active: bool) {
     let _ = out.flush();
 }
 
-/// Emit a desktop notification (OSC 9) plus a bell fallback.
+/// Emit a turn-completion attention signal: exactly one standalone BEL
+/// (the classic tab-attention bell — lights the tab marker / rings in the
+/// terminal Clawde runs in, which is the point), plus an OSC 9 desktop toast
+/// on terminals that support it.
 ///
 /// OSC 9 is the iTerm2/Windows Terminal/WezTerm/kitty desktop-toast escape:
 /// `ESC ] 9 ; <message> BEL`. It addresses terminal chrome (notification
 /// center), not the cell grid, so it is safe inside the alternate screen.
-/// Terminals without OSC 9 support ignore the sequence but usually still
-/// act on the trailing BEL, giving an audible cue. No-op when stdout is not
-/// a terminal (headless runs).
+/// The BEL terminating the OSC sequence is consumed by the terminal's parser
+/// and never rung; the standalone BEL that follows is the only audible
+/// signal, so supporting and non-supporting terminals alike ring exactly
+/// once. No-op when stdout is not a terminal (headless runs).
 pub fn emit_desktop_notification(message: &str) {
     use std::io::IsTerminal as _;
     use std::io::Write;
     if !io::stdout().is_terminal() {
         return;
     }
-    let payload = desktop_notification_sequence(message);
+    let payload = notification_payload(message, supports_progress_osc());
     let mut out = io::stdout();
     let _ = out.write_all(&payload);
     let _ = out.flush();
 }
 
-/// Build the full OSC 9 + bell byte sequence for a desktop notification.
+/// Build the byte sequence for a turn-completion notification.
 /// Control characters are stripped (a raw newline or ESC inside the payload
 /// would break the OSC envelope or inject terminal commands) and the message
 /// is capped at 200 chars — notification toasts truncate anyway. Kept pure
-/// so the wire format is unit-testable without a tty.
-fn desktop_notification_sequence(message: &str) -> Vec<u8> {
+/// (the `osc9_supported` flag is passed in rather than probed) so the wire
+/// format is unit-testable without a tty or env-var races.
+fn notification_payload(message: &str, osc9_supported: bool) -> Vec<u8> {
     let sanitized: String = message
         .chars()
         .filter(|c| !c.is_control())
         .take(200)
         .collect();
-    let mut seq = format!("\x1b]9;{}\x07", sanitized).into_bytes();
-    // Bell fallback for terminals that ignore OSC 9.
+    let mut seq = Vec::new();
+    if osc9_supported {
+        seq.extend_from_slice(format!("\x1b]9;{}\x07", sanitized).as_bytes());
+    }
+    // Exactly one standalone BEL — the tab-attention bell. Terminals that
+    // parsed the OSC 9 sequence above consumed its terminator BEL without
+    // ringing; this is the only bell on the wire.
     seq.push(b'\x07');
     seq
 }
@@ -560,18 +570,27 @@ mod tests {
     // ---- desktop notification sequence -----------------------------------
 
     #[test]
-    fn desktop_notification_sequence_shapes_osc9_and_bell() {
-        let seq = super::desktop_notification_sequence("Clawde: task complete");
+    fn notification_payload_osc9_terminal_gets_toast_plus_single_bell() {
+        let seq = super::notification_payload("Clawde: task complete", true);
         assert_eq!(seq, b"\x1b]9;Clawde: task complete\x07\x07".to_vec());
     }
 
     #[test]
-    fn desktop_notification_sequence_strips_control_chars() {
+    fn notification_payload_plain_terminal_gets_exactly_one_bell() {
+        // tmux / unknown terminals: no OSC 9 attempt (tmux would just eat it
+        // or pass garbage through) — only the tab-attention bell.
+        let seq = super::notification_payload("Clawde: task complete", false);
+        assert_eq!(seq, b"\x07".to_vec());
+    }
+
+    #[test]
+    fn notification_payload_strips_control_chars() {
         // A raw newline or ESC inside the payload would break the OSC
         // envelope or inject terminal commands.
-        let seq = super::desktop_notification_sequence("line1\nline2\x1b]2;pwned");
+        let seq = super::notification_payload("line1\nline2\x1b]2;pwned", true);
         // The injected ESC is stripped ("\x1b]2;" collapses to "]2;"), so
-        // the only escape left is the leading OSC 9 header + the two BELs.
+        // the only escapes are the leading OSC 9 header + terminator BEL,
+        // then the single standalone bell.
         assert_eq!(
             seq,
             b"\x1b]9;line1line2]2;pwned\x07\x07".to_vec(),
@@ -580,10 +599,10 @@ mod tests {
     }
 
     #[test]
-    fn desktop_notification_sequence_caps_length() {
+    fn notification_payload_caps_length() {
         let long = "x".repeat(500);
-        let seq = super::desktop_notification_sequence(&long);
-        // OSC 9 head (4 bytes) + 200 payload + two BELs.
+        let seq = super::notification_payload(&long, true);
+        // OSC 9 head (4 bytes) + 200 payload + terminator BEL + standalone BEL.
         assert_eq!(seq.len(), 4 + 200 + 2);
     }
 
