@@ -2128,6 +2128,12 @@ impl App {
 
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
         let model_name = config.effective_model().to_string();
+        // Price this session from its effective model before any usage is
+        // recorded. `CostTracker::new()` starts on Opus pricing, and nothing
+        // else sets it until the user changes model/provider through the UI, so
+        // without this the DEFAULT session (free/auto) reports money spent at
+        // the most expensive tier — a free provider advertising a nonzero cost.
+        cost_tracker.set_model(&model_name);
         // Startup banner (once per launch, not per load): surface a corrupt
         // auth store or settings file immediately instead of silently running
         // with invisible keys / defaulted settings. The dialog is dismissed
@@ -13328,6 +13334,37 @@ mod tests {
         let config = Config::default();
         let cost_tracker = clawde_core::cost::CostTracker::new();
         App::new(config, cost_tracker)
+    }
+
+    #[test]
+    fn default_session_prices_free_models_at_zero() {
+        // The default config resolves to the `free/auto` route, whose real cost
+        // is $0. `CostTracker::new()` starts on Opus pricing and nothing else
+        // set it at startup, so a free session advertised money spent at the
+        // most expensive tier ($75/Mtok output) in the status bar and in every
+        // persisted message cost.
+        let app = make_app();
+        assert_eq!(
+            app.config.effective_model(),
+            clawde_core::constants::DEFAULT_MODEL
+        );
+        app.cost_tracker.add_usage(3_000, 1_000, 0, 0);
+        assert_eq!(
+            app.cost_tracker.total_cost_usd(),
+            0.0,
+            "a free/auto session must not report a cost"
+        );
+    }
+
+    #[test]
+    fn switching_to_a_free_upstream_model_still_prices_at_zero() {
+        // Re-pricing happens on model switches; a free upstream pin
+        // (`groq/…`, `poolside/…`) must stay at $0 rather than fall through the
+        // substring matcher to a paid tier.
+        let mut app = make_app();
+        app.set_model("groq/openai/gpt-oss-120b".to_string());
+        app.cost_tracker.add_usage(3_000, 1_000, 0, 0);
+        assert_eq!(app.cost_tracker.total_cost_usd(), 0.0);
     }
 
     #[test]

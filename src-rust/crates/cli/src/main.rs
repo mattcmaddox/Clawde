@@ -2752,6 +2752,12 @@ async fn run_headless(
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
+    // Price the run from its effective model before any usage accrues. The
+    // tracker starts on Opus pricing and only the TUI ever re-priced it, so
+    // headless runs billed every provider at the top tier — the default
+    // free/auto route reported a nonzero cost for a free request.
+    cost_tracker.set_model(config.effective_model());
+
     let resumed_session = if let Some(id) = resume_id {
         Some(load_headless_resume_session(id).await?)
     } else {
