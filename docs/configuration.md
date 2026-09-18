@@ -170,6 +170,12 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 | `auto_compact` | boolean | true | Automatically compact the conversation context when the context window nears capacity. |
 | `compact_threshold` | float | 0.75 | Fraction of the context window that triggers auto-compaction (0.0–1.0). 75% is the research-backed optimal quality point (Chroma 2025); the remaining 25% is working memory for reasoning. |
 
+### Disk hygiene
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `diskCleanThreshold` | integer \| null | 40 | GiB size at which the TUI offers to clean the cargo dev-profile build tree (`cargo clean --profile dev`). Applies only to source checkouts, never deletes without confirmation, and stands down while a build is running or was built in the last 30 minutes. `0` disables the check; `DISK_CLEAN_THRESHOLD_GIB` overrides it and `CLAWDE_DISABLE_DISK_CLEAN=1` opts out entirely. See [Build-tree disk hygiene](advanced.md#build-tree-disk-hygiene). |
+
 ### System prompt
 
 | Key | Type | Default | Description |
@@ -560,6 +566,8 @@ and `api_base` override the corresponding environment variables.
 | `NVIDIA_API_KEY` | API key for the `nvidia` provider. |
 | `CLAWDE_BRIDGE_URL` | Enable the remote-control bridge by setting the server URL. |
 | `CLAWDE_BRIDGE_TOKEN` | Bearer token for the remote-control bridge. |
+| `DISK_CLEAN_THRESHOLD_GIB` | Override `diskCleanThreshold` for the cargo dev-tree hygiene check. `0` disables it. |
+| `CLAWDE_DISABLE_DISK_CLEAN` | Set to `1` to hard-disable automatic cargo dev-tree hygiene. |
 | `RUST_LOG` | Tracing filter (e.g. `debug`, `clawde_core=trace`). |
 
 ---

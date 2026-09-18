@@ -367,6 +367,11 @@ pub fn spawn(
     threshold_gib: u64,
     ask: Option<tokio::sync::mpsc::UnboundedSender<clawde_tools::UserQuestionEvent>>,
 ) {
+    // Deliberately a detached task rather than a `pending_writes::spawn`: a
+    // cleanup the user approved should be allowed to finish even if they quit
+    // while it runs, and waiting on a multi-GiB delete at exit would make
+    // quitting slow. Cancelling it would leave the tree half-removed; letting
+    // it complete (or be killed by the OS at worst) is the better failure mode.
     tokio::spawn(async move {
         run(threshold_gib, ask).await;
     });
