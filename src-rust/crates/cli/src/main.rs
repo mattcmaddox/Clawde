@@ -3703,6 +3703,23 @@ fn scroll_signal(app: &clawde_tui::App) -> ScrollSignal {
     }
 }
 
+/// True for a keystroke that is prose rather than an answer to a dialog.
+///
+/// The permission dialog consumes its own keys before this is consulted, so a
+/// `KeyCode::Char` with no Ctrl/Alt left over is text the user was composing
+/// when the dialog appeared — dialogs open mid-turn. Dropping it silently lost
+/// those keystrokes. Modifier chords and control keys are excluded so no
+/// shortcut fires behind an open dialog.
+fn is_unclaimed_text_key(key: crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && !c.is_control()
+}
+
 async fn run_interactive(
     config: Config,
     settings: clawde_core::config::Settings,
@@ -6057,6 +6074,18 @@ async fn run_interactive(
                                 }
                             }
                             continue;
+                        }
+                        // The dialog did not claim this key. Its own keys
+                        // (option letters, in-range digits, Enter, Esc, paging,
+                        // arrows) were consumed above, so printable text left
+                        // here is a message the user was composing when the
+                        // dialog appeared. This used to `continue` away, which
+                        // silently discarded every such keystroke; hand it to
+                        // the prompt instead. Deliberately not
+                        // `handle_key_event`: that would let configured chords
+                        // fire behind an open dialog.
+                        if is_unclaimed_text_key(key) {
+                            app.insert_unclaimed_prompt_text(key);
                         }
                         continue;
                     }
@@ -9529,6 +9558,51 @@ mod scroll_signal_tests {
         let app = app_on_free_default();
         app.last_max_scroll.set(42);
         assert_eq!(scroll_signal(&app), scroll_signal(&app));
+    }
+}
+
+#[cfg(test)]
+mod unclaimed_text_key_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn printable_characters_are_text() {
+        // The regression: these were consumed by the permission dialog's
+        // fall-through and lost, so a follow-up typed while a dialog was up
+        // arrived truncated ("Please …" became "se …").
+        for c in ['P', 'l', 'e', 'a', 's', ' ', '7', '/', '?'] {
+            assert!(
+                is_unclaimed_text_key(key(KeyCode::Char(c), KeyModifiers::NONE)),
+                "{c:?} is text and must not be discarded"
+            );
+        }
+    }
+
+    #[test]
+    fn shortcuts_never_fire_behind_an_open_dialog() {
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert!(!is_unclaimed_text_key(key(KeyCode::Char('k'), modifiers)));
+        }
+        assert!(!is_unclaimed_text_key(key(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
+        assert!(!is_unclaimed_text_key(key(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+        assert!(!is_unclaimed_text_key(key(KeyCode::Up, KeyModifiers::NONE)));
+        // Control characters are not prose; Enter arrives as '\r' on some
+        // terminals and must stay with the dialog.
+        assert!(!is_unclaimed_text_key(key(
+            KeyCode::Char('\r'),
+            KeyModifiers::NONE
+        )));
     }
 }
 

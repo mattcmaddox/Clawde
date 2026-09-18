@@ -8817,6 +8817,14 @@ impl App {
         // Permission dialog mode intercepts most keys
         if self.permission_request.is_some() {
             self.handle_permission_key(key);
+            // A dialog can open mid-turn, while the next message is being
+            // typed. Its own keys (option letters, digits, Enter, Esc, arrows,
+            // paging) are answered above or are not text; anything left is
+            // prose. Swallowing it truncated whatever the user was composing —
+            // a prompt starting "Please …" reached the model as "se …" — so
+            // route it into the prompt instead. No shortcut runs here: only a
+            // plain character is forwarded, never a chord.
+            self.insert_unclaimed_prompt_text(key);
             return false;
         }
 
@@ -9635,6 +9643,33 @@ impl App {
         }
 
         false
+    }
+
+    /// Insert a printable keystroke into the prompt on behalf of an open dialog.
+    ///
+    /// Used when a permission (or other modal) prompt owns the keyboard but the
+    /// key is not one of its answers: the user is composing the next message and
+    /// that text must not vanish. Mirroring the ordinary text path keeps
+    /// layout/shift normalization consistent; in vim command mode a letter is a
+    /// command rather than text, and commands are not run behind an open dialog,
+    /// so those are still refused. Returns whether anything was inserted.
+    pub fn insert_unclaimed_prompt_text(&mut self, key: KeyEvent) -> bool {
+        let KeyCode::Char(c) = key.code else {
+            return false;
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+            || c.is_control()
+        {
+            return false;
+        }
+        if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
+            return false;
+        }
+        let c = self.shift_normalize(c, key.modifiers);
+        self.prompt_input.insert_char(c);
+        self.refresh_prompt_input();
+        true
     }
 
     fn current_key_context(&self) -> KeyContext {
@@ -13378,6 +13413,62 @@ mod tests {
             app.needs_full_repaint,
             "the redraw action must ask the frame loop for a full clear"
         );
+    }
+
+    #[test]
+    fn typing_while_a_permission_dialog_is_open_keeps_the_text() {
+        // The regression: the dialog owns the keyboard, and every key it did not
+        // answer was dropped, so a follow-up typed while a dialog was up reached
+        // the model truncated ("Please …" arrived as "se …").
+        use crate::dialogs::PermissionRequest;
+        let mut app = make_app();
+        app.permission_request = Some(PermissionRequest::bash(
+            "tu-1".to_string(),
+            "Bash".to_string(),
+            "This will execute a shell command.".to_string(),
+            "ls -d crates/*/".to_string(),
+            None,
+        ));
+
+        for c in ['P', 'l', 'e'] {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        assert_eq!(
+            app.prompt_input.text, "Ple",
+            "text that is not a dialog answer belongs in the prompt"
+        );
+        assert!(
+            app.permission_request.is_some(),
+            "none of those keys answered the dialog"
+        );
+    }
+
+    #[test]
+    fn dialog_keys_and_chords_are_not_diverted_into_the_prompt() {
+        // The other half: only prose is rescued. A chord must not fire behind an
+        // open dialog, and non-text keys stay with the dialog.
+        use crate::dialogs::PermissionRequest;
+        let mut app = make_app();
+        app.permission_request = Some(PermissionRequest::bash(
+            "tu-1".to_string(),
+            "Bash".to_string(),
+            "This will execute a shell command.".to_string(),
+            "ls".to_string(),
+            None,
+        ));
+
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        app.handle_key_event(press_key(KeyCode::Char('x'), KeyModifiers::ALT));
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+
+        assert!(
+            app.prompt_input.text.is_empty(),
+            "a chord or a navigation key must not become prompt text"
+        );
+        // A plain char still lands, so the two cases are genuinely separated.
+        app.handle_key_event(press_key(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(app.prompt_input.text, "z");
     }
 
     #[test]
