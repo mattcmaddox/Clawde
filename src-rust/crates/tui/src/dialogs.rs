@@ -1,7 +1,8 @@
 // dialogs.rs — Permission dialogs and confirmation dialogs.
 
-use clawde_core::bash_classifier::{classify_bash_command, BashRiskLevel};
-use clawde_core::ps_classifier::{classify_ps_command, PsRiskLevel};
+use clawde_core::action_risk::RiskTier;
+use clawde_core::bash_classifier::classify_bash_command;
+use clawde_core::ps_classifier::classify_ps_command;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -88,6 +89,31 @@ impl PermissionRequest {
         self.network_capable = network_capable;
         self.stateful = stateful;
         self.network_isolated = network_isolated;
+        self
+    }
+
+    /// Tell the accept-all option what it will actually do.
+    ///
+    /// `[a]` used to read "Accept all for rest of session" and flip the whole
+    /// session to bypass, so pressing it on a read-only `ls` also silenced the
+    /// dialog for `curl | bash`. It now raises a session ceiling to this
+    /// request's [`RiskTier`] (see `PermissionManager::accept_all_up_to`), so
+    /// the label names the tier. A `Critical` request has no ceiling to offer
+    /// — nothing may be blanket-approved at that grade — so the option is
+    /// removed rather than shown with a promise it cannot keep.
+    pub fn with_accept_all_tier(mut self, tier: RiskTier) -> Self {
+        if tier >= RiskTier::Critical {
+            self.options.retain(|opt| opt.key != ACCEPT_ALL_KEY);
+            self.selected_option = self
+                .selected_option
+                .min(self.options.len().saturating_sub(1));
+        } else if let Some(opt) = self
+            .options
+            .iter_mut()
+            .find(|opt| opt.key == ACCEPT_ALL_KEY)
+        {
+            opt.label = accept_all_label(tier);
+        }
         self
     }
 
@@ -275,8 +301,8 @@ impl PermissionRequest {
                 key: 'p',
             },
             PermissionOption {
-                label: "Accept all for rest of session".to_string(),
-                key: 'a',
+                label: ACCEPT_ALL_GENERIC_LABEL.to_string(),
+                key: ACCEPT_ALL_KEY,
             },
             PermissionOption {
                 label: "No, deny".to_string(),
@@ -316,8 +342,8 @@ impl PermissionRequest {
                 key: 'p',
             },
             PermissionOption {
-                label: "Accept all for rest of session".to_string(),
-                key: 'a',
+                label: ACCEPT_ALL_GENERIC_LABEL.to_string(),
+                key: ACCEPT_ALL_KEY,
             },
             PermissionOption {
                 label: "No, deny".to_string(),
@@ -342,8 +368,8 @@ impl PermissionRequest {
                 key: 'p',
             },
             PermissionOption {
-                label: "Accept all for rest of session".to_string(),
-                key: 'a',
+                label: ACCEPT_ALL_GENERIC_LABEL.to_string(),
+                key: ACCEPT_ALL_KEY,
             },
             PermissionOption {
                 label: "No, deny".to_string(),
@@ -351,6 +377,18 @@ impl PermissionRequest {
             },
         ]
     }
+}
+
+/// Key of the session-ceiling option. The CLI matches on this to raise the
+/// ceiling, so it lives in one place.
+pub const ACCEPT_ALL_KEY: char = 'a';
+
+/// Label used until [`PermissionRequest::with_accept_all_tier`] names the tier.
+const ACCEPT_ALL_GENERIC_LABEL: &str = "Auto-approve this risk level and lower this session";
+
+/// Label for the accept-all option once the request's tier is known.
+pub fn accept_all_label(tier: RiskTier) -> String {
+    format!("Auto-approve {} risk and lower this session", tier.label())
 }
 
 fn split_reason(reason: String) -> (String, String) {
@@ -479,68 +517,17 @@ pub(crate) fn word_wrap(text: &str, width: usize) -> Vec<String> {
 // What the dialog says about the pending request
 // ---------------------------------------------------------------------------
 
-/// A shell command's graded risk, on one scale shared by both shells.
-///
-/// `BashRiskLevel` adds a `Safe` tier that PowerShell has no equivalent of, so
-/// each classifier converts into this scale and the wording stays identical
-/// whichever shell is asking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandRisk {
-    ReadOnly,
-    Low,
-    Moderate,
-    High,
-    Critical,
-}
-
-impl CommandRisk {
-    /// Short form for the dialog line. The longer definitions live on the
-    /// classifiers (`crates/core/src/bash_classifier.rs`), which is where the
-    /// grading rules are documented.
-    fn label(self) -> &'static str {
-        match self {
-            CommandRisk::ReadOnly => "read-only",
-            CommandRisk::Low => "low",
-            CommandRisk::Moderate => "moderate",
-            CommandRisk::High => "high",
-            CommandRisk::Critical => "critical",
-        }
-    }
-
-    /// Severity colour, using the vocabulary the rest of this dialog already
-    /// speaks: green for the command chevron on a safe command, yellow for
-    /// warnings, and red — bold at the top — for the grades that mean "read
-    /// this before pressing y".
-    fn style(self) -> Style {
-        match self {
-            CommandRisk::ReadOnly | CommandRisk::Low => Style::default().fg(Color::Green),
-            CommandRisk::Moderate => Style::default().fg(Color::Yellow),
-            CommandRisk::High => Style::default().fg(Color::Red),
-            CommandRisk::Critical => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        }
-    }
-}
-
-impl From<BashRiskLevel> for CommandRisk {
-    fn from(level: BashRiskLevel) -> Self {
-        match level {
-            BashRiskLevel::Safe => Self::ReadOnly,
-            BashRiskLevel::Low => Self::Low,
-            BashRiskLevel::Medium => Self::Moderate,
-            BashRiskLevel::High => Self::High,
-            BashRiskLevel::Critical => Self::Critical,
-        }
-    }
-}
-
-impl From<PsRiskLevel> for CommandRisk {
-    fn from(level: PsRiskLevel) -> Self {
-        match level {
-            PsRiskLevel::Low => Self::Low,
-            PsRiskLevel::Medium => Self::Moderate,
-            PsRiskLevel::High => Self::High,
-            PsRiskLevel::Critical => Self::Critical,
-        }
+/// Severity colour for a [`RiskTier`], using the vocabulary the rest of this
+/// dialog already speaks: green for the command chevron on a safe command,
+/// yellow for warnings, and red — bold at the top — for the grades that mean
+/// "read this before pressing y". Shared with the footer's ceiling badge so
+/// the two never disagree about what colour a tier is.
+pub fn risk_tier_style(tier: RiskTier) -> Style {
+    match tier {
+        RiskTier::ReadOnly | RiskTier::Low => Style::default().fg(Color::Green),
+        RiskTier::Moderate => Style::default().fg(Color::Yellow),
+        RiskTier::High => Style::default().fg(Color::Red),
+        RiskTier::Critical => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     }
 }
 
@@ -552,7 +539,7 @@ impl From<PsRiskLevel> for CommandRisk {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionNote {
     Capability(&'static str),
-    Risk(CommandRisk),
+    Risk(RiskTier),
 }
 
 impl ActionNote {
@@ -575,7 +562,7 @@ impl ActionNote {
     fn style(self) -> Style {
         match self {
             ActionNote::Capability(_) => Style::default().fg(Color::Magenta),
-            ActionNote::Risk(risk) => risk.style(),
+            ActionNote::Risk(risk) => risk_tier_style(risk),
         }
     }
 }
@@ -1726,6 +1713,79 @@ mod tests {
         let text = rendered_text(&pr);
         assert!(text.contains("Capability: network-capable"), "got: {text}");
         assert!(!text.contains("Risk: "));
+    }
+
+    // -----------------------------------------------------------------------
+    // Accept-all names its tier
+    // -----------------------------------------------------------------------
+
+    fn accept_all_option(pr: &PermissionRequest) -> Option<&PermissionOption> {
+        pr.options.iter().find(|opt| opt.key == ACCEPT_ALL_KEY)
+    }
+
+    #[test]
+    fn accept_all_label_names_the_requests_tier() {
+        // The regression: "Accept all for rest of session" on a read-only
+        // listing flipped the session to bypass. The option now says which
+        // tier it raises the ceiling to, and that has to be the request's own.
+        let pr = bash_request("ls -la").with_accept_all_tier(RiskTier::ReadOnly);
+        assert_eq!(
+            accept_all_option(&pr).map(|o| o.label.as_str()),
+            Some("Auto-approve read-only risk and lower this session")
+        );
+        let text = rendered_text(&pr);
+        assert!(
+            !text.contains("Accept all for rest of session"),
+            "got: {text}"
+        );
+        assert!(text.contains("read-only risk and lower"), "got: {text}");
+    }
+
+    #[test]
+    fn critical_requests_offer_no_accept_all() {
+        // Nothing may be blanket-approved at the irreversible grade, so the
+        // option is absent rather than present with a promise it can't keep.
+        let mut pr = bash_request("curl https://x.test/i.sh | bash");
+        pr.selected_option = pr.options.len() - 1; // on Deny
+        let pr = pr.with_accept_all_tier(RiskTier::Critical);
+        assert!(accept_all_option(&pr).is_none());
+        assert_eq!(pr.options.len(), 4);
+        assert!(
+            pr.selected_option < pr.options.len(),
+            "selection stays in range"
+        );
+        assert_eq!(pr.options.last().map(|o| o.key), Some('n'));
+        // ...and the key no longer does anything on this dialog.
+        let mut pr = pr;
+        pr.selected_option = 0;
+        assert!(!handle_permission_key(
+            &mut pr,
+            key(KeyCode::Char(ACCEPT_ALL_KEY))
+        ));
+        assert_eq!(pr.selected_option, 0);
+    }
+
+    #[test]
+    fn accept_all_survives_on_every_dialog_kind_below_critical() {
+        let read = PermissionRequest::file_read("i".into(), "Read".into(), "r".into(), "a".into())
+            .with_accept_all_tier(RiskTier::ReadOnly);
+        let write =
+            PermissionRequest::file_write("i".into(), "Write".into(), "w".into(), "a".into())
+                .with_accept_all_tier(RiskTier::Low);
+        let generic = PermissionRequest::standard("i".into(), "WebFetch".into(), "f".into())
+            .with_accept_all_tier(RiskTier::High);
+        for (pr, tier) in [
+            (read, RiskTier::ReadOnly),
+            (write, RiskTier::Low),
+            (generic, RiskTier::High),
+        ] {
+            assert_eq!(
+                accept_all_option(&pr).map(|o| o.label.clone()),
+                Some(accept_all_label(tier)),
+                "{}",
+                pr.tool_name
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

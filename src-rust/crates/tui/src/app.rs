@@ -1989,6 +1989,12 @@ pub struct App {
     /// word is checked against this set; a match silently auto-approves the request.
     pub bash_prefix_allowlist: std::collections::HashSet<String>,
 
+    /// Session auto-approval ceiling raised by the permission dialog's `[a]`
+    /// option. Mirrors `PermissionManager::session_risk_ceiling` (the CLI
+    /// syncs it when the ceiling changes) so the footer can show what is being
+    /// approved unasked. `None` means every non-safe request still prompts.
+    pub session_risk_ceiling: Option<clawde_core::action_risk::RiskTier>,
+
     // ---- Auto-update notification ----------------------------------------
     /// If a newer version was found during background update check, this holds
     /// the latest version string (e.g. "0.1.0"). Shown in the footer status bar.
@@ -2504,6 +2510,7 @@ impl App {
             scroll_accel: 3.0,
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
+            session_risk_ceiling: None,
             update_available: None,
             managed_agent_cost_breakdown: None,
             managed_agents_active: false,
@@ -9513,23 +9520,8 @@ impl App {
             }
 
             // ---- Shift+Tab: cycle permission mode ----------------------
-            // Default → AcceptEdits → BypassPermissions → Default
-            // Mirrors TS bottom-left indicator cycling behaviour.
             KeyCode::BackTab if !self.is_streaming => {
-                use clawde_core::config::PermissionMode;
-                self.config.permission_mode = match self.config.permission_mode {
-                    PermissionMode::Default => PermissionMode::AcceptEdits,
-                    PermissionMode::AcceptEdits => PermissionMode::BypassPermissions,
-                    PermissionMode::BypassPermissions => PermissionMode::Default,
-                    PermissionMode::Plan => PermissionMode::Default,
-                };
-                let label = match self.config.permission_mode {
-                    PermissionMode::Default => "Default permissions",
-                    PermissionMode::AcceptEdits => "Accept-edits mode",
-                    PermissionMode::BypassPermissions => "Bypass permissions (dangerous)",
-                    PermissionMode::Plan => "Plan mode",
-                };
-                self.status_message = Some(label.to_string());
+                self.cycle_permission_mode();
             }
 
             // ---- Submit ------------------------------------------------
@@ -10637,20 +10629,7 @@ impl App {
             }
             "cyclePermissionMode" => {
                 // Shift+Tab: cycle the permission mode
-                use clawde_core::config::PermissionMode;
-                self.config.permission_mode = match self.config.permission_mode {
-                    PermissionMode::Default => PermissionMode::AcceptEdits,
-                    PermissionMode::AcceptEdits => PermissionMode::BypassPermissions,
-                    PermissionMode::BypassPermissions => PermissionMode::Default,
-                    PermissionMode::Plan => PermissionMode::Default,
-                };
-                let label = match self.config.permission_mode {
-                    PermissionMode::Default => "Default permissions",
-                    PermissionMode::AcceptEdits => "Accept-edits mode",
-                    PermissionMode::BypassPermissions => "Bypass permissions (dangerous)",
-                    PermissionMode::Plan => "Plan mode",
-                };
-                self.status_message = Some(label.to_string());
+                self.cycle_permission_mode();
                 false
             }
             "openHelp" => {
@@ -11090,6 +11069,35 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Shift+Tab. Default → AcceptEdits → BypassPermissions → Default, mirroring
+    /// the TS bottom-left indicator. An active session ceiling (the dialog's
+    /// `[a]`) is the one permission state the footer shows that has no other
+    /// way off, so the first press clears it and stops there; the mode cycles
+    /// on the next press. The CLI mirrors the cleared ceiling into the manager.
+    pub fn cycle_permission_mode(&mut self) {
+        use clawde_core::config::PermissionMode;
+        if let Some(ceiling) = self.session_risk_ceiling.take() {
+            self.status_message = Some(format!(
+                "Cleared auto-approval of {} risk and lower; every request asks again",
+                ceiling.label()
+            ));
+            return;
+        }
+        self.config.permission_mode = match self.config.permission_mode {
+            PermissionMode::Default => PermissionMode::AcceptEdits,
+            PermissionMode::AcceptEdits => PermissionMode::BypassPermissions,
+            PermissionMode::BypassPermissions => PermissionMode::Default,
+            PermissionMode::Plan => PermissionMode::Default,
+        };
+        let label = match self.config.permission_mode {
+            PermissionMode::Default => "Default permissions",
+            PermissionMode::AcceptEdits => "Accept-edits mode",
+            PermissionMode::BypassPermissions => "Bypass permissions (dangerous)",
+            PermissionMode::Plan => "Plan mode",
+        };
+        self.status_message = Some(label.to_string());
     }
 
     /// Returns `true` if the given bash `command` is covered by the session-local
@@ -13381,6 +13389,29 @@ mod tests {
         let config = Config::default();
         let cost_tracker = clawde_core::cost::CostTracker::new();
         App::new(config, cost_tracker)
+    }
+
+    #[test]
+    fn shift_tab_clears_an_active_ceiling_before_cycling_the_mode() {
+        use clawde_core::action_risk::RiskTier;
+        use clawde_core::config::PermissionMode;
+        let mut app = make_app();
+        app.session_risk_ceiling = Some(RiskTier::Low);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+
+        // First press: the ceiling goes, the mode stays put.
+        app.cycle_permission_mode();
+        assert_eq!(app.session_risk_ceiling, None);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|m| m.contains("Cleared auto-approval of low risk")));
+
+        // Second press: the ordinary cycle.
+        app.cycle_permission_mode();
+        assert_eq!(app.config.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(app.session_risk_ceiling, None);
     }
 
     #[test]

@@ -77,7 +77,18 @@ arbitrary execution remains an execute-level operation.
 
 ### Interactive vs. Auto Mode
 
-**Interactive mode** (default REPL): Clawde presents a confirmation prompt for any tool that lacks a pre-existing approval rule. The user can approve once, approve always (adding a permanent rule), or deny.
+**Interactive mode** (default REPL): Clawde presents a confirmation prompt for any tool that lacks a pre-existing approval rule. The dialog grades the request on a shared risk scale (`read-only < low < moderate < high < critical`; shell commands come from the bash/PowerShell classifiers, other tools from their permission level and capabilities) and offers:
+
+| Key | Option | Effect |
+|-----|--------|--------|
+| `y` | Allow once | This request only |
+| `Y` | Allow this session | Session allow rule for the tool (and path, when there is one) |
+| `p` | Always allow | Persistent allow rule saved to settings |
+| `a` | Auto-approve *tier* risk and lower this session | Raises a session ceiling: later requests graded at or below this one's tier run without asking; anything above still prompts. The ceiling only rises, never reaches `critical`, and is shown in the footer as `auto≤tier`. Not offered on `critical` requests. Reads outside the workspace roots grade `moderate` regardless of tool, so a `read-only` ceiling never covers them. Press Shift+Tab once to clear the ceiling (the mode cycles on the next press). |
+| `P` | Allow commands matching *prefix* (Bash only) | Prefix allowlist, persisted |
+| `n` | Deny | Refuse this request |
+
+The ceiling turns prompts into approvals only: deny rules, `plan` mode, forbidden capabilities, and network isolation are evaluated first and are unaffected. To skip all ordinary prompts, switch modes explicitly (`Shift+Tab` or `bypassPermissions`).
 
 **Bypass mode** (`--dangerously-skip-permissions` or `bypassPermissions`): No ordinary prompts are shown. Explicit deny rules, forbidden capabilities, and Ollama network isolation still apply. Use only in trusted, sandboxed environments.
 

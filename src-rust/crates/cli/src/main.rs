@@ -3463,11 +3463,16 @@ fn permission_request_from_core(
             pending.request.path.clone(),
         ),
     };
-    request.with_capabilities(
-        pending.request.network_capable,
-        pending.request.stateful,
-        pending.request.network_isolated,
-    )
+    // Same grader the manager compares the ceiling against, on the same
+    // request, so the label promises exactly what `[a]` will do.
+    let tier = clawde_core::permissions::request_risk_tier(&pending.request);
+    request
+        .with_capabilities(
+            pending.request.network_capable,
+            pending.request.stateful,
+            pending.request.network_isolated,
+        )
+        .with_accept_all_tier(tier)
 }
 
 /// `--dump-task-state <SESSION_ID>`: reconstruct the task-state projection
@@ -6024,15 +6029,24 @@ async fn run_interactive(
                                 if let Some(manager) = tool_ctx.permission_manager.as_ref() {
                                     if let Ok(mut manager) = manager.lock() {
                                         match selected_key {
-                                            Some('a') => {
-                                                manager.mode =
-                                                    clawde_core::config::PermissionMode::BypassPermissions;
-                                                app.config.permission_mode =
-                                                    clawde_core::config::PermissionMode::BypassPermissions;
-                                                app.status_message = Some(
-                                                    "Accept all for rest of session enabled"
-                                                        .to_string(),
-                                                );
+                                            // Raise the session ceiling to this
+                                            // request's tier. This used to flip
+                                            // the whole session to bypass, so
+                                            // accepting a read-only `ls` also
+                                            // silenced the dialog for `curl |
+                                            // bash`; now only requests graded at
+                                            // or below this one run unasked.
+                                            Some(clawde_tui::dialogs::ACCEPT_ALL_KEY) => {
+                                                let tier =
+                                                    clawde_core::permissions::request_risk_tier(
+                                                        &pending.request,
+                                                    );
+                                                let ceiling = manager.accept_all_up_to(tier);
+                                                app.session_risk_ceiling = Some(ceiling);
+                                                app.status_message = Some(format!(
+                                                    "Auto-approving {} risk and lower for the rest of this session",
+                                                    ceiling.label()
+                                                ));
                                             }
                                             Some('Y') => {
                                                 if let Some(path) = selected_path.as_deref() {
@@ -6173,6 +6187,12 @@ async fn run_interactive(
                     if let Some(manager) = tool_ctx.permission_manager.as_ref() {
                         if let Ok(mut manager) = manager.lock() {
                             manager.mode = tool_ctx.config.permission_mode.clone();
+                            // Shift+Tab with a ceiling active clears it on the
+                            // App side (`cycle_permission_mode`); the manager
+                            // is the one that decides, so mirror the clear.
+                            if app.session_risk_ceiling.is_none() {
+                                manager.session_risk_ceiling = None;
+                            }
                         }
                     }
                     if !app.model_name.is_empty() {

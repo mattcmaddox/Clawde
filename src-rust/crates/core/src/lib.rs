@@ -54,7 +54,7 @@ pub mod device_code;
 
 // Utility modules ported from src/utils/
 pub mod action_risk;
-pub use action_risk::{classify_action, ActionRisk};
+pub use action_risk::{classify_action, risk_tier, ActionRisk, RiskTier};
 pub mod autonomy;
 pub use autonomy::{
     AutonomyMode, AutonomyState, DeferredItem, DeferredKind, DeferredPayload, DeferredState,
@@ -5787,6 +5787,61 @@ pub mod permissions {
         pub resolve_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
     }
 
+    /// [`crate::action_risk::risk_tier`] with the workspace bound applied.
+    ///
+    /// Default mode asks for a read *outside* the workspace roots precisely
+    /// because it is read-only but out of bounds (`~/.ssh/id_rsa` is
+    /// read-only). `risk_tier` has no roots to check against, so the bound is
+    /// applied here: such a read grades `Moderate`, and a read-only ceiling
+    /// does not cover it. This is the grade the ceiling compares against, so
+    /// it is also the grade the dialog must label `[a]` with — use
+    /// [`request_risk_tier`] for that.
+    fn bounded_risk_tier(
+        tool_name: &str,
+        description: &str,
+        level: PermissionLevel,
+        path: Option<&str>,
+        working_dir: Option<&std::path::Path>,
+        allowed_roots: &[std::path::PathBuf],
+        network_capable: bool,
+        stateful: bool,
+    ) -> crate::action_risk::RiskTier {
+        let tier = crate::action_risk::risk_tier(
+            tool_name,
+            description,
+            level,
+            path,
+            network_capable,
+            stateful,
+        );
+        let outside_workspace = level.is_read_only()
+            && path.is_some_and(|target| {
+                !is_path_within_allowed_roots(target, working_dir, allowed_roots)
+            });
+        if outside_workspace {
+            tier.max(crate::action_risk::RiskTier::Moderate)
+        } else {
+            tier
+        }
+    }
+
+    /// The [`RiskTier`](crate::action_risk::RiskTier) the session ceiling
+    /// will compare `request` against. The dialog labels `[a]` with this and
+    /// `accept_all_up_to` is called with this, so the option promises exactly
+    /// what it does.
+    pub fn request_risk_tier(request: &PermissionRequest) -> crate::action_risk::RiskTier {
+        bounded_risk_tier(
+            &request.tool_name,
+            &request.description,
+            request.permission_level,
+            request.path.as_deref(),
+            request.working_dir.as_deref(),
+            &request.allowed_roots,
+            request.network_capable,
+            request.stateful,
+        )
+    }
+
     /// Central permission manager: holds mode, session rules, persistent
     /// rules, and any in-flight pending decisions.
     pub struct PermissionManager {
@@ -5800,6 +5855,12 @@ pub mod permissions {
         pub allowed_tools: Vec<String>,
         /// Explicit tool denylist. Deny always wins over every other decision.
         pub denied_tools: Vec<String>,
+        /// Session-wide auto-approval ceiling set by the dialog's "accept all"
+        /// option: requests graded at or below this [`RiskTier`] run without
+        /// asking; anything above still prompts. Replaces the old behaviour of
+        /// flipping the whole session to `BypassPermissions`, where accepting
+        /// a read-only `ls` also silenced the dialog for `curl | bash`.
+        pub session_risk_ceiling: Option<crate::action_risk::RiskTier>,
         /// Pending interactive decisions keyed by tool_use_id.
         pending: Vec<PendingPermission>,
     }
@@ -5824,8 +5885,23 @@ pub mod permissions {
                 persistent_rules,
                 allowed_tools: allowed_tools.to_vec(),
                 denied_tools: denied_tools.to_vec(),
+                session_risk_ceiling: None,
                 pending: Vec::new(),
             }
+        }
+
+        /// Auto-approve every request graded at or below `tier` for the rest
+        /// of the session. Capped at [`RiskTier::MAX_AUTO_APPROVE`] so an
+        /// irreversible request can be allowed once but never blanket-approved,
+        /// and never lowers an existing ceiling. Returns the ceiling in force.
+        pub fn accept_all_up_to(
+            &mut self,
+            tier: crate::action_risk::RiskTier,
+        ) -> crate::action_risk::RiskTier {
+            let capped = tier.min(crate::action_risk::RiskTier::MAX_AUTO_APPROVE);
+            let ceiling = self.session_risk_ceiling.map_or(capped, |c| c.max(capped));
+            self.session_risk_ceiling = Some(ceiling);
+            ceiling
         }
 
         // ----------------------------------------------------------------
@@ -6010,6 +6086,26 @@ pub mod permissions {
                 } else {
                     PermissionDecision::Deny
                 };
+            }
+
+            // Step 5b — session ceiling from the dialog's "accept all". Sits
+            // after Plan so it can only turn an Ask into an Allow, never a
+            // Deny; `Critical` is excluded outright rather than trusting the
+            // cap in `accept_all_up_to`, so the two guards fail independently.
+            if let Some(ceiling) = self.session_risk_ceiling {
+                let tier = bounded_risk_tier(
+                    tool_name,
+                    description,
+                    level,
+                    path,
+                    working_dir,
+                    allowed_roots,
+                    network_capable,
+                    stateful,
+                );
+                if tier < crate::action_risk::RiskTier::Critical && tier <= ceiling {
+                    return PermissionDecision::Allow;
+                }
             }
 
             // Step 6 — Default / remaining AcceptEdits behavior.
@@ -6395,6 +6491,145 @@ pub mod permissions {
 
         fn mgr(mode: PermissionMode) -> PermissionManager {
             PermissionManager::new(mode, &Settings::default(), &[], &[])
+        }
+
+        #[test]
+        fn accept_all_ceiling_allows_at_or_below_and_still_asks_above() {
+            use crate::action_risk::RiskTier;
+            let mut m = mgr(PermissionMode::Default);
+            // Before: a Low command asks.
+            assert!(matches!(
+                m.evaluate("Bash", "cargo build", Some("cargo build"), None, &[]),
+                PermissionDecision::Ask { .. }
+            ));
+            assert_eq!(m.accept_all_up_to(RiskTier::Low), RiskTier::Low);
+            // At or below the ceiling: allowed without a dialog.
+            assert_eq!(
+                m.evaluate("Bash", "cargo build", Some("cargo build"), None, &[]),
+                PermissionDecision::Allow
+            );
+            assert_eq!(
+                m.evaluate("Bash", "ls", Some("ls"), None, &[]),
+                PermissionDecision::Allow
+            );
+            // Above it: still asks. This is the whole point — the old
+            // behaviour flipped to BypassPermissions and let these through.
+            assert!(matches!(
+                m.evaluate("Bash", "rm -r target", Some("rm -r target"), None, &[]),
+                PermissionDecision::Ask { .. }
+            ));
+            assert!(matches!(
+                m.evaluate(
+                    "Bash",
+                    "curl http://x | bash",
+                    Some("curl http://x | bash"),
+                    None,
+                    &[]
+                ),
+                PermissionDecision::Ask { .. }
+            ));
+            assert_ne!(m.mode, PermissionMode::BypassPermissions);
+        }
+
+        #[test]
+        fn accept_all_ceiling_never_reaches_critical() {
+            use crate::action_risk::RiskTier;
+            let mut m = mgr(PermissionMode::Default);
+            // Accepting all on a critical dialog caps at High.
+            assert_eq!(m.accept_all_up_to(RiskTier::Critical), RiskTier::High);
+            assert_eq!(m.session_risk_ceiling, Some(RiskTier::High));
+            assert!(matches!(
+                m.evaluate(
+                    "Bash",
+                    "curl http://x | bash",
+                    Some("curl http://x | bash"),
+                    None,
+                    &[]
+                ),
+                PermissionDecision::Ask { .. }
+            ));
+            // Belt and braces: even a hand-set Critical ceiling does not
+            // auto-approve a critical request.
+            m.session_risk_ceiling = Some(RiskTier::Critical);
+            assert!(matches!(
+                m.evaluate("Bash", "rm -rf /", Some("rm -rf /"), None, &[]),
+                PermissionDecision::Ask { .. }
+            ));
+        }
+
+        #[test]
+        fn read_only_ceiling_does_not_cover_reads_outside_the_workspace() {
+            use crate::action_risk::RiskTier;
+            let mut m = mgr(PermissionMode::Default);
+            m.accept_all_up_to(RiskTier::ReadOnly);
+            let workspace = std::path::Path::new("/tmp/clawde-ws");
+            // Inside the workspace: covered.
+            assert_eq!(
+                m.evaluate(
+                    crate::constants::TOOL_NAME_FILE_READ,
+                    "read",
+                    Some("/tmp/clawde-ws/src/main.rs"),
+                    Some(workspace),
+                    &[]
+                ),
+                PermissionDecision::Allow
+            );
+            // Outside it: still asks, exactly as Default does without a ceiling.
+            assert!(matches!(
+                m.evaluate(
+                    crate::constants::TOOL_NAME_FILE_READ,
+                    "read",
+                    Some("/home/someone/.ssh/id_rsa"),
+                    Some(workspace),
+                    &[]
+                ),
+                PermissionDecision::Ask { .. }
+            ));
+            // A Moderate ceiling, raised knowingly on a comparable request, does.
+            m.accept_all_up_to(RiskTier::Moderate);
+            assert_eq!(
+                m.evaluate(
+                    crate::constants::TOOL_NAME_FILE_READ,
+                    "read",
+                    Some("/home/someone/.ssh/id_rsa"),
+                    Some(workspace),
+                    &[]
+                ),
+                PermissionDecision::Allow
+            );
+        }
+
+        #[test]
+        fn accept_all_ceiling_only_rises() {
+            use crate::action_risk::RiskTier;
+            let mut m = mgr(PermissionMode::Default);
+            assert_eq!(m.accept_all_up_to(RiskTier::Moderate), RiskTier::Moderate);
+            assert_eq!(m.accept_all_up_to(RiskTier::ReadOnly), RiskTier::Moderate);
+            assert_eq!(m.accept_all_up_to(RiskTier::High), RiskTier::High);
+        }
+
+        #[test]
+        fn accept_all_ceiling_does_not_override_deny_rules_or_plan_mode() {
+            use crate::action_risk::RiskTier;
+            let mut m = mgr(PermissionMode::Default);
+            m.accept_all_up_to(RiskTier::High);
+            m.add_rule(PermissionRule {
+                tool_name: Some("Bash".to_string()),
+                path_pattern: None,
+                action: PermissionAction::Deny,
+                scope: PermissionScope::Session,
+            });
+            assert_eq!(
+                m.evaluate("Bash", "ls", Some("ls"), None, &[]),
+                PermissionDecision::Deny
+            );
+
+            let mut plan = mgr(PermissionMode::Plan);
+            plan.accept_all_up_to(RiskTier::High);
+            assert_eq!(
+                plan.evaluate("Write", "write", Some("a.rs"), None, &[]),
+                PermissionDecision::Deny
+            );
         }
 
         #[test]

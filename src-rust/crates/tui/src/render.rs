@@ -4278,6 +4278,19 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
+        // Session ceiling badge: what the dialog's `[a]` is auto-approving.
+        // Replaces the `⏵⏵ bypass` badge that option used to trigger; coloured
+        // by tier so a raised ceiling is as visible as the risk line that set it.
+        if let Some(ceiling) = app.session_risk_ceiling {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                format!("auto\u{2264}{}", ceiling.label()),
+                crate::dialogs::risk_tier_style(ceiling),
+            ));
+        }
+
         // Autopilot badge (Phase 4C) — shown only while autopilot is active,
         // with the session's pending count read from the shared autonomy state.
         // Blast-radius counters (Phase 4F) are shown when non-zero.
