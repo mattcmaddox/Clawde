@@ -316,9 +316,26 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
         }};
     }
 
-    // Question text
+    // Question text — clipped, never allowed to evict the option viewport,
+    // custom-answer row, or hint (a long question in a short terminal used to
+    // `return` here and leave the dialog unanswerable). The reservation
+    // mirrors the layout below: spacer + option viewport (+ scroll indicators)
+    // + spacer before custom + custom row (its guard wants one spare row
+    // below) + spacer + hint = indicators + visible options + 5.
+    let opts_len0 = state.options.as_ref().map(|v| v.len()).unwrap_or(0);
+    let ind0 = (state.scroll_offset > 0) as usize
+        + (opts_len0 > state.scroll_offset + AskUserDialogState::VISIBLE_OPTION_ROWS) as usize;
+    let vis0 = opts_len0.min(AskUserDialogState::VISIBLE_OPTION_ROWS);
+    let question_cap = (inner.y + inner.height).saturating_sub((ind0 + vis0 + 5) as u16);
+
     row += 1; // top padding
+    let mut clipped = false;
     for wrap_line in word_wrap(&state.question, inner_w) {
+        // Keep one row in reserve for the ellipsis marker.
+        if row + 1 >= question_cap {
+            clipped = true;
+            break;
+        }
         write_line!(
             row,
             Line::from(Span::styled(
@@ -327,9 +344,18 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
             ))
         );
         row += 1;
-        if row >= inner.y + inner.height {
-            return;
-        }
+    }
+    // Ellipsis only when there is actually room for it; with zero question
+    // rows available the tail rows take precedence.
+    if clipped && row < question_cap {
+        write_line!(
+            row,
+            Line::from(Span::styled(
+                "  \u{2026}",
+                Style::default().fg(HINT_FG).bg(CLAWDE_PANEL_BG)
+            ))
+        );
+        row += 1;
     }
 
     // Spacer
@@ -492,4 +518,45 @@ fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
         }
     }
     lines
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+
+    /// Regression: a long question in a short terminal used to `return` out of
+    /// the question loop, so options and the custom-answer row never rendered
+    /// and the dialog was unanswerable. The question must now clip with an
+    /// ellipsis while the tail rows survive.
+    #[test]
+    fn long_question_never_evicts_options_and_custom_row() {
+        let mut state = AskUserDialogState::new();
+        state.visible = true;
+        state.question = "Explain in exhaustive detail ".repeat(30); // far beyond viewport
+        state.options = Some(vec![
+            "first option".to_string(),
+            "second option".to_string(),
+            "third option".to_string(),
+        ]);
+
+        let area = Rect::new(0, 0, 58, 12); // small terminal: question cannot fit
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_ask_user_dialog(&state, area, &mut buf);
+
+        let text: String = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+        for opt in state.options.as_ref().unwrap().iter() {
+            assert!(
+                text.contains(opt.as_str()),
+                "option '{}' evicted by long question",
+                opt
+            );
+        }
+        // The custom-answer prompt must also survive.
+        assert!(
+            text.contains("type to fill custom answer"),
+            "custom-answer row evicted by long question"
+        );
+        // The question is clipped with an ellipsis marker, not silently cut.
+        assert!(text.contains('\u{2026}'), "clipped question lacks ellipsis");
+    }
 }

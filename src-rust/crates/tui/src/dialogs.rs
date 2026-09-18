@@ -69,6 +69,10 @@ pub struct PermissionRequest {
     pub network_isolated: bool,
     pub options: Vec<PermissionOption>,
     pub selected_option: usize,
+    /// Bottom-anchored body scroll: rows of the descriptive content scrolled
+    /// up from the bottom (0 = option list fully visible). Clamped by the
+    /// renderer each frame; a Cell so render can clamp through `&self`.
+    pub scroll_offset: std::cell::Cell<usize>,
 }
 
 impl PermissionRequest {
@@ -102,6 +106,7 @@ impl PermissionRequest {
             stateful: false,
             network_isolated: false,
             selected_option: 0,
+            scroll_offset: std::cell::Cell::new(0),
             options: Self::default_options(),
         }
     }
@@ -131,6 +136,7 @@ impl PermissionRequest {
             stateful: false,
             network_isolated: false,
             selected_option: 0,
+            scroll_offset: std::cell::Cell::new(0),
             options: Self::default_options(),
         }
     }
@@ -161,6 +167,7 @@ impl PermissionRequest {
             stateful: false,
             network_isolated: false,
             selected_option: 0,
+            scroll_offset: std::cell::Cell::new(0),
             options,
         }
     }
@@ -182,6 +189,7 @@ impl PermissionRequest {
             stateful: false,
             network_isolated: false,
             selected_option: 0,
+            scroll_offset: std::cell::Cell::new(0),
             options: Self::default_options(),
         }
     }
@@ -208,6 +216,7 @@ impl PermissionRequest {
             stateful: false,
             network_isolated: false,
             selected_option: 0,
+            scroll_offset: std::cell::Cell::new(0),
             options: Self::file_read_options(),
         }
     }
@@ -239,6 +248,7 @@ impl PermissionRequest {
             stateful: false,
             network_isolated: false,
             selected_option: 0,
+            scroll_offset: std::cell::Cell::new(0),
             options: Self::file_write_options(),
         }
     }
@@ -562,38 +572,71 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
     };
 
     // preview line count (used for non-Bash kinds; Bash uses its own block above)
-    let preview_line_count: u16 = match &pr.kind {
-        PermissionDialogKind::Bash { .. } | PermissionDialogKind::PowerShell { .. } => 0,
-        _ => {
-            if pr.input_preview.is_some() {
-                3
-            } else {
-                0
-            }
-        }
+    // The preview is word-wrapped like every other text block — counting it as a
+    // fixed 3 rows made the height math drift on long paths/URLs, which is what
+    // pushed the option list past the dialog's bottom border.
+    let preview_lines: Vec<Line> = match (&pr.kind, pr.input_preview.as_deref()) {
+        (PermissionDialogKind::Bash { .. } | PermissionDialogKind::PowerShell { .. }, _)
+        | (_, None) => vec![],
+        (_, Some(preview)) => word_wrap(preview, text_width.saturating_sub(4))
+            .into_iter()
+            .map(|line| {
+                Line::from(vec![
+                    Span::styled(
+                        "  \u{276F} ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        line,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            })
+            .collect(),
     };
+    let preview_line_count = preview_lines.len() as u16 + 1; // + blank after
+    let has_preview_block = preview_line_count > 1;
 
     let bash_block_height: u16 = bash_command_lines
         .as_ref()
         .map(|lines| lines.len() as u16 + 2) // lines + blank before + blank after
         .unwrap_or(0);
 
+    // Reserve the option rows FIRST: they are the actionable part of the
+    // dialog, so when content overflows the available height, descriptive
+    // text must be the part that scrolls away — never the choices themselves.
+    let options_block_height: u16 = 1 // blank before options
+        + pr.options.len() as u16
+        + 1; // trailing blank
+
     let content_lines: u16 = 2 // "  Tool: <name>"  +  blank
         + bash_block_height
         + desc_lines.len() as u16
         + if !expl_lines.is_empty() { expl_lines.len() as u16 + 1 } else { 0 }
-        + preview_line_count
+        + if has_preview_block { preview_line_count } else { 0 }
         + if capability_label.is_some() { 2 } else { 0 }
-        + 1 // blank before options
-        + pr.options.len() as u16
-        + 1; // trailing blank
+        + options_block_height;
 
-    let dialog_height = (content_lines + 2) // +2 for top/bottom border
-        .min(area.height.saturating_sub(4));
+    let max_dialog_height = area.height.saturating_sub(4);
+    let dialog_height = (content_lines + 2).min(max_dialog_height); // +2 for top/bottom border
 
     let dialog_area = centered_rect(dialog_width, dialog_height, area);
 
     frame.render_widget(Clear, dialog_area);
+
+    // Body scroll, bottom-anchored: `pr.scroll_offset` counts rows scrolled UP
+    // from the bottom, so 0 (the fresh-open state) always shows the option list;
+    // scrolling up reveals the description. Render recomputes the clamp every
+    // frame; the Paragraph viewport starts at `max_scroll - offset` from the top.
+    let body_rows = dialog_height.saturating_sub(2) as usize;
+    let max_scroll = (content_lines as usize).saturating_sub(body_rows);
+    let offset = pr.scroll_offset.get().min(max_scroll);
+    pr.scroll_offset.set(offset);
+    let scroll = max_scroll - offset;
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -625,28 +668,12 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         lines.push(Line::from(""));
     }
 
-    // ---- Input preview for non-Bash kinds -----------------------------------
-    if !matches!(
-        pr.kind,
-        PermissionDialogKind::Bash { .. } | PermissionDialogKind::PowerShell { .. }
-    ) {
-        if let Some(ref preview) = pr.input_preview {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "  \u{276F} ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    preview.clone(),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-            lines.push(Line::from(""));
-        }
+    // ---- Input preview for non-Bash kinds (word-wrapped) ---------------------
+    for line in &preview_lines {
+        lines.push(line.clone());
+    }
+    if has_preview_block {
+        lines.push(Line::from(""));
     }
 
     // ---- Description (word-wrapped) -----------------------------------------
@@ -716,9 +743,12 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
     // breaks every span to fit, but if a future change introduces an
     // un-wrapped line (e.g. a tool-emitted preview), ratatui will still wrap
     // it at the dialog border instead of letting it bleed past the right edge.
+    // The `.scroll` offset keeps the option list visible when content overflows
+    // (overflow above scrolls; the options render last, so they stay in view).
     let para = Paragraph::new(lines)
         .block(block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll as u16, 0));
     frame.render_widget(para, dialog_area);
 }
 
@@ -771,6 +801,20 @@ pub fn handle_permission_key(pr: &mut PermissionRequest, key: KeyEvent) -> bool 
             // Move selection to the last option (deny) without confirming.
             pr.selected_option = option_count.saturating_sub(1);
             return true;
+        }
+        KeyCode::PageUp => {
+            pr.scroll_offset
+                .set(pr.scroll_offset.get().saturating_add(5));
+        }
+        KeyCode::PageDown => {
+            pr.scroll_offset
+                .set(pr.scroll_offset.get().saturating_sub(5));
+        }
+        KeyCode::Home => {
+            pr.scroll_offset.set(usize::MAX); // render clamps to max
+        }
+        KeyCode::End => {
+            pr.scroll_offset.set(0);
         }
         _ => {}
     }
@@ -1890,6 +1934,44 @@ mod tests {
         assert_eq!(state.tool_names.len(), 10);
         // We test the cap by checking state.tool_names.iter().take(5) gives 5 items.
         assert_eq!(state.tool_names.iter().take(5).count(), 5);
+    }
+
+    #[test]
+    fn permission_dialog_overflow_keeps_options_visible() {
+        // On a small terminal, a long description + command must scroll away
+        // — the option list stays fully visible (bottom-anchored scroll).
+        let pr = PermissionRequest::bash(
+            "id".to_string(),
+            "Bash".to_string(),
+            "Long explanation ".repeat(40).trim_end().to_string(),
+            "cargo build --release --features everything-and-the-kitchen-sink".to_string(),
+            None,
+        );
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 14)).unwrap();
+        term.draw(|f| render_permission_dialog(f, &pr, f.area()))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // Every option label must be rendered somewhere in the buffer.
+        let text: String = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+        for opt in &pr.options {
+            let key = format!("[{}]", opt.key);
+            assert!(
+                text.contains(&key),
+                "option [{}] clipped by overflow",
+                opt.key
+            );
+        }
+        // Fresh open: offset is bottom-anchored (0 = options visible).
+        assert_eq!(pr.scroll_offset.get(), 0);
+
+        // Simulate Home (scroll to top): description becomes visible, options
+        // would now be scrolled away — that's expected; clamp keeps it sane.
+        pr.scroll_offset.set(usize::MAX);
+        term.draw(|f| render_permission_dialog(f, &pr, f.area()))
+            .unwrap();
+        let clamped = pr.scroll_offset.get();
+        assert!(clamped < usize::MAX, "render must clamp the offset");
     }
 
     #[test]

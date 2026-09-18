@@ -10936,10 +10936,43 @@ impl App {
                     pr.selected_option += 1;
                 }
             }
+            KeyCode::PageUp => {
+                if let Some(pr) = self.permission_request.as_ref() {
+                    pr.scroll_offset
+                        .set(pr.scroll_offset.get().saturating_add(5));
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(pr) = self.permission_request.as_ref() {
+                    pr.scroll_offset
+                        .set(pr.scroll_offset.get().saturating_sub(5));
+                }
+            }
+            KeyCode::Home => {
+                if let Some(pr) = self.permission_request.as_ref() {
+                    pr.scroll_offset.set(usize::MAX); // render clamps to max
+                }
+            }
+            KeyCode::End => {
+                if let Some(pr) = self.permission_request.as_ref() {
+                    pr.scroll_offset.set(0);
+                }
+            }
             KeyCode::Esc => {
                 self.permission_request = None;
             }
             _ => {}
+        }
+    }
+
+    /// Mouse-wheel scroll for the permission dialog body (bottom-anchored:
+    /// wheel-down returns toward the option list, wheel-up reveals more of
+    /// the description). No-op when the dialog is absent or content fits.
+    fn handle_permission_scroll(&mut self, rows: isize) {
+        if let Some(pr) = self.permission_request.as_ref() {
+            let cur = pr.scroll_offset.get() as isize;
+            let next = (cur + rows).max(0) as usize;
+            pr.scroll_offset.set(next); // render clamps to max
         }
     }
 
@@ -11631,6 +11664,17 @@ impl App {
             match mouse_event.kind {
                 MouseEventKind::ScrollUp => self.error_modal_scroll_up(3),
                 MouseEventKind::ScrollDown => self.error_modal_scroll_down(3),
+                _ => {}
+            }
+            return;
+        }
+
+        // The permission dialog swallows wheel events when its content
+        // overflows: scrolling the transcript underneath would be wrong.
+        if self.permission_request.is_some() {
+            match mouse_event.kind {
+                MouseEventKind::ScrollUp => self.handle_permission_scroll(2),
+                MouseEventKind::ScrollDown => self.handle_permission_scroll(-2),
                 _ => {}
             }
             return;
