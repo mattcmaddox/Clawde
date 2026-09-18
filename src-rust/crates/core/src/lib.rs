@@ -7158,10 +7158,17 @@ pub mod cost {
             cache_read_per_mtk: 0.0,
         };
 
-        /// Default pricing is Opus (most capable, highest cost).
+        /// Pricing for a model that has not been identified yet: nothing owed.
+        ///
+        /// Clawde runs on free upstreams, so an unpriced session costs $0.
+        /// Guessing a paid tier here is how a free provider came to advertise a
+        /// nonzero dollar cost: `CostTracker::new()` started on [`Self::OPUS`],
+        /// so every path that never called `set_model` billed free traffic at
+        /// $15/$75 per Mtok. Name a paid tier explicitly, as [`Self::OPUS`]
+        /// does, when a call site really knows it is pricing one.
         #[allow(dead_code)]
         pub fn default_pricing() -> Self {
-            Self::OPUS
+            Self::default()
         }
 
         /// Pick pricing based on model name substring matching.
@@ -7184,8 +7191,9 @@ pub mod cost {
     }
 
     impl Default for ModelPricing {
+        // Unpriced means free — see `ModelPricing::default_pricing`.
         fn default() -> Self {
-            Self::OPUS
+            Self::FREE
         }
     }
 
@@ -7199,11 +7207,13 @@ pub mod cost {
         pricing: parking_lot::RwLock<ModelPricing>,
     }
 
-    // We need a default for RwLock<ModelPricing> -- use Opus as default.
+    // A tracker with no model set prices at $0: an unset model is an unknown
+    // model, and an unknown model on a free-only product owes nothing. Use
+    // `set_model` to price a model that is actually known.
     impl CostTracker {
         pub fn new() -> Arc<Self> {
             Arc::new(Self {
-                pricing: parking_lot::RwLock::new(ModelPricing::OPUS),
+                pricing: parking_lot::RwLock::new(ModelPricing::default()),
                 ..Default::default()
             })
         }
@@ -8163,6 +8173,7 @@ mod tests {
     #[test]
     fn test_cost_tracker() {
         let tracker = CostTracker::new();
+        tracker.set_model("claude-sonnet");
         tracker.add_usage(1000, 500, 200, 100);
         assert_eq!(tracker.input_tokens(), 1000);
         assert_eq!(tracker.output_tokens(), 500);
@@ -8914,6 +8925,29 @@ mod tests {
         assert_eq!(tracker.input_tokens(), 0);
         assert_eq!(tracker.output_tokens(), 0);
         assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn test_cost_tracker_unpriced_reports_no_cost() {
+        // Regression: `new()` used to start on Opus pricing, so any path that
+        // never called `set_model` reported a fabricated dollar cost for free
+        // traffic. 3000 in + 1000 out is the case that exposed it:
+        // 3000*15/Mtok + 1000*75/Mtok = $0.12 for a session that owed nothing.
+        let tracker = CostTracker::new();
+        tracker.add_usage(3000, 1000, 0, 0);
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn test_cost_tracker_prices_once_a_model_is_set() {
+        let tracker = CostTracker::new();
+        tracker.set_model("claude-opus");
+        tracker.add_usage(3000, 1000, 0, 0);
+        assert!(
+            (tracker.total_cost_usd() - 0.12).abs() < 1e-9,
+            "explicit Opus pricing must still bill, got {}",
+            tracker.total_cost_usd()
+        );
     }
 
     #[test]

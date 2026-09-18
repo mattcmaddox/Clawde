@@ -2129,10 +2129,10 @@ impl App {
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
         let model_name = config.effective_model().to_string();
         // Price this session from its effective model before any usage is
-        // recorded. `CostTracker::new()` starts on Opus pricing, and nothing
-        // else sets it until the user changes model/provider through the UI, so
-        // without this the DEFAULT session (free/auto) reports money spent at
-        // the most expensive tier — a free provider advertising a nonzero cost.
+        // recorded. An unset model is an unknown model, and an unknown model
+        // now prices at $0 (see `ModelPricing::default_pricing`), so this call
+        // is what gives a session its real rate — a free route must stay at $0
+        // and must not be billed at the most expensive tier by default.
         cost_tracker.set_model(&model_name);
         // Startup banner (once per launch, not per load): surface a corrupt
         // auth store or settings file immediately instead of silently running
@@ -13339,10 +13339,9 @@ mod tests {
     #[test]
     fn default_session_prices_free_models_at_zero() {
         // The default config resolves to the `free/auto` route, whose real cost
-        // is $0. `CostTracker::new()` starts on Opus pricing and nothing else
-        // set it at startup, so a free session advertised money spent at the
-        // most expensive tier ($75/Mtok output) in the status bar and in every
-        // persisted message cost.
+        // is $0. Nothing set the tracker's model at startup, so a free session
+        // advertised money spent at the most expensive tier ($75/Mtok output)
+        // in the status bar and in every persisted message cost.
         let app = make_app();
         assert_eq!(
             app.config.effective_model(),
