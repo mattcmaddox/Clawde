@@ -9486,8 +9486,9 @@ impl App {
                     }
                     self.prompt_input.accept_suggestion_with_auto_space();
                     self.refresh_prompt_input();
-                } else if !self.is_streaming && self.prompt_input.is_empty() {
-                    // Cycle agent mode: build → plan → image → build
+                } else if !self.is_streaming {
+                    // Cycle agent mode: build → plan → image → build. Any text
+                    // already in the box is kept — see the `indent` action.
                     self.cycle_agent_mode();
                 }
             }
@@ -10811,8 +10812,13 @@ impl App {
                 false
             }
             "indent" => {
-                // Tab: cycle agent mode when prompt is empty, accept
-                // slash-command suggestion otherwise.
+                // Tab: complete an open slash-command suggestion, otherwise
+                // cycle the agent mode (build → plan → image).
+                //
+                // Cycling is deliberately not gated on an empty prompt. The
+                // mode decides how the text being written is handled, so
+                // requiring a cleared box meant it could not be changed at the
+                // moment it mattered. The draft is left untouched by the swap.
                 if !self.is_streaming {
                     if !self.prompt_input.suggestions.is_empty() {
                         if self.prompt_input.suggestion_index.is_none() {
@@ -10820,7 +10826,7 @@ impl App {
                         }
                         self.prompt_input.accept_suggestion_with_auto_space();
                         self.refresh_prompt_input();
-                    } else if self.prompt_input.is_empty() {
+                    } else {
                         self.cycle_agent_mode();
                     }
                 }
@@ -13696,6 +13702,64 @@ mod tests {
         assert_eq!(app.agent_mode.as_deref(), Some("image"));
         assert_eq!(app.config.model.as_deref(), Some("google/gemini-2.5-flash"));
         assert_eq!(app.config.provider.as_deref(), Some("google"));
+    }
+
+    #[test]
+    fn tab_cycles_agent_mode_with_text_already_in_the_prompt() {
+        // Regression: the cycle was gated on an empty prompt, so the mode could
+        // not be changed once the user had started typing — exactly when it
+        // matters, since the mode decides how that text is handled.
+        let mut app = make_app();
+
+        // Start from image so each cycle lands on a non-image mode and the
+        // image-mode model swap (which reads the clipboard) stays out of the
+        // test.
+        app.agent_mode = Some("image".to_string());
+        app.handle_keybinding_action("indent");
+        assert_eq!(app.agent_mode.as_deref(), Some("build"));
+
+        app.prompt_input.text = "half-written idea".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.handle_keybinding_action("indent");
+
+        assert_eq!(
+            app.agent_mode.as_deref(),
+            Some("plan"),
+            "text in the box must not block the mode cycle"
+        );
+        assert_eq!(
+            app.prompt_input.text, "half-written idea",
+            "changing mode must not disturb the draft"
+        );
+    }
+
+    #[test]
+    fn tab_completes_an_open_suggestion_instead_of_cycling_modes() {
+        // The typeahead still owns Tab while it is open; mode cycling is the
+        // fallback, not the override. Typed as an incomplete prefix so the
+        // completion assertion below cannot pass by accident.
+        let mut app = make_app();
+        for c in "/hel".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(
+            !app.prompt_input.suggestions.is_empty(),
+            "the slash-command popup should be open"
+        );
+        assert_eq!(app.prompt_input.text, "/hel", "prefix typed verbatim");
+        let mode_before = app.agent_mode.clone();
+
+        app.handle_keybinding_action("indent");
+
+        assert!(
+            app.prompt_input.text.starts_with("/help"),
+            "Tab must complete the command, got {:?}",
+            app.prompt_input.text
+        );
+        assert_eq!(
+            app.agent_mode, mode_before,
+            "an open completion takes Tab; the mode must not move"
+        );
     }
 
     #[test]

@@ -53,8 +53,8 @@ These bindings are active when focus is in the chat input field.
 | `Up` | historyPrev | Navigate to the previous message in input history |
 | `Down` / `Ctrl+I` | historyNext | Navigate to the next message in input history |
 | `Ctrl+O` | toggleThinkingExpand | Expand or collapse all thinking blocks |
-| `Tab` | indent | Insert indentation (or cycle completions if open) |
-| `Shift+Tab` | reverseIndent | Remove one level of indentation |
+| `Tab` | indent | Complete the open suggestion, otherwise cycle the agent mode (build → plan → image). Text already in the input is kept |
+| `Shift+Tab` | reverseIndent | Cycle the permission mode (Default → Accept edits → Bypass → Default) |
 | `Page Up` | scrollUp | Scroll the conversation view up one page |
 | `Page Down` | scrollDown | Scroll the conversation view down one page |
 | `Home` / `Cmd+Left` / `Ctrl+A` | goLineStart | Move cursor to beginning of line |
