@@ -91,6 +91,53 @@ Runs compaction immediately. Optionally pass custom instructions to guide the su
 
 ---
 
+## Build-tree disk hygiene
+
+Building Clawde from a source checkout accumulates artifacts in
+`<workspace>/target/debug` that cargo never garbage-collects beyond its own
+incremental heuristics. A tree can grow to hundreds of GiB and fill the disk
+with no signal until space actually runs out.
+
+When you run the TUI from a source checkout, a background startup check
+measures the dev-profile tree and offers to clean it if it is oversized.
+Nothing is deleted without your consent.
+
+- Applies **only** to source checkouts — a binary installed with
+  `clawde upgrade` has no `target/` and this is a no-op.
+- Removes **only** the dev profile (`cargo clean --profile dev`). `release`
+  and cross-compile artifacts are never touched.
+- Deleting forces a full rebuild of the next `cargo build`, so it always asks
+  first: a dialog reports the tree size and the path, and offers *Clean it* or
+  *Keep it*. Dismissing the dialog keeps the tree.
+- Never runs while a build is in flight or **within 30 minutes of one**, since
+  `cargo clean` waits on the same lock cargo holds — an unchecked clean would
+  queue behind your build and then wipe the tree the moment it finished.
+- Only the interactive TUI prompts. A run with nobody to ask just warns.
+
+### Controlling it
+
+| Setting | Effect |
+| --- | --- |
+| `diskCleanThreshold: 40` | Clean prompt above 40 GiB (the default) |
+| `diskCleanThreshold: 120` | Raise the threshold |
+| `diskCleanThreshold: 0` | Disable the check entirely |
+| `DISK_CLEAN_THRESHOLD_GIB=80` | Env override, wins over the config value |
+| `CLAWDE_DISABLE_DISK_CLEAN=1` | Hard opt-out, regardless of config |
+
+```json
+{
+  "diskCleanThreshold": 40
+}
+```
+
+To reclaim the space by hand instead:
+
+```bash
+cargo clean --profile dev
+```
+
+---
+
 ## Context window management
 
 ### /context

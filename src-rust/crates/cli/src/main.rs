@@ -3986,17 +3986,19 @@ async fn run_interactive(
         spawn_models_cache_refresh_loop();
     }
 
-    // Background: automatic disk hygiene for the cargo debug build tree. Only
-    // acts on a source checkout whose `target/debug` has grown past the
-    // `diskCleanThreshold` (default 40 GiB); runs `cargo clean --profile dev`
-    // in the background and preserves release/cross artifacts. A fast no-op
-    // otherwise. Disable via `diskCleanThreshold: 0` or
-    // `CLAWDE_DISABLE_DISK_CLEAN=1`.
+    // Background: disk hygiene for the cargo debug build tree. Only acts on a
+    // source checkout whose `target/debug` has grown past the
+    // `diskCleanThreshold` (default 40 GiB), and never without consent: it asks
+    // through the interactive question channel and runs `cargo clean --profile
+    // dev` only on approval, preserving release/cross artifacts. Skips whenever
+    // a build is running or was just built, so it can never wipe a build the
+    // developer just finished. A fast no-op otherwise. Disable via
+    // `diskCleanThreshold: 0` or `CLAWDE_DISABLE_DISK_CLEAN=1`.
     {
         let hygiene_threshold_gib = live_config
             .disk_clean_threshold
             .unwrap_or(disk_hygiene::DEFAULT_DISK_CLEAN_THRESHOLD_GIB);
-        disk_hygiene::spawn(hygiene_threshold_gib);
+        disk_hygiene::spawn(hygiene_threshold_gib, tool_ctx.user_question_tx.clone());
     }
 
     // Background: zero-token health poller — probes every configured free
