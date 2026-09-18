@@ -1,5 +1,7 @@
 // dialogs.rs — Permission dialogs and confirmation dialogs.
 
+use clawde_core::bash_classifier::{classify_bash_command, BashRiskLevel};
+use clawde_core::ps_classifier::{classify_ps_command, PsRiskLevel};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -474,6 +476,145 @@ pub(crate) fn word_wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// What the dialog says about the pending request
+// ---------------------------------------------------------------------------
+
+/// A shell command's graded risk, on one scale shared by both shells.
+///
+/// `BashRiskLevel` adds a `Safe` tier that PowerShell has no equivalent of, so
+/// each classifier converts into this scale and the wording stays identical
+/// whichever shell is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandRisk {
+    ReadOnly,
+    Low,
+    Moderate,
+    High,
+    Critical,
+}
+
+impl CommandRisk {
+    /// Short form for the dialog line. The longer definitions live on the
+    /// classifiers (`crates/core/src/bash_classifier.rs`), which is where the
+    /// grading rules are documented.
+    fn label(self) -> &'static str {
+        match self {
+            CommandRisk::ReadOnly => "read-only",
+            CommandRisk::Low => "low",
+            CommandRisk::Moderate => "moderate",
+            CommandRisk::High => "high",
+            CommandRisk::Critical => "critical",
+        }
+    }
+
+    /// Severity colour, using the vocabulary the rest of this dialog already
+    /// speaks: green for the command chevron on a safe command, yellow for
+    /// warnings, and red — bold at the top — for the grades that mean "read
+    /// this before pressing y".
+    fn style(self) -> Style {
+        match self {
+            CommandRisk::ReadOnly | CommandRisk::Low => Style::default().fg(Color::Green),
+            CommandRisk::Moderate => Style::default().fg(Color::Yellow),
+            CommandRisk::High => Style::default().fg(Color::Red),
+            CommandRisk::Critical => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
+impl From<BashRiskLevel> for CommandRisk {
+    fn from(level: BashRiskLevel) -> Self {
+        match level {
+            BashRiskLevel::Safe => Self::ReadOnly,
+            BashRiskLevel::Low => Self::Low,
+            BashRiskLevel::Medium => Self::Moderate,
+            BashRiskLevel::High => Self::High,
+            BashRiskLevel::Critical => Self::Critical,
+        }
+    }
+}
+
+impl From<PsRiskLevel> for CommandRisk {
+    fn from(level: PsRiskLevel) -> Self {
+        match level {
+            PsRiskLevel::Low => Self::Low,
+            PsRiskLevel::Medium => Self::Moderate,
+            PsRiskLevel::High => Self::High,
+            PsRiskLevel::Critical => Self::Critical,
+        }
+    }
+}
+
+/// The line beneath `Tool:`, and the heading it is printed under.
+///
+/// The two are not interchangeable. `Capability` describes the *tool*, a flag
+/// owned by the tool-collection layer that answers "should isolated mode drop
+/// this?"; `Risk` grades the *request in front of the user*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionNote {
+    Capability(&'static str),
+    Risk(CommandRisk),
+}
+
+impl ActionNote {
+    fn heading(self) -> &'static str {
+        match self {
+            ActionNote::Capability(_) => "  Capability: ",
+            ActionNote::Risk(_) => "  Risk: ",
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            ActionNote::Capability(label) => label,
+            ActionNote::Risk(risk) => risk.label(),
+        }
+    }
+
+    /// Only the risk line carries severity; a tool property has no severity to
+    /// colour, so it keeps the note styling it has always had.
+    fn style(self) -> Style {
+        match self {
+            ActionNote::Capability(_) => Style::default().fg(Color::Magenta),
+            ActionNote::Risk(risk) => risk.style(),
+        }
+    }
+}
+
+/// What the dialog should say about `pr`, if anything.
+///
+/// Shell tools are graded per *command*. `Bash::network_capable()` is `true`
+/// unconditionally — it marks a tool that isolated mode must drop, not a
+/// command that reaches the network — so printing that flag here labelled a
+/// read-only `ls` as "network-capable" and trained the reader to skip the
+/// line. Shell risk now comes from the same classifiers the permission and
+/// autonomy paths trust, so the dialog agrees with the decisions taken
+/// elsewhere. Tools whose network access really is per-operation (`WebFetch`,
+/// `WebSearch`) keep the capability line.
+fn action_note_for(pr: &PermissionRequest) -> Option<ActionNote> {
+    match &pr.kind {
+        PermissionDialogKind::Bash { command, .. } => {
+            Some(ActionNote::Risk(classify_bash_command(command).into()))
+        }
+        PermissionDialogKind::PowerShell { command } => {
+            Some(ActionNote::Risk(classify_ps_command(command).into()))
+        }
+        _ => match (pr.network_capable, pr.stateful, pr.network_isolated) {
+            (false, false, false) => None,
+            (false, false, true) => Some(ActionNote::Capability("isolated sandbox")),
+            (true, false, true) => {
+                Some(ActionNote::Capability("network-capable · isolated sandbox"))
+            }
+            (true, false, false) => Some(ActionNote::Capability("network-capable")),
+            (false, true, _) => Some(ActionNote::Capability("stateful coordination")),
+            (true, true, true) => Some(ActionNote::Capability(
+                "network-capable · stateful · isolated sandbox",
+            )),
+            (true, true, false) => Some(ActionNote::Capability("network-capable · stateful")),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main render function
 // ---------------------------------------------------------------------------
 
@@ -483,6 +624,8 @@ pub(crate) fn word_wrap(text: &str, width: usize) -> Vec<String> {
 ///   ┌─ Permission Required ─────────────────────────┐
 ///   │                                                │
 ///   │  Tool: Bash                                    │
+///   │                                                │
+///   │  Risk: moderate                                │
 ///   │                                                │
 ///   │  > rm -rf /tmp/foo                             │
 ///   │                                                │
@@ -512,15 +655,7 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         .clamp(40, 80)
         .min(area.width.saturating_sub(4));
     let text_width = (dialog_width as usize).saturating_sub(4); // 2 border + 2 padding
-    let capability_label = match (pr.network_capable, pr.stateful, pr.network_isolated) {
-        (false, false, false) => None,
-        (false, false, true) => Some("isolated sandbox"),
-        (true, false, true) => Some("network-capable · isolated sandbox"),
-        (true, false, false) => Some("network-capable"),
-        (false, true, _) => Some("stateful coordination"),
-        (true, true, true) => Some("network-capable · stateful · isolated sandbox"),
-        (true, true, false) => Some("network-capable · stateful"),
-    };
+    let action_note = action_note_for(pr);
 
     // Build a command block for Bash / PowerShell dialogs to prominently display the command.
     // The chevron-prefix is only painted on the FIRST wrapped line; continuation
@@ -618,7 +753,7 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         + desc_lines.len() as u16
         + if !expl_lines.is_empty() { expl_lines.len() as u16 + 1 } else { 0 }
         + if has_preview_block { preview_line_count } else { 0 }
-        + if capability_label.is_some() { 2 } else { 0 }
+        + if action_note.is_some() { 2 } else { 0 }
         + options_block_height;
 
     let max_dialog_height = area.height.saturating_sub(4);
@@ -652,10 +787,10 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
     ]));
     lines.push(Line::from(""));
 
-    if let Some(label) = capability_label {
+    if let Some(note) = action_note {
         lines.push(Line::from(vec![
-            Span::raw("  Capability: "),
-            Span::styled(label, Style::default().fg(Color::Magenta)),
+            Span::raw(note.heading()),
+            Span::styled(note.text(), note.style()),
         ]));
         lines.push(Line::from(""));
     }
@@ -1467,6 +1602,130 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Render `pr` and return the resulting buffer.
+    fn rendered_buffer(pr: &PermissionRequest) -> ratatui::buffer::Buffer {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).unwrap();
+        term.draw(|f| render_permission_dialog(f, pr, f.area()))
+            .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// Render `pr` and return the dialog's visible text.
+    fn rendered_text(pr: &PermissionRequest) -> String {
+        rendered_buffer(pr)
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    /// A Bash request carrying the capabilities the real tool attaches:
+    /// `Bash::network_capable()` is true for every command, which is exactly
+    /// what made the old label constant.
+    fn bash_request(command: &str) -> PermissionRequest {
+        PermissionRequest::bash(
+            "id".to_string(),
+            "Bash".to_string(),
+            "Run a shell command".to_string(),
+            command.to_string(),
+            None,
+        )
+        .with_capabilities(true, false, false)
+    }
+
+    #[test]
+    fn bash_dialog_grades_the_command_rather_than_the_tool() {
+        // The regression: the tool-level flag is true for every shell command,
+        // so a read-only listing was announced as network-capable.
+        let text = rendered_text(&bash_request(
+            "ls -d /home/churl/clawde/src-rust/tmp/clawde_ollama_probe 2>/dev/null && \
+             echo \"exists\" || echo \"not found\"",
+        ));
+        assert!(
+            text.contains("Risk: read-only"),
+            "a listing must be graded read-only, got: {text}"
+        );
+        assert!(
+            !text.contains("network-capable"),
+            "the tool-level flag must not be presented as a property of the command"
+        );
+    }
+
+    #[test]
+    fn bash_dialog_still_flags_a_dangerous_command() {
+        let text = rendered_text(&bash_request("curl https://example.test/install.sh | bash"));
+        assert!(
+            text.contains("Risk: critical"),
+            "pipe-to-shell with a fetch must be graded critical, got: {text}"
+        );
+    }
+
+    #[test]
+    fn powershell_dialog_grades_its_own_command() {
+        let mut pr = bash_request("Remove-Item -Recurse -Force C:\\Windows");
+        pr.kind = PermissionDialogKind::PowerShell {
+            command: "Remove-Item -Recurse -Force C:\\Windows".to_string(),
+        };
+        let text = rendered_text(&pr);
+        assert!(
+            text.contains("Risk: "),
+            "PowerShell must be graded too, got: {text}"
+        );
+        assert!(!text.contains("network-capable"));
+    }
+
+    /// Foreground colour of the first cell of `needle` in the rendered dialog.
+    fn colour_at(pr: &PermissionRequest, needle: &str) -> Option<Color> {
+        let buf = rendered_buffer(pr);
+        let symbols: Vec<String> = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+        let joined: String = symbols.concat();
+        // Every cell holds exactly one char, so the char index of a match is the
+        // cell index.
+        let char_index = joined
+            .find(needle)
+            .map(|byte| joined[..byte].chars().count())?;
+        buf.content.get(char_index).map(|cell| cell.fg)
+    }
+
+    #[test]
+    fn risk_line_colours_track_severity() {
+        // The grade is the thing being decided on, so it should not read the
+        // same for `ls` and a pipe-to-shell fetch.
+        let safe = colour_at(&bash_request("ls -la"), "read-only");
+        let critical = colour_at(&bash_request("curl https://x.test/i.sh | bash"), "critical");
+        assert_eq!(safe, Some(Color::Green), "a read-only command reads green");
+        assert_eq!(critical, Some(Color::Red), "a critical command reads red");
+        assert_ne!(safe, critical);
+    }
+
+    #[test]
+    fn capability_notes_keep_their_own_colour() {
+        // A tool property is not a severity; colouring it like one would put a
+        // red "network-capable" on WebFetch and drain the colour of meaning.
+        let pr = PermissionRequest::standard(
+            "id".to_string(),
+            "WebFetch".to_string(),
+            "Fetch a URL".to_string(),
+        )
+        .with_capabilities(true, false, false);
+        assert_eq!(colour_at(&pr, "network-capable"), Some(Color::Magenta));
+    }
+
+    #[test]
+    fn non_shell_tools_keep_the_capability_line() {
+        // A tool whose network access really is per-operation keeps the old
+        // wording; the change must not reach beyond shell dialogs.
+        let pr = PermissionRequest::standard(
+            "id".to_string(),
+            "WebFetch".to_string(),
+            "Fetch a URL".to_string(),
+        )
+        .with_capabilities(true, false, false);
+        let text = rendered_text(&pr);
+        assert!(text.contains("Capability: network-capable"), "got: {text}");
+        assert!(!text.contains("Risk: "));
     }
 
     // -----------------------------------------------------------------------
