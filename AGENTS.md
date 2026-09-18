@@ -66,16 +66,27 @@ tmux send-keys -t clawde-test "./target/debug/clawde" Enter
 # Give it time to redraw, then capture
 sleep 2 && tmux capture-pane -t clawde-test -p
 
-# Drive input
-tmux send-keys -t clawde-test "your prompt here" C-m   # C-m submits (ENTER key is interpreted as newline!)
+# Drive input. The prompt text and the submit key MUST be separate
+# `send-keys` invocations — see the tip below.
+tmux send-keys -t clawde-test "your prompt here"
+sleep 1
+tmux send-keys -t clawde-test C-m   # submit
 tmux send-keys -t clawde-test Escape
 tmux send-keys -t clawde-test C-o   # ctrl+o
 
-# TIP: Use C-m instead of Enter for submitting text in the TUI prompt.
-# The tmux `send-keys ... Enter` command inserts a newline into the
-# multi-line prompt buffer instead of submitting it — the prompt_input
-# widget treats plain Enter as Shift+Enter (newline), not as submit.
-# Carriage return (C-m) triggers the actual submit action.
+# TIP: the app enables bracketed paste on Linux/macOS (`crates/tui/src/lib.rs`),
+# so tmux wraps every `send-keys` payload in paste markers. A submit key sent in
+# the SAME invocation as the text is therefore delivered as *pasted content* and
+# inserts a literal newline in the multi-line prompt buffer instead of
+# submitting. The prompt just sits in the box, cursor on a new line, and the
+# session looks wedged until someone presses a key by hand:
+#
+#   tmux send-keys -t s "a long prompt" C-m   # NOT submitted (verified)
+#   tmux send-keys -t s "a long prompt"       # submitted
+#   tmux send-keys -t s C-m
+#
+# Both `Enter` and `C-m` submit fine when each is its own invocation, so a
+# "send-keys never submits" symptom means the burst, not the key choice.
 
 # Cleanup
 tmux kill-session -t clawde-test
