@@ -1671,8 +1671,21 @@ impl StreamAccumulator {
                 }
                 if let Some(u) = usage {
                     // The delta usage usually only has output_tokens;
-                    // add them to the running total.
+                    // add them to the running total. OpenAI-compatible
+                    // providers instead put the full usage block on the final
+                    // delta, so take the input side when it is present —
+                    // otherwise `input_tokens` stays 0 for every
+                    // OpenAI-compatible provider and cost under-reports.
                     self.usage.output_tokens += u.output_tokens;
+                    if u.input_tokens > 0 {
+                        self.usage.input_tokens = u.input_tokens;
+                    }
+                    if u.cache_read_input_tokens > 0 {
+                        self.usage.cache_read_input_tokens = u.cache_read_input_tokens;
+                    }
+                    if u.cache_creation_input_tokens > 0 {
+                        self.usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+                    }
                 }
             }
 
@@ -1801,6 +1814,59 @@ mod tests {
         let (msg, _usage, stop) = acc.finish();
         assert_eq!(msg.get_text(), Some("Hello world!"));
         assert_eq!(stop.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn usage_delta_carries_input_tokens() {
+        // OpenAI-compatible providers leave `message_start` empty and report the
+        // whole prompt on the final delta. Taking only `output_tokens` from it
+        // pinned `input_tokens` at 0 for every such provider — the entire free
+        // tier — so a 3k-token prompt was recorded as 0 tokens of input and the
+        // cost missed its dominant component.
+        let mut acc = StreamAccumulator::new();
+        acc.on_event(&streaming::AnthropicStreamEvent::MessageStart {
+            id: "m1".into(),
+            model: "poolside/laguna-s-2.1".into(),
+            usage: UsageInfo::default(),
+        });
+        acc.on_event(&streaming::AnthropicStreamEvent::MessageDelta {
+            stop_reason: Some("end_turn".into()),
+            usage: Some(UsageInfo {
+                input_tokens: 3_029,
+                output_tokens: 19,
+                cache_read_input_tokens: 7,
+                ..Default::default()
+            }),
+        });
+
+        let (_msg, usage, _stop) = acc.finish();
+        assert_eq!(usage.input_tokens, 3_029);
+        assert_eq!(usage.output_tokens, 19);
+        assert_eq!(usage.cache_read_input_tokens, 7);
+        assert_eq!(usage.total_input(), 3_036, "input + cache reads");
+    }
+
+    #[test]
+    fn repeated_usage_deltas_do_not_inflate_input_tokens() {
+        // Some compat servers repeat the usage block on every chunk. The prompt
+        // is the same each time, so assignment (not accumulation) must keep the
+        // count honest; `output_tokens` keeps its historical accumulate
+        // behaviour because Anthropic sends it as a running total.
+        let mut acc = StreamAccumulator::new();
+        for _ in 0..3 {
+            acc.on_event(&streaming::AnthropicStreamEvent::MessageDelta {
+                stop_reason: None,
+                usage: Some(UsageInfo {
+                    input_tokens: 100,
+                    output_tokens: 5,
+                    ..Default::default()
+                }),
+            });
+        }
+
+        let (_msg, usage, _stop) = acc.finish();
+        assert_eq!(usage.input_tokens, 100, "input is a snapshot, not a sum");
+        assert_eq!(usage.output_tokens, 15, "output stays cumulative");
     }
 
     // -----------------------------------------------------------------------

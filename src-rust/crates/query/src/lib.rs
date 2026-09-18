@@ -3997,6 +3997,30 @@ async fn run_query_loop_inner(
                                                 };
                                                 if let Some(u) = u {
                                                     usage.output_tokens = u.output_tokens;
+                                                    // OpenAI-compatible providers send the
+                                                    // whole usage block — prompt tokens
+                                                    // included — on the final delta, and
+                                                    // leave `message_start` empty; Anthropic
+                                                    // reports input on `message_start`
+                                                    // (read above) and sends only output
+                                                    // here. Taking just `output_tokens` left
+                                                    // input at 0 for every OpenAI-compatible
+                                                    // provider, i.e. the entire free tier,
+                                                    // so cost and context accounting both
+                                                    // under-reported. Assignment is
+                                                    // idempotent, so a server that repeats
+                                                    // usage on every chunk can't inflate it.
+                                                    if u.input_tokens > 0 {
+                                                        usage.input_tokens = u.input_tokens;
+                                                    }
+                                                    if u.cache_read_input_tokens > 0 {
+                                                        usage.cache_read_input_tokens =
+                                                            u.cache_read_input_tokens;
+                                                    }
+                                                    if u.cache_creation_input_tokens > 0 {
+                                                        usage.cache_creation_input_tokens =
+                                                            u.cache_creation_input_tokens;
+                                                    }
                                                 }
                                             }
                                             clawde_api::StreamEvent::MessageStop => break,
