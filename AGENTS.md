@@ -74,19 +74,26 @@ tmux send-keys -t clawde-test C-m   # submit
 tmux send-keys -t clawde-test Escape
 tmux send-keys -t clawde-test C-o   # ctrl+o
 
-# TIP: the app enables bracketed paste on Linux/macOS (`crates/tui/src/lib.rs`),
-# so tmux wraps every `send-keys` payload in paste markers. A submit key sent in
-# the SAME invocation as the text is therefore delivered as *pasted content* and
-# inserts a literal newline in the multi-line prompt buffer instead of
-# submitting. The prompt just sits in the box, cursor on a new line, and the
-# session looks wedged until someone presses a key by hand:
+# TIP: submit with `C-m`. Two different things stop `Enter` from working, and
+# both leave the same signature — the prompt sits in the box and the session
+# looks wedged until someone presses a key by hand.
 #
-#   tmux send-keys -t s "a long prompt" C-m   # NOT submitted (verified)
-#   tmux send-keys -t s "a long prompt"       # submitted
-#   tmux send-keys -t s C-m
+# 1. `send-keys ... Enter` sends a line feed, which the app maps to its newline
+#    binding (Ctrl+J == 0x0A, see `default_bindings`), so it inserts a newline
+#    into the multi-line buffer rather than submitting. Verified with text in
+#    the box:
 #
-# Both `Enter` and `C-m` submit fine when each is its own invocation, so a
-# "send-keys never submits" symptom means the burst, not the key choice.
+#      tmux send-keys -t s "PROBEMARK" Enter   # still in the box
+#      tmux send-keys -t s "PROBEMARK" C-m     # submitted
+#
+# 2. Sending text and the submit key in the SAME invocation fails even with
+#    `C-m`: the app enables bracketed paste (`crates/tui/src/lib.rs`), so tmux
+#    wraps the payload in paste markers and the CR inside it is delivered as
+#    pasted content — a literal newline:
+#
+#      tmux send-keys -t s "a long prompt" C-m   # NOT submitted (verified)
+#      tmux send-keys -t s "a long prompt"       # submitted
+#      tmux send-keys -t s C-m
 
 # Cleanup
 tmux kill-session -t clawde-test
