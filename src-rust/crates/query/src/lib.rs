@@ -33,6 +33,7 @@ pub mod relevant_context;
 pub(crate) mod repeat_guard;
 pub mod sanitize;
 pub mod session_memory;
+pub mod session_synopsis;
 pub mod session_title;
 pub mod skill_prefetch;
 pub(crate) mod state_emission;

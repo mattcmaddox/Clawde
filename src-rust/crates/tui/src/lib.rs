@@ -1456,6 +1456,9 @@ mod tests {
                 last_updated: "now".to_string(),
                 message_count: 1,
                 cost_usd: 0.0,
+                synopsis_about: String::new(),
+                synopsis_left_off: String::new(),
+                transcript_path: std::path::PathBuf::new(),
             },
             SessionEntry {
                 id: "b".to_string(),
@@ -1464,6 +1467,9 @@ mod tests {
                 last_updated: "now".to_string(),
                 message_count: 2,
                 cost_usd: 0.0,
+                synopsis_about: String::new(),
+                synopsis_left_off: String::new(),
+                transcript_path: std::path::PathBuf::new(),
             },
             SessionEntry {
                 id: "c".to_string(),
@@ -1472,6 +1478,9 @@ mod tests {
                 last_updated: "now".to_string(),
                 message_count: 3,
                 cost_usd: 0.0,
+                synopsis_about: String::new(),
+                synopsis_left_off: String::new(),
+                transcript_path: std::path::PathBuf::new(),
             },
         ]);
 
@@ -1516,6 +1525,9 @@ mod tests {
             last_updated: "now".to_string(),
             message_count: 1,
             cost_usd: 0.0,
+            synopsis_about: String::new(),
+            synopsis_left_off: String::new(),
+            transcript_path: std::path::PathBuf::new(),
         }]);
         // Without vim, letters filter immediately and j/k stay as filter text.
         app.handle_key_event(key(KeyCode::Char('l')));

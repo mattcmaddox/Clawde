@@ -53,6 +53,11 @@ pub enum TranscriptEntry {
     /// An AI-generated session title (written by the auto-titler, not the user).
     #[serde(rename = "ai-title")]
     AiTitle(AiTitleEntry),
+    /// An AI-generated session synopsis (what the session was about / where it
+    /// left off) written by the session-exit synopsizer. Consumed by the
+    /// session browser's two-row entries.
+    #[serde(rename = "synopsis")]
+    Synopsis(SynopsisEntry),
     /// A user-set custom session title.
     #[serde(rename = "custom-title")]
     CustomTitle(CustomTitleEntry),
@@ -405,6 +410,17 @@ pub struct AiTitleEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SynopsisEntry {
+    pub session_id: String,
+    /// One-line synopsis of what the session was (first) about.
+    pub about: String,
+    /// One-line synopsis of where the session left off (last known working
+    /// point). Empty when the session had no meaningful progress.
+    pub left_off: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CustomTitleEntry {
     pub session_id: String,
     pub custom_title: String,
@@ -480,6 +496,10 @@ pub struct SessionSummary {
     /// The AI-generated title found in the tail, if any (written by the
     /// auto-titler at session exit).
     pub ai_title: Option<String>,
+    /// Synopsis of what the session was (first) about, if written.
+    pub synopsis_about: Option<String>,
+    /// Synopsis of where the session left off, if written.
+    pub synopsis_left_off: Option<String>,
     /// Approximate message count (user + assistant entries in the tail).
     pub message_count: usize,
 }
@@ -787,7 +807,8 @@ pub async fn list_sessions_in(
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
         // Read the tail of the file (up to 64 KB) to extract metadata.
-        let (last_prompt, title, ai_title, message_count) = read_session_tail_metadata(&path).await;
+        let (last_prompt, title, ai_title, synopsis_about, synopsis_left_off, message_count) =
+            read_session_tail_metadata(&path).await;
 
         sessions.push(SessionSummary {
             session_id,
@@ -796,6 +817,8 @@ pub async fn list_sessions_in(
             last_prompt,
             title,
             ai_title,
+            synopsis_about,
+            synopsis_left_off,
             message_count,
         });
     }
@@ -899,6 +922,22 @@ pub async fn write_ai_title(path: &Path, session_id: &str, ai_title: &str) -> cr
     write_transcript_entry(path, &entry).await
 }
 
+/// Append a `synopsis` metadata entry with the auto-generated session synopsis
+/// (about / left-off one-liners) written by the session-exit synopsizer.
+pub async fn write_synopsis(
+    path: &Path,
+    session_id: &str,
+    about: &str,
+    left_off: &str,
+) -> crate::Result<()> {
+    let entry = TranscriptEntry::Synopsis(SynopsisEntry {
+        session_id: session_id.to_string(),
+        about: about.to_string(),
+        left_off: left_off.to_string(),
+    });
+    write_transcript_entry(path, &entry).await
+}
+
 /// Non-destructive counterpart to [`truncate_after`].
 ///
 /// Finds the entry whose *message* uuid matches `target_message_uuid` — the
@@ -960,26 +999,34 @@ pub async fn branch_before(path: &Path, target_message_uuid: &str) -> crate::Res
 // ---------------------------------------------------------------------------
 
 /// Reads up to 64 KB from the end of `path` and extracts `last-prompt`,
-/// `custom-title`, and `ai-title` values by scanning JSONL lines.
+/// `custom-title`, `ai-title`, and `synopsis` values by scanning JSONL lines.
 ///
-/// Returns `(last_prompt, custom_title, ai_title)`.  All three are `None` if
-/// the relevant entries are absent or the file cannot be read.
+/// Returns `(last_prompt, custom_title, ai_title, synopsis_about,
+/// synopsis_left_off, message_count)`. All synopsis fields are `None` if the
+/// entry is absent or the file cannot be read.
 async fn read_session_tail_metadata(
     path: &Path,
-) -> (Option<String>, Option<String>, Option<String>, usize) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    usize,
+) {
     const TAIL_BUF: u64 = 65_536; // 64 KB
 
     let file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
-        Err(_) => return (None, None, None, 0),
+        Err(_) => return (None, None, None, None, None, 0),
     };
     let meta = match file.metadata().await {
         Ok(m) => m,
-        Err(_) => return (None, None, None, 0),
+        Err(_) => return (None, None, None, None, None, 0),
     };
     let file_size = meta.len();
     if file_size == 0 {
-        return (None, None, None, 0);
+        return (None, None, None, None, None, 0);
     }
 
     // Seek to the start of the tail window.
@@ -989,10 +1036,10 @@ async fn read_session_tail_metadata(
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut file = file;
     if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
-        return (None, None, None, 0);
+        return (None, None, None, None, None, 0);
     }
     if file.read_exact(&mut buf).await.is_err() {
-        return (None, None, None, 0);
+        return (None, None, None, None, None, 0);
     }
 
     // Scan lines in reverse order so we get the last occurrence of each field.
@@ -1000,6 +1047,8 @@ async fn read_session_tail_metadata(
     let mut last_prompt: Option<String> = None;
     let mut title: Option<String> = None;
     let mut ai_title: Option<String> = None;
+    let mut synopsis_about: Option<String> = None;
+    let mut synopsis_left_off: Option<String> = None;
     // Count user + assistant entries for an approximate message count.
     // We scan the full tail (up to 64 KB) to get a reasonable count; for
     // sessions that fit in the tail this is exact.
@@ -1054,12 +1103,112 @@ async fn read_session_tail_metadata(
             }
         }
 
-        if last_prompt.is_some() && title.is_some() && ai_title.is_some() {
+        if synopsis_about.is_none()
+            && (trimmed.contains("\"type\":\"synopsis\"")
+                || trimmed.contains("\"type\": \"synopsis\""))
+        {
+            if let Ok(TranscriptEntry::Synopsis(sy)) =
+                serde_json::from_str::<TranscriptEntry>(trimmed)
+            {
+                synopsis_about = Some(sy.about);
+                synopsis_left_off = Some(sy.left_off);
+            }
+        }
+
+        if last_prompt.is_some()
+            && title.is_some()
+            && ai_title.is_some()
+            && synopsis_about.is_some()
+        {
             break;
         }
     }
 
-    (last_prompt, title, ai_title, message_count)
+    (
+        last_prompt,
+        title,
+        ai_title,
+        synopsis_about,
+        synopsis_left_off,
+        message_count,
+    )
+}
+
+/// Read the last few conversation messages from a session transcript for the
+/// session browser's tail preview.
+///
+/// Scans up to the last 64 KB of the JSONL in reverse, extracts user and
+/// assistant message text (whitespace-collapsed, tool noise elided), and
+/// returns at most `max_messages` entries in chronological order as
+/// `(is_user, text)` pairs. Returns an empty vec when the file is missing,
+/// unreadable, or has no parseable participant entries in the tail window.
+pub async fn read_session_tail_messages(path: &Path, max_messages: usize) -> Vec<(bool, String)> {
+    const TAIL_BUF: u64 = 65_536; // 64 KB
+
+    if max_messages == 0 {
+        return Vec::new();
+    }
+
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let meta = match file.metadata().await {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let file_size = meta.len();
+    if file_size == 0 {
+        return Vec::new();
+    }
+
+    let offset = file_size.saturating_sub(TAIL_BUF);
+    let mut buf = vec![0u8; (file_size - offset) as usize];
+
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = file;
+    if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
+        return Vec::new();
+    }
+    if file.read_exact(&mut buf).await.is_err() {
+        return Vec::new();
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut tail: Vec<(bool, String)> = Vec::new();
+
+    'outer: for line in text.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed = match serde_json::from_str::<TranscriptEntry>(trimmed) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let (is_user, msg) = match &parsed {
+            TranscriptEntry::User(m) => (true, &m.message),
+            TranscriptEntry::Assistant(m) => (false, &m.message),
+            _ => continue,
+        };
+        let body: String = msg
+            .get_all_text()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if body.is_empty() {
+            continue;
+        }
+        // Keep the body scannable: one row per message in the preview.
+        let body: String = body.chars().take(240).collect();
+        tail.push((is_user, body));
+        if tail.len() >= max_messages {
+            break 'outer;
+        }
+    }
+
+    tail.reverse();
+    tail
 }
 
 // ---------------------------------------------------------------------------
@@ -2563,15 +2712,56 @@ mod tests {
         write_ai_title(&path, "sess", "Fix flaky test")
             .await
             .unwrap();
+        write_synopsis(
+            &path,
+            "sess",
+            "Fix the flaky login test",
+            "waiting on CI rerun",
+        )
+        .await
+        .unwrap();
 
-        // The tail reader extracts all three metadata fields plus message count.
-        let (last_prompt, custom_title, ai_title, message_count) =
+        // The tail reader extracts all metadata fields plus message count.
+        let (last_prompt, custom_title, ai_title, _about, _left_off, message_count) =
             read_session_tail_metadata(&path).await;
         assert_eq!(last_prompt.as_deref(), Some("Fix the flaky test"));
         assert_eq!(custom_title, None, "no custom title written");
         assert_eq!(ai_title.as_deref(), Some("Fix flaky test"));
         // The tail contains the user entry from write_last_prompt.
         assert!(message_count >= 1, "at least one entry: {message_count}");
+        let (_lp, _ct, _at, about, left_off, _mc) = read_session_tail_metadata(&path).await;
+        assert_eq!(about.as_deref(), Some("Fix the flaky login test"));
+        assert_eq!(left_off.as_deref(), Some("waiting on CI rerun"));
+    }
+
+    #[tokio::test]
+    async fn tail_messages_returns_chronological_text() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("tailmsgs.jsonl");
+        let mut m1 = make_msg(Role::User);
+        m1.content = MessageContent::Text("first user prompt about karaoke".into());
+        let mut m2 = make_msg(Role::Assistant);
+        m2.content = MessageContent::Text("assistant reply with findings".into());
+        let e1 = make_user_entry(m1, &uuid::Uuid::new_v4().to_string(), None, "sess", "/p");
+        let e2 = make_assistant_entry(m2, &uuid::Uuid::new_v4().to_string(), None, "sess", "/p");
+        write_transcript_entry(&path, &e1).await.unwrap();
+        write_transcript_entry(&path, &e2).await.unwrap();
+
+        let rows = read_session_tail_messages(&path, 4).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            (true, "first user prompt about karaoke".to_string())
+        );
+        assert_eq!(
+            rows[1],
+            (false, "assistant reply with findings".to_string())
+        );
+
+        // max_messages caps from the tail (most recent wins).
+        let rows = read_session_tail_messages(&path, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "assistant reply with findings");
     }
 
     #[tokio::test]

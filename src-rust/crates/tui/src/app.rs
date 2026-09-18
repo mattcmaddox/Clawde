@@ -1672,6 +1672,10 @@ pub struct App {
     /// Receiver for background session-list results.
     pub session_list_rx:
         Option<tokio::sync::mpsc::Receiver<Vec<crate::session_browser::SessionEntry>>>,
+    /// Receiver for the session browser's tail preview load (one-shot).
+    pub tail_preview_rx: Option<tokio::sync::mpsc::Receiver<Vec<(bool, String)>>>,
+    /// Session id the in-flight tail load is for (dedupe guard).
+    pub tail_preview_pending_for: Option<String>,
     /// Set by the session browser when the user presses Enter on a session.
     /// The CLI main loop drains this and loads/resumes the session.
     pub pending_resume_session_id: Option<String>,
@@ -2349,6 +2353,8 @@ impl App {
             model_picker_provider_id: None,
             session_list_pending: false,
             session_list_rx: None,
+            tail_preview_rx: None,
+            tail_preview_pending_for: None,
             pending_resume_session_id: None,
             pending_rename: None,
             recent_sessions: Vec::new(),
@@ -8388,7 +8394,10 @@ impl App {
                             self.session_browser.close();
                         }
                     }
-                    KeyCode::Up => self.session_browser.select_prev(),
+                    KeyCode::Up => {
+                        self.session_browser.select_prev();
+                        self.session_browser.invalidate_tail();
+                    }
                     // Always-on j/k in vim normal mode, or while the search
                     // query is empty (the connect-dialog pattern); letters
                     // type into it once it has text.
@@ -8396,14 +8405,29 @@ impl App {
                         if self.prompt_input.vim_enabled
                             || self.session_browser.search_query.is_empty() =>
                     {
-                        self.session_browser.select_prev()
+                        self.session_browser.select_prev();
+                        self.session_browser.invalidate_tail();
                     }
-                    KeyCode::Down => self.session_browser.select_next(),
+                    KeyCode::Down => {
+                        self.session_browser.select_next();
+                        self.session_browser.invalidate_tail();
+                    }
                     KeyCode::Char('j')
                         if self.prompt_input.vim_enabled
                             || self.session_browser.search_query.is_empty() =>
                     {
-                        self.session_browser.select_next()
+                        self.session_browser.select_next();
+                        self.session_browser.invalidate_tail();
+                    }
+                    // Tail preview scrolling: PageUp/Down move the preview
+                    // window inside the focused session's transcript.
+                    KeyCode::PageUp => {
+                        self.session_browser.tail_scroll =
+                            self.session_browser.tail_scroll.saturating_sub(5);
+                    }
+                    KeyCode::PageDown => {
+                        self.session_browser.tail_scroll =
+                            self.session_browser.tail_scroll.saturating_add(5);
                     }
                     KeyCode::Char('r') => self.session_browser.start_rename(),
                     KeyCode::Backspace if !self.prompt_input.vim_enabled => {
@@ -12794,6 +12818,59 @@ impl App {
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
             }
+        } // Spawn the session browser's tail-preview load when the focused
+          // session has no tail loaded yet.
+        if self.session_browser.visible
+            && self.session_browser.mode == crate::session_browser::SessionBrowserMode::Browse
+        {
+            let need = self.session_browser.tail_preview.is_none()
+                && self.session_browser.tail_preview_for.is_empty()
+                && !self.session_browser.tail_loading;
+            if need {
+                if let Some(selected) = self.session_browser.selected_session() {
+                    let path = selected.transcript_path.clone();
+                    let sid = selected.id.clone();
+                    self.session_browser.tail_loading = true;
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    self.tail_preview_rx = Some(rx);
+                    self.tail_preview_pending_for = Some(sid);
+                    tokio::spawn(async move {
+                        let rows =
+                            clawde_core::session_storage::read_session_tail_messages(&path, 12)
+                                .await;
+                        let _ = tx.send(rows).await;
+                    });
+                }
+            }
+        }
+
+        // Drain the tail-preview load.
+        if let Some(ref mut rx) = self.tail_preview_rx {
+            match rx.try_recv() {
+                Ok(rows) => {
+                    if let Some(sid) = self.tail_preview_pending_for.take() {
+                        // Only apply if the user is still on this session.
+                        let still = self
+                            .session_browser
+                            .selected_session()
+                            .map(|s| s.id == sid)
+                            .unwrap_or(false);
+                        if still {
+                            self.session_browser.tail_preview = Some(rows);
+                            self.session_browser.tail_preview_for = sid;
+                            self.session_browser.tail_scroll = 0;
+                        }
+                        self.session_browser.tail_loading = false;
+                    }
+                    self.tail_preview_rx = None;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    self.tail_preview_rx = None;
+                    self.tail_preview_pending_for = None;
+                    self.session_browser.tail_loading = false;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            }
         }
 
         // Spawn async session-list load when requested.
@@ -12827,12 +12904,15 @@ impl App {
                             searchable_text.push_str(prompt);
                         }
                         crate::session_browser::SessionEntry {
-                            id: s.session_id,
+                            id: s.session_id.clone(),
                             title,
                             searchable_text,
                             last_updated,
                             message_count: s.message_count,
                             cost_usd: 0.0,
+                            synopsis_about: s.synopsis_about.unwrap_or_default(),
+                            synopsis_left_off: s.synopsis_left_off.unwrap_or_default(),
+                            transcript_path: s.path,
                         }
                     })
                     .collect();

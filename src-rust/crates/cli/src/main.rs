@@ -3647,6 +3647,24 @@ fn reset_autonomy_for_session(tool_ctx: &mut ToolContext, session_id: &str) {
 /// provider is Ollama and a model is set; `None` otherwise. Only the session's
 /// own model is targeted so a shared Ollama server's other models are never
 /// evicted.
+/// Resolve the model id used for the session-exit synopsis call.
+///
+/// Prefers a pin into the free chain's Groq upstream (fast, cheap, ideal for
+/// a two-line summary). When Groq has no configured key, falls back to the
+/// free Auto route (`free/auto`), which the composite provider routes across
+/// configured upstreams in catalog order. The model string only matters when
+/// the selected provider is the free chain; other providers ignore/resolve it.
+fn synopsis_model_for_config(config: &Config, _model_name: &str) -> String {
+    let auth = clawde_core::AuthStore::load();
+    if clawde_api::providers::free::first_free_upstream_key(&auth, "groq").is_some() {
+        // Pin format consumed by FreeProvider::resolve_route.
+        "groq/openai/gpt-oss-120b".to_string()
+    } else {
+        let _ = config;
+        "free/auto".to_string()
+    }
+}
+
 fn exit_ollama_model_target(config: &Config, model_name: &str) -> Option<String> {
     if config.selected_provider_id() != "ollama" {
         return None;
@@ -7881,6 +7899,66 @@ async fn run_interactive(
                         }
                     }
                 });
+            }
+
+            // Auto-synopsis: one cheap free-chain completion producing two
+            // one-liners (what the session was about / where it left off).
+            // Written to the transcript as a `synopsis` entry so the session
+            // browser rows are meaningful. Falls back to a heuristic distill
+            // of the first user prompt when the call fails — a few important
+            // words beat nothing. Fire-and-forget like the auto-titler.
+            if session.messages.len() >= 2 {
+                let messages = session.messages.clone();
+                let session_id = session.id.clone();
+                let path = path.clone();
+                // Resolve a live provider at exit time (covers model switches
+                // made during the session); prefer the free chain's Auto route
+                // which lands on Groq-class fast upstreams when configured.
+                let provider = base_query_config
+                    .provider_registry
+                    .as_ref()
+                    .and_then(|reg| reg.get(&clawde_core::ProviderId::new("free")))
+                    .cloned()
+                    .or_else(|| {
+                        base_query_config
+                            .provider_registry
+                            .as_ref()?
+                            .default_provider()
+                            .cloned()
+                    });
+                if let Some(provider) = provider {
+                    let model = synopsis_model_for_config(&app.config, &app.model_name);
+                    tokio::spawn(async move {
+                        let cancel = CancellationToken::new();
+                        let gen = clawde_query::session_synopsis::generate_session_synopsis(
+                            &messages,
+                            provider.as_ref(),
+                            &model,
+                            160,
+                            cancel,
+                        );
+                        let result = tokio::time::timeout(std::time::Duration::from_secs(15), gen)
+                            .await
+                            .unwrap_or_default();
+                        let (about, left_off) = match result {
+                            Some(pair) => pair,
+                            None => {
+                                // Heuristic fallback: first user prompt only.
+                                match clawde_query::session_synopsis::heuristic_about(&messages) {
+                                    Some(a) => (a, None),
+                                    None => return,
+                                }
+                            }
+                        };
+                        let _ = clawde_core::session_storage::write_synopsis(
+                            &path,
+                            &session_id,
+                            &about,
+                            left_off.as_deref().unwrap_or(""),
+                        )
+                        .await;
+                    });
+                }
             }
         }
     }
