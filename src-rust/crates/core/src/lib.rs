@@ -7796,6 +7796,7 @@ pub mod migrations;
 pub mod oauth_config;
 pub mod output_styles;
 pub mod paths;
+pub mod pending_writes;
 pub mod prompt_history;
 pub mod ps_classifier;
 pub mod session_tracing;

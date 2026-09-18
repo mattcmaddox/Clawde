@@ -7869,17 +7869,19 @@ async fn run_interactive(
                 .await;
             }
 
-            // Non-blocking auto-title generation.  Spawned as a fire-and-forget
-            // task so the exit path (session save, LSP shutdown, terminal restore)
-            // is never blocked by a slow provider.  The title is written to the
-            // JSONL transcript directly; the session JSON is saved below without
-            // waiting for the title to arrive.
+            // Non-blocking auto-title generation, registered as a pending write
+            // so the exit path can drain it before the runtime is dropped.
+            // Tokio does not run spawned tasks to completion on runtime drop —
+            // they are dropped at their first yield — so an untracked spawn here
+            // loses the title whenever teardown outpaces the provider call. The
+            // title is written to the JSONL transcript directly; the session JSON
+            // is saved below without waiting for the title to arrive.
             if session.title.is_none() && session.messages.len() >= 2 {
                 let messages = session.messages.clone();
                 let session_id = session.id.clone();
                 let client = client.clone();
                 let path = path.clone();
-                tokio::spawn(async move {
+                clawde_core::pending_writes::spawn(async move {
                     let cancel = CancellationToken::new();
                     let title_cfg = clawde_query::session_title::SessionTitleConfig::default();
                     let gen = clawde_query::session_title::generate_session_title(
@@ -7906,7 +7908,8 @@ async fn run_interactive(
             // Written to the transcript as a `synopsis` entry so the session
             // browser rows are meaningful. Falls back to a heuristic distill
             // of the first user prompt when the call fails — a few important
-            // words beat nothing. Fire-and-forget like the auto-titler.
+            // words beat nothing. Tracked like the auto-titler so the exit drain
+            // can wait for it rather than losing it to runtime teardown.
             if session.messages.len() >= 2 {
                 let messages = session.messages.clone();
                 let session_id = session.id.clone();
@@ -7928,7 +7931,7 @@ async fn run_interactive(
                     });
                 if let Some(provider) = provider {
                     let model = synopsis_model_for_config(&app.config, &app.model_name);
-                    tokio::spawn(async move {
+                    clawde_core::pending_writes::spawn(async move {
                         let cancel = CancellationToken::new();
                         let gen = clawde_query::session_synopsis::generate_session_synopsis(
                             &messages,
@@ -8012,6 +8015,21 @@ async fn run_interactive(
                 );
             }
         }
+    }
+
+    // Drain exit-time durable writes before the runtime is dropped. Both tasks
+    // were spawned above, ahead of the session save / LSP shutdown / Ollama
+    // unload, so they have already had that whole window to run concurrently and
+    // this wait only covers the remainder. Tokio cancels spawned tasks on runtime
+    // drop instead of running them to completion, so skipping this wait silently
+    // loses whichever write had not finished.
+    const EXIT_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(6);
+    let still_pending = clawde_core::pending_writes::drain(EXIT_WRITE_GRACE).await;
+    if still_pending > 0 {
+        eprintln!(
+            "[clawde] exit: {still_pending} background write(s) did not finish within {}s",
+            EXIT_WRITE_GRACE.as_secs()
+        );
     }
 
     restore_terminal(&mut terminal)?;

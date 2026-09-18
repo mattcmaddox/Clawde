@@ -5073,7 +5073,10 @@ async fn run_query_loop_inner(
                                     },
                                 ) {
                                     let sm_client = std::sync::Arc::new(sm_client);
-                                    tokio::spawn(async move {
+                                    // Tracked so the exit drain can wait for this
+                                    // durable write instead of losing it to
+                                    // runtime teardown (see pending_writes).
+                                    clawde_core::pending_writes::spawn(async move {
                                         let extractor = session_memory::SessionMemoryExtractor::new(
                                             &model_clone,
                                         );
@@ -5219,6 +5222,10 @@ async fn run_query_loop_inner(
                                 let event_tx_for_dream = event_tx.clone();
                                 let memory_entrypoint =
                                     task.memory_dir.join(clawde_core::memdir::MEMORY_ENTRYPOINT);
+                                // Intentionally NOT tracked: a dream is a long,
+                                // retried background consolidation (backoff-gated),
+                                // so dropping it at exit costs nothing while
+                                // tracking it would add wait to every quit.
                                 tokio::spawn(async move {
                                     let agent = crate::agent_tool::AgentTool::default();
                                     // Wall-clock budget (Phase 1c): a dream is a
