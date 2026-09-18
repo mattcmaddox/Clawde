@@ -3676,6 +3676,27 @@ fn exit_ollama_model_target(config: &Config, model_name: &str) -> Option<String>
     Some(bare.to_string())
 }
 
+/// Everything that moves the transcript on screen between two frames.
+///
+/// The rendered top row is `max_scroll` whenever auto-scroll is on, so it
+/// advances on its own as a streaming turn appends lines — without `offset` or
+/// `auto` moving at all. Comparing all three is what makes the terminal resync
+/// fire on content growth, not just on a user scroll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScrollSignal {
+    offset: usize,
+    auto: bool,
+    max: usize,
+}
+
+fn scroll_signal(app: &clawde_tui::App) -> ScrollSignal {
+    ScrollSignal {
+        offset: app.scroll_offset,
+        auto: app.auto_scroll,
+        max: app.last_max_scroll.get(),
+    }
+}
+
 async fn run_interactive(
     config: Config,
     settings: clawde_core::config::Settings,
@@ -4382,8 +4403,12 @@ async fn run_interactive(
     // fragments of scrolled-away lines. A physical clear (ESC[2J) on scroll
     // resyncs them; it's only issued while actively scrolling, so motion hides
     // any flash.
-    let mut last_scroll_offset = app.scroll_offset;
-    let mut last_auto_scroll = app.auto_scroll;
+    //
+    // `max_scroll` is part of that signal, and is the one that actually moves
+    // during a streaming turn (see `ScrollSignal`). Keying the clear on
+    // `scroll_offset`/`auto_scroll` alone missed the commonest scroll of all —
+    // content growing under auto-scroll — and left the ghosts behind.
+    let mut last_scroll_signal = scroll_signal(&app);
     // The terminal progress bar (OSC 9;4) is opt-out via the terminalProgressBar
     // setting; read it once at startup. `progress_shown` tracks whether we've
     // told the terminal we're "busy", so the escape is only emitted on an actual
@@ -4492,10 +4517,10 @@ async fn run_interactive(
         // If the transcript scrolled since the last frame, force a full screen
         // clear so wide/ambiguous-glyph desync can't leave ghost fragments of
         // scrolled-away lines (see note at the top of the loop).
-        if app.scroll_offset != last_scroll_offset || app.auto_scroll != last_auto_scroll {
+        let signal = scroll_signal(&app);
+        if signal != last_scroll_signal {
             let _ = terminal.clear();
-            last_scroll_offset = app.scroll_offset;
-            last_auto_scroll = app.auto_scroll;
+            last_scroll_signal = signal;
         }
 
         // Draw the UI
@@ -9447,6 +9472,49 @@ mod session_swap_tests {
         assert!(session_swap_changes_sessions("session-a", "session-b"));
         // /new always generates a fresh id, so it always counts as a swap.
         assert!(session_swap_changes_sessions("", "session-c"));
+    }
+}
+
+#[cfg(test)]
+mod scroll_signal_tests {
+    use super::*;
+    use clawde_tui::App;
+
+    fn app_on_free_default() -> App {
+        // `CostTracker::new()` already hands back an `Arc`.
+        App::new(Config::default(), clawde_core::cost::CostTracker::new())
+    }
+
+    #[test]
+    fn growing_content_under_auto_scroll_signals_a_resync() {
+        // The regression: a streaming turn appends lines, which advances the
+        // rendered top row (`max_scroll`) while the user's scroll state stays
+        // put. Keying the resync on scroll_offset/auto_scroll alone missed it,
+        // so stale glyphs from scrolled-away lines survived on screen —
+        // visible as junk inside tool-result gutters.
+        let app = app_on_free_default();
+        assert!(
+            app.auto_scroll,
+            "streaming sessions start pinned to the tail"
+        );
+        assert_eq!(app.scroll_offset, 0);
+        app.last_max_scroll.set(10);
+        let before = scroll_signal(&app);
+
+        app.last_max_scroll.set(11);
+
+        assert_ne!(scroll_signal(&app), before, "content growth must resync");
+        assert_eq!(app.scroll_offset, 0, "the user did not scroll");
+        assert!(app.auto_scroll, "auto-scroll did not change");
+    }
+
+    #[test]
+    fn a_settled_transcript_does_not_resync() {
+        // An idle frame must not clear the screen, or every 250 ms tick would
+        // flash the whole terminal.
+        let app = app_on_free_default();
+        app.last_max_scroll.set(42);
+        assert_eq!(scroll_signal(&app), scroll_signal(&app));
     }
 }
 
