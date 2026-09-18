@@ -478,7 +478,7 @@ impl SettingsScreen {
             .to_string();
 
         // Read keybinding preset from keybindings.json
-        self.keybinding_preset = UserKeybindings::load(&Settings::config_dir())
+        self.keybinding_preset = UserKeybindings::load(&crate::keybindings_dir())
             .preset
             .label()
             .to_string();
@@ -3046,7 +3046,7 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                     }
                     "keybinding_preset" => {
                         screen.keybinding_preset = new_value.to_string();
-                        let config_dir = Settings::config_dir();
+                        let config_dir = crate::keybindings_dir();
                         let mut kb = UserKeybindings::load(&config_dir);
                         kb.preset =
                             clawde_core::keybindings::KeybindingPreset::from_name(new_value)

@@ -2164,7 +2164,7 @@ impl App {
             }
             state
         };
-        let user_keybindings = UserKeybindings::load(&Settings::config_dir());
+        let user_keybindings = UserKeybindings::load(&crate::keybindings_dir());
         // Restore the last-used free-model task sort from settings (e.g.
         // "coding") so the /models picker opens pre-sorted on next launch.
         let saved_task = Settings::load_sync()
@@ -4668,7 +4668,7 @@ impl App {
             let name = args.trim().trim_start_matches("preset").trim();
             match KeybindingPreset::from_name(name) {
                 Some(preset) => {
-                    let config_dir = Settings::config_dir();
+                    let config_dir = crate::keybindings_dir();
                     let mut kb = UserKeybindings::load(&config_dir);
                     kb.preset = preset;
                     if let Err(e) = kb.save(&config_dir) {
@@ -5065,7 +5065,7 @@ impl App {
                     "disabled"
                 };
                 // Persist: save the preset to keybindings.json so it survives restarts.
-                let config_dir = Settings::config_dir();
+                let config_dir = crate::keybindings_dir();
                 let mut kb = UserKeybindings::load(&config_dir);
                 kb.preset = if self.prompt_input.vim_enabled {
                     KeybindingPreset::Vim
@@ -10582,8 +10582,8 @@ impl App {
                 self.jump_to_previous_error();
                 false
             }
-            "reverseIndent" => {
-                // Shift+Tab: Reverse indent (cycle permission mode)
+            "cyclePermissionMode" => {
+                // Shift+Tab: cycle the permission mode
                 use clawde_core::config::PermissionMode;
                 self.config.permission_mode = match self.config.permission_mode {
                     PermissionMode::Default => PermissionMode::AcceptEdits,
@@ -10811,7 +10811,7 @@ impl App {
                 }
                 false
             }
-            "indent" => {
+            "cycleAgentMode" => {
                 // Tab: complete an open slash-command suggestion, otherwise
                 // cycle the agent mode (build → plan → image).
                 //
@@ -13705,6 +13705,27 @@ mod tests {
     }
 
     #[test]
+    fn tests_resolve_keybindings_to_a_scratch_directory() {
+        // Regression: constructing an App loads keybindings, and
+        // `UserKeybindings::load` writes the file back whenever the schema
+        // version rises. A plain `cargo test` run therefore migrated — and
+        // rewrote — the developer's real ~/.clawde/keybindings.json when the
+        // mode actions were renamed. Asserted rather than assumed, because the
+        // failure is silent and destroys user config.
+        let dir = crate::keybindings_dir();
+        assert_ne!(
+            dir,
+            clawde_core::config::Settings::config_dir(),
+            "a test run must never read or write the real keybindings.json"
+        );
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "expected a scratch directory, got {}",
+            dir.display()
+        );
+    }
+
+    #[test]
     fn tab_cycles_agent_mode_with_text_already_in_the_prompt() {
         // Regression: the cycle was gated on an empty prompt, so the mode could
         // not be changed once the user had started typing — exactly when it
@@ -13715,12 +13736,12 @@ mod tests {
         // image-mode model swap (which reads the clipboard) stays out of the
         // test.
         app.agent_mode = Some("image".to_string());
-        app.handle_keybinding_action("indent");
+        app.handle_keybinding_action("cycleAgentMode");
         assert_eq!(app.agent_mode.as_deref(), Some("build"));
 
         app.prompt_input.text = "half-written idea".to_string();
         app.prompt_input.cursor = app.prompt_input.text.len();
-        app.handle_keybinding_action("indent");
+        app.handle_keybinding_action("cycleAgentMode");
 
         assert_eq!(
             app.agent_mode.as_deref(),
@@ -13749,7 +13770,7 @@ mod tests {
         assert_eq!(app.prompt_input.text, "/hel", "prefix typed verbatim");
         let mode_before = app.agent_mode.clone();
 
-        app.handle_keybinding_action("indent");
+        app.handle_keybinding_action("cycleAgentMode");
 
         assert!(
             app.prompt_input.text.starts_with("/help"),

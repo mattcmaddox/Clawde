@@ -196,7 +196,9 @@ pub const NON_REBINDABLE: &[&str] = &["ctrl+c", "ctrl+d", "ctrl+m"];
 /// - **Alt+←/Alt+→**: Navigate to previous/next message in transcript
 /// - **Alt+.**: Jump to previous error/issue in messages
 /// - **Alt+N**: Jump to next error/issue in messages
-/// - **Shift+Tab**: Reverse indent/unindent in input (cycle permission mode)
+/// - **Tab**: Complete an open suggestion, otherwise cycle the agent mode
+///   (build → plan → image)
+/// - **Shift+Tab**: Cycle the permission mode (Default → Accept edits → Bypass)
 /// - **Ctrl+H**: Delete character before cursor (Chat context, Emacs-style)
 /// - **Alt+/**: Open help (alternative to F1)
 /// - **Alt+R**: History search
@@ -285,9 +287,10 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         //
         // Removed: findInMessage (ctrl+f), globalSearch (ctrl+shift+f),
         // findNext (f3/ctrl+]), findPrev (shift+f3/ctrl+[), goToLine (ctrl+g).
-        // Indentation
-        ("tab", "indent", KeyContext::Chat),
-        ("shift+tab", "reverseIndent", KeyContext::Chat),
+        // Mode cycling. Tab also completes an open suggestion — the handler
+        // decides which, since both live in the Chat context.
+        ("tab", "cycleAgentMode", KeyContext::Chat),
+        ("shift+tab", "cyclePermissionMode", KeyContext::Chat),
         // Paste placeholders — expand `[Pasted text #N ...]` back into the
         // full pasted body (clicking the placeholder does the same).
         ("alt+p", "expandPaste", KeyContext::Chat),
@@ -506,8 +509,13 @@ const EMACS_PRESET_EXTRAS: &[(&str, &str, KeyContext)] = &[
     ("ctrl+shift+p", "openCommandPalette", KeyContext::Chat),
 ];
 
-/// Current schema version for keybindings
-pub const KEYBINDINGS_SCHEMA_VERSION: u32 = 1;
+/// Current schema version for keybindings.
+///
+/// Bumped whenever a default's *action name* changes: a persisted file carries
+/// the old name, and `smart_merge_with_defaults` is the only thing that rewrites
+/// it, so without a bump the renamed action matches no handler and the chord
+/// silently stops doing anything.
+pub const KEYBINDINGS_SCHEMA_VERSION: u32 = 2;
 /// User keybindings loaded from ~/.clawde/keybindings.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserKeybindings {
@@ -649,7 +657,8 @@ impl UserKeybindings {
 
         // Build a set of user-customized bindings (those that differ from old defaults)
         // and bindings user explicitly unbound
-        let mut user_customizations: std::collections::HashMap<String, Option<String>> =
+        // Maps "<context>|<chord>" to the persisted (chord, action).
+        let mut user_customizations: std::collections::HashMap<String, (String, Option<String>)> =
             std::collections::HashMap::new();
         for binding in &self.bindings {
             // Migration: remove old bindings that have changed in defaults
@@ -668,7 +677,37 @@ impl UserKeybindings {
                 continue;
             }
 
-            user_customizations.insert(binding.chord.clone(), binding.action.clone());
+            // Old: tab -> indent. `indent` never inserted indentation; it
+            // completes an open suggestion and otherwise cycles the agent
+            // mode, so it was renamed to cycleAgentMode.
+            if binding.chord == "tab"
+                && binding.context.as_deref() == Some("Chat")
+                && binding.action.as_deref() == Some("indent")
+            {
+                continue;
+            }
+
+            // Old: shift+tab -> reverseIndent. It cycles the permission mode
+            // rather than removing indentation, so it was renamed to
+            // cyclePermissionMode.
+            if binding.chord == "shift+tab"
+                && binding.context.as_deref() == Some("Chat")
+                && binding.action.as_deref() == Some("reverseIndent")
+            {
+                continue;
+            }
+
+            // Keyed by context *and* chord: the same chord is bound in several
+            // contexts (Tab cycles the agent mode in Chat and toggles the
+            // preview in HistorySearch), and a chord-only key let a
+            // customization in one context silently overwrite the default in
+            // another.
+            let key = format!(
+                "{}|{}",
+                binding.context.as_deref().unwrap_or(""),
+                binding.chord
+            );
+            user_customizations.insert(key, (binding.chord.clone(), binding.action.clone()));
         }
 
         // Get current defaults and integrate customizations
@@ -677,14 +716,15 @@ impl UserKeybindings {
             let chord_str = format_chord_string(&default.chord);
             let context_str = format!("{:?}", default.context);
 
-            if let Some(custom_action) = user_customizations.get(&chord_str) {
+            let key = format!("{context_str}|{chord_str}");
+            if let Some((_, custom_action)) = user_customizations.get(&key) {
                 // User has customized this binding, use their version
                 merged_bindings.push(UserBinding {
                     chord: chord_str.clone(),
                     action: custom_action.clone(),
                     context: Some(context_str),
                 });
-                user_customizations.remove(&chord_str);
+                user_customizations.remove(&key);
             } else {
                 // Use the default
                 merged_bindings.push(UserBinding {
@@ -696,7 +736,7 @@ impl UserKeybindings {
         }
 
         // Add any remaining user customizations that aren't in current defaults
-        for (chord, action) in user_customizations {
+        for (_, (chord, action)) in user_customizations {
             merged_bindings.push(UserBinding {
                 chord,
                 action,
@@ -1356,8 +1396,8 @@ mod tests {
             "deleteCharBefore action not found"
         );
         assert!(
-            actions.contains(&"reverseIndent".to_string()),
-            "reverseIndent action not found"
+            actions.contains(&"cyclePermissionMode".to_string()),
+            "cyclePermissionMode action not found"
         );
 
         // Verify we have at least 10 new keybindings (Phase 1 requirement)
@@ -1365,6 +1405,113 @@ mod tests {
             actions.len() >= 40,
             "Expected at least 40 keybindings, found {}",
             actions.len()
+        );
+    }
+
+    #[test]
+    fn customization_in_one_context_does_not_overwrite_another() {
+        // Regression: the merge keyed customizations by chord alone, but the
+        // same chord is bound in several contexts — Tab cycles the agent mode
+        // in Chat and toggles the preview in HistorySearch. A single custom
+        // binding therefore hijacked the default for every context sharing
+        // that chord.
+        let file = r#"{
+            "schema_version": 1,
+            "bindings": [
+                {
+                    "context": "Chat",
+                    "bindings": { "tab": "openModelPicker" }
+                },
+                {
+                    "context": "HistorySearch",
+                    "bindings": { "tab": "togglePreview" }
+                }
+            ]
+        }"#;
+        let mut kb = UserKeybindings::from_json_str(file);
+        kb.smart_merge_with_defaults();
+
+        let action_in = |ctx: &str| {
+            kb.bindings
+                .iter()
+                .find(|b| b.chord == "tab" && b.context.as_deref() == Some(ctx))
+                .and_then(|b| b.action.clone())
+        };
+        assert_eq!(
+            action_in("Chat").as_deref(),
+            Some("openModelPicker"),
+            "the Chat customization must survive"
+        );
+        assert_eq!(
+            action_in("HistorySearch").as_deref(),
+            Some("togglePreview"),
+            "the other context's binding must not be hijacked by the same chord"
+        );
+    }
+
+    #[test]
+    fn test_renamed_mode_actions_migrate_to_the_new_defaults() {
+        // A file written before the rename carries `tab -> indent` and
+        // `shift+tab -> reverseIndent`. Neither name exists any more, so the
+        // merge must drop them and fall back to the new defaults — otherwise
+        // the chords would resolve to actions no handler matches and Tab would
+        // silently stop cycling modes.
+        let stale = r#"{
+            "schema_version": 1,
+            "bindings": [
+                {
+                    "context": "Chat",
+                    "bindings": {
+                        "tab": "indent",
+                        "shift+tab": "reverseIndent"
+                    }
+                }
+            ]
+        }"#;
+        let mut kb = UserKeybindings::from_json_str(stale);
+        kb.smart_merge_with_defaults();
+
+        let action_for = |chord: &str| {
+            kb.bindings
+                .iter()
+                .find(|b| b.chord == chord)
+                .and_then(|b| b.action.clone())
+        };
+        assert_eq!(
+            action_for("tab").as_deref(),
+            Some("cycleAgentMode"),
+            "the stale indent binding must give way to the renamed default"
+        );
+        assert_eq!(
+            action_for("shift+tab").as_deref(),
+            Some("cyclePermissionMode"),
+            "the stale reverseIndent binding must give way to the renamed default"
+        );
+
+        // A genuine customization of the same chord must still survive: the
+        // drop conditions are scoped to the retired names, not to the chord.
+        let customized = r#"{
+            "schema_version": 1,
+            "bindings": [
+                {
+                    "context": "Chat",
+                    "bindings": {
+                        "tab": "openModelPicker"
+                    }
+                }
+            ]
+        }"#;
+        let mut kb = UserKeybindings::from_json_str(customized);
+        kb.smart_merge_with_defaults();
+        let tab = kb
+            .bindings
+            .iter()
+            .find(|b| b.chord == "tab")
+            .expect("tab must still be bound");
+        assert_eq!(
+            tab.action.as_deref(),
+            Some("openModelPicker"),
+            "a user's own tab binding must not be clobbered by the rename"
         );
     }
 
@@ -1387,7 +1534,10 @@ mod tests {
 
         kb.smart_merge_with_defaults();
 
-        assert_eq!(kb.schema_version, 1, "Should be upgraded to version 1");
+        assert_eq!(
+            kb.schema_version, KEYBINDINGS_SCHEMA_VERSION,
+            "Should be upgraded to the current schema version"
+        );
         assert!(
             kb.bindings.iter().any(|b| b.chord == "meta+left"),
             "meta+left (cmd+left) should be added from defaults after merge"
@@ -1635,9 +1785,9 @@ mod tests {
     fn test_tab_h_chord_resolves_to_effort_decrease() {
         let user = UserKeybindings::default();
         let mut resolver = KeybindingResolver::new(&user);
-        // Tab pressed → PendingSingle("indent")
+        // Tab pressed → PendingSingle("cycleAgentMode")
         match resolver.process(ks("tab"), &KeyContext::Chat) {
-            KeybindingResult::PendingSingle(action) => assert_eq!(action, "indent"),
+            KeybindingResult::PendingSingle(action) => assert_eq!(action, "cycleAgentMode"),
             other => panic!("Expected PendingSingle, got {:?}", other),
         }
         // H completes the chord → effortDecrease
@@ -1662,22 +1812,22 @@ mod tests {
     }
 
     #[test]
-    fn test_tab_followed_by_unrelated_key_fires_indent() {
+    fn test_tab_followed_by_unrelated_key_fires_cycle_agent_mode() {
         let user = UserKeybindings::default();
         let mut resolver = KeybindingResolver::new(&user);
         match resolver.process(ks("tab"), &KeyContext::Chat) {
             KeybindingResult::PendingSingle(_) => {}
             other => panic!("Expected PendingSingle, got {:?}", other),
         }
-        // Pressing 'a' doesn't complete any chord → fires held indent action
+        // Pressing 'a' doesn't complete any chord → fires the held action
         match resolver.process(ks("a"), &KeyContext::Chat) {
-            KeybindingResult::Action(action) => assert_eq!(action, "indent"),
-            other => panic!("Expected Action(indent), got {:?}", other),
+            KeybindingResult::Action(action) => assert_eq!(action, "cycleAgentMode"),
+            other => panic!("Expected Action(cycleAgentMode), got {:?}", other),
         }
     }
 
     #[test]
-    fn test_tab_timeout_fires_indent() {
+    fn test_tab_timeout_fires_cycle_agent_mode() {
         let user = UserKeybindings::default();
         let mut resolver = KeybindingResolver::new(&user);
         match resolver.process(ks("tab"), &KeyContext::Chat) {
@@ -1688,7 +1838,7 @@ mod tests {
         resolver.pending_single_started =
             Some(Instant::now() - Duration::from_millis(CHORD_TIMEOUT_MS + 1));
         let action = resolver.check_timeout().expect("timeout should fire");
-        assert_eq!(action, "indent");
+        assert_eq!(action, "cycleAgentMode");
     }
 
     #[test]
@@ -1707,9 +1857,9 @@ mod tests {
         assert!(!resolver.has_pending_chord());
         assert!(resolver.check_timeout().is_none());
         // The next keystroke is processed fresh and never fires the held
-        // indent action.
+        // mode-cycling action.
         let result = resolver.process(ks("h"), &KeyContext::Chat);
-        assert!(!matches!(result, KeybindingResult::Action(action) if action == "indent"));
+        assert!(!matches!(result, KeybindingResult::Action(action) if action == "cycleAgentMode"));
     }
 
     #[test]

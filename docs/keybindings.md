@@ -53,8 +53,8 @@ These bindings are active when focus is in the chat input field.
 | `Up` | historyPrev | Navigate to the previous message in input history |
 | `Down` / `Ctrl+I` | historyNext | Navigate to the next message in input history |
 | `Ctrl+O` | toggleThinkingExpand | Expand or collapse all thinking blocks |
-| `Tab` | indent | Complete the open suggestion, otherwise cycle the agent mode (build → plan → image). Text already in the input is kept |
-| `Shift+Tab` | reverseIndent | Cycle the permission mode (Default → Accept edits → Bypass → Default) |
+| `Tab` | cycleAgentMode | Complete the open suggestion, otherwise cycle the agent mode (build → plan → image). Text already in the input is kept |
+| `Shift+Tab` | cyclePermissionMode | Cycle the permission mode (Default → Accept edits → Bypass → Default) |
 | `Page Up` | scrollUp | Scroll the conversation view up one page |
 | `Page Down` | scrollDown | Scroll the conversation view down one page |
 | `Home` / `Cmd+Left` / `Ctrl+A` | goLineStart | Move cursor to beginning of line |
@@ -131,7 +131,7 @@ For batch edits or scripted configuration, edit `~/.clawde/keybindings.json` dir
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "bindings": [
     {
       "context": "Chat",
@@ -157,12 +157,12 @@ Each binding object has:
 
 ### Schema Versioning and Smart Merge
 
-`keybindings.json` carries a top-level `schema_version` field (currently `1`). When Clawde's defaults change in a release, the file is auto-migrated on next launch:
+`keybindings.json` carries a top-level `schema_version` field (currently `2`). When Clawde's defaults change in a release, the file is auto-migrated on next launch:
 
 1. Clawde reads the file and compares `schema_version` against the bundled `KEYBINDINGS_SCHEMA_VERSION`.
 2. If the file is older, Clawde runs a **smart merge**:
    - Your customizations (any binding whose `chord` you set explicitly) are preserved.
-   - Stale bindings that match an *old* default that has since changed are dropped — for example, the previous `ctrl+a → openModelPicker` binding is removed because `ctrl+a` is now reserved for select-all in the input.
+   - Stale bindings that match an *old* default that has since changed are dropped — for example, the previous `ctrl+a → openModelPicker` binding is removed because `ctrl+a` is now reserved for select-all in the input, and the retired `tab → indent` is dropped in favour of `tab → cycleAgentMode` because the action never inserted indentation.
    - Any new bindings present in the current defaults but not in your file are added.
 3. The migrated file is written back with the new `schema_version`.
 

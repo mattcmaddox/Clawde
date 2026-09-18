@@ -26,6 +26,32 @@
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Directory the app reads and writes `keybindings.json` from.
+///
+/// Production uses the real config dir. A test build resolves to a scratch
+/// directory instead, because `App::new` loads the keybindings and
+/// `UserKeybindings::load` writes the file back whenever the schema version
+/// rises. Without this, a plain `cargo test` run migrates — and rewrites — the
+/// developer's real `~/.clawde/keybindings.json` as soon as the defaults change.
+/// It also keeps tests hermetic: a locally customized keymap must not change
+/// what a test observes. Keyed by process id so a stale file from an earlier run
+/// can never influence a later one.
+pub(crate) fn keybindings_dir() -> std::path::PathBuf {
+    #[cfg(test)]
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "clawde-tui-test-keybindings-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+    #[cfg(not(test))]
+    {
+        clawde_core::config::Settings::config_dir()
+    }
+}
+
 use crossterm::event::{
     DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
