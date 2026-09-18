@@ -28,3 +28,6 @@ dirs = { workspace = true }
 tokio-util = { workspace = true }
 regex = { workspace = true }
 hostname = "0.4"
+
+[lints]
+workspace = true

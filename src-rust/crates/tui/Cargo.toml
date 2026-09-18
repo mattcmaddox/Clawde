@@ -83,3 +83,6 @@ hound = { version = "3.5", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

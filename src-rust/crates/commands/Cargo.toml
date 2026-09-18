@@ -43,3 +43,6 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 crossterm = { workspace = true }
+
+[lints]
+workspace = true

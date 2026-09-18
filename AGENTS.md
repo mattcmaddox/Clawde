@@ -43,7 +43,7 @@ Run from `src-rust/` unless noted.
 
 - **Ollama runs on the LAN GPU box, never localhost.** All Ollama probes, curls, and manual tests target `http://192.168.1.45:11434` — set `OLLAMA_HOST=http://192.168.1.45:11434` for env-driven tools or pass the host explicitly. A local CPU `ollama` systemd service also listens on 127.0.0.1:11434 on this dev machine; it is NOT the test target and its model list differs. Core's resolver already rejects loopback in online mode (`is_ollama_network_blocked`) — never work around a connection failure by pointing at localhost.
 - After Rust changes (not docs): `cargo check --workspace` — fix every error and warning before committing.
-- Clippy: `cargo clippy --workspace --all-targets -- -D warnings`. Fix lints; do not `#[allow(...)]` without justification.
+- Clippy: `cargo clippy --workspace --all-targets -- -D warnings`. Fix lints; do not `#[allow(...)]` without justification. Workspace lint policy lives in `[workspace.lints.clippy]` in `src-rust/Cargo.toml`, and every member opts in with `[lints] workspace = true` — so a plain local `cargo clippy` enforces exactly what CI does. A new workspace member that omits that opt-in silently escapes every workspace lint.
 - Format: `cargo fmt --all`. Run before committing.
 - Tests: `cargo test --workspace` for everything, `cargo test --package clawde-<crate>` for a single crate, `cargo test --package clawde-<crate> -- <pattern>` for a specific test.
 - Avoid running `cargo build --release` or `cargo run --release` unless you specifically need optimised output — debug builds and `cargo check` are 10× faster.
@@ -111,9 +111,9 @@ cargo check -p clawde-tui --tests
 
 ### Pre-commit hook
 
-`.githooks/pre-commit` runs gitleaks + rustfmt + the TUI test-target check + an idle-CPU
-smoke probe (skipped when the debug binary is missing/stale) before commits
-(see the script header). Enable once per clone:
+`.githooks/pre-commit` runs gitleaks + the async file-flush audit + rustfmt + the
+TUI test-target check + an idle-CPU smoke probe (skipped when the debug binary is
+missing/stale) before commits (see the script header). Enable once per clone:
 
 ```bash
 git config core.hooksPath .githooks
@@ -137,6 +137,29 @@ directory) MUST serialize on a crate-level `ENV_LOCK` mutex before mutating
 (see the canonical lock at `crates/core/src/paths.rs`). New tests that miss a
 guard will race under parallelism and flake CI. `scripts/audit-env-tests.py`
 scans for unguarded mutations — keep it green when adding tests.
+
+### Async file writes must be flushed (tokio)
+
+`tokio::fs::File` returns `Ok` from `write_all` once the bytes are queued to a
+blocking-pool task, and the type has **no `Drop` impl** — dropping the handle
+detaches the queued write. Tokio's own docs require calling `flush` before
+dropping. An unflushed append therefore reports success and can silently lose
+data; that is how ~1-2% of transcript appends were dropped (issue #3).
+
+Any write to a tokio file handle must be followed by `handle.flush().await`.
+`tokio::fs::write` is exempt — it runs the blocking `std::fs::write` on the
+thread pool and awaits it, so a return already implies durability. `std::fs`
+handles never need flushing (synchronous writes, real close on drop).
+
+`scripts/audit-tokio-file-flush.py` enforces this: a CI step (Linux-only) plus a
+pre-commit check. It validates its own detector against built-in fixtures on
+every run, so a drifted detector fails loudly instead of clearing the tree.
+Use `--verbose` to list every checked handle and `--root DIR` to scan another
+tree. A genuine exception is exempted with an `ALLOW_NO_FLUSH` comment inside
+the function — state the reason, never silence a real fire-and-forget write.
+
+Known detector limits: a handle wrapped before writing (`BufWriter::new(file)`)
+or moved into another owner is not tracked.
 
 ## Issues & PR Comments
 

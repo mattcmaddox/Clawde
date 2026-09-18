@@ -24,6 +24,18 @@ edition = "2021"
 authors = ["Clawde"]
 license = "GPL-3.0"
 
+# Workspace lint policy. Every member opts in with `[lints] workspace = true`,
+# so a plain `cargo clippy` locally reports exactly what CI's `-D warnings`
+# enforces — no local/CI drift.
+#
+# Both lints are pedantic (off by default) and enforce the documented rule that
+# a lock guard is never held across an `.await`: lock -> read/copy -> unlock ->
+# then await. A guard held across a suspension point deadlocks as soon as a
+# second task needs the same lock.
+[workspace.lints.clippy]
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.44", features = ["full"] }

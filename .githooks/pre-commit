@@ -7,17 +7,23 @@
 #      snapshot, not the whole history (CI/history stays covered by
 #      `gitleaks detect` runs and the baseline config). Self-skips when the
 #      binary is not on PATH; bypass via CLAWDE_HOOK_SKIP_GITLEAKS=1.
-#   1. rustfmt drift (`cargo fmt --all --check`) — instant.
-#   2. TUI test-target compile (`cargo check -p clawde-tui --tests`) — catches
+#   1. Async file-flush audit (`scripts/audit-tokio-file-flush.py`) — instant.
+#      tokio's fs::File returns Ok from `write_all` once the bytes are queued
+#      to a blocking task and has no Drop impl, so a write with no following
+#      `flush()` is fire-and-forget and can silently lose data (issue #3).
+#      The script self-tests its detector first, so a broken detector fails
+#      loudly rather than reporting a false all-clear.
+#   2. rustfmt drift (`cargo fmt --all --check`) — instant.
+#   3. TUI test-target compile (`cargo check -p clawde-tui --tests`) — catches
 #      test-code compile breaks that plain `cargo check --workspace` skips
 #      (test targets are not compiled by the default check/build).
-#   3. Idle-CPU smoke probe (`scripts/probes/idle-cpu-probe.py`) — fails if an
+#   4. Idle-CPU smoke probe (`scripts/probes/idle-cpu-probe.py`) — fails if an
 #      idle TUI session repaints at full rate, i.e. the
 #      `App::needs_fast_repaint()` / poll-timeout throttle regressed. Runs with
 #      a shortened window (5s warmup / 6s idle) to stay quick; Linux-only, and
 #      skipped when the debug binary is missing or older than the staged Rust
 #      sources (a stale binary would silently test the previous code).
-#   4. Live eval gate (`scripts/eval/run_eval.py`, catalog-order fixture) —
+#   5. Live eval gate (`scripts/eval/run_eval.py`, catalog-order fixture) —
 #      runs the real free-provider chain and blocks the commit if the model
 #      stops enumerating the FREE_CATALOG order (answer-quality regression).
 #      Same binary staleness skip as the probe; skips when no free keys are
@@ -78,6 +84,23 @@ fi
 if ! git diff --cached --name-only | grep -q '^src-rust/.*\.rs$'; then
     exit 0
 fi
+# ---- Async file-flush audit ----------------------------------------------
+# Instant, so it runs before the cargo checks. tokio's fs::File returns Ok
+# from write_all once the bytes are queued to a blocking task and has no Drop
+# impl, so dropping the handle detaches the write: an unflushed append is
+# acknowledged and silently lost (issue #3). The script validates its own
+# detector against built-in fixtures on every run.
+if command -v python3 >/dev/null 2>&1; then
+    if ! python3 "$ROOT/scripts/audit-tokio-file-flush.py" >/dev/null 2>&1; then
+        echo "pre-commit: async file-flush audit FAILED."
+        echo "  A tokio file handle is written with no following flush(), so the"
+        echo "  queued write can be dropped and the data silently lost."
+        echo "  Inspect:  python3 scripts/audit-tokio-file-flush.py --verbose"
+        echo "  Fix:      add `handle.flush().await?` after the write (see #3)."
+        exit 1
+    fi
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
     exit 0
 fi

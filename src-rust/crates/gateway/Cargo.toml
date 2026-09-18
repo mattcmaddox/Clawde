@@ -32,3 +32,6 @@ async-trait = { workspace = true }
 [[bin]]
 name = "clawde-gateway"
 path = "src/main.rs"
+
+[lints]
+workspace = true

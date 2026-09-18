@@ -6,12 +6,16 @@ on:
     paths:
       - 'src-rust/**'
       - 'scripts/probes/tui-permissions-smoke.py'
+      - 'scripts/audit-env-tests.py'
+      - 'scripts/audit-tokio-file-flush.py'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
     paths:
       - 'src-rust/**'
       - 'scripts/probes/tui-permissions-smoke.py'
+      - 'scripts/audit-env-tests.py'
+      - 'scripts/audit-tokio-file-flush.py'
       - '.github/workflows/ci.yml'
 
 concurrency:
@@ -79,6 +83,16 @@ jobs:
       - name: Env-mutation audit
         if: runner.os == 'Linux'
         run: python3 scripts/audit-env-tests.py
+
+      # Async file-write audit: tokio's fs::File returns Ok from `write_all`
+      # once the bytes are queued to a blocking task and has no Drop impl, so
+      # a write with no following `flush()` is silently fire-and-forget and
+      # can lose data (issue #3). The script self-tests its detector against
+      # built-in fixtures first, so a rotted detector fails loudly instead of
+      # reporting a false all-clear over the tree.
+      - name: Async file-flush audit
+        if: runner.os == 'Linux'
+        run: python3 scripts/audit-tokio-file-flush.py
 
       # Dead-code guard: rustc's `dead_code` lint never fires for `pub` items,
       # so every workspace crate carries a `test_no_unreferenced_pub_functions_in_workspace`
