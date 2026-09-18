@@ -439,10 +439,15 @@ impl SlashCommand for HistoryCommand {
         "Show recent sessions for this project and where history lives"
     }
     fn help(&self) -> &str {
-        "Usage: /history\n\n\
-         Lists the most recent sessions for the current project (the git repo\n\
-         root, or the working directory when not in a repo), newest first, with\n\
-         their timestamps and titles, plus pointers to the on-disk stores.\n\n\
+        "Usage: /history [filter]\n\n\
+         In the TUI: opens the interactive session browser. With a filter\n\
+         term, the browser is pre-filtered to sessions whose title or message\n\
+         text contains it (e.g. /history karaoke). Select a row and press\n\
+         Enter to resume that session.\n\n\
+         Headless (--print) or non-TUI: lists the most recent sessions for\n\
+         the current project (the git repo root, or the working directory\n\
+         when not in a repo), newest first, with timestamps and titles, plus\n\
+         pointers to the on-disk stores.\n\n\
          See also: /session list (all sessions), /resume <id>, /stats."
     }
 

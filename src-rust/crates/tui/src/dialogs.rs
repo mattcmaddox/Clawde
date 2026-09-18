@@ -386,7 +386,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// breaks but falling back to a hard character break when a single token is
 /// longer than `width`. Without the hard-break fallback, long unbreakable
 /// tokens (Windows paths, base64 blobs, URLs, …) overflow the dialog border.
-fn word_wrap(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn word_wrap(text: &str, width: usize) -> Vec<String> {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     if width == 0 {
         return vec![text.to_string()];

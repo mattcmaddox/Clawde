@@ -61,7 +61,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "heapdump", description: "Show process memory and diagnostic information", category: "Diagnostics", tui_only: false },
     PromptCommand { name: "health", description: "Probe free-mode key health — /health [<upstream>]", category: "Diagnostics", tui_only: false },
     PromptCommand { name: "help", description: "Show help", category: "Commands", tui_only: false },
-    PromptCommand { name: "history", description: "Show recent sessions for this project and where history lives", category: "Session", tui_only: false },
+    PromptCommand { name: "history", description: "Open the session browser (optionally pre-filtered, e.g. /history karaoke)", category: "Session", tui_only: false },
     PromptCommand { name: "hooks", description: "Browse configured hooks (read-only)", category: "Workspace", tui_only: false },
     PromptCommand { name: "image", description: "Switch to a vision-capable model for image processing", category: "Commands", tui_only: false },
     PromptCommand { name: "import-config", description: "Import CLAUDE.md and settings.json from ~/.claude", category: "Workspace", tui_only: false },

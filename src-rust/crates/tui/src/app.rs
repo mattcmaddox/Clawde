@@ -1481,6 +1481,12 @@ pub struct App {
     pub notifications: NotificationQueue,
     /// Scroll offset for error modal text (in lines).
     pub error_modal_scroll_offset: usize,
+    /// Max scroll offset (in wrapped lines) for the error modal body,
+    /// recomputed each frame by the renderer so clamping stays honest as the
+    /// terminal resizes or the message changes. `0` when no scrolling is
+    /// needed (the body fits). A `Cell` because the render pass gets `&App`
+    /// but must report the measured bound back.
+    pub error_modal_max_scroll: Cell<usize>,
     /// Plugin hint banners.
     pub plugin_hints: Vec<PluginHintBanner>,
     /// Optional session title shown in the status bar.
@@ -2261,6 +2267,7 @@ impl App {
             bridge_state: BridgeConnectionState::Disconnected,
             notifications: NotificationQueue::new(),
             error_modal_scroll_offset: 0,
+            error_modal_max_scroll: Cell::new(0),
             plugin_hints: Vec::new(),
             session_title: None,
             remote_session_url: None,
@@ -4850,10 +4857,18 @@ impl App {
             return true;
         }
 
-        // `/history <id>` keeps the text command (project transcript list);
-        // bare `/history` is intercepted below as the interactive browser.
+        // `/history <filter>` opens the browser pre-filtered to sessions whose
+        // title or message text contains the term (everything after the first
+        // word is joined into one search query — the browser filter is
+        // substring-based, not id-based). Bare `/history` is handled by the
+        // bare-intercept below.
         if cmd == "history" && !args.trim().is_empty() {
-            return false;
+            let query = args.trim().to_string();
+            self.intercept_slash_command("history");
+            for c in query.chars() {
+                self.session_browser.push_search_char(c);
+            }
+            return true;
         }
 
         self.intercept_slash_command(cmd)
@@ -5513,6 +5528,20 @@ impl App {
             self.notifications.dismiss_current();
         }
         self.error_modal_scroll_offset = 0;
+        self.error_modal_max_scroll.set(0);
+    }
+
+    /// Scroll the error-modal body up by `lines` wrapped lines.
+    pub fn error_modal_scroll_up(&mut self, lines: usize) {
+        self.error_modal_scroll_offset = self.error_modal_scroll_offset.saturating_sub(lines);
+    }
+
+    /// Scroll the error-modal body down by `lines` wrapped lines. Clamped to
+    /// `error_modal_max_scroll` (recomputed each frame by the renderer) so the
+    /// viewport can never scroll past the end of the message.
+    pub fn error_modal_scroll_down(&mut self, lines: usize) {
+        let max = self.error_modal_max_scroll.get();
+        self.error_modal_scroll_offset = (self.error_modal_scroll_offset + lines).min(max);
     }
 
     /// Perform the export based on the selected format. Returns the path written.
@@ -5767,6 +5796,7 @@ impl App {
     ) {
         if kind == NotificationKind::Error {
             self.error_modal_scroll_offset = 0;
+            self.error_modal_max_scroll.set(0);
         }
         self.notifications.push(kind, msg, duration_secs);
     }
@@ -6343,9 +6373,48 @@ impl App {
         // cancel prompt, and the modal stayed up. Any error text worth keeping
         // is already mirrored into the transcript (QueryEvent::Error pushes an
         // assistant message), so dismissing the modal never loses information.
-        if key.code == KeyCode::Esc && self.notifications.current_is_error() {
-            self.dismiss_error_notifications();
-            return false;
+        // Error modal interaction: scroll first (Up/Down/PgUp/PgDn, vim j/k
+        // only in vim mode so plain typing is unaffected), Esc dismisses. The
+        // modal renders above everything (render.rs returns early when it is
+        // up), so a modal visible while `is_streaming` must still be
+        // dismissible — gating on `!is_streaming` here made a provider-failure
+        // modal that arrived mid-turn undismissable: the first Esc paused the
+        // (hidden) transcript, the second armed the cancel prompt, and the
+        // modal stayed up. Any error text worth keeping is already mirrored
+        // into the transcript (QueryEvent::Error pushes an assistant message),
+        // so dismissing the modal never loses information.
+        if self.notifications.current_is_error() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.dismiss_error_notifications();
+                    return false;
+                }
+                KeyCode::Up => {
+                    self.error_modal_scroll_up(1);
+                    return false;
+                }
+                KeyCode::Down => {
+                    self.error_modal_scroll_down(1);
+                    return false;
+                }
+                KeyCode::PageUp => {
+                    self.error_modal_scroll_up(10);
+                    return false;
+                }
+                KeyCode::PageDown => {
+                    self.error_modal_scroll_down(10);
+                    return false;
+                }
+                KeyCode::Home => {
+                    self.error_modal_scroll_offset = 0;
+                    return false;
+                }
+                KeyCode::End => {
+                    self.error_modal_scroll_offset = self.error_modal_max_scroll.get();
+                    return false;
+                }
+                _ => {}
+            }
         }
 
         if self.global_search.visible {
@@ -11556,6 +11625,17 @@ impl App {
             return;
         }
 
+        // The error modal likewise swallows wheel events: it renders above
+        // everything, so scrolling the transcript underneath would be wrong.
+        if self.notifications.current_is_error() {
+            match mouse_event.kind {
+                MouseEventKind::ScrollUp => self.error_modal_scroll_up(3),
+                MouseEventKind::ScrollDown => self.error_modal_scroll_down(3),
+                _ => {}
+            }
+            return;
+        }
+
         // Fast-reject mouse-move events — they flood at 60+ Hz and we don't
         // need hover tracking. Exception: context menu needs hover to update
         // the selected item highlight.
@@ -14773,14 +14853,35 @@ mod tests {
             "bare /history opens the browser"
         );
     }
+    #[test]
+    fn test_history_with_args_opens_browser_prefiltered() {
+        // /history <terms> opens the browser with the filter pre-filled so
+        // the list shows only matching sessions.
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("history", "karaoke video"));
+        assert!(app.session_browser.visible, "arg form opens the browser");
+        assert_eq!(app.session_browser.search_query, "karaoke video");
+    }
 
     #[test]
-    fn test_history_with_args_falls_through_to_text_command() {
+    fn test_error_modal_scroll_clamps_to_measured_max() {
+        // scroll_down never passes the renderer-measured bound, and the
+        // offset returns to 0 on dismissal.
         let mut app = make_app();
-        assert!(!app.intercept_slash_command_with_args("history", "abc123"));
-        assert!(
-            !app.session_browser.visible,
-            "arg form must not open the browser"
+        app.error_modal_max_scroll.set(5);
+        app.error_modal_scroll_down(3);
+        assert_eq!(app.error_modal_scroll_offset, 3);
+        app.error_modal_scroll_down(10);
+        assert_eq!(app.error_modal_scroll_offset, 5, "clamped to max");
+        app.error_modal_scroll_up(2);
+        assert_eq!(app.error_modal_scroll_offset, 3);
+        app.error_modal_scroll_up(10);
+        assert_eq!(app.error_modal_scroll_offset, 0, "saturates at top");
+        app.error_modal_scroll_down(2);
+        app.push_notification(NotificationKind::Error, "fresh error".to_string(), None);
+        assert_eq!(
+            app.error_modal_scroll_offset, 0,
+            "a new error resets the scroll to the top"
         );
     }
 

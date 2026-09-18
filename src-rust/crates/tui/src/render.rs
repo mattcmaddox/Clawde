@@ -1,5 +1,6 @@
 // render.rs â€” All ratatui rendering logic.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 
 use crate::agents_view::render_agents_menu;
@@ -128,9 +129,10 @@ fn render_error_modal(
     frame: &mut Frame,
     area: Rect,
     notification: &Notification,
-    _scroll_offset: usize,
+    scroll_offset: usize,
     footer_area: Rect,
     is_welcome_screen: bool,
+    max_scroll_out: &Cell<usize>,
 ) {
     // When the footer anchor is inside the welcome box (y < WELCOME_BOX_HEIGHT), or explicitly on
     // the welcome screen, center the modal so it doesn't awkwardly overlap the welcome box.
@@ -206,10 +208,51 @@ fn render_error_modal(
         height: body_height,
     };
 
-    let body_para = Paragraph::new(notification.message.as_str())
+    // Scroll support: measure how many wrapped lines the body needs, clamp
+    // the incoming offset to the largest useful one, and report it back so
+    // App's scroll-down clamping stays honest across resizes/message changes.
+    // Measurement uses the dialogs crate's unicode-aware word_wrap (same
+    // greedy word-fill + hard-break model as ratatui's WordWrapper, which
+    // matches `Wrap { trim: true }` for this plain-text body).
+    let wrap_width = body_area.width.max(1) as usize;
+    let total_lines = crate::dialogs::word_wrap(notification.message.as_str(), wrap_width).len();
+    let max_scroll = total_lines.saturating_sub(body_height as usize);
+    let scroll_offset = scroll_offset.min(max_scroll);
+    max_scroll_out.set(max_scroll);
+
+    let mut body_para = Paragraph::new(notification.message.as_str())
         .style(Style::default().fg(Color::Rgb(220, 220, 220)))
         .wrap(Wrap { trim: true });
+    if max_scroll > 0 {
+        body_para = body_para.scroll((scroll_offset as u16, 0));
+    }
     frame.render_widget(body_para, body_area);
+
+    // Scroll affordance: only when the body overflows. Sits on the last body
+    // row so it never collides with the header or separator.
+    if max_scroll > 0 && body_height >= 2 {
+        let hint = if scroll_offset == 0 {
+            " ↓ more · PgDn/End"
+        } else if scroll_offset >= max_scroll {
+            " ↑ top · PgUp/Home"
+        } else {
+            " ↑↓ scroll · Esc close"
+        };
+        let hint_area = Rect {
+            x: modal_area.x + 1,
+            y: modal_area.y + modal_area.height.saturating_sub(2),
+            width: modal_area.width.saturating_sub(2),
+            height: 1,
+        };
+        let hint_spans = vec![
+            Span::styled(
+                " ".repeat(hint_area.width.saturating_sub(hint.width() as u16) as usize),
+                Style::default(),
+            ),
+            Span::styled(hint, Style::default().fg(Color::Rgb(150, 90, 90))),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(hint_spans)), hint_area);
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1272,6 +1315,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
                 app.error_modal_scroll_offset,
                 app.footer_right_column_area.get(),
                 is_welcome_screen,
+                &app.error_modal_max_scroll,
             );
             return; // Don't render other overlays/notifications when error modal is showing
         }
