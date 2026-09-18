@@ -174,7 +174,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `diskCleanThreshold` | integer \| null | 40 | GiB size at which the TUI offers to clean the cargo dev-profile build tree (`cargo clean --profile dev`). Applies only to source checkouts, never deletes without confirmation, and stands down while a build is running or was built in the last 30 minutes. `0` disables the check; `DISK_CLEAN_THRESHOLD_GIB` overrides it and `CLAWDE_DISABLE_DISK_CLEAN=1` opts out entirely. See [Build-tree disk hygiene](advanced.md#build-tree-disk-hygiene). |
+| `diskCleanThreshold` | integer \| null | 40 | GiB size at which the cargo dev-profile build tree is trimmed. Tier 1 drops rustc's incremental cache automatically (the workspace's own crates rebuild, dependencies stay). Tier 2 runs `cargo clean --profile dev` automatically only above 3x this value or when the filesystem is below 10% free, since it costs a dependency rebuild. Applies only to source checkouts and stands down while a build is running or was built in the last 30 minutes. `0` disables the check; `DISK_CLEAN_THRESHOLD_GIB` overrides it and `CLAWDE_DISABLE_DISK_CLEAN=1` opts out entirely. See [Build-tree disk hygiene](advanced.md#build-tree-disk-hygiene). |
 
 ### System prompt
 

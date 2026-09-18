@@ -98,27 +98,46 @@ Building Clawde from a source checkout accumulates artifacts in
 incremental heuristics. A tree can grow to hundreds of GiB and fill the disk
 with no signal until space actually runs out.
 
-When you run the TUI from a source checkout, a background startup check
-measures the dev-profile tree and offers to clean it if it is oversized.
-Nothing is deleted without your consent.
+When you run Clawde from a source checkout (TUI or headless), a background
+startup check measures the dev-profile tree and manages it if it is oversized.
+Both tiers decide on measured rebuild cost and disk pressure — it never asks,
+so there is nothing to answer and nothing to configure.
 
-- Applies **only** to source checkouts — a binary installed with
-  `clawde upgrade` has no `target/` and this is a no-op.
-- Removes **only** the dev profile (`cargo clean --profile dev`). `release`
-  and cross-compile artifacts are never touched.
-- Deleting forces a full rebuild of the next `cargo build`, so it always asks
-  first: a dialog reports the tree size and the path, and offers *Clean it* or
-  *Keep it*. Dismissing the dialog keeps the tree.
-- Never runs while a build is in flight or **within 30 minutes of one**, since
-  `cargo clean` waits on the same lock cargo holds — an unchecked clean would
-  queue behind your build and then wipe the tree the moment it finished.
-- Only the interactive TUI prompts. A run with nobody to ask just warns.
+**Tier 1 — rustc's incremental cache** (`target/debug/incremental`), trimmed
+automatically whenever the tree is over the threshold. Cargo never prunes stale
+build stamp directories out of it, so it is the largest genuinely disposable
+chunk: 4.5 GiB of a 12 GiB tree measured here. Dropping it costs one
+non-incremental rebuild of the workspace's own crates (~14 s measured) and
+leaves dependency rlibs, build-script output and the binary intact. If that
+brings the tree back under the threshold, nothing else happens.
+
+**Tier 2 — the rest of the dev profile** (`cargo clean --profile dev`), which
+costs a full dependency rebuild and therefore has to earn it. It runs
+automatically only when either:
+
+- the tree is **3x the threshold** (120 GiB by default). That means real
+  accumulation — stale rlibs from superseded dependency versions, which cargo
+  never collects and only a full clean removes — rather than a working tree; or
+- the filesystem is **below 10% free**, the situation this whole feature exists
+  for, where a rebuild is nothing next to a full disk.
+
+Anything else is logged and left alone. A merely-oversized tree on a roomy disk
+is not worth minutes of rebuild: even with every cache trimmed, a built
+workspace here holds ~9 GiB of legitimate artifacts.
+
+Both tiers apply **only** to source checkouts — a binary installed with
+`clawde upgrade` has no `target/` and this is a no-op — and only ever touch the
+dev profile. `release` and cross-compile artifacts are never removed.
+
+Neither tier runs while a build is in flight or **within 30 minutes of one**,
+since `cargo clean` waits on the same lock cargo holds — an unchecked clean
+would queue behind your build and then wipe the tree the moment it finished.
 
 ### Controlling it
 
 | Setting | Effect |
 | --- | --- |
-| `diskCleanThreshold: 40` | Clean prompt above 40 GiB (the default) |
+| `diskCleanThreshold: 40` | Trim above 40 GiB (the default) |
 | `diskCleanThreshold: 120` | Raise the threshold |
 | `diskCleanThreshold: 0` | Disable the check entirely |
 | `DISK_CLEAN_THRESHOLD_GIB=80` | Env override, wins over the config value |
@@ -130,10 +149,11 @@ Nothing is deleted without your consent.
 }
 ```
 
-To reclaim the space by hand instead:
+To reclaim the space by hand instead — cheapest first:
 
 ```bash
-cargo clean --profile dev
+rm -rf target/debug/incremental   # tier 1: no dependency rebuild
+cargo clean --profile dev         # tier 2: full rebuild
 ```
 
 ---

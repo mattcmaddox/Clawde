@@ -9,8 +9,8 @@
 //!
 //! This module runs a *background* check at interactive startup: it only acts
 //! on a source checkout (a `target/debug` next to the binary), only when that
-//! tree is oversized past a configurable threshold, and only removes the
-//! rebuildable dev profile — `release` and cross-compile artifacts are never
+//! tree is oversized past a configurable threshold, and only removes
+//! rebuildable artifacts — `release` and cross-compile outputs are never
 //! touched. It is a no-op for non-source installs (`clawde upgrade` binaries)
 //! where no `target/` exists.
 //!
@@ -19,9 +19,15 @@
 //!   so a startup check is sufficient and avoids any runtime cost otherwise.
 //! * The size probe bails early once the running total exceeds the threshold
 //!   rather than fully enumerating an enormous tree.
-//! * Never deletes unattended. Deleting the tree costs the next build a full
-//!   rebuild, so the user is asked to confirm; a run with nobody to ask only
-//!   warns, and an unanswered or dismissed prompt means the tree is kept.
+//! * Tiered, cheapest layer first, and both tiers decide for themselves.
+//!   Tier 1 drops rustc's incremental cache — it costs one non-incremental
+//!   rebuild of the workspace's own crates and leaves dependency artifacts
+//!   alone. Tier 2 is the full `cargo clean --profile dev`, which costs a
+//!   dependency rebuild and therefore only runs when the tree has grown far
+//!   past the threshold or the filesystem is nearly full; a merely-oversized
+//!   tree on a roomy disk is left alone and the sizes are logged. Nothing ever
+//!   waits on an answer from the user, so headless and interactive runs behave
+//!   identically.
 //! * Never deletes during or just after a build. `cargo clean` waits on the
 //!   same lock cargo holds for a build, so an unchecked clean would queue
 //!   behind an in-flight build and then wipe the tree the moment it finished —
@@ -29,13 +35,15 @@
 //! * Runs detached in its own task; the TUI render loop is never blocked.
 //! * `diskCleanThreshold` (or `CLAWDE_DISABLE_DISK_CLEAN=1`) fully disables it.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The built-in threshold (GiB) used when `Config::disk_clean_threshold` is
-/// unset. A fresh dev build is ~6 GiB, so 40 GiB leaves ~6x room for
-/// incremental accumulation before a background clean triggers — catching bloat
-/// well before it pressures the disk.
+/// unset. A dev tree rebuilt from scratch measures ~7 GiB on this workspace, so
+/// 40 GiB leaves room for several rounds of incremental accumulation before a
+/// background clean triggers — catching bloat well before it pressures the
+/// disk.
 pub const DEFAULT_DISK_CLEAN_THRESHOLD_GIB: u64 = 40;
 
 /// Env var that hard-disables automatic debug-target hygiene, mirroring
@@ -43,21 +51,31 @@ pub const DEFAULT_DISK_CLEAN_THRESHOLD_GIB: u64 = 40;
 /// background task.
 const DISABLE_ENV: &str = "CLAWDE_DISABLE_DISK_CLEAN";
 
+/// Subdirectory of the dev profile holding rustc's incremental compilation
+/// cache. Cargo never prunes stale build stamp directories out of it, so it
+/// grows with every rebuild — measured at 4.5 GiB of a 12 GiB tree on this
+/// workspace. No cargo command trims it, so the cheap tier of the clean removes
+/// the directory directly.
+const INCREMENTAL_DIR: &str = "incremental";
+
 /// How recently a build must have touched cargo's dev-profile lock file for
 /// hygiene to stand down. A cold build of this workspace can run past ten
 /// minutes, so anything inside half an hour is plausibly still in use by the
 /// developer who triggered it — and deleting it would cost them a full rebuild.
 const RECENT_BUILD_WINDOW: Duration = Duration::from_secs(30 * 60);
 
-/// How long to wait for an answer to the cleanup prompt before giving up and
-/// leaving the tree alone. The user may leave the dialog open indefinitely.
-const ASK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Multiple of the threshold at which the tree is big enough that a full
+/// dev-profile clean is worth a dependency rebuild. At the default 40 GiB
+/// threshold that is 120 GiB: far beyond the ~9 GiB of legitimate artifacts a
+/// built workspace holds here, so reaching it means stale accumulation (rlibs
+/// from superseded dependency versions, which cargo never collects and only a
+/// full clean removes).
+const FULL_CLEAN_MULTIPLIER: u64 = 3;
 
-/// Option label that authorises the cleanup.
-const CLEAN_OPTION: &str = "Clean it";
-
-/// Option label that keeps the tree.
-const KEEP_OPTION: &str = "Keep it";
+/// Free space below this share of the filesystem triggers a full clean
+/// regardless of tree size. That is the case the whole module exists for: a
+/// full rebuild is nothing next to a full disk.
+const LOW_FREE_SPACE_PERCENT: u128 = 10;
 
 /// Locate the cargo workspace root from the compiled-in manifest dir, exactly
 /// mirroring `build.rs::workspace_root_from`. Returns `None` when this binary
@@ -95,23 +113,53 @@ fn allocated_bytes(md: &std::fs::Metadata) -> u64 {
     md.len()
 }
 
-/// Cheap, early-bail scan of a directory tree's on-disk size in bytes.
+/// Identity of a multiply-linked file, used to charge a hardlinked inode once.
+/// `None` for ordinary single-link files (the overwhelming majority) and on
+/// platforms where we cannot read an inode number.
+#[cfg(unix)]
+fn shared_inode(md: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    (md.nlink() > 1).then(|| (md.dev(), md.ino()))
+}
+
+#[cfg(not(unix))]
+fn shared_inode(_md: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// Result of a size walk.
+struct Sized {
+    /// Block allocation summed so far — an underestimate when `exceeded` is set.
+    bytes: u64,
+    /// Set when the walk stopped early because the running total passed the
+    /// limit, so the caller learns only *that* it is over, never the total.
+    exceeded: bool,
+}
+
+/// Walk `roots` accumulating on-disk size in bytes, stopping as soon as the
+/// running total exceeds `limit`. Pass `u64::MAX` for an exhaustive total.
 ///
 /// Uses an explicit stack rather than recursion so arbitrarily deep trees
-/// cannot overflow the call stack. Stops accumulating (and returns `true`)
-/// as soon as the running total exceeds `limit` — it never needs to enumerate
-/// the remainder of an oversized tree to know it is oversized.
+/// cannot overflow the call stack. The early bail is what makes the common
+/// "is this tree oversized?" question cheap: it never has to enumerate the
+/// remainder of an enormous tree to answer it.
 ///
 /// Sizes use filesystem *block allocation* (`st_blocks`), not logical `len`:
-/// cargo's `incremental`/`.fingerprint` dirs hold hundreds of thousands of
-/// tiny files that each occupy a 4 KiB block despite tiny logical sizes, so a
-/// logical scan would under-report real disk pressure by an order of magnitude
-/// — meaning hygiene would only trigger after the disk was already nearly
-/// full. Directories themselves allocate negligible blocks and are skipped;
-/// symlinks are not followed (their own small allocation is ignored).
-fn tree_exceeds(roots: &[PathBuf], limit: u64) -> bool {
+/// cargo's `incremental`/`.fingerprint` trees hold thousands of small files
+/// that each occupy a full 4 KiB block, so a logical scan under-reports real
+/// disk pressure — and hygiene would then only trigger once the disk was
+/// already nearly full. Directories themselves allocate negligible blocks and
+/// are skipped; symlinks are not followed (their own small allocation is
+/// ignored).
+///
+/// Multiply-linked files are charged once, matching `du`: cargo hardlinks every
+/// workspace binary from `deps/` into the profile root, so without inode
+/// de-duplication the same bytes are counted twice — measured at 2.4 GiB of an
+/// 8.6 GiB tree here, enough to make hygiene fire early.
+fn walk_alloc(roots: &[PathBuf], limit: u64) -> Sized {
     let mut stack: Vec<PathBuf> = roots.to_vec();
-    let mut total: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut charged: HashSet<(u64, u64)> = HashSet::new();
 
     while let Some(path) = stack.pop() {
         let md = match std::fs::symlink_metadata(&path) {
@@ -125,13 +173,34 @@ fn tree_exceeds(roots: &[PathBuf], limit: u64) -> bool {
                 }
             }
         } else if !md.is_symlink() {
-            total = total.saturating_add(allocated_bytes(&md));
-            if total > limit {
-                return true;
+            if let Some(inode) = shared_inode(&md) {
+                if !charged.insert(inode) {
+                    continue; // the same inode under another name
+                }
+            }
+            bytes = bytes.saturating_add(allocated_bytes(&md));
+            if bytes > limit {
+                return Sized {
+                    bytes,
+                    exceeded: true,
+                };
             }
         }
     }
-    false
+    Sized {
+        bytes,
+        exceeded: false,
+    }
+}
+
+/// The dev-profile output directory that hygiene manages.
+fn debug_dir(workspace: &Path) -> PathBuf {
+    workspace.join("target").join("debug")
+}
+
+/// rustc's incremental cache inside the dev profile.
+fn incremental_dir(workspace: &Path) -> PathBuf {
+    debug_dir(workspace).join(INCREMENTAL_DIR)
 }
 
 /// Decide whether the debug target tree is oversized relative to `limit_bytes`.
@@ -139,17 +208,17 @@ fn tree_exceeds(roots: &[PathBuf], limit: u64) -> bool {
 ///
 /// Byte-native (not GiB) so it stays directly testable with small limits.
 fn oversized_debug_target(workspace: &Path, limit_bytes: u64) -> Option<bool> {
-    let debug = workspace.join("target").join("debug");
+    let debug = debug_dir(workspace);
     if !debug.is_dir() {
         return None; // not a debug source checkout (already cleaned or release-only)
     }
-    Some(tree_exceeds(&[debug], limit_bytes))
+    Some(walk_alloc(&[debug], limit_bytes).exceeded)
 }
 
 /// The dev-profile lock file cargo holds (and refreshes the mtime of) for the
 /// whole of a build.
 fn debug_lock_path(workspace: &Path) -> PathBuf {
-    workspace.join("target").join("debug").join(".cargo-lock")
+    debug_dir(workspace).join(".cargo-lock")
 }
 
 /// True when the dev profile is being built right now, or was built recently.
@@ -202,24 +271,111 @@ fn lock_is_held(_path: &Path) -> bool {
     false
 }
 
+/// Bytes as GiB, for log lines.
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// Free-space facts for the filesystem holding the build tree.
+#[derive(Clone, Copy)]
+struct Space {
+    /// Bytes available to this process.
+    free: u64,
+    /// Filesystem size, so "running out of room" is a share rather than a raw
+    /// byte count that means something different on a laptop than on a 2 TB
+    /// drive.
+    total: u64,
+}
+
+/// Space on the filesystem holding `path`.
+///
+/// `None` when it cannot be read, which keeps hygiene from escalating a
+/// dependency-rebuild-costing clean on a guess.
+#[cfg(unix)]
+fn space_at(path: &Path) -> Option<Space> {
+    let vfs = nix::sys::statvfs::statvfs(path).ok()?;
+    // Block counts are in fragment units, not `block_size` — mixing the two is
+    // the classic statvfs error and skews the answer by orders of magnitude.
+    // Accumulated in u128 so a multi-exabyte filesystem cannot overflow, then
+    // saturated back down. (Not `u64::from`: the libc counters are already u64
+    // on Linux, which clippy flags as a useless conversion.)
+    let unit = u128::from(vfs.fragment_size());
+    let free = u128::from(vfs.blocks_available()) * unit;
+    let total = u128::from(vfs.blocks()) * unit;
+    Some(Space {
+        free: u64::try_from(free).unwrap_or(u64::MAX),
+        total: u64::try_from(total).unwrap_or(u64::MAX),
+    })
+}
+
+#[cfg(not(unix))]
+fn space_at(_path: &Path) -> Option<Space> {
+    None
+}
+
+/// Whether the tree justifies the expensive tier.
+///
+/// Two independent triggers, because either on its own is wrong: a tree far past
+/// the threshold is pathological accumulation worth clearing even on an empty
+/// drive, while a modest tree is worth clearing when the filesystem is nearly
+/// full — and a merely-oversized tree on a roomy disk is worth neither.
+fn warrants_full_clean(tree_bytes: u64, threshold_bytes: u64, space: Option<Space>) -> bool {
+    if tree_bytes >= threshold_bytes.saturating_mul(FULL_CLEAN_MULTIPLIER) {
+        return true;
+    }
+    match space {
+        Some(space) if space.total > 0 => {
+            let free_percent = u128::from(space.free) * 100 / u128::from(space.total);
+            free_percent < LOW_FREE_SPACE_PERCENT
+        }
+        _ => false,
+    }
+}
+
+/// Outcome of the unattended tier-1 trim.
+enum Trimmed {
+    /// Bytes reclaimed; `0` when there was no cache present to remove.
+    Freed(u64),
+    /// A build appeared between the probe and the trim, so the whole pass
+    /// stands down rather than deleting files a live `rustc` may be writing.
+    BuildStarted,
+}
+
+/// Remove rustc's incremental cache, returning the bytes it occupied.
+///
+/// `0` when there is nothing there or the removal failed (logged, never fatal).
+/// The caller owns the build-in-progress check — this deletes unconditionally,
+/// because removing the cache out from under a live `rustc` breaks the build
+/// already in flight.
+fn trim_incremental(workspace: &Path) -> u64 {
+    let dir = incremental_dir(workspace);
+    if !dir.is_dir() {
+        return 0;
+    }
+    let freed = walk_alloc(std::slice::from_ref(&dir), u64::MAX).bytes;
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        tracing::warn!("could not remove {}: {e}", dir.display());
+        return 0;
+    }
+    freed
+}
+
 /// Perform automatic debug-target hygiene if warranted. Idempotent, silent on
 /// success unless action was taken, never errors the process.
 ///
 /// The passed `threshold_gib` is `Config::disk_clean_threshold` resolved via
 /// `unwrap_or(DEFAULT_DISK_CLEAN_THRESHOLD_GIB)` (0 disables hygiene entirely);
 /// a `DISK_CLEAN_THRESHOLD_GIB` env override wins over it.
-/// Cleanup runs `cargo clean --profile dev` in the workspace — it removes the
-/// dev profile's build artifacts but preserves `release` and cross-compile
-/// outputs (which the release pipeline still needs).
 ///
-/// Deleting is never unattended: `ask` is the interactive session's question
-/// channel, and `None` (or an unanswered/dismissed prompt) only warns. Cargo's
-/// dev-profile lock is honoured too, so a build in flight — or one that just
-/// finished — is never wiped.
-pub async fn run(
-    threshold_gib: u64,
-    ask: Option<tokio::sync::mpsc::UnboundedSender<clawde_tools::UserQuestionEvent>>,
-) {
+/// Cleaning is tiered and both tiers decide for themselves — nothing waits on an
+/// answer from the user, so a headless run behaves exactly like an interactive
+/// one. Tier 1 drops rustc's incremental cache. Tier 2 runs `cargo clean
+/// --profile dev` in the workspace, removing the rest of the dev profile but
+/// preserving `release` and cross-compile outputs (which the release pipeline
+/// still needs), and only when the tree has grown far past the threshold or the
+/// filesystem is nearly full. Cargo's dev-profile lock is honoured before every
+/// deletion, so a build in flight — or one that just finished — is never wiped.
+pub async fn run(threshold_gib: u64) {
     // Hard opt-out (belt and suspenders to the config knob).
     if std::env::var(DISABLE_ENV).is_ok() {
         tracing::debug!("{DISABLE_ENV} set — skipping automatic debug-target hygiene");
@@ -266,7 +422,7 @@ pub async fn run(
         return;
     }
 
-    let debug_dir = workspace.join("target").join("debug");
+    let tree_dir = debug_dir(&workspace);
 
     // `cargo clean` waits on the same lock cargo takes for a build, so without
     // this it would queue behind an in-flight build and then wipe the tree the
@@ -274,65 +430,100 @@ pub async fn run(
     if build_active_or_recent(&workspace) {
         tracing::debug!(
             "dev profile is being built or was built recently — leaving {} alone",
-            debug_dir.display()
+            tree_dir.display()
         );
         return;
     }
 
-    // Deleting the tree costs the next build a full rebuild, so it is never done
-    // unattended: ask first, and only warn when there is nobody to ask.
-    let Some(ask) = ask else {
+    // Tier 1: rustc's incremental cache on its own. This runs unattended
+    // because it is the cheap lever — it costs one non-incremental rebuild of
+    // the workspace's own crates (a measured ~14 s here) while leaving
+    // dependency rlibs, build-script output and the binary in place. Prompting
+    // for a seconds-long action would only train the user to click through the
+    // dialog that guards the expensive one. The build check is repeated inside
+    // the blocking task so a build that started since the probe is not caught
+    // with a live `rustc` writing into the directory being removed.
+    let trim_ws = workspace.clone();
+    let trimmed = tokio::task::spawn_blocking(move || {
+        if build_active_or_recent(&trim_ws) {
+            Trimmed::BuildStarted
+        } else {
+            Trimmed::Freed(trim_incremental(&trim_ws))
+        }
+    })
+    .await;
+    let freed = match trimmed {
+        Ok(Trimmed::Freed(freed)) => freed,
+        Ok(Trimmed::BuildStarted) => {
+            tracing::debug!("a build started during the hygiene pass — leaving the tree alone");
+            return;
+        }
+        Err(_) => return, // blocking task panicked — never fail the process
+    };
+    if freed > 0 {
         tracing::warn!(
-            "debug target at {} exceeded {threshold_gib} GiB — not cleaning automatically \
-             (no interactive session to confirm); run `cargo clean --profile dev` to reclaim the space",
-            debug_dir.display()
+            "trimmed rustc's incremental cache ({:.1} GiB) — regenerated on the next build",
+            gib(freed)
         );
-        return;
-    };
+    }
 
-    let question = format!(
-        "The cargo debug build tree is over {threshold_gib} GiB:\n  {}\n\nDelete the dev-profile \
-         artifacts to reclaim the space? The next `cargo build` then has to rebuild everything.",
-        debug_dir.display()
-    );
-    let options = vec![CLEAN_OPTION.to_string(), KEEP_OPTION.to_string()];
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if ask
-        .send(clawde_tools::UserQuestionEvent {
-            question,
-            options: Some(options),
-            reply_tx,
-        })
-        .is_err()
-    {
-        tracing::debug!("question channel closed — leaving the debug target alone");
+    // Measure exactly now that the cheap tier is done. The walk is ~60 ms on a
+    // 13k-file tree and this branch only runs while the tree is over threshold,
+    // so the cost is irrelevant — and the real number lets the log state what
+    // was measured instead of restating the threshold.
+    let measure_path = debug_dir(&workspace);
+    let tree_bytes =
+        tokio::task::spawn_blocking(move || walk_alloc(&[measure_path], u64::MAX).bytes)
+            .await
+            .unwrap_or(0);
+    if tree_bytes <= limit_bytes {
+        tracing::debug!(
+            "debug target is back under {threshold_gib} GiB after trimming the incremental cache"
+        );
         return;
     }
 
-    // The dialog may be left open, or the session may exit with it unanswered.
-    // Dismissing replies with an empty string, which is not consent either.
-    let answer = match tokio::time::timeout(ASK_TIMEOUT, reply_rx).await {
-        Ok(Ok(answer)) => answer,
-        Ok(Err(_)) => {
-            tracing::debug!("cleanup prompt dropped unanswered — leaving the tree alone");
-            return;
+    // Tier 2 costs a dependency rebuild, so it has to earn it: the tree must be
+    // pathological or the disk must actually be under pressure. Being over an
+    // arbitrary GiB threshold is not by itself a problem — this workspace holds
+    // ~9 GiB of legitimate artifacts even with every cache trimmed — so a tree
+    // that is merely oversized on a roomy disk is logged and left alone.
+    let space = space_at(&tree_dir);
+    if !warrants_full_clean(tree_bytes, limit_bytes, space) {
+        match space {
+            Some(space) => tracing::info!(
+                "debug target at {} is {:.1} GiB, {:.0} GiB free of {:.0} GiB — keeping it; \
+                 a full clean runs above {} GiB or below {LOW_FREE_SPACE_PERCENT}% free",
+                tree_dir.display(),
+                gib(tree_bytes),
+                gib(space.free),
+                gib(space.total),
+                threshold_gib * FULL_CLEAN_MULTIPLIER
+            ),
+            None => tracing::info!(
+                "debug target at {} is {:.1} GiB — keeping it (free space unreadable)",
+                tree_dir.display(),
+                gib(tree_bytes)
+            ),
         }
-        Err(_) => {
-            tracing::debug!(
-                "no answer to the cleanup prompt within {}s — leaving the tree alone",
-                ASK_TIMEOUT.as_secs()
-            );
-            return;
-        }
-    };
-    if answer.trim() != CLEAN_OPTION {
-        tracing::info!("debug-target cleanup not confirmed — nothing removed");
+        return;
+    }
+
+    // `cargo clean` waits on the same lock cargo holds for a build — without
+    // this re-check the clean would queue behind a build and wipe the tree the
+    // moment that build finished.
+    if build_active_or_recent(&workspace) {
+        tracing::debug!(
+            "a build started before the clean could run — leaving {} alone",
+            tree_dir.display()
+        );
         return;
     }
 
     tracing::warn!(
-        "debug target at {} exceeded {threshold_gib} GiB — confirmed by the user, running `cargo clean --profile dev`",
-        debug_dir.display()
+        "debug target at {} is {:.1} GiB — running `cargo clean --profile dev`",
+        tree_dir.display(),
+        gib(tree_bytes)
     );
     let output = tokio::process::Command::new("cargo")
         .arg("clean")
@@ -360,20 +551,16 @@ pub async fn run(
 }
 
 /// Spawn the hygiene pass as a detached background task. `threshold_gib` comes
-/// from `Config::disk_clean_threshold` (0 disables), and `ask` is the
-/// interactive session's question channel used to confirm the deletion. Callers
-/// invoke this once at startup; it never blocks and cannot fail the process.
-pub fn spawn(
-    threshold_gib: u64,
-    ask: Option<tokio::sync::mpsc::UnboundedSender<clawde_tools::UserQuestionEvent>>,
-) {
+/// from `Config::disk_clean_threshold` (0 disables). Callers invoke this once at
+/// startup; it never blocks and cannot fail the process.
+pub fn spawn(threshold_gib: u64) {
     // Deliberately a detached task rather than a `pending_writes::spawn`: a
-    // cleanup the user approved should be allowed to finish even if they quit
-    // while it runs, and waiting on a multi-GiB delete at exit would make
+    // cleanup already underway should be allowed to finish even if the user
+    // quits while it runs, and waiting on a multi-GiB delete at exit would make
     // quitting slow. Cancelling it would leave the tree half-removed; letting
     // it complete (or be killed by the OS at worst) is the better failure mode.
     tokio::spawn(async move {
-        run(threshold_gib, ask).await;
+        run(threshold_gib).await;
     });
 }
 
@@ -498,8 +685,8 @@ mod tests {
     #[cfg(unix)]
     fn many_small_files_measured_by_block_allocation() {
         // Regression: the probe must charge per-file block allocation, not
-        // logical size. Cargo's incremental dirs hold hundreds of thousands of
-        // tiny files — if we summed logical `len`, 40 × 1-byte files would
+        // logical size. Cargo's incremental/.fingerprint trees hold thousands
+        // of small files — if we summed logical `len`, 40 × 1-byte files would
         // measure 40 bytes and under-report real disk pressure by an order of
         // magnitude. The probe must instead measure the same `du -sk` total.
         let ws = tmp_workspace();
@@ -510,12 +697,170 @@ mod tests {
         // 40 files × ≤4 KiB alloc ≈ ≥160 KiB. A threshold slightly below the
         // block total MUST trip even though logical bytes are only 40 —
         // proving allocation, not logical size, is what's measured.
-        let tight = 1024 * 21; // ~21 KiB mouth allocations
+        let tight = 1024 * 21; // ~21 KiB of block allocations
         assert!(oversized_debug_target(&ws, tight).unwrap());
 
         // A generous threshold well above the block total does not trip.
         let loose = 8 * MIB;
         assert!(!oversized_debug_target(&ws, loose).unwrap());
+
+        fs::remove_dir_all(&ws).unwrap();
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn full_clean_needs_gross_oversize_or_disk_pressure() {
+        let threshold = 40 * GIB;
+        let roomy = Some(Space {
+            free: 700 * GIB,
+            total: 1900 * GIB,
+        });
+
+        // A modest oversize on a roomy disk must not cost a dependency rebuild.
+        assert!(!warrants_full_clean(2 * threshold, threshold, roomy));
+        // Gross accumulation is worth clearing even with the drive half empty.
+        assert!(warrants_full_clean(3 * threshold, threshold, roomy));
+        // A nearly-full disk is worth clearing at any size above the threshold.
+        assert!(warrants_full_clean(
+            threshold + 1,
+            threshold,
+            Some(Space {
+                free: 10,
+                total: 200
+            })
+        ));
+        // Exactly at the free-space bar is not yet pressure.
+        assert!(!warrants_full_clean(
+            threshold + 1,
+            threshold,
+            Some(Space {
+                free: 200,
+                total: 2000
+            })
+        ));
+        // Unreadable free space must not escalate on a guess...
+        assert!(!warrants_full_clean(2 * threshold, threshold, None));
+        // ...but gross oversize still stands on its own.
+        assert!(warrants_full_clean(4 * threshold, threshold, None));
+        // A zero-size filesystem record is not an emergency.
+        assert!(!warrants_full_clean(
+            threshold + 1,
+            threshold,
+            Some(Space { free: 0, total: 0 })
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn space_at_reads_a_real_filesystem() {
+        let space = space_at(&std::env::temp_dir()).expect("statvfs must work on a real dir");
+        assert!(space.total > 0, "a mounted filesystem has a size");
+        assert!(
+            space.free <= space.total,
+            "free space cannot exceed the filesystem size"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hardlinked_binaries_are_charged_once() {
+        // Regression: cargo hardlinks every workspace binary from `deps/` into
+        // the profile root and `du` charges that inode once. Summing per-link
+        // block counts over-reports by the size of every binary (2.4 GiB on an
+        // 8.6 GiB tree when this was found), which trips hygiene early.
+        let ws = tmp_workspace();
+        add_file(&ws, "deps/clawde-deadbeef", 2 * MIB);
+        fs::hard_link(
+            ws.join("target")
+                .join("debug")
+                .join("deps")
+                .join("clawde-deadbeef"),
+            ws.join("target").join("debug").join("clawde"),
+        )
+        .unwrap();
+
+        let total = walk_alloc(&[ws.join("target").join("debug")], u64::MAX).bytes;
+        assert!(
+            total >= 2 * MIB,
+            "the inode itself must still be charged, got {total}"
+        );
+        assert!(
+            total < 3 * MIB,
+            "a second link must not be charged again, got {total} bytes"
+        );
+
+        fs::remove_dir_all(&ws).unwrap();
+    }
+
+    #[test]
+    fn walk_alloc_bails_early_only_when_over_limit() {
+        let ws = tmp_workspace();
+        add_file(&ws, "deps/one", 2 * MIB);
+        let debug = ws.join("target").join("debug");
+
+        let over = walk_alloc(std::slice::from_ref(&debug), MIB);
+        assert!(
+            over.exceeded,
+            "2 MiB over a 1 MiB limit must report exceeded"
+        );
+        assert!(over.bytes >= 2 * MIB, "the crossing file is included");
+
+        let under = walk_alloc(&[debug], 100 * MIB);
+        assert!(!under.exceeded);
+        assert!(
+            under.bytes >= 2 * MIB,
+            "an exhaustive walk must total the tree, got {}",
+            under.bytes
+        );
+
+        fs::remove_dir_all(&ws).unwrap();
+    }
+
+    #[test]
+    fn trim_incremental_removes_only_the_cache() {
+        // The tier-1 clean must never cost the developer a dependency rebuild:
+        // deps/ and build/ have to survive it. This is the whole reason the
+        // tiers exist rather than one blanket `cargo clean`.
+        let ws = tmp_workspace();
+        add_file(&ws, "incremental/unit-a", MIB);
+        add_file(&ws, "incremental/unit-b", MIB);
+        add_file(&ws, "deps/keep-me", MIB);
+        add_file(&ws, "build/keep-me", MIB);
+
+        let freed = trim_incremental(&ws);
+
+        assert!(
+            freed >= 2 * MIB,
+            "must report the cache it removed, got {freed}"
+        );
+        assert!(
+            !incremental_dir(&ws).exists(),
+            "the incremental cache must be gone"
+        );
+        let debug = ws.join("target").join("debug");
+        assert!(
+            debug.join("deps").join("keep-me").is_file(),
+            "dependency artifacts must survive a tier-1 trim"
+        );
+        assert!(
+            debug.join("build").join("keep-me").is_file(),
+            "build-script output must survive a tier-1 trim"
+        );
+
+        fs::remove_dir_all(&ws).unwrap();
+    }
+
+    #[test]
+    fn trim_incremental_is_a_noop_without_a_cache() {
+        let ws = tmp_workspace();
+        add_file(&ws, "deps/keep-me", 1024);
+
+        assert_eq!(
+            trim_incremental(&ws),
+            0,
+            "nothing to trim reports zero bytes"
+        );
 
         fs::remove_dir_all(&ws).unwrap();
     }
