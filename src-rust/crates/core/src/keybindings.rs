@@ -189,7 +189,10 @@ pub const NON_REBINDABLE: &[&str] = &["ctrl+c", "ctrl+d", "ctrl+m"];
 /// Default keybindings with comprehensive coverage of text editing, navigation, vim, and TUI actions
 ///
 /// # Standard Keybindings (Phase 1 Implementation)
-/// - **Ctrl+L**: Clear current input line (like bash) [Chat context only due to conflict]
+/// - **Ctrl+L**: Force a full repaint (readline's clear-screen), the manual
+///   escape from a render desync
+/// - **Ctrl+Shift+L**: Clear the current input line (moved off Ctrl+L, which
+///   readline reserves for clear-screen)
 /// - **Ctrl+Shift+A**: Open the model picker
 /// - **Ctrl+K**: Open the command palette
 /// - **Ctrl+U**: Kill input from cursor to start of line (Emacs-style)
@@ -209,6 +212,11 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== GLOBAL CONTROL ==========
         // ("ctrl+c", "interrupt", KeyContext::Global), // Handled directly in handle_key_event for two-press confirmation
         // ("ctrl+d", "exit", KeyContext::Global), // Handled directly in handle_key_event for two-press confirmation
+        // Ctrl+L == readline's clear-screen. This is the user-triggered escape
+        // from a render desync; `needs_full_repaint` makes the frame loop clear
+        // the terminal before the next draw. It must stay in the Global context
+        // so it also works from Chat — a context-specific binding outranks this
+        // one (see the `clearLine` note in the Chat table).
         ("ctrl+l", "redraw", KeyContext::Global),
         ("alt+r", "historySearch", KeyContext::Global),
         ("alt+f", "toggleFollowupHistory", KeyContext::Chat),
@@ -261,7 +269,11 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // Character/line deletion
         ("ctrl+h", "deleteCharBefore", KeyContext::Chat),
         ("ctrl+u", "killToStart", KeyContext::Chat),
-        ("ctrl+l", "clearLine", KeyContext::Chat),
+        // Clearing the input line is an *edit*, and a destructive one, so it
+        // does not belong on Ctrl+L: readline uses that key to clear the
+        // screen, and a Chat-context binding would shadow the Global `redraw`
+        // action. Ctrl+Shift+L keeps the capability without the conflict.
+        ("ctrl+shift+l", "clearLine", KeyContext::Chat),
         // History navigation
         ("up", "historyPrev", KeyContext::Chat),
         // Shift+J/K are case-insensitive vertical-navigation aliases. The TUI
@@ -515,7 +527,14 @@ const EMACS_PRESET_EXTRAS: &[(&str, &str, KeyContext)] = &[
 /// the old name, and `smart_merge_with_defaults` is the only thing that rewrites
 /// it, so without a bump the renamed action matches no handler and the chord
 /// silently stops doing anything.
-pub const KEYBINDINGS_SCHEMA_VERSION: u32 = 2;
+///
+/// Also bumped when a default *chord* moves. A persisted file is materialised
+/// from the defaults it was written against, so the old chord stays bound to the
+/// old action; and because a row that no longer matches a default is re-added as
+/// a context-less (Global) binding, it outranks the new default rather than
+/// merely lingering. The bump gives `smart_merge_with_defaults` the chance to
+/// retire the old row.
+pub const KEYBINDINGS_SCHEMA_VERSION: u32 = 3;
 /// User keybindings loaded from ~/.clawde/keybindings.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserKeybindings {
@@ -693,6 +712,19 @@ impl UserKeybindings {
             if binding.chord == "shift+tab"
                 && binding.context.as_deref() == Some("Chat")
                 && binding.action.as_deref() == Some("reverseIndent")
+            {
+                continue;
+            }
+
+            // Old: ctrl+l -> clearLine in Chat. Ctrl+L is readline's
+            // clear-screen and now drives the Global `redraw` action, so this
+            // row has to be dropped rather than carried through: a row with no
+            // matching default is re-added as a context-less (= Global)
+            // binding, which resolves ahead of the default and keeps Ctrl+L on
+            // the editing action. The edit itself moved to ctrl+shift+l.
+            if binding.chord == "ctrl+l"
+                && binding.context.as_deref() == Some("Chat")
+                && binding.action.as_deref() == Some("clearLine")
             {
                 continue;
             }
@@ -1259,9 +1291,21 @@ mod tests {
     fn test_resolver_context_match_global_from_chat() {
         let user = UserKeybindings::default();
         let mut resolver = KeybindingResolver::new(&user);
-        // ctrl+l in Chat context maps to "clearLine" (newly added Phase 1 keybinding)
-        // Global context is checked after context-specific bindings
+        // Global context is checked after context-specific bindings, so a Chat
+        // binding on the same chord would shadow `redraw`. Ctrl+L must resolve
+        // to the repaint from inside Chat, which is where a desync is seen.
         let ks = parse_keystroke("ctrl+l").unwrap();
+        let result = resolver.process(ks, &KeyContext::Chat);
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "redraw"));
+    }
+
+    #[test]
+    fn clear_line_moved_off_ctrl_l() {
+        // Ctrl+L clearing the input line shadowed the Global repaint binding;
+        // the capability lives on Ctrl+Shift+L instead.
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+        let ks = parse_keystroke("ctrl+shift+l").unwrap();
         let result = resolver.process(ks, &KeyContext::Chat);
         assert!(matches!(result, KeybindingResult::Action(ref a) if a == "clearLine"));
     }
@@ -1446,6 +1490,41 @@ mod tests {
             action_in("HistorySearch").as_deref(),
             Some("togglePreview"),
             "the other context's binding must not be hijacked by the same chord"
+        );
+    }
+
+    #[test]
+    fn test_ctrl_l_line_clearing_migrates_to_the_repaint() {
+        // A persisted file (schema 2) binds `Chat|ctrl+l -> clearLine`,
+        // materialised from the defaults of its day. Ctrl+L now drives the
+        // Global `redraw` action, and the stale row must be retired: the merge
+        // re-adds unmatched rows as context-less (= Global) bindings, which
+        // resolve ahead of the default, so leaving it in place kept Ctrl+L
+        // clearing the input *and* left no reachable repaint binding.
+        let stale = r#"{
+            "schema_version": 2,
+            "preset": "vim",
+            "bindings": [
+                { "chord": "ctrl+l", "action": "redraw", "context": "Global" },
+                { "chord": "ctrl+l", "action": "clearLine", "context": "Chat" },
+                { "chord": "ctrl+u", "action": "killToStart", "context": "Chat" }
+            ]
+        }"#;
+        let mut kb = UserKeybindings::from_json_str(stale);
+        kb.smart_merge_with_defaults();
+        let mut resolver = KeybindingResolver::new(&kb);
+
+        let ks = parse_keystroke("ctrl+l").unwrap();
+        assert!(
+            matches!(resolver.process(ks, &KeyContext::Chat),
+                     KeybindingResult::Action(ref a) if a == "redraw"),
+            "Ctrl+L must reach the repaint from Chat, where a desync is seen"
+        );
+        let ks = parse_keystroke("ctrl+shift+l").unwrap();
+        assert!(
+            matches!(resolver.process(ks, &KeyContext::Chat),
+                     KeybindingResult::Action(ref a) if a == "clearLine"),
+            "clearing the input line moved to Ctrl+Shift+L"
         );
     }
 

@@ -4520,6 +4520,14 @@ async fn run_interactive(
             app.pending_auto_submit = true;
         }
 
+        // Ctrl+L (`redraw`): the manual escape from a desync. The signal-driven
+        // clear below only fires when the scroll signal moves, so a desync the
+        // terminal itself caused (wide/ambiguous glyphs) needs this on demand.
+        if app.needs_full_repaint {
+            app.needs_full_repaint = false;
+            let _ = terminal.clear();
+        }
+
         // If the transcript scrolled since the last frame, force a full screen
         // clear so wide/ambiguous-glyph desync can't leave ghost fragments of
         // scrolled-away lines (see note at the top of the loop).

@@ -1346,6 +1346,10 @@ pub struct App {
     /// observes this and cancels the live query's cancellation token (the
     /// same hard interrupt Ctrl+C uses in `handle_exit_key`).
     pub stream_cancel_requested: bool,
+    /// Set by the `redraw` action (Ctrl+L). The CLI frame loop consumes it and
+    /// clears the terminal before the next draw, which is the manual escape
+    /// from a render desync the automatic scroll guard cannot see.
+    pub needs_full_repaint: bool,
     pub input: String,
     pub prompt_input: PromptInputState,
     pub input_history: Vec<String>,
@@ -2213,6 +2217,7 @@ impl App {
             compact_cancel_requested: false,
             stream_paused: false,
             stream_cancel_requested: false,
+            needs_full_repaint: false,
             ctx_warning_rx: None,
             terminal_focused: true,
             input: String::new(),
@@ -10249,7 +10254,14 @@ impl App {
                 }
                 false
             }
-            "redraw" => false,
+            "redraw" => {
+                // Ctrl+L: ask the frame loop for a full clear before the next
+                // draw. The automatic guard in cli/main.rs only fires when the
+                // scroll signal moves, so a desync the terminal itself caused
+                // (wide/ambiguous glyphs) needs a user-triggered clear.
+                self.needs_full_repaint = true;
+                false
+            }
             "historySearch" => {
                 let overlay = HistorySearchOverlay::open(&self.prompt_input.history);
                 self.history_search_overlay = overlay;
@@ -13352,6 +13364,19 @@ mod tests {
             app.cost_tracker.total_cost_usd(),
             0.0,
             "a free/auto session must not report a cost"
+        );
+    }
+
+    #[test]
+    fn redraw_action_requests_a_full_repaint() {
+        // Ctrl+L is the manual escape from a render desync. The action used to
+        // return without doing anything, so the Global binding was a no-op.
+        let mut app = make_app();
+        assert!(!app.needs_full_repaint);
+        app.handle_keybinding_action("redraw");
+        assert!(
+            app.needs_full_repaint,
+            "the redraw action must ask the frame loop for a full clear"
         );
     }
 
