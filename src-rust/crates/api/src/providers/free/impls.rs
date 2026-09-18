@@ -2440,8 +2440,8 @@ impl Stream for RetryingFreeStream {
                     return Poll::Ready(Some(Ok(evt)));
                 }
                 Poll::Ready(Some(Err(err))) => {
-                    // Once any content has been exposed, replaying the full
-                    // request on another upstream would duplicate visible
+                    // Once any real output has left this stream, replaying the
+                    // full request on another upstream would duplicate visible
                     // assistant output. Record the failure but surface it to
                     // the caller instead of silently switching streams.
                     if self.first_byte_received {
@@ -2449,7 +2449,14 @@ impl Stream for RetryingFreeStream {
                         self.maybe_cooldown_upstream_for_5xx(self.current_idx, &err);
                         return Poll::Ready(Some(Err(err)));
                     }
-                    if FreeProvider::should_fallback(&err) {
+                    // No output was committed here: either nothing arrived yet,
+                    // or the refusal-buffer still holds withheld, uncommitted
+                    // content. Both are replay-safe, so fall through on ANY
+                    // error class when nothing has left the stream — including
+                    // a mid-stream "VisibleStreamFailure" whose partial wire
+                    // output is withheld and discarded by discard_deferred()
+                    // ahead of the next attempt (never a partial-relay leak).
+                    if !self.first_byte_received || FreeProvider::should_fallback(&err) {
                         self.record_failure(self.current_idx);
                         self.maybe_cooldown_upstream_for_5xx(self.current_idx, &err);
                         let uid = self.chain[self.current_idx].upstream.id;

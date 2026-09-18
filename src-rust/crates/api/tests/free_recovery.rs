@@ -487,3 +487,174 @@ async fn streaming_success_records_last_route_telemetry() {
         assert_eq!(last.usage.reasoning_tokens, 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tool-decline refusal buffering: hide, then auto-switch upstream
+// ---------------------------------------------------------------------------
+
+const REFUSAL_TEXT: &str = "The Bash tool is currently inactive, which means I cannot directly execute the SSH commands needed to verify TheHive's setup. I need to either: 1. Have the Bash tool enabled in this session, or 2. receive the output from you directly.";
+const FALLBACK_ANSWER: &str = "Verified TheHive is reachable and the remote build is configured.";
+const NORMAL_ANSWER: &str = "Here is a summary of what I checked on TheHive.";
+
+/// `request()` equipped with a Bash tool definition — required so FreeProvider
+/// sees a tool-bearing request and the refusal-buffer engages.
+fn tool_request() -> ProviderRequest {
+    let mut req = request();
+    req.tools = vec![clawde_core::types::ToolDefinition {
+        name: "bash".to_string(),
+        description: "run a shell command".to_string(),
+        input_schema: serde_json::json!({"type": "object", "properties": {}}),
+    }];
+    req
+}
+
+/// A completed tool-decline refusal ("The Bash tool is inactive…", zero tool
+/// calls) must be hidden and the request transparently re-dispatched to the
+/// next upstream — the user only ever sees the working model's reply.
+#[tokio::test]
+async fn tool_decline_refusal_hidden_and_switches_upstream() {
+    let _dispatch = dispatch_guard().await;
+    let chain = Chain::new(
+        vec![ScriptedResponse::SseStream {
+            frames: text_stream("groq/mock-model", REFUSAL_TEXT),
+        }],
+        vec![ScriptedResponse::SseStream {
+            frames: text_stream("poolside/mock-model", FALLBACK_ANSWER),
+        }],
+    );
+
+    let stream = chain
+        .provider
+        .create_message_stream(tool_request())
+        .await
+        .expect("chain succeeds");
+    let (events, error) = collect(stream).await;
+
+    assert!(
+        error.is_none(),
+        "refusal-switch must not surface an error: {error:?}"
+    );
+    let seen = text(&events);
+    assert!(
+        !seen.contains("Bash tool"),
+        "tool-decline refusal must be hidden, got: {seen:?}"
+    );
+    assert_eq!(
+        seen, FALLBACK_ANSWER,
+        "only the fallback upstream's answer should surface"
+    );
+
+    let attributions: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ProviderAttribution { upstream_id, .. } => Some(upstream_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        attributions.first().copied(),
+        Some("groq"),
+        "the declined upstream leads"
+    );
+    assert_eq!(
+        attributions.last().copied(),
+        Some("poolside"),
+        "the surviving upstream trails"
+    );
+
+    let (first, second) = chain.requests();
+    assert_eq!(first.len(), 1, "declined upstream attempted once");
+    assert_eq!(
+        second.len(),
+        1,
+        "fallback upstream contacted after the refusal"
+    );
+}
+
+/// A genuine (non-refusal) answer to a tool-bearing request is buffered and
+/// replayed, never discarded — the classifier must not over-trigger and burn
+/// the healthy fallback upstream.
+#[tokio::test]
+async fn tool_request_real_answer_not_discarded() {
+    let _dispatch = dispatch_guard().await;
+    let chain = Chain::new(
+        vec![ScriptedResponse::SseStream {
+            frames: text_stream("groq/mock-model", NORMAL_ANSWER),
+        }],
+        vec![ScriptedResponse::SseStream {
+            frames: text_stream("poolside/mock-model", "must never be used"),
+        }],
+    );
+
+    let stream = chain
+        .provider
+        .create_message_stream(tool_request())
+        .await
+        .expect("chain succeeds");
+    let (events, error) = collect(stream).await;
+
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(
+        text(&events),
+        NORMAL_ANSWER,
+        "a genuine answer must not be discarded"
+    );
+    let (first, second) = chain.requests();
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        second.len(),
+        0,
+        "healthy upstream must not be contacted for a normal answer"
+    );
+}
+
+/// A mid-stream failure while the refusal-buffer is still holding the (so far
+/// uncommitted) prefix must switch to the healthy upstream instead of surfacing
+/// a replay-unsafe error or leaking the withheld partial.
+#[tokio::test]
+async fn tool_buffered_mid_stream_truncation_switches_without_leak() {
+    let _dispatch = dispatch_guard().await;
+    let chain = Chain::new(
+        vec![ScriptedResponse::SseTruncated {
+            frames: vec![
+                common::mock_provider::sse_first_delta(
+                    "groq/mock-model",
+                    "The Bash tool is currently inactive, so ",
+                ),
+                common::mock_provider::sse_text_delta("I cannot directly "),
+            ],
+        }],
+        vec![ScriptedResponse::SseStream {
+            frames: text_stream("poolside/mock-model", FALLBACK_ANSWER),
+        }],
+    );
+
+    let stream = chain
+        .provider
+        .create_message_stream(tool_request())
+        .await
+        .expect("chain succeeds");
+    let (events, error) = collect(stream).await;
+
+    assert!(
+        error.is_none(),
+        "buffered mid-stream failure must switch, not surface: {error:?}"
+    );
+    let seen = text(&events);
+    assert!(
+        !seen.contains("Bash tool"),
+        "withheld partial must never leak: {seen:?}"
+    );
+    assert_eq!(
+        seen, FALLBACK_ANSWER,
+        "healthy upstream must answer after the switch"
+    );
+
+    let (first, second) = chain.requests();
+    assert_eq!(first.len(), 1, "declined upstream attempted once");
+    assert_eq!(
+        second.len(),
+        1,
+        "fallback upstream contacted after the mid-stream failure"
+    );
+}
