@@ -33,6 +33,7 @@ pub use modes::{
 };
 
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
+pub mod session_digest;
 pub mod session_storage;
 
 // SQLite-backed session storage (faster alternative to JSONL).
