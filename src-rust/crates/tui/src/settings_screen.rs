@@ -3464,6 +3464,11 @@ mod tests {
 
     #[test]
     fn memory_toggle_flips_snapshot_and_config() {
+        // `toggle_or_cycle_current` persists through `Settings::save_sync`.
+        // Without a pinned home this test wrote the developer's real
+        // `~/.clawde/settings.json` and clobbered unrelated preferences
+        // (observed 2026-09-18).
+        let _home = MemoryTestHome::acquire();
         let mut screen = fresh_controlled_screen();
         let mut config = Config::default();
         // Select the memory_enabled row — toggle_or_cycle_current acts on the

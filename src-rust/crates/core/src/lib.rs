@@ -3323,8 +3323,50 @@ pub mod config {
             home.join(".config").join("clawde")
         }
 
+        /// True when this process is a cargo test harness.
+        ///
+        /// `cfg!(test)` is not enough: a test in a *dependent* crate compiles
+        /// this crate without `cfg(test)`, which is exactly how a TUI test
+        /// managed to rewrite the real settings file. Cargo places every test
+        /// executable under `<target>/<profile>/deps/`, while a built binary
+        /// sits in `<target>/<profile>/` — so that path segment is the signal
+        /// that works for every crate. Cached: the executable cannot change
+        /// mid-process.
+        fn running_under_cargo_test() -> bool {
+            static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *CACHE.get_or_init(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| {
+                        exe.parent()
+                            .and_then(|dir| dir.file_name().map(|name| name == "deps"))
+                    })
+                    .unwrap_or(false)
+            })
+        }
+
         /// Full path to the global settings JSON file.
+        ///
+        /// Production resolves under the real config dir. Under a cargo test
+        /// harness with no explicit `CLAWDE_HOME`, it resolves to a per-process
+        /// scratch directory instead: tests load settings, mutate them, and
+        /// save, so one that forgets to pin a home rewrites the developer's
+        /// real `~/.clawde/settings.json`. That happened on 2026-09-18 —
+        /// `tui::settings_screen::tests::memory_toggle_flips_snapshot_and_config`
+        /// destroyed an unrelated `config.output_style` value. This mirrors the
+        /// scratch-directory fix already in place for `keybindings.json`
+        /// (`crates/tui/src/lib.rs::keybindings_dir`).
+        ///
+        /// A test that wants a specific home just sets `CLAWDE_HOME` (see the
+        /// `TestHome` guards), which still wins; only the implicit fallback to
+        /// the real user directory is removed while testing.
         pub fn global_settings_path() -> PathBuf {
+            if std::env::var_os("CLAWDE_HOME").is_none() && Self::running_under_cargo_test() {
+                let dir =
+                    std::env::temp_dir().join(format!("clawde-test-home-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&dir);
+                return dir.join("settings.json");
+            }
             Self::config_dir().join("settings.json")
         }
 
@@ -8304,6 +8346,36 @@ mod tests {
         assert!(
             json.contains("semantic_fix_when_no_lowlevel_tests"),
             "round-trip must preserve the fix gate key: {json}"
+        );
+    }
+
+    /// A plain `cargo test` run must never read or write the developer's real
+    /// settings file. Tests load settings, mutate them, and save; one that
+    /// forgot to pin `CLAWDE_HOME` rewrote the real `~/.clawde/settings.json`
+    /// and destroyed unrelated preferences (2026-09-18 — see
+    /// `Settings::global_settings_path`). Asserted rather than assumed because
+    /// the failure is silent and costs user config.
+    #[test]
+    fn tests_resolve_settings_to_a_scratch_directory() {
+        // When another test thread holds a `TestHome`, CLAWDE_HOME points at
+        // that temp dir; either way it must never be the developer's home.
+        if let Some(explicit) = std::env::var_os("CLAWDE_HOME") {
+            assert!(
+                explicit.is_empty(),
+                "a test-scoped CLAWDE_HOME must be a scratch dir, got {:?}",
+                explicit
+            );
+        }
+        let path = crate::config::Settings::global_settings_path();
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "a test build must resolve settings into a scratch directory, got {}",
+            path.display()
+        );
+        assert!(
+            !path.starts_with(dirs::home_dir().unwrap_or_default().join(".clawde")),
+            "the developer's real ~/.clawde must never be in scope for a test: {}",
+            path.display()
         );
     }
 
