@@ -158,6 +158,9 @@ pub struct SessionBrowserState {
     pub loading: bool,
     /// Which digest flags the list is restricted to (`^F` cycles it).
     pub facet: FacetFilter,
+    /// Entry density (`^L` cycles it). Kept for the whole session, across
+    /// opens: it is a reading preference, not per-list state.
+    pub layout: LayoutMode,
     /// Filtered index the pointer is over, for the hover highlight.
     pub hover_idx: Option<usize>,
     /// Session id to re-select when the next list arrives, so reopening the
@@ -203,6 +206,7 @@ impl SessionBrowserState {
             tail_loading: false,
             loading: false,
             facet: FacetFilter::All,
+            layout: LayoutMode::Adaptive,
             hover_idx: None,
             last_selected_id: String::new(),
             confirm_session_id: String::new(),
@@ -411,6 +415,12 @@ impl SessionBrowserState {
         self.facet = self.facet.next();
         self.selected_idx = 0;
         self.invalidate_tail();
+    }
+
+    /// Cycle the list density. The selection is kept: the same session stays
+    /// focused, it is just drawn shorter or taller.
+    pub fn cycle_layout(&mut self) {
+        self.layout = self.layout.next();
     }
 
     /// Enter confirm mode for deleting the selected session.
@@ -773,6 +783,49 @@ fn highlight_spans(text: &str, base: Style, hit: Style, terms: &[String]) -> Vec
     spans
 }
 
+/// How dense the list is drawn.
+///
+/// `Adaptive` is the default and lets the available rows decide; the other two
+/// pin the choice, so the user can trade the keyword rows for more sessions at
+/// once (or insist on them) without resizing the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayoutMode {
+    #[default]
+    Adaptive,
+    Compact,
+    Expanded,
+}
+
+impl LayoutMode {
+    /// The next mode in the cycle.
+    pub fn next(self) -> Self {
+        match self {
+            LayoutMode::Adaptive => LayoutMode::Compact,
+            LayoutMode::Compact => LayoutMode::Expanded,
+            LayoutMode::Expanded => LayoutMode::Adaptive,
+        }
+    }
+
+    /// Short label shown in the search line's mode chip.
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutMode::Adaptive => "auto",
+            LayoutMode::Compact => "compact",
+            LayoutMode::Expanded => "expanded",
+        }
+    }
+
+    /// Rows per entry when this mode pins the layout, or `None` when the
+    /// available space decides.
+    fn pinned_rows(self) -> Option<usize> {
+        match self {
+            LayoutMode::Adaptive => None,
+            LayoutMode::Compact => Some(2),
+            LayoutMode::Expanded => Some(4),
+        }
+    }
+}
+
 /// Width of the browser modal. The list is a table, so the width stays fixed
 /// and readable rather than stretching to an ultrawide terminal.
 const MODAL_W: u16 = 78;
@@ -946,7 +999,11 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         );
         // Facet chip, right-aligned in the search row: the active facet is a
         // mode, so it belongs next to the query rather than hidden in help.
-        let chip = format!("[^F {}] ", state.facet.label());
+        let chip = format!(
+            "[^F {} \u{b7} ^L {}] ",
+            state.facet.label(),
+            state.layout.label()
+        );
         let used: usize = search_line
             .spans
             .iter()
@@ -1051,7 +1108,10 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         // modal (see `render_detail_preview`); when it does not, the list is
         // the only place the keywords can appear.
         let popup_shown = area.height.saturating_sub(dialog_area.bottom()) >= 4;
-        let row_h = rows_per_entry_for(list_rows, popup_shown);
+        let row_h = state
+            .layout
+            .pinned_rows()
+            .unwrap_or_else(|| rows_per_entry_for(list_rows, popup_shown));
         let row_w = inner_w.saturating_sub(6);
         // Group by recency only when browsing a long list: with a query the
         // ranking order is the useful structure, and headers cost rows.
@@ -1321,6 +1381,7 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                     ("^B", " fork   "),
                     ("^T", " title   "),
                     ("^R", " rename   "),
+                    ("^L", " layout   "),
                     ("F5", " reload"),
                 ],
                 inner_w,
@@ -2601,6 +2662,74 @@ mod tests {
         );
         // The hint bar survives too: nothing covers the bottom of the modal.
         assert!(text.contains("Enter resume"));
+    }
+
+    #[test]
+    fn layout_mode_cycles_and_overrides_the_adaptive_choice() {
+        let mut s = SessionBrowserState::new();
+        assert_eq!(s.layout, LayoutMode::Adaptive);
+        s.cycle_layout();
+        assert_eq!(s.layout, LayoutMode::Compact);
+        s.cycle_layout();
+        assert_eq!(s.layout, LayoutMode::Expanded);
+        s.cycle_layout();
+        assert_eq!(s.layout, LayoutMode::Adaptive);
+
+        // Row spacing for the focused entry's block under each mode, on a
+        // terminal where the adaptive rule would choose the four-row layout.
+        let spacing = |layout: LayoutMode| -> u16 {
+            let mut s = SessionBrowserState::new();
+            s.open();
+            s.layout = layout;
+            s.set_sessions((0..20).map(plain_session).collect());
+            let area = Rect::new(0, 0, 100, 40);
+            let mut buf = Buffer::empty(area);
+            render_session_browser(&s, area, &mut buf);
+            row_index(&buf, area, "session 1") - row_index(&buf, area, "session 0")
+        };
+        assert_eq!(spacing(LayoutMode::Expanded), 4);
+        assert_eq!(spacing(LayoutMode::Compact), 2);
+        assert_eq!(spacing(LayoutMode::Adaptive), 4);
+
+        // Compact fits strictly more sessions into the same window.
+        let visible = |layout: LayoutMode| -> usize {
+            let mut s = SessionBrowserState::new();
+            s.open();
+            s.layout = layout;
+            s.set_sessions((0..40).map(plain_session).collect());
+            let area = Rect::new(0, 0, 100, 40);
+            let mut buf = Buffer::empty(area);
+            render_session_browser(&s, area, &mut buf);
+            let text: String = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+            (0..40)
+                .filter(|i| text.contains(&format!("session {i} ")))
+                .count()
+        };
+        assert!(
+            visible(LayoutMode::Compact) > visible(LayoutMode::Expanded),
+            "compact {} vs expanded {}",
+            visible(LayoutMode::Compact),
+            visible(LayoutMode::Expanded)
+        );
+    }
+
+    #[test]
+    fn the_search_line_reports_the_active_mode() {
+        let render = |layout: LayoutMode| -> String {
+            let mut s = SessionBrowserState::new();
+            s.open();
+            s.layout = layout;
+            s.set_sessions((0..3).map(plain_session).collect());
+            let area = Rect::new(0, 0, 120, 40);
+            let mut buf = Buffer::empty(area);
+            render_session_browser(&s, area, &mut buf);
+            buf.content.iter().map(|c| c.symbol().to_string()).collect()
+        };
+        assert!(render(LayoutMode::Adaptive).contains("^L auto"));
+        assert!(render(LayoutMode::Compact).contains("^L compact"));
+        assert!(render(LayoutMode::Expanded).contains("^L expanded"));
+        // The facet chip and the mode chip share one line.
+        assert!(render(LayoutMode::Compact).contains("^F all"));
     }
 
     #[test]

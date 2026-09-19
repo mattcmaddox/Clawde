@@ -8492,6 +8492,9 @@ impl App {
                             self.pending_title_session_id = Some(session.id);
                         }
                     }
+                    (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                        self.session_browser.cycle_layout()
+                    }
                     (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
                         self.session_browser.start_rename()
                     }

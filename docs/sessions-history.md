@@ -86,10 +86,12 @@ unfiltered list is grouped under `Today` / `Yesterday` / `This week` / `Earlier`
 headers.
 
 The modal also sizes itself to the terminal: on a tall screen it grows into the
-spare rows (up to 46) so the list shows many more sessions at once, while the
+spare rows (up to 46) so the list shows many more sessions at once, and on a
+wide one it widens (up to 120 columns) so keyword rows stop truncating. The
 detail popup stays anchored directly beneath it. On a terminal too short for
 four-row entries the keyword rows move into the popup (two rows per entry), so
-the list keeps showing many sessions rather than two or three.
+the list keeps showing many sessions rather than two or three. `^L` overrides
+all of that when you want a particular density.
 
 Rows 2-4 are inferred offline from the transcript (no model call, bounded
 reads), so they are best-effort: a status flag appears only when the sampled
@@ -108,6 +110,7 @@ selected session. Sessions with no recorded messages at all are skipped.
 | `Shift+↑` / `Shift+↓` | Scroll the popup's transcript preview |
 | `Enter` | Resume the selected session |
 | `^F` | Cycle the status filter: all → uncommitted → errors → interrupted → committed → no edits |
+| `^L` | Cycle the list density: `auto` (the terminal decides) → `compact` (title + status, the most sessions per screen) → `expanded` (always the keyword rows). The choice lasts for the session |
 | `^D` | Delete the selected session (asks to confirm; the running session cannot be deleted) |
 | `^E` | Export the selected session (JSON / Markdown / text / clipboard) |
 | `^B` | Resume the selected session as a new branch, leaving the original intact |
