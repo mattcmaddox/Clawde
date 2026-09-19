@@ -1,6 +1,8 @@
 # Development Rules
 
-Agent-facing rules for working on Clawde. Mirrors and extends `src-rust/.claude/CLAUDE.md`; when the two disagree, the rule closer to the code wins.
+Agent-facing rules for working on Clawde. This is the single instructions file for the repo; skills under `.agents/skills/` add procedure-specific detail (remote builds, backups, project philosophy) and defer to this file on conflict.
+
+Keep this file honest: when a path, line number, or count below stops matching the code, fix the sentence in the same change. Prefer naming a function or constant over a line number — line numbers rot within weeks here.
 
 ## Conversational Style
 
@@ -67,12 +69,17 @@ tmux send-keys -t clawde-test "./target/debug/clawde" Enter
 sleep 2 && tmux capture-pane -t clawde-test -p
 
 # Drive input. The prompt text and the submit key MUST be separate
-# `send-keys` invocations — see the tip below.
+# `send-keys` invocations, with a pause between them — see the tips below.
 tmux send-keys -t clawde-test "your prompt here"
-sleep 1
+sleep 3
 tmux send-keys -t clawde-test C-m   # submit
 tmux send-keys -t clawde-test Escape
 tmux send-keys -t clawde-test C-o   # ctrl+o
+
+# Before pressing dialog keys, CONFIRM the dialog is up. Poll for it:
+#   for i in $(seq 1 45); do sleep 1; tmux capture-pane -t clawde-test -p | grep -q 'Permission Required' && break; done
+# A key sent while no dialog is open goes into the prompt box (and `a`
+# on a real dialog is "auto-approve this tier and lower for the session").
 
 # TIP: submit with `C-m`. Two different things stop `Enter` from working, and
 # both leave the same signature — the prompt sits in the box and the session
@@ -94,6 +101,13 @@ tmux send-keys -t clawde-test C-o   # ctrl+o
 #      tmux send-keys -t s "a long prompt" C-m   # NOT submitted (verified)
 #      tmux send-keys -t s "a long prompt"       # submitted
 #      tmux send-keys -t s C-m
+#
+# 3. The same bracketed paste means a long prompt often arrives as a paste
+#    CHIP (`[Pasted text #1 +1 lines]`) rather than inline text. A `C-m` sent
+#    within ~1 s of the text is swallowed into the chip as a newline (that is
+#    the "+1 lines"). Wait >= 3 s after the text, then send `C-m` alone; if
+#    the chip is still in the box afterwards, send `C-m` once more. Check
+#    with `capture-pane` before assuming the turn started.
 
 # Cleanup
 tmux kill-session -t clawde-test
@@ -156,6 +170,37 @@ directory) MUST serialize on a crate-level `ENV_LOCK` mutex before mutating
 guard will race under parallelism and flake CI. `scripts/audit-env-tests.py`
 scans for unguarded mutations — keep it green when adding tests.
 
+### Tests must never touch real user state (settings, keybindings)
+
+`cargo test` must not read or write the developer's real config. Two guards
+exist; use them and do not route around them:
+
+- **keybindings** — a test build resolves through `crate::keybindings_dir()`
+  (`crates/tui/src/lib.rs`), which returns a per-process scratch dir.
+- **settings** — `Settings::global_settings_path()` returns a per-process
+  scratch dir when `CLAWDE_HOME` is unset *and* the process is a cargo test
+  harness (detected by the executable living under a `deps/` directory;
+  `cfg!(test)` is NOT sufficient because a dependent crate compiles this one
+  without it). `crates/tui/src/app.rs::TestHome` still pins an explicit home
+  where a test needs one.
+
+This is enforced, not advisory. `tui::settings_screen::tests::
+memory_toggle_flips_snapshot_and_config` called a persisting helper without a
+home guard and rewrote the real `~/.clawde/settings.json`, silently destroying
+unrelated preferences. Regression tests:
+`core::tests::tests_resolve_settings_to_a_scratch_directory` and
+`tui::app::tests::tests_resolve_keybindings_to_a_scratch_directory`.
+
+When adding a test that calls any persisting path (`save_sync`,
+`apply_theme`, `toggle_or_cycle_current`, `maybe_record_bash_prefix`, …), either
+acquire the crate's `TestHome`/`MemoryTestHome` guard or confirm the path above
+keeps it in scratch space. Verify with a canary value in the real file:
+
+```bash
+python3 -c "import json,os;p=os.path.expanduser('~/.clawde/settings.json');d=json.load(open(p));d['config']['output_style']='__CANARY__';open(p,'w').write(json.dumps(d,indent=2))"
+cargo test --workspace && grep -c '__CANARY__' ~/.clawde/settings.json   # must be 1
+```
+
 ### Async file writes must be flushed (tokio)
 
 `tokio::fs::File` returns `Ok` from `write_all` once the bytes are queued to a
@@ -179,6 +224,26 @@ the function — state the reason, never silence a real fire-and-forget write.
 Known detector limits: a handle wrapped before writing (`BufWriter::new(file)`)
 or moved into another owner is not tracked.
 
+### Permission dialog semantics (do not regress)
+
+- Shell dialogs show `Risk: <tier>` graded per command by
+  `classify_bash_command` / `classify_ps_command`; non-shell tools show the
+  tool-level `Capability:` line. Never print the tool-level `network_capable`
+  flag for a shell command — it is `true` for every command (issue #4).
+- `[a]` raises a session **risk ceiling** (`PermissionManager::accept_all_up_to`,
+  compared via `permissions::request_risk_tier`); it never switches the session
+  to `BypassPermissions`. The ceiling caps at `high`, is absent on `critical`
+  dialogs, and is cleared by Shift+Tab (`App::cycle_permission_mode`). Any new
+  auto-approval path must go through `PermissionManager::evaluate_with_capabilities`,
+  not around it.
+- Text typed while a permission dialog is open must land in the prompt, not be
+  dropped (`App::insert_unclaimed_prompt_text`).
+- `allowedBashPrefixes` in `~/.clawde/settings.json` silently approves every
+  command whose first word matches. Check it before concluding a permission
+  path is broken — a `cargo` prefix there is why `cargo --version` may run
+  unasked. Known open item: a session run was observed to rewrite that file
+  and drop the list (2026-09-18); the writer has not been identified.
+
 ## Issues & PR Comments
 
 When posting issue/PR comments:
@@ -190,9 +255,13 @@ When posting issue/PR comments:
 - If a comment is malformed, delete it immediately, then post one corrected comment.
 - Keep comments concise, technical, and in the user's tone.
 
-When creating issues, add labels that map to the relevant crate(s) — for example `crate:tui`, `crate:api`, `crate:tools`, `crate:mcp`, `crate:acp`. If an issue spans multiple crates, add all relevant labels.
+When creating issues, add labels that map to the relevant crate(s) — `crate:<name>` for any of `acp api bridge buddy cli commands core gateway katban mcp plugins query tools tui`. Only `crate:core`, `crate:tui`, and `crate:tools` exist on GitHub today; create a missing one with `gh label create crate:<name> --color <hex> --description "..."` (match the existing ones) rather than skipping the label. If an issue spans multiple crates, add all relevant labels.
 
 When closing issues via commit, include `fixes #<number>` or `closes #<number>` in the commit message — GitHub closes the issue automatically on merge to main.
+
+## Adding a Provider
+
+Seven steps, in order. Skipping the tests or docs steps is the usual failure.
 
 ### 1. Provider identifier (`crates/core/src/provider_id.rs`)
 
@@ -218,9 +287,9 @@ If the provider uses an env var (e.g. `FOO_API_KEY`), wire it into the auth-stor
 
 ### 6. Tests
 
-- Add a smoke test in `crates/api/tests/` that exercises request shaping and response parsing against a mocked HTTP body. No live API calls — use the fixture pattern that the existing provider tests follow.
+- Add a smoke test in `crates/api/tests/` that exercises request shaping and response parsing against a mocked HTTP body. No live API calls — follow the fixture pattern in `crates/api/tests/ollama_native_chat.rs` and `crates/api/tests/free_recovery.rs` (shared helpers live in `crates/api/tests/common/`, bodies in `crates/api/tests/fixtures/`).
 - If the provider supports tool calls, add a tool-call round-trip fixture.
-- For OpenAI-compatible providers, the shared test in `crates/api/tests/openai_compat.rs` covers most paths; usually just adding a row to its provider matrix is enough.
+- OpenAI-compatible providers share the transport in `openai_compat_providers.rs`; a new entry there still needs a request-shaping test if it has any base-URL or header quirk.
 
 ### 7. Documentation
 
@@ -274,7 +343,8 @@ This repo runs parallel agents in worktrees under `.claude/worktrees/`. Multiple
 
 ### Committing
 
-- **ONLY commit files YOU changed in THIS session.** Never commit unless the user has explicitly asked you to commit (see `src-rust/.claude/CLAUDE.md` — the rule is "NEVER EVER commit").
+- **ONLY commit files YOU changed in THIS session.** Never commit unless the user has asked you to commit in this conversation ("commit", "commit and push", or a clear delegation such as "do what's best" after you have listed uncommitted work). Never commit on your own initiative at the end of a task.
+- Untracked files you did not create (e.g. another agent's scratch notes) are not yours; leave them alone and do not mention them as problems.
 - ALWAYS include `fixes #<number>` or `closes #<number>` in the commit message when there is a related issue or PR.
 - NEVER use `git add -A` or `git add .` — these sweep up changes from other agents.
 - ALWAYS use `git add <specific-file-paths>` listing only files you modified.
@@ -327,17 +397,17 @@ If the user's instructions conflict with the rules above, ask for confirmation t
 ### Two-Level Fallback Hierarchy
 
 ```
-Level 1: FreeProvider (across providers)
-  ├── upstream[0]:  Hugging Face
-  ├── upstream[1]:  NVIDIA NIM
-  ├── upstream[2]:  Cerebras
-  ├── upstream[3]:  Google Gemini
-  ├── upstream[4]:  Cloudflare Workers AI
-  ├── upstream[5]:  Groq
-  ├── upstream[6]:  SambaNova
-  ├── upstream[7]:  Cline
-  ├── upstream[8]:  Mistral
-  ├── upstream[9]:  Cohere
+Level 1: FreeProvider (across providers) — order is FREE_CATALOG order
+  ├── upstream[0]:  GitHub Copilot
+  ├── upstream[1]:  Poolside
+  ├── upstream[2]:  NVIDIA NIM
+  ├── upstream[3]:  Cerebras
+  ├── upstream[4]:  Google Gemini
+  ├── upstream[5]:  Cloudflare Workers AI
+  ├── upstream[6]:  Groq
+  ├── upstream[7]:  SambaNova
+  ├── upstream[8]:  Cline
+  ├── upstream[9]:  Mistral
   ├── upstream[10]: OpenCode Zen
   ├── upstream[11]: Z.AI
   └── upstream[12]: OpenRouter
@@ -345,6 +415,10 @@ Level 1: FreeProvider (across providers)
 Level 2: KeyRotatingProvider (within each upstream, 2+ keys)
   └── key[0], key[1], key[2], ...  (round-robins on exhaustion)
 ```
+
+The list above is a snapshot (2026-09-18). `FREE_CATALOG` in
+`crates/api/src/providers/free/catalog.rs` is authoritative; when it changes,
+change this diagram in the same commit.
 
 ### Component Locations
 
@@ -427,12 +501,12 @@ Synthetic only — never calls upstream `discover_models()`. Produces one `free/
 - `0 < active < total`: yellow indicator
 - `active == 0`: red indicator with retry time
 - Reading: `provider:active/total (retry in Xs)`
-- Location: `crates/tui/src/render.rs:2510-2613`
+- Location: footer/status text in `crates/tui/src/render.rs` (search `key_ring_summaries`); the per-key rows in the context visualiser come from `key_ring_rows_from_registry` in `crates/tui/src/context_viz.rs`
 
 ### Chain Assembly (`build_free_provider`)
 
-- `FREE_CATALOG` constant at free/catalog.rs defines 13 upstreams by priority
-- Each `FreeUpstream` has: id, title, key_url, default_model, note
+- `FREE_CATALOG` in `crates/api/src/providers/free/catalog.rs` defines the upstreams by priority (13 as of 2026-09-18)
+- Each `FreeUpstream` has: id, title, key_url, default_model, model_family, note, tool_calling, vision, thinking, max_tokens_cap
 - Cloudflare: OpenAI-compat endpoint embeds the account ID in the URL path,
   so its stored key is the composite `ACCOUNT_ID:API_TOKEN`; key validation
   uses the chat probe (the `/ai/v1/models` endpoint returns 405 for GET)
@@ -440,6 +514,6 @@ Synthetic only — never calls upstream `discover_models()`. Produces one `free/
   12K TPM) — a quick-task lane, not a daily driver
 - OpenCode Zen/Go key sharing: checks both auth store slots
 - Silent skip for unconfigured upstreams (no error)
-- Catalog order = fallback priority (Hugging Face first; see the
-  FREE_CATALOG constant at free.rs:70-192 for the authoritative 13-upstream
-  order — GitHub Models (retired 2026-07-30) is no longer included)
+- Catalog order = fallback priority (GitHub Copilot first). Retired upstreams
+  are removed, not commented out: GitHub Models (2026-07-30), Hugging Face and
+  Cohere are no longer in the catalog.

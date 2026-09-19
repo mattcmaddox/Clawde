@@ -28,7 +28,7 @@ The LLM landscape changes rapidly (weekly). When researching:
 
 ## Implementation Strategy
 
-1. **Maximize upstream count** in FreeProvider's `FREE_CATALOG` — every additional free provider adds a fallback layer
+1. **Maximize upstream count** in FreeProvider's `FREE_CATALOG` (`src-rust/crates/api/src/providers/free/catalog.rs`) — every additional free provider adds a fallback layer. When an upstream retires, remove it and update the diagram in `AGENTS.md` in the same commit
 2. **Per-upstream timeout** (30s default) prevents hanging providers from blocking the chain
 3. **Multi-key rotation** (2+ keys per provider) adds another fallback dimension within each upstream
 4. **Circuit breaker** skips repeatedly failing upstreams so the chain converges faster
