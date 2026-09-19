@@ -623,7 +623,8 @@ clawde --provider ollama --model llama3.2 "explain this code"
 
 - `/ollama`, `/ollama config`, `/connect ollama`, and Alt+O all open the
   same Ollama configuration screen: host, installed-model picker with
-  loaded-in-VRAM markers, connectivity mode, and common request options.
+  loaded-in-VRAM markers and per-model VRAM sizes, connectivity mode, and
+  common request options.
 - `/ollama status` reports loaded models and the VRAM sizes reported by
   Ollama (headless-safe text output).
 - `/ollama online` / `/ollama isolated` apply and persist the connectivity
@@ -634,6 +635,12 @@ clawde --provider ollama --model llama3.2 "explain this code"
   loopback, bounded concurrency, per-host timeout) and reports candidates
   with latency and model counts. It prefills the screen with the best
   candidate but never switches your configured host silently.
+
+In the model picker, models currently resident on the server are marked
+`●` and show the VRAM Ollama reports for them (e.g. `18.0GiB VRAM`, from
+`/api/ps` `size_vram`); `○` marks installed-only models. Ollama exposes no
+free/total GPU memory, so per-model VRAM usage is the metric shown. The
+VRAM column is dropped on terminals too narrow to fit it.
 
 Inside the screen: `t` runs a connection test, `r` refreshes the model
 list, the Mode row toggles Online/Isolated in place, and the Options rows
@@ -667,6 +674,16 @@ automatically.
 
 **VRAM controls:**
 
+- The footer shows `VRAM: n/N GB` while Ollama is the active provider,
+  coloured green/yellow/red at 75%/90% pressure, and `--` for the numerator
+  when the host did not answer. `N` comes from the optional `vram_probe_cmd`
+  (a command printing `used,total` in MiB per line, run on its own cadence —
+  `vram_probe_interval_secs`, default 30s — with a 3s timeout) or the declared
+  `vram_total_mb` capacity — Ollama's API reports no card total, so with
+  neither set the pill stays hidden. A probe reports whole-GPU usage; a
+  declared capacity falls back to the loaded models' `size_vram`.
+- The `/ollama` screen shows a VRAM line explaining which of those states
+  applies, including when a configured probe is failing.
 - `/ollama status` reports loaded models and the VRAM sizes reported by Ollama.
 - `/unload` unloads every currently loaded model on the configured server.
 - `/unload <model>` unloads only the named loaded model, for example

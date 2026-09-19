@@ -1781,6 +1781,14 @@ pub struct App {
     /// `/api/ps`). Empty when no models are loaded or when Ollama is not
     /// configured.
     pub ollama_loaded_models: Vec<clawde_core::OllamaLoadedModel>,
+    /// GPU memory for the footer's `VRAM: n/N GB` pill, assembled alongside the
+    /// loaded-models poll from the optional probe's own slower result.
+    /// `sample` is `None` when no denominator can be established (no probe and
+    /// no declared capacity) or when Ollama is not the active provider — the
+    /// pill then stays hidden rather than showing a bare number. Inside the
+    /// sample, `used_bytes` is itself `None` when the host did not answer, so
+    /// "unknown" never renders as `0.0`.
+    pub ollama_vram: clawde_core::config::OllamaVramStatus,
     /// What the Ollama server last reported about itself during a dialog
     /// ping: version string plus the effective request parameters
     /// (`/api/show`) for the model the screen selected. `None` until the
@@ -2437,6 +2445,7 @@ impl App {
             free_model_lists: Vec::new(),
             ollama_mode: clawde_core::OllamaMode::default(),
             ollama_loaded_models: Vec::new(),
+            ollama_vram: clawde_core::config::OllamaVramStatus::default(),
             ollama_server_info: None,
             last_health_sweep: None,
             free_upstream_index: 0,
@@ -3300,12 +3309,12 @@ impl App {
         let has_saved_host = current_url.is_some();
         // Seed the loaded-in-VRAM markers from the footer poll so the model
         // list shows them immediately, before the next poll tick.
-        let loaded = self
-            .ollama_loaded_models
-            .iter()
-            .map(|model| model.name.clone())
-            .collect();
-        self.ollama_config_dialog.set_loaded_model_names(loaded);
+        let loaded = self.ollama_loaded_models.clone();
+        self.ollama_config_dialog.set_loaded_models(loaded);
+        // Seed the probe diagnostics + VRAM state too, so the screen explains
+        // the footer's pill immediately instead of after the next poll.
+        let vram = self.ollama_vram.clone();
+        self.ollama_config_dialog.set_vram_status(vram);
         // Seed mode + canonical request options from the effective settings
         // through the centralized helper so the screen and the request
         // pipeline can never disagree.
@@ -4441,6 +4450,10 @@ impl App {
         self.ollama_ping_host = String::new();
         self.ollama_ping_for_models = false;
         self.ollama_server_info = None;
+        // The sample describes the previous provider/host; a reload invalidates
+        // it rather than leaving the pill describing a GPU box the session no
+        // longer points at.
+        self.ollama_vram = clawde_core::config::OllamaVramStatus::default();
         self.free_mode_dialog = crate::free_mode_dialog::FreeModeDialogState::new();
         self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
         self.device_auth_pending = None;

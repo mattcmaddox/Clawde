@@ -102,6 +102,18 @@ impl OllamaModelExt for OllamaModel {
     }
 }
 
+/// Human-readable VRAM size for the model picker (e.g. "18.2GiB"). Uses GiB
+/// to match the footer's VRAM-in-use badge; drops to MiB below 1 GiB.
+pub fn format_vram_display(bytes: u64) -> String {
+    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if gib >= 1.0 {
+        format!("{gib:.1}GiB")
+    } else {
+        let mib = bytes as f64 / (1024.0 * 1024.0);
+        format!("{mib:.0}MiB")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -150,16 +162,22 @@ pub struct OllamaConfigDialogState {
     /// dialog session, so the 60s background rescan cannot yank the user
     /// back into the picker after they left it.
     pub auto_host_prompted: bool,
-    /// Exact model names currently loaded in the server's VRAM (from the
-    /// periodic `/api/ps` poll). Drives the loaded-state markers in the
-    /// model picker; kept outside `models` so it survives refreshes.
-    pub loaded_model_names: Vec<String>,
+    /// Models currently loaded in the server's VRAM (from the periodic
+    /// `/api/ps` poll), including the per-model `size_vram` Ollama reports.
+    /// Drives the loaded markers and the VRAM column in the model picker;
+    /// kept outside `models` so it survives refreshes.
+    pub loaded_models: Vec<clawde_core::OllamaLoadedModel>,
     /// What the server reported about itself during the last ping: version
     /// plus the effective request parameters for the selected model
     /// (modelfile parameters via `/api/show`). `None` until a ping
     /// succeeds — the screen then shows a server-reported block below the
     /// options rows.
     pub server_info: Option<clawde_query::OllamaServerInfo>,
+    /// Footer VRAM state: the sample behind the footer pill plus the probe
+    /// outcome, so this screen can report *why* a number is present, absent,
+    /// or `--`. Without it a typo'd `vram_probe_cmd` looks exactly like no
+    /// command at all. Kept in sync from the poll and seeded on open.
+    pub vram: clawde_core::config::OllamaVramStatus,
     pub health: HealthStatus,
     /// Vim-modal insert state (only used when vim is enabled).
     pub vim_search: VimSearch,
@@ -197,17 +215,19 @@ impl OllamaConfigDialogState {
             discovery_scanning: false,
             discovery_checked: false,
             auto_host_prompted: false,
-            loaded_model_names: Vec::new(),
+            loaded_models: Vec::new(),
             server_info: None,
+            vram: clawde_core::config::OllamaVramStatus::default(),
             health: HealthStatus::Untested,
             vim_search: VimSearch::new(),
         }
     }
 
-    /// Replace the loaded-in-VRAM snapshot (exact model names from
-    /// `/api/ps`). Called on screen open and when a poll updates.
-    pub fn set_loaded_model_names(&mut self, names: Vec<String>) {
-        self.loaded_model_names = names;
+    /// Replace the loaded-in-VRAM snapshot (exact models from `/api/ps`,
+    /// including per-model VRAM sizes). Called on screen open and when a
+    /// poll updates.
+    pub fn set_loaded_models(&mut self, models: Vec<clawde_core::OllamaLoadedModel>) {
+        self.loaded_models = models;
     }
 
     /// Replace the server-reported info snapshot (version + effective
@@ -223,6 +243,69 @@ impl OllamaConfigDialogState {
     /// parameters.
     pub fn clear_server_info(&mut self) {
         self.server_info = None;
+    }
+
+    /// Replace the VRAM/probe snapshot. Called on screen open and whenever the
+    /// footer poll assembles a new status.
+    pub fn set_vram_status(&mut self, vram: clawde_core::config::OllamaVramStatus) {
+        self.vram = vram;
+    }
+
+    /// One line explaining the footer's VRAM pill: where the number came from
+    /// and — when a probe is configured — whether it answered.
+    ///
+    /// Always rendered, including with nothing configured, because this is the
+    /// only surface that names the `vram_probe_cmd` / `vram_total_mb` knobs.
+    pub fn vram_probe_line(&self) -> Line<'static> {
+        use clawde_core::config::{OllamaVramProbe, OllamaVramSample};
+
+        let dim = Style::default().fg(Color::Rgb(90, 90, 90));
+        let muted = Style::default().fg(Color::Rgb(180, 180, 180));
+        let warn = Style::default().fg(Color::Rgb(220, 50, 50));
+
+        // "6.3GiB of 8.0GiB", or "-- of 8.0GiB" when the host never answered.
+        let reading = |sample: &OllamaVramSample| match sample.used_bytes {
+            Some(used) => format!(
+                "{} of {}",
+                format_vram_display(used),
+                format_vram_display(sample.total_bytes)
+            ),
+            None => format!("-- of {}", format_vram_display(sample.total_bytes)),
+        };
+
+        let (text, style) = match (&self.vram.probe, self.vram.sample.as_ref()) {
+            (
+                OllamaVramProbe::Reported {
+                    used_bytes,
+                    total_bytes,
+                },
+                _,
+            ) => (
+                format!(
+                    "VRAM probe: {} of {} (whole-GPU)",
+                    format_vram_display(*used_bytes),
+                    format_vram_display(*total_bytes)
+                ),
+                muted,
+            ),
+            (OllamaVramProbe::Failed, Some(sample)) => (
+                format!("VRAM probe failed; Ollama-reported {}", reading(sample)),
+                warn,
+            ),
+            (OllamaVramProbe::Failed, None) => (
+                "VRAM probe failed; set vram_total_mb for a capacity".to_string(),
+                warn,
+            ),
+            (OllamaVramProbe::NotConfigured, Some(sample)) => (
+                format!("VRAM {} (declared capacity)", reading(sample)),
+                muted,
+            ),
+            (OllamaVramProbe::NotConfigured, None) => (
+                "VRAM not measured: set vram_probe_cmd or vram_total_mb".to_string(),
+                dim,
+            ),
+        };
+        Line::from(vec![Span::styled("   · ", dim), Span::styled(text, style)])
     }
 
     /// The parameters the server reported for the selected model, as
@@ -404,19 +487,32 @@ impl OllamaConfigDialogState {
         oo::effective_preview(&self.common_options_map())
     }
 
-    /// Whether an exact model tag is currently loaded in VRAM. Ollama treats
-    /// a bare tag as `:latest`, so `foo` and `foo:latest` are the same model;
-    /// any other explicit tag (`foo:7b`) is distinct.
-    pub fn is_model_loaded(&self, name: &str) -> bool {
+    /// The loaded entry matching `name`. Ollama treats a bare tag as
+    /// `:latest`, so `foo` and `foo:latest` are the same model; any other
+    /// explicit tag (`foo:7b`) is distinct.
+    fn loaded_entry(&self, name: &str) -> Option<&clawde_core::OllamaLoadedModel> {
         let canonical = |tag: &str| {
             tag.strip_suffix(":latest")
                 .map(|bare| bare.to_string())
                 .unwrap_or_else(|| tag.to_string())
         };
         let wanted = canonical(name);
-        self.loaded_model_names
+        self.loaded_models
             .iter()
-            .any(|loaded| canonical(loaded) == wanted)
+            .find(|loaded| canonical(&loaded.name) == wanted)
+    }
+
+    /// Whether an exact model tag is currently loaded in VRAM.
+    pub fn is_model_loaded(&self, name: &str) -> bool {
+        self.loaded_entry(name).is_some()
+    }
+
+    /// Bytes of VRAM Ollama reports as resident for a loaded model. `None`
+    /// when the model is not loaded, or when the server reported no size
+    /// (older Ollama) — the picker row then shows the marker alone rather
+    /// than a bogus zero.
+    pub fn loaded_vram(&self, name: &str) -> Option<u64> {
+        self.loaded_entry(name).and_then(|loaded| loaded.size_vram)
     }
 
     /// Open the dialog with optional current values.
@@ -899,9 +995,9 @@ fn render_default_view(
     render_dark_overlay(frame, area);
 
     let width = 62u16.min(area.width.saturating_sub(4));
-    // Room for the Servers row plus the server-reported block (version +
-    // up to 3 params).
-    let height = 26u16;
+    // Room for the Servers row, the server-reported block (version + up to 3
+    // params), and the VRAM-probe line.
+    let height = 27u16;
     let dialog_area = centered_rect(width, height, area);
     state.last_rect.set(dialog_area);
     render_dialog_bg(frame, dialog_area);
@@ -1099,7 +1195,7 @@ fn render_default_view(
     // Loaded-models summary (spec §Model/server behavior: use /api/ps to
     // mark loaded models). Surfaced even in the fast-path view so the user
     // sees what the server is holding before connecting.
-    let loaded_count = state.loaded_model_names.len();
+    let loaded_count = state.loaded_models.len();
     let loaded_line = if loaded_count == 0 {
         Line::from(Span::styled(
             "   No models loaded in VRAM",
@@ -1107,10 +1203,10 @@ fn render_default_view(
         ))
     } else {
         let preview = state
-            .loaded_model_names
+            .loaded_models
             .iter()
             .take(2)
-            .cloned()
+            .map(|model| model.name.clone())
             .collect::<Vec<_>>()
             .join(", ");
         let more = loaded_count.saturating_sub(2);
@@ -1128,6 +1224,11 @@ fn render_default_view(
         ])
     };
     lines.push(loaded_line);
+
+    // Footer-pill provenance: what the VRAM number means, and whether the
+    // optional probe answered. Rendered unconditionally — it is the only
+    // surface that names the knobs.
+    lines.push(state.vram_probe_line());
 
     // Server-reported block (spec §Model/server behavior): version and the
     // effective request parameters Ollama reports for the selected model
@@ -1496,7 +1597,7 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
 
     render_dark_overlay(frame, area);
 
-    let width = 65u16.min(area.width.saturating_sub(4));
+    let width = 78u16.min(area.width.saturating_sub(4));
     let model_rows = state.models.len().min(MODEL_PICKER_VISIBLE_ROWS) as u16;
     let height = (5 + model_rows + 2).max(9);
     let dialog_area = centered_rect(width, height, area);
@@ -1532,6 +1633,13 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
         Style::default().fg(muted),
     )]));
     lines.push(Line::from(""));
+
+    // Row layout: " ▸ ●" (4) + name (30) + size/quant/params (24) + the VRAM
+    // column (13). The VRAM column is dropped on narrow terminals so a
+    // number is never truncated mid-value.
+    const PICKER_ROW_META_WIDTH: u16 = 58;
+    const PICKER_VRAM_WIDTH: u16 = 13;
+    let show_vram = inner.width >= PICKER_ROW_META_WIDTH + PICKER_VRAM_WIDTH;
 
     if state.models.is_empty() {
         lines.push(Line::from(vec![Span::styled(
@@ -1569,7 +1677,28 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
             let quant_str = &model.quantization;
             let params_str = &model.parameter_size;
 
-            lines.push(Line::from(vec![
+            // Per-model VRAM from `/api/ps`, shown for loaded models only —
+            // this is the metric Ollama actually reports (it exposes no
+            // free/total GPU memory).
+            let vram_span = show_vram
+                .then(|| state.loaded_vram(&model.name))
+                .flatten()
+                .map(|bytes| {
+                    Span::styled(
+                        format!(
+                            "{:>width$}",
+                            format!("{} VRAM", format_vram_display(bytes)),
+                            width = PICKER_VRAM_WIDTH as usize
+                        ),
+                        if is_selected {
+                            Style::default().bg(highlight_bg).fg(marker_color)
+                        } else {
+                            Style::default().fg(marker_color)
+                        },
+                    )
+                });
+
+            let mut spans = vec![
                 Span::styled(format!(" {} ", indicator), row_style),
                 Span::styled(
                     loaded_marker.to_string(),
@@ -1588,7 +1717,10 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
                         Style::default().fg(muted)
                     },
                 ),
-            ]));
+            ];
+            spans.extend(vram_span);
+
+            lines.push(Line::from(spans));
         }
     }
 
@@ -1737,6 +1869,17 @@ fn render_host_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loaded-model snapshot entry as `/api/ps` reports it.
+    fn loaded_model(name: &str, size_vram: Option<u64>) -> clawde_core::OllamaLoadedModel {
+        clawde_core::OllamaLoadedModel {
+            name: name.to_string(),
+            size: size_vram,
+            size_vram,
+            expires_at: None,
+            context_length: None,
+        }
+    }
 
     /// Render the dialog on a test backend and return the visible text.
     fn render_screen_for_test(state: &OllamaConfigDialogState) -> String {
@@ -2180,11 +2323,105 @@ mod tests {
         assert_eq!(state.health, HealthStatus::Untested);
     }
 
+    /// Flatten a rendered line's spans into plain text.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn vram_sample(
+        used_bytes: Option<u64>,
+        total_bytes: u64,
+    ) -> clawde_core::config::OllamaVramSample {
+        clawde_core::config::OllamaVramSample {
+            used_bytes,
+            total_bytes,
+        }
+    }
+
+    /// Every state the probe can be in must be distinguishable on-screen: an
+    /// unreported typo and no command at all cannot look the same, and an
+    /// unknown numerator cannot look like an empty card.
+    #[test]
+    fn vram_probe_line_reports_each_state() {
+        use clawde_core::config::{OllamaVramProbe, OllamaVramStatus};
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+
+        // Nothing configured: the line names both knobs, which is the only
+        // place they are discoverable from the TUI.
+        let text = line_text(&state.vram_probe_line());
+        assert!(text.contains("vram_probe_cmd"), "{text:?}");
+        assert!(text.contains("vram_total_mb"), "{text:?}");
+
+        // A working probe: whole-GPU used/total, and it does not claim to be
+        // the declared-capacity fallback.
+        state.set_vram_status(OllamaVramStatus {
+            sample: Some(vram_sample(Some(24 * GIB), 50 * GIB)),
+            probe: OllamaVramProbe::Reported {
+                used_bytes: 24 * GIB,
+                total_bytes: 50 * GIB,
+            },
+        });
+        let text = line_text(&state.vram_probe_line());
+        assert!(text.contains("whole-GPU"), "{text:?}");
+        assert!(!text.contains("declared capacity"), "{text:?}");
+
+        // A configured-but-failing probe is called out rather than silently
+        // rendering as "no command".
+        state.set_vram_status(OllamaVramStatus {
+            sample: Some(vram_sample(Some(4 * GIB), 8 * GIB)),
+            probe: OllamaVramProbe::Failed,
+        });
+        let text = line_text(&state.vram_probe_line());
+        assert!(text.contains("probe failed"), "{text:?}");
+
+        // Declared capacity only.
+        state.set_vram_status(OllamaVramStatus {
+            sample: Some(vram_sample(Some(4 * GIB), 8 * GIB)),
+            probe: OllamaVramProbe::NotConfigured,
+        });
+        let text = line_text(&state.vram_probe_line());
+        assert!(text.contains("declared capacity"), "{text:?}");
+
+        // Declared capacity with an unreachable host: the reading is `--`, not
+        // a zero that would read as an empty card.
+        state.set_vram_status(OllamaVramStatus {
+            sample: Some(vram_sample(None, 8 * GIB)),
+            probe: OllamaVramProbe::NotConfigured,
+        });
+        let text = line_text(&state.vram_probe_line());
+        assert!(text.contains("-- of 8.0GiB"), "{text:?}");
+    }
+
+    #[test]
+    fn default_view_renders_the_vram_probe_line() {
+        use clawde_core::config::{OllamaVramProbe, OllamaVramStatus};
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        state.set_vram_status(OllamaVramStatus {
+            sample: Some(vram_sample(Some(4 * GIB), 8 * GIB)),
+            probe: OllamaVramProbe::NotConfigured,
+        });
+
+        let out = render_screen_for_test(&state);
+        assert!(
+            out.contains("declared capacity"),
+            "the probe line must reach the screen. Output: {out:?}"
+        );
+    }
+
     #[test]
     fn test_loaded_model_markers() {
         let mut state = OllamaConfigDialogState::new();
         state.open(None, None);
-        state.set_loaded_model_names(vec!["qwen2.5-coder:7b".to_string()]);
+        state.set_loaded_models(vec![loaded_model("qwen2.5-coder:7b", Some(4_500_000_000))]);
 
         let models = vec![
             OllamaModel {
@@ -2203,7 +2440,7 @@ mod tests {
         state.ping_success(models);
         assert!(state.is_model_loaded("qwen2.5-coder:7b"));
         // Bare tag and `:latest` are the same model to Ollama...
-        state.set_loaded_model_names(vec!["llama3:latest".to_string()]);
+        state.set_loaded_models(vec![loaded_model("llama3:latest", Some(2_000_000_000))]);
         assert!(state.is_model_loaded("llama3"));
         assert!(state.is_model_loaded("llama3:latest"));
         // ...but a versioned tag is distinct from any other tag.
@@ -2212,8 +2449,86 @@ mod tests {
 
         // The snapshot survives a refresh cycle (models replaced, loaded
         // names kept) — this is why it lives outside `models`.
-        state.set_loaded_model_names(vec![]);
+        state.set_loaded_models(vec![]);
         assert!(!state.is_model_loaded("qwen2.5-coder:7b"));
+    }
+
+    #[test]
+    fn test_loaded_vram_lookup() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        state.set_loaded_models(vec![
+            loaded_model("qwen3:32b", Some(19_300_000_000)),
+            loaded_model("llama3:latest", Some(2_000_000_000)),
+            // Older servers omit `size_vram`; the marker still shows.
+            loaded_model("gemma3:4b", None),
+        ]);
+
+        assert_eq!(state.loaded_vram("qwen3:32b"), Some(19_300_000_000));
+        // Bare tag and `:latest` resolve to the same loaded entry.
+        assert_eq!(state.loaded_vram("llama3"), Some(2_000_000_000));
+        // Loaded but with no reported size: marker yes, size no.
+        assert!(state.is_model_loaded("gemma3:4b"));
+        assert_eq!(state.loaded_vram("gemma3:4b"), None);
+        // Not loaded at all.
+        assert_eq!(state.loaded_vram("not-installed:1b"), None);
+    }
+
+    #[test]
+    fn test_model_picker_shows_per_model_vram() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        state.set_loaded_models(vec![
+            loaded_model("qwen3:32b", Some(19_300_000_000)),
+            loaded_model("gemma3:4b", None),
+        ]);
+        state.ping_success(vec![
+            OllamaModel {
+                name: "qwen3:32b".to_string(),
+                size: 19_800_000_000,
+                quantization: "Q4_K_M".to_string(),
+                parameter_size: "32B".to_string(),
+            },
+            OllamaModel {
+                name: "gemma3:4b".to_string(),
+                size: 3_300_000_000,
+                quantization: "Q4_0".to_string(),
+                parameter_size: "4B".to_string(),
+            },
+            OllamaModel {
+                name: "llama3:8b".to_string(),
+                size: 4_000_000_000,
+                quantization: "Q4_0".to_string(),
+                parameter_size: "8B".to_string(),
+            },
+        ]);
+        state.phase = OllamaConfigPhase::SelectModel;
+
+        let out = render_screen_for_test(&state);
+        // Loaded model row carries its VRAM figure...
+        assert!(
+            out.contains("18.0GiB VRAM"),
+            "expected per-model VRAM in picker rows, got:\n{out}"
+        );
+        // ...the installed-only row does not, and no bogus zero is drawn.
+        assert!(!out.contains("0.0GiB"), "no bogus zero VRAM: \n{out}");
+        // Loaded without a reported size: marker only, no VRAM text.
+        let gemma_row = out
+            .lines()
+            .find(|line| line.contains("gemma3:4b"))
+            .expect("gemma row rendered");
+        assert!(
+            !gemma_row.contains("VRAM"),
+            "gemma row should have no VRAM column, got: {gemma_row}"
+        );
+    }
+
+    #[test]
+    fn test_vram_display_format() {
+        assert_eq!(format_vram_display(19_327_352_832), "18.0GiB");
+        assert_eq!(format_vram_display(1_073_741_824), "1.0GiB");
+        // Below 1 GiB drops to MiB rather than showing "0.3GiB".
+        assert_eq!(format_vram_display(287_000_000), "274MiB");
     }
 
     #[test]

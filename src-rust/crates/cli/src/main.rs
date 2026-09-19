@@ -4096,6 +4096,23 @@ async fn run_interactive(
         tokio::sync::mpsc::unbounded_channel::<Vec<clawde_core::OllamaLoadedModel>>();
     let (ollama_info_tx, mut ollama_info_rx) =
         tokio::sync::mpsc::unbounded_channel::<clawde_query::OllamaPolledServerInfo>();
+    // GPU memory for the footer's `VRAM: n/N GB` pill. Assembled each cycle
+    // from the last probe result (whole-GPU used/total, refreshed on its own
+    // slow cadence below) or a declared capacity plus the loaded models'
+    // `size_vram`. `sample: None` = no denominator known → the pill stays
+    // hidden; `used_bytes: None` = the host did not answer, so the numerator
+    // is unknown rather than zero.
+    let (ollama_vram_tx, mut ollama_vram_rx) =
+        tokio::sync::mpsc::unbounded_channel::<clawde_core::config::OllamaVramStatus>();
+    // Last result of the optional probe command. Written by the probe task
+    // below, read by the poll loop when it assembles the sample. std (not
+    // tokio) mutex: both critical sections are a value copy with no await, and
+    // one side runs on the sync TUI main loop where a tokio mutex would panic
+    // ("cannot block the current thread from within a runtime"). Never held
+    // across an await.
+    let ollama_vram_probe = std::sync::Arc::new(std::sync::Mutex::new(
+        clawde_core::config::OllamaVramProbe::NotConfigured,
+    ));
     // Auto-polled model list (`/api/tags`) from the same loop: keeps the
     // /ollama model picker populated and fresh whenever a host is configured
     // — the footer badge renders ollama in every frame, so "ollama hinted"
@@ -4112,7 +4129,10 @@ async fn run_interactive(
         model: String::new(),
     }));
     {
+        // Both this loop and the probe task below read the shared probe slot,
+        // so each gets its own handle.
         let ollama_info_wish = ollama_info_wish.clone();
+        let ollama_vram_probe = ollama_vram_probe.clone();
         tokio::spawn(async move {
             let poll_interval = std::time::Duration::from_secs(5);
             loop {
@@ -4120,11 +4140,27 @@ async fn run_interactive(
                 let config = Settings::load_sync()
                     .map(|settings| settings.effective_config())
                     .unwrap_or_default();
-                let models = match clawde_core::ollama_status_for_config(&config).await {
-                    Ok(status) => status.models,
-                    Err(_) => Vec::new(),
-                };
+                let (models, host_reachable) =
+                    match clawde_core::ollama_status_for_config(&config).await {
+                        Ok(status) => (status.models, true),
+                        Err(_) => (Vec::new(), false),
+                    };
+                // Numerator for a declared-capacity sample: the loaded models'
+                // `size_vram`. `None` (not `0`) when `/api/ps` did not answer,
+                // so an unreachable host renders as unknown instead of as an
+                // empty card. The probe — the only thing on this path that
+                // spawns a process — comes from its own task's last result, so
+                // this loop never waits on it.
+                let loaded_vram =
+                    host_reachable.then(|| models.iter().filter_map(|m| m.size_vram).sum::<u64>());
                 let _ = ollama_loaded_tx.send(models);
+                let probe = ollama_vram_probe
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let vram =
+                    clawde_core::config::ollama_vram_status_for(&config, loaded_vram, &probe);
+                let _ = ollama_vram_tx.send(vram);
                 // Model-list poll: one small GET per cycle, skipped entirely
                 // when no host is configured. Same cadence + gate as the
                 // /api/ps poll above, so the picker auto-populates without
@@ -4155,6 +4191,33 @@ async fn run_interactive(
                     None => None,
                 };
                 let _ = ollama_info_tx.send(clawde_query::OllamaPolledServerInfo { model, info });
+            }
+        });
+    }
+
+    // The GPU-memory probe runs on its own, much slower cadence than the poll
+    // above. This is the only place a probe command is spawned: running it per
+    // poll cycle meant a new process (typically `ssh`) every few seconds for
+    // the life of the session, with its latency serialized in front of the
+    // model-list and server-info polls in that same iteration. With no command
+    // configured this task publishes `NotConfigured` and sleeps, spawning
+    // nothing.
+    {
+        let ollama_vram_probe = ollama_vram_probe.clone();
+        tokio::spawn(async move {
+            loop {
+                // Re-read the config each cycle so a command or host edit takes
+                // effect without a restart, and so the cadence follows the
+                // current setting instead of a value captured at startup.
+                let config = Settings::load_sync()
+                    .map(|settings| settings.effective_config())
+                    .unwrap_or_default();
+                let probe = clawde_core::config::ollama_vram_probe_for(&config).await;
+                let interval = config.ollama_vram_probe_interval();
+                *ollama_vram_probe
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = probe;
+                tokio::time::sleep(interval).await;
             }
         });
     }
@@ -7474,11 +7537,22 @@ async fn run_interactive(
             ollama_latest = Some(models);
         }
         if let Some(models) = ollama_latest {
-            // Keep the Ollama config screen's loaded-in-VRAM markers in sync
-            // with the footer poll so an open screen refreshes live.
-            app.ollama_config_dialog
-                .set_loaded_model_names(models.iter().map(|m| m.name.clone()).collect());
+            // Keep the Ollama config screen's loaded-in-VRAM markers and VRAM
+            // column in sync with the footer poll so an open screen refreshes
+            // live.
+            app.ollama_config_dialog.set_loaded_models(models.clone());
             app.ollama_loaded_models = models;
+        }
+
+        // GPU memory for the footer's VRAM pill, plus the probe outcome the
+        // /ollama screen reports as diagnostics. Latest status wins.
+        let mut vram_latest: Option<clawde_core::config::OllamaVramStatus> = None;
+        while let Ok(status) = ollama_vram_rx.try_recv() {
+            vram_latest = Some(status);
+        }
+        if let Some(status) = vram_latest {
+            app.ollama_config_dialog.set_vram_status(status.clone());
+            app.ollama_vram = status;
         }
 
         // Publish the server-info wish for the poller: whether the /ollama

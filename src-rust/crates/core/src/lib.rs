@@ -1654,6 +1654,215 @@ pub mod config {
         ollama_status_for_config(&config).await
     }
 
+    /// Bytes per MiB, the unit a VRAM probe is expected to print (the
+    /// `nvidia-smi --format=csv,noheader,nounits` convention).
+    const VRAM_PROBE_MIB: u64 = 1024 * 1024;
+
+    /// One GPU-memory reading shown in the footer while Ollama is active.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OllamaVramSample {
+        /// Bytes currently resident, or `None` when only the card total is
+        /// known. That is the declared-capacity path with no probe: the
+        /// numerator is the loaded models' `size_vram`, which can only be
+        /// summed when `/api/ps` answered. A `0` there would claim the card is
+        /// empty rather than admit the host could not be reached.
+        pub used_bytes: Option<u64>,
+        /// Total card memory in bytes.
+        pub total_bytes: u64,
+    }
+
+    /// What the optional VRAM probe command last did.
+    ///
+    /// Carried alongside the sample so the `/ollama` screen can report *why*
+    /// the footer shows a number, a `--`, or no pill at all — without it a
+    /// typo'd command is indistinguishable from no command.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub enum OllamaVramProbe {
+        /// No `vram_probe_cmd` configured, or Ollama is not the active
+        /// provider.
+        #[default]
+        NotConfigured,
+        /// Configured, but produced no usable reading (spawn failure, non-zero
+        /// exit, timeout, or unparsable output).
+        Failed,
+        /// Reported whole-GPU `used,total` from the host itself.
+        Reported { used_bytes: u64, total_bytes: u64 },
+    }
+
+    /// The footer's VRAM state: what to display, and how it was obtained.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct OllamaVramStatus {
+        /// The pair to display, or `None` when no honest denominator exists
+        /// (neither a probe result nor a declared capacity) — the pill is then
+        /// omitted rather than implying "0 of 0".
+        pub sample: Option<OllamaVramSample>,
+        pub probe: OllamaVramProbe,
+    }
+
+    /// Parse a VRAM probe's stdout.
+    ///
+    /// Each non-empty line must start with two integers: `used,total`, in MiB
+    /// (commas or whitespace separate them, so `10500, 8192` and `10500 8192`
+    /// both work). Multiple lines — one per GPU, as `nvidia-smi` prints them —
+    /// are summed so a multi-card host reports one aggregate figure. Lines that
+    /// do not start with two integers (`N/A`, headers) are skipped; `None` when
+    /// no line yields a pair with a positive total.
+    pub fn parse_vram_probe_output(stdout: &str) -> Option<(u64, u64)> {
+        let mut used_mib = 0u64;
+        let mut total_mib = 0u64;
+        let mut saw_pair = false;
+        for line in stdout.lines() {
+            let mut tokens = line
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|token| !token.is_empty());
+            let (Some(used), Some(total)) = (
+                tokens.next().and_then(|t| t.parse::<u64>().ok()),
+                tokens.next().and_then(|t| t.parse::<u64>().ok()),
+            ) else {
+                continue;
+            };
+            used_mib += used;
+            total_mib += total;
+            saw_pair = true;
+        }
+        if !saw_pair || total_mib == 0 {
+            return None;
+        }
+        Some((used_mib * VRAM_PROBE_MIB, total_mib * VRAM_PROBE_MIB))
+    }
+
+    /// Default timeout for one VRAM probe invocation. The command is
+    /// user-configured and typically crosses the network (e.g. `ssh`), so it
+    /// must never be able to stall the caller that awaits it.
+    const VRAM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Cap on how much of the probe's stdout is read. The command is arbitrary
+    /// user input: without a cap, one that streams (`yes`, `cat /dev/zero`)
+    /// allocates without bound until the timeout fires.
+    const VRAM_PROBE_MAX_BYTES: u64 = 8 * 1024;
+
+    /// Run a configured VRAM probe command and parse its output. Best-effort:
+    /// spawn failure, non-zero exit, timeout, or unparsable output all yield
+    /// `None`, and the caller keeps whatever it had.
+    ///
+    /// At most [`VRAM_PROBE_MAX_BYTES`] of stdout is read, and the child is
+    /// killed through `kill_on_drop` when a timeout fires.
+    pub async fn run_ollama_vram_probe(cmd: &str) -> Option<(u64, u64)> {
+        use tokio::io::AsyncReadExt;
+
+        let mut command = if cfg!(target_os = "windows") {
+            let mut command = tokio::process::Command::new("cmd");
+            command.args(["/C", cmd]);
+            command
+        } else {
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", cmd]);
+            command
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().ok()?;
+        let mut stdout = child.stdout.take()?;
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(
+            VRAM_PROBE_TIMEOUT,
+            (&mut stdout)
+                .take(VRAM_PROBE_MAX_BYTES)
+                .read_to_end(&mut buf),
+        )
+        .await;
+        // Close our end of the pipe before waiting: a command still writing
+        // past the cap then fails the write instead of blocking forever on a
+        // full pipe (and `wait` with it).
+        drop(stdout);
+        read.ok()?.ok()?;
+
+        let status = tokio::time::timeout(VRAM_PROBE_TIMEOUT, child.wait())
+            .await
+            .ok()?
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+        parse_vram_probe_output(&String::from_utf8_lossy(&buf))
+    }
+
+    /// Run the configured probe, if any, for the *current* provider.
+    ///
+    /// Returns [`OllamaVramProbe::NotConfigured`] without spawning anything
+    /// when Ollama is not the active provider or no command is set, so an
+    /// unconfigured session costs nothing. This is the only entry point that
+    /// spawns a process, and its caller runs it on the probe's own slow
+    /// cadence rather than on the footer's poll.
+    pub async fn ollama_vram_probe_for(config: &Config) -> OllamaVramProbe {
+        if config.selected_provider_id() != crate::ProviderId::OLLAMA {
+            return OllamaVramProbe::NotConfigured;
+        }
+        let Some(cmd) = config.ollama_vram_probe_cmd() else {
+            return OllamaVramProbe::NotConfigured;
+        };
+        match run_ollama_vram_probe(&cmd).await {
+            Some((used_bytes, total_bytes)) => OllamaVramProbe::Reported {
+                used_bytes,
+                total_bytes,
+            },
+            None => OllamaVramProbe::Failed,
+        }
+    }
+
+    /// Combine the three inputs into the footer's VRAM state.
+    ///
+    /// A [`OllamaVramProbe::Reported`] result supplies both numbers from the
+    /// host itself — the only source of a card's total, which Ollama's API
+    /// never reports — and its `used` is the driver's whole-GPU figure, so it
+    /// needs no numerator from `/api/ps`. Otherwise a declared `vram_total_mb`
+    /// supplies the denominator and the numerator is the loaded models'
+    /// `size_vram`: Ollama's own accounting, which reads lower than the
+    /// driver's because it excludes other processes and CUDA overhead.
+    ///
+    /// `loaded_vram` is that numerator, and is `None` when the Ollama host did
+    /// not answer `/api/ps` — which is what keeps an unreachable host from
+    /// rendering as an empty card. It is a plain value (no locking, no
+    /// spawning) so the caller can assemble it on the fast poll.
+    ///
+    /// Nothing is reported unless Ollama is the selected provider, so the pill
+    /// only ever appears in an Ollama session.
+    pub fn ollama_vram_status_for(
+        config: &Config,
+        loaded_vram: Option<u64>,
+        probe: &OllamaVramProbe,
+    ) -> OllamaVramStatus {
+        if config.selected_provider_id() != crate::ProviderId::OLLAMA {
+            return OllamaVramStatus::default();
+        }
+        let sample = match probe {
+            OllamaVramProbe::Reported {
+                used_bytes,
+                total_bytes,
+            } => Some(OllamaVramSample {
+                used_bytes: Some(*used_bytes),
+                total_bytes: *total_bytes,
+            }),
+            // A failing (or absent) probe falls back to the declared capacity
+            // so a transient ssh failure does not blank the pill.
+            _ => config
+                .ollama_vram_total_mb()
+                .map(|total_mib| OllamaVramSample {
+                    used_bytes: loaded_vram,
+                    // The declared capacity is in MiB; the sample is in bytes.
+                    total_bytes: total_mib * VRAM_PROBE_MIB,
+                }),
+        };
+        OllamaVramStatus {
+            sample,
+            probe: probe.clone(),
+        }
+    }
+
     /// Split an Ollama model identifier into its base name and optional tag.
     ///
     /// Ollama model ids look like `qwen2.5-coder:7b` (base + explicit tag)
@@ -2963,6 +3172,57 @@ pub mod config {
                 .and_then(|cfg| cfg.options.get("auto_unload"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
+        }
+
+        /// Read one non-request Ollama knob from the nested provider config.
+        /// On an effective config the top-level `providers` entry has already
+        /// been folded in here by `effective_config`, so one lookup covers
+        /// both documented locations.
+        fn ollama_knob(&self, key: &str) -> Option<&serde_json::Value> {
+            self.provider_configs
+                .get("ollama")
+                .and_then(|cfg| cfg.options.get(key))
+        }
+
+        /// Optional command that reports the GPU's memory from the host
+        /// itself, e.g.
+        /// `ssh -o BatchMode=yes gpu-box nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits`.
+        /// It must print `used,total` in MiB per line; see
+        /// [`parse_vram_probe_output`]. Ollama's API exposes no card total, so
+        /// this (or `vram_total_mb`) is the only way the footer can show a
+        /// denominator.
+        pub fn ollama_vram_probe_cmd(&self) -> Option<String> {
+            self.ollama_knob("vram_probe_cmd")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|cmd| !cmd.is_empty())
+                .map(str::to_string)
+        }
+
+        /// Declared card capacity in MiB, used as the VRAM denominator when no
+        /// probe command is configured (e.g. `8192` for an 8 GB card).
+        pub fn ollama_vram_total_mb(&self) -> Option<u64> {
+            self.ollama_knob("vram_total_mb")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|mib| *mib > 0)
+        }
+
+        /// How often the optional `vram_probe_cmd` runs.
+        ///
+        /// Deliberately not the footer's poll cadence: each invocation spawns a
+        /// process — typically `ssh` — and running that every few seconds for
+        /// the life of a session is hundreds of connections an hour to answer a
+        /// badge. Defaults to 30s, and is clamped to a 5s floor so a typo
+        /// cannot turn it into a hot loop.
+        pub fn ollama_vram_probe_interval(&self) -> std::time::Duration {
+            const DEFAULT_SECS: u64 = 30;
+            const MIN_SECS: u64 = 5;
+            let secs = self
+                .ollama_knob("vram_probe_interval_secs")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(DEFAULT_SECS)
+                .max(MIN_SECS);
+            std::time::Duration::from_secs(secs)
         }
 
         /// Whether app-level mouse capture should be enabled. Defaults to `true`
@@ -4369,6 +4629,255 @@ pub mod config {
             assert_eq!(
                 settings.effective_config().resolve_ollama_mode(),
                 OllamaMode::Isolated
+            );
+        }
+
+        /// A config whose active provider is Ollama, with the given knobs in
+        /// the nested provider entry.
+        fn config_with_ollama_knobs(knobs: &[(&str, serde_json::Value)]) -> Config {
+            let mut config = Config {
+                provider: Some("ollama".to_string()),
+                ..Default::default()
+            };
+            let entry = config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default();
+            for (key, value) in knobs {
+                entry.options.insert((*key).to_string(), value.clone());
+            }
+            config
+        }
+
+        #[test]
+        fn parse_vram_probe_output_reads_used_and_total_mib() {
+            const MIB: u64 = 1024 * 1024;
+            // The documented contract: `used,total` in MiB, exactly what
+            // `nvidia-smi --format=csv,noheader,nounits` prints.
+            assert_eq!(
+                parse_vram_probe_output("10500, 8192\n"),
+                Some((10500 * MIB, 8192 * MIB))
+            );
+            // Whitespace separator and a Windows CRLF line ending.
+            assert_eq!(
+                parse_vram_probe_output("10500 8192\r\n"),
+                Some((10500 * MIB, 8192 * MIB))
+            );
+            // One line per GPU — summed into a single aggregate figure.
+            assert_eq!(
+                parse_vram_probe_output("1000, 8192\n2000, 8192\n"),
+                Some((3000 * MIB, 16384 * MIB))
+            );
+            // Anything else yields nothing rather than a bogus pair: empty
+            // output, an nvidia-smi header, a bare number, N/A fields.
+            assert_eq!(parse_vram_probe_output(""), None);
+            assert_eq!(parse_vram_probe_output("used, total\n"), None);
+            assert_eq!(parse_vram_probe_output("512\n"), None);
+            assert_eq!(parse_vram_probe_output("N/A, N/A\n"), None);
+            // A zero total is not a denominator.
+            assert_eq!(parse_vram_probe_output("1024, 0\n"), None);
+        }
+
+        #[test]
+        fn vram_knobs_reject_blank_and_non_positive_values() {
+            let mut config = config_with_ollama_knobs(&[
+                ("vram_probe_cmd", serde_json::json!("   ")),
+                ("vram_total_mb", serde_json::json!(0)),
+            ]);
+            assert_eq!(config.ollama_vram_probe_cmd(), None);
+            assert_eq!(config.ollama_vram_total_mb(), None);
+
+            let entry = config
+                .provider_configs
+                .get_mut("ollama")
+                .expect("ollama entry");
+            entry.options.insert(
+                "vram_probe_cmd".to_string(),
+                serde_json::json!("  ssh gpu-box nvidia-smi  "),
+            );
+            entry
+                .options
+                .insert("vram_total_mb".to_string(), serde_json::json!(8192));
+            assert_eq!(
+                config.ollama_vram_probe_cmd().as_deref(),
+                Some("ssh gpu-box nvidia-smi")
+            );
+            assert_eq!(config.ollama_vram_total_mb(), Some(8192));
+        }
+
+        #[test]
+        fn declared_capacity_supplies_the_vram_denominator() {
+            const MIB: u64 = 1024 * 1024;
+            let config = config_with_ollama_knobs(&[("vram_total_mb", serde_json::json!(8192))]);
+
+            let status = ollama_vram_status_for(
+                &config,
+                Some(6_400_000_000),
+                &OllamaVramProbe::NotConfigured,
+            );
+            let sample = status.sample.expect("declared capacity is a denominator");
+            assert_eq!(sample.total_bytes, 8192 * MIB);
+            assert_eq!(sample.used_bytes, Some(6_400_000_000));
+            assert_eq!(status.probe, OllamaVramProbe::NotConfigured);
+        }
+
+        #[test]
+        fn no_denominator_means_no_sample() {
+            // Ollama reports no card total, so with neither a probe nor a
+            // declared capacity the pill must stay hidden rather than imply a
+            // denominator.
+            let config = config_with_ollama_knobs(&[]);
+            assert!(
+                ollama_vram_status_for(&config, Some(4_000_000_000), &OllamaVramProbe::Failed)
+                    .sample
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn unreachable_host_leaves_the_numerator_unknown() {
+            const MIB: u64 = 1024 * 1024;
+            // A declared capacity with no probe: the numerator is Ollama's own
+            // accounting, and `None` means `/api/ps` never answered. Rendering
+            // that as `0` would claim the card is empty.
+            let config = config_with_ollama_knobs(&[("vram_total_mb", serde_json::json!(8192))]);
+
+            let sample = ollama_vram_status_for(&config, None, &OllamaVramProbe::NotConfigured)
+                .sample
+                .expect("the denominator is still known");
+            assert_eq!(sample.total_bytes, 8192 * MIB);
+            assert_eq!(sample.used_bytes, None);
+
+            // A reachable host with nothing loaded is a real zero, and is
+            // distinguishable from the unknown above.
+            let idle = ollama_vram_status_for(&config, Some(0), &OllamaVramProbe::NotConfigured)
+                .sample
+                .expect("denominator");
+            assert_eq!(idle.used_bytes, Some(0));
+        }
+
+        #[tokio::test]
+        async fn probe_is_not_run_outside_an_ollama_session() {
+            let mut config = config_with_ollama_knobs(&[(
+                "vram_probe_cmd",
+                serde_json::json!("echo 10500, 8192"),
+            )]);
+            config.provider = Some("anthropic".to_string());
+            // The runner returns before spawning anything, and the assembler
+            // reports nothing at all.
+            assert_eq!(
+                ollama_vram_probe_for(&config).await,
+                OllamaVramProbe::NotConfigured
+            );
+            assert_eq!(
+                ollama_vram_status_for(&config, Some(0), &OllamaVramProbe::NotConfigured),
+                OllamaVramStatus::default()
+            );
+        }
+
+        #[tokio::test]
+        async fn probe_reports_nothing_when_no_command_is_configured() {
+            let config = config_with_ollama_knobs(&[("vram_total_mb", serde_json::json!(8192))]);
+            assert_eq!(
+                ollama_vram_probe_for(&config).await,
+                OllamaVramProbe::NotConfigured
+            );
+        }
+
+        #[tokio::test]
+        async fn probe_command_supplies_used_and_total() {
+            const MIB: u64 = 1024 * 1024;
+            // A working probe wins over the declared capacity, and its `used`
+            // is whole-GPU usage — not Ollama's per-model accounting.
+            let config = config_with_ollama_knobs(&[
+                ("vram_probe_cmd", serde_json::json!("echo 10500, 8192")),
+                ("vram_total_mb", serde_json::json!(4096)),
+            ]);
+            let probe = ollama_vram_probe_for(&config).await;
+            assert_eq!(
+                probe,
+                OllamaVramProbe::Reported {
+                    used_bytes: 10500 * MIB,
+                    total_bytes: 8192 * MIB,
+                }
+            );
+            let sample = ollama_vram_status_for(&config, Some(0), &probe)
+                .sample
+                .expect("probe supplies both numbers");
+            assert_eq!(sample.used_bytes, Some(10500 * MIB));
+            assert_eq!(sample.total_bytes, 8192 * MIB);
+        }
+
+        #[tokio::test]
+        async fn failing_probe_falls_back_to_declared_capacity() {
+            const MIB: u64 = 1024 * 1024;
+            let config = config_with_ollama_knobs(&[
+                ("vram_probe_cmd", serde_json::json!("exit 1")),
+                ("vram_total_mb", serde_json::json!(8192)),
+            ]);
+            let probe = ollama_vram_probe_for(&config).await;
+            assert_eq!(probe, OllamaVramProbe::Failed);
+
+            // The failure is reported (so the screen can explain it) while the
+            // declared capacity still answers the footer.
+            let status = ollama_vram_status_for(&config, Some(4_000_000_000), &probe);
+            assert_eq!(status.probe, OllamaVramProbe::Failed);
+            let sample = status.sample.expect("declared capacity still answers");
+            assert_eq!(sample.total_bytes, 8192 * MIB);
+            assert_eq!(sample.used_bytes, Some(4_000_000_000));
+        }
+
+        #[test]
+        fn probe_interval_defaults_and_clamps() {
+            use std::time::Duration;
+            // Unset: the slow default, never the footer's poll cadence.
+            let config = config_with_ollama_knobs(&[]);
+            assert_eq!(config.ollama_vram_probe_interval(), Duration::from_secs(30));
+
+            // A deliberate value is honoured...
+            let config =
+                config_with_ollama_knobs(&[("vram_probe_interval_secs", serde_json::json!(120))]);
+            assert_eq!(
+                config.ollama_vram_probe_interval(),
+                Duration::from_secs(120)
+            );
+
+            // ...but an accidental (or hostile) `1` cannot become a hot loop.
+            let config =
+                config_with_ollama_knobs(&[("vram_probe_interval_secs", serde_json::json!(1))]);
+            assert_eq!(config.ollama_vram_probe_interval(), Duration::from_secs(5));
+        }
+
+        /// The read cap is what keeps an arbitrary user command from
+        /// allocating without bound. Both halves are asserted: a truncated
+        /// read yields exactly the capped prefix, and a command that never
+        /// exits cannot hold the reader (the old unconditional `read_to_end`
+        /// waited out the full 3s timeout here).
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn probe_read_is_capped_and_never_hangs() {
+            const MIB: u64 = 1024 * 1024;
+            // 2000 lines, well past the cap; the whole stream parses to 200_000
+            // in the `used` column, so a truncated result proves the cap.
+            let (used_mib, total_mib) = run_ollama_vram_probe("yes 100,200 | head -n 2000")
+                .await
+                .expect("the capped prefix still parses");
+            let line_bytes = "100,200\n".len() as u64;
+            let capped_lines = VRAM_PROBE_MAX_BYTES / line_bytes;
+            assert!(capped_lines < 2000, "the fixture must exceed the cap");
+            assert_eq!(used_mib / MIB, capped_lines * 100);
+            assert_eq!(total_mib / MIB, capped_lines * 200);
+
+            // A command that never exits: the cap ends the read, the closed
+            // pipe kills the child, and the non-zero status rejects the
+            // garbage rather than reporting it.
+            let started = std::time::Instant::now();
+            assert_eq!(run_ollama_vram_probe("yes 100,200").await, None);
+            assert!(
+                started.elapsed() < VRAM_PROBE_TIMEOUT,
+                "a streaming probe must not hold the reader for the timeout. \
+                 Elapsed: {:?}",
+                started.elapsed()
             );
         }
 

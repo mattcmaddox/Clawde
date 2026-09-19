@@ -3909,6 +3909,43 @@ fn free_fallback_upstream_count(defaults: &[(String, String, String)]) -> usize 
 // Keybinding hints footer
 // -----------------------------------------------------------------------
 
+/// Card capacity for the footer pill: whole GiB print bare (`8`), fractional
+/// ones keep a decimal (`7.7`).
+fn vram_total_gib_label(total_gib: f64) -> String {
+    let rounded = (total_gib * 10.0).round() / 10.0;
+    if rounded.fract().abs() < f64::EPSILON {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.1}")
+    }
+}
+
+/// Footer pill for GPU memory: `VRAM: 6.3/8 GB`. Colour tracks pressure so a
+/// card that is nearly full is obvious at a glance.
+///
+/// When only the capacity is known — a declared `vram_total_mb` with a host
+/// that did not answer `/api/ps` — the numerator prints as `--` and stays dim.
+/// A `0.0` there would claim the card is empty rather than admit we could not
+/// read it.
+fn vram_pill_label(sample: clawde_core::config::OllamaVramSample) -> (String, Color) {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let total_gib = sample.total_bytes as f64 / GIB;
+    let total_label = vram_total_gib_label(total_gib);
+    let Some(used_bytes) = sample.used_bytes else {
+        return (format!("VRAM: --/{total_label} GB"), Color::DarkGray);
+    };
+    let used_gib = used_bytes as f64 / GIB;
+    let used_pct = used_gib / total_gib * 100.0;
+    let color = if used_pct >= 90.0 {
+        Color::Red
+    } else if used_pct >= 75.0 {
+        Color::Yellow
+    } else {
+        Color::Rgb(80, 200, 80)
+    };
+    (format!("VRAM: {used_gib:.1}/{total_label} GB"), color)
+}
+
 /// Single footer line matching the TS contract more closely:
 /// - `? for shortcuts` is suppressed once the prompt becomes non-empty
 /// - the right side shows comprehensive status info and notifications
@@ -4352,6 +4389,21 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     // Right side: status metrics and lightweight badges.
     let mut right_spans: Vec<Span> = {
         let mut parts: Vec<Span> = Vec::new();
+
+        // 0. GPU memory in use — Ollama sessions only, and only when a
+        //    denominator is known. `n` is the whole-GPU figure reported by the
+        //    configured `vram_probe_cmd`, or the sum of the loaded models'
+        //    `size_vram` when just a `vram_total_mb` capacity is declared; `N`
+        //    comes from the probe or from that declared capacity. Ollama's own
+        //    API exposes no card total, so without either setting there is no
+        //    honest denominator and the pill is omitted entirely. A known
+        //    denominator with no numerator (host unreachable) prints `--`.
+        if app.config.selected_provider_id() == clawde_core::ProviderId::OLLAMA {
+            if let Some(sample) = app.ollama_vram.sample {
+                let (label, color) = vram_pill_label(sample);
+                parts.push(Span::styled(label, Style::default().fg(color)));
+            }
+        }
 
         // 1. Context window usage — show "N% until auto-compact" mirroring TS TokenWarning.
         //    When an update is available and context is below 85%, show the update notification
@@ -6889,5 +6941,145 @@ mod ollama_indicator_tests {
             "'ollama:online' must NOT appear in isolated mode. Output: {:?}",
             out
         );
+    }
+
+    /// An Ollama session: `provider` is what `selected_provider_id` reads.
+    fn ollama_app(vram: Option<clawde_core::config::OllamaVramSample>) -> App {
+        let mut app = App::new(
+            Config {
+                provider: Some("ollama".to_string()),
+                ..Default::default()
+            },
+            CostTracker::new(),
+        );
+        app.status_message = Some("test".to_string());
+        app.ollama_vram = clawde_core::config::OllamaVramStatus {
+            sample: vram,
+            probe: clawde_core::config::OllamaVramProbe::NotConfigured,
+        };
+        app
+    }
+
+    fn vram_sample(used_mib: u64, total_mib: u64) -> clawde_core::config::OllamaVramSample {
+        const MIB: u64 = 1024 * 1024;
+        clawde_core::config::OllamaVramSample {
+            used_bytes: Some(used_mib * MIB),
+            total_bytes: total_mib * MIB,
+        }
+    }
+
+    /// A known capacity with no reading — the declared-capacity path when the
+    /// host did not answer.
+    fn vram_sample_unknown(total_mib: u64) -> clawde_core::config::OllamaVramSample {
+        const MIB: u64 = 1024 * 1024;
+        clawde_core::config::OllamaVramSample {
+            used_bytes: None,
+            total_bytes: total_mib * MIB,
+        }
+    }
+
+    #[test]
+    fn ollama_footer_shows_vram_used_over_total() {
+        let app = ollama_app(Some(vram_sample(6451, 8192)));
+        let out = render_screen(&app);
+        assert!(
+            out.contains("VRAM: 6.3/8 GB"),
+            "VRAM pill should read used/total. Output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ollama_footer_vram_pill_sits_left_of_context() {
+        let mut app = ollama_app(Some(vram_sample(6451, 8192)));
+        app.context_window_size = 200_000;
+        app.context_used_tokens = 12_000;
+        let out = render_screen(&app);
+
+        let footer = out
+            .lines()
+            .find(|line| line.contains("VRAM:"))
+            .unwrap_or_else(|| panic!("VRAM pill missing. Output: {out:?}"));
+        assert!(
+            footer.contains("ctx: 6%"),
+            "context pill should share the row. Footer: {footer:?}"
+        );
+        let vram_at = footer.find("VRAM:").expect("vram index");
+        let ctx_at = footer.find("ctx:").expect("ctx index");
+        assert!(
+            vram_at < ctx_at,
+            "VRAM must render left of ctx. Footer: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn ollama_footer_vram_pill_needs_an_ollama_session() {
+        // Same sample, but Ollama is not the active provider: the pill is
+        // about *this* session's GPU box, so it stays hidden elsewhere.
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.status_message = Some("test".to_string());
+        app.ollama_vram = clawde_core::config::OllamaVramStatus {
+            sample: Some(vram_sample(6451, 8192)),
+            probe: clawde_core::config::OllamaVramProbe::Reported {
+                used_bytes: 6451 * 1024 * 1024,
+                total_bytes: 8192 * 1024 * 1024,
+            },
+        };
+        let out = render_screen(&app);
+        assert!(
+            !out.contains("VRAM:"),
+            "non-Ollama sessions must not show the VRAM pill. Output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ollama_footer_vram_pill_shows_unknown_rather_than_zero() {
+        // A declared capacity with an unreachable host: the numerator is
+        // unknown, so the pill must not claim the card is empty.
+        let app = ollama_app(Some(vram_sample_unknown(8192)));
+        let out = render_screen(&app);
+        assert!(
+            out.contains("VRAM: --/8 GB"),
+            "an unknown numerator prints `--`. Output: {out:?}"
+        );
+        assert!(
+            !out.contains("VRAM: 0.0/8 GB"),
+            "unknown must not render as an empty card. Output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ollama_footer_vram_pill_hidden_without_a_denominator() {
+        // No probe result: an Ollama session with no measurable card total
+        // shows nothing rather than a bare number that reads as "of nothing".
+        let app = ollama_app(None);
+        let out = render_screen(&app);
+        assert!(
+            !out.contains("VRAM:"),
+            "no denominator must mean no pill. Output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn vram_pill_label_formats_and_colours_pressure() {
+        // Whole-GiB capacities print bare; fractional ones keep a decimal.
+        let (label, color) = vram_pill_label(vram_sample(6451, 8192));
+        assert_eq!(label, "VRAM: 6.3/8 GB");
+        // 6451/8192 MiB = 79% — already into the warning band.
+        assert_eq!(color, Color::Yellow);
+
+        let (label, _) = vram_pill_label(vram_sample(0, 7414));
+        assert_eq!(label, "VRAM: 0.0/7.2 GB");
+
+        // A known capacity with no reading: `--`, never `0.0`.
+        let (label, color) = vram_pill_label(vram_sample_unknown(8192));
+        assert_eq!(label, "VRAM: --/8 GB");
+        assert_eq!(color, Color::DarkGray);
+
+        // Pressure: >=75% yellow, >=90% red — a model that will not fit on
+        // the card is visible without reading the numbers.
+        let (_, green) = vram_pill_label(vram_sample(4096, 8192));
+        assert_eq!(green, Color::Rgb(80, 200, 80));
+        let (_, red) = vram_pill_label(vram_sample(8192, 8192));
+        assert_eq!(red, Color::Red);
     }
 }

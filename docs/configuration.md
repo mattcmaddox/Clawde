@@ -135,6 +135,32 @@ and `/ollama online|isolated`). A legacy top-level
 absent, but the nested value wins when both are set, so a stale top-level
 `mode` cannot override the TUI's choice.
 
+While Ollama is the active provider the footer shows a `VRAM: n/N GB` pill.
+`N` — the card total — is the one thing Ollama's API never reports, so it comes
+from the optional settings under the same
+`config.provider_configs.ollama.options` object:
+
+- `vram_probe_cmd` — a command that prints `used,total` in MiB per line (the
+  `nvidia-smi --format=csv,noheader,nounits` shape), for example
+  `ssh -o BatchMode=yes -o ConnectTimeout=3 gpu-host nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits`.
+  Multiple lines (one per GPU) are summed, at most 8 KiB of output is read, and
+  each run is capped by a 3s timeout. With a working probe, `n` is whole-GPU
+  usage.
+- `vram_probe_interval_secs` — how often the probe runs. Defaults to `30` and
+  is clamped to a 5s floor. Each run spawns a process (usually `ssh`), so this
+  is deliberately slower than the footer's 5-second poll.
+- `vram_total_mb` — a declared capacity, e.g. `8192` for an 8 GB card, used
+  when no probe is configured or a probe fails. With only a declared capacity,
+  `n` is the sum of the loaded models' `size_vram`: Ollama's own accounting,
+  which reads lower than the driver's because it excludes other processes and
+  CUDA overhead.
+
+With neither setting there is no honest denominator, so the pill is omitted.
+With a declared capacity and an unanswered `/api/ps`, the numerator is unknown
+and prints as `--` rather than `0.0`, which would claim the card is empty. The
+`/ollama` screen carries a VRAM line reporting which of these states applies,
+including whether a configured probe failed.
+
 ```json
 {
   "provider": "ollama",
