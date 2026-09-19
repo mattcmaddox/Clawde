@@ -776,6 +776,10 @@ fn highlight_spans(text: &str, base: Style, hit: Style, terms: &[String]) -> Vec
 /// Width of the browser modal. The list is a table, so the width stays fixed
 /// and readable rather than stretching to an ultrawide terminal.
 const MODAL_W: u16 = 78;
+/// Ceiling for the modal width. The keyword rows truncate at 78 columns, so a
+/// wide terminal gets a wider table — but only up to a point, past which the
+/// rows are long enough to be hard to scan.
+const MODAL_MAX_W: u16 = 120;
 /// Floor for the modal height: the size the browser shipped with, kept as the
 /// minimum so a short terminal behaves exactly as it always has.
 const MODAL_MIN_H: u16 = 26;
@@ -794,7 +798,11 @@ const DETAIL_POPUP_H: u16 = 14;
 /// block so the popup sits under the modal instead of being clamped up over the
 /// bottom of the list.
 fn modal_rect_for(area: Rect) -> Rect {
-    let width = MODAL_W.min(area.width.saturating_sub(2));
+    let width = area
+        .width
+        .saturating_sub(4)
+        .clamp(MODAL_W, MODAL_MAX_W)
+        .min(area.width.saturating_sub(2));
     let room = area.height.saturating_sub(2);
     let height = if room <= MODAL_MIN_H + DETAIL_POPUP_H {
         MODAL_MIN_H.min(room).max(6)
@@ -1435,7 +1443,6 @@ fn render_detail_preview(state: &SessionBrowserState, browser_area: Rect, buf: &
         return;
     };
 
-    const DETAIL_W: u16 = MODAL_W;
     const DETAIL_H: u16 = DETAIL_POPUP_H;
     /// Rows the summary block may occupy above the divider, before wrapping.
     const SUMMARY_ROWS: u16 = 5;
@@ -1446,7 +1453,9 @@ fn render_detail_preview(state: &SessionBrowserState, browser_area: Rect, buf: &
     // list — including the hint bar. With fewer than four rows there is nothing
     // useful to show, so the list keeps the space instead.
     let below = buf.area.height.saturating_sub(browser_area.bottom());
-    let width = DETAIL_W.min(browser_area.width);
+    // Match the modal's width exactly, so the popup lines up with the list it
+    // belongs to at every terminal size.
+    let width = browser_area.width;
     let height = DETAIL_H.min(below);
     if width < 10 || height < 4 {
         return;
@@ -2467,8 +2476,60 @@ mod tests {
             let area = Rect::new(0, 0, 100, h);
             let rect = modal_rect_for(area);
             assert!(rect.bottom() <= area.bottom(), "h={h}");
-            assert_eq!(rect.x, 11, "centred in 100 columns: h={h}");
         }
+    }
+
+    #[test]
+    fn wide_terminals_widen_the_modal() {
+        // The floor keeps narrow terminals exactly as they were.
+        assert_eq!(modal_rect_for(Rect::new(0, 0, 80, 40)).width, MODAL_W);
+        assert_eq!(modal_rect_for(Rect::new(0, 0, 60, 40)).width, 58);
+        // Spare columns are used, up to the cap.
+        assert_eq!(modal_rect_for(Rect::new(0, 0, 91, 40)).width, 87);
+        assert_eq!(modal_rect_for(Rect::new(0, 0, 130, 40)).width, MODAL_MAX_W);
+        assert_eq!(modal_rect_for(Rect::new(0, 0, 300, 40)).width, MODAL_MAX_W);
+        // Centred, and never wider than the area.
+        for w in [40u16, 60, 80, 91, 130, 300] {
+            let area = Rect::new(0, 0, w, 40);
+            let rect = modal_rect_for(area);
+            assert!(rect.right() <= area.right(), "w={w}");
+            assert_eq!(
+                rect.x,
+                area.x + area.width.saturating_sub(rect.width) / 2,
+                "w={w}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wider_modal_shows_more_of_the_keyword_rows() {
+        let keyword_row = "alpha bravo charlie delta echo foxtrot golf hotel \
+                           india juliet kilo lima mike november oscar"
+            .to_string();
+        assert!(keyword_row.len() > 70, "long enough to truncate at 78 cols");
+        let render = |width: u16| -> String {
+            let mut s = SessionBrowserState::new();
+            s.open();
+            let mut entry = plain_session(1);
+            entry.middle = keyword_row.clone();
+            s.set_sessions(vec![entry]);
+            let area = Rect::new(0, 0, width, 40);
+            let mut buf = Buffer::empty(area);
+            render_session_browser(&s, area, &mut buf);
+            buf.content.iter().map(|c| c.symbol().to_string()).collect()
+        };
+        // A narrow modal truncates with an ellipsis...
+        let narrow = render(80);
+        assert!(
+            narrow.contains("\u{2026}"),
+            "expected truncation at 80 cols"
+        );
+        // ...a wide one has room for the whole row.
+        let wide = render(130);
+        assert!(
+            wide.contains(&keyword_row),
+            "the widened modal should show the full keyword row"
+        );
     }
 
     #[test]
