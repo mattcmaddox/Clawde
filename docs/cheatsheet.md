@@ -33,7 +33,7 @@ The essentials. Type `/command` at the prompt. For everything else, type `/help`
 | Command | What it does |
 |---------|--------------|
 | `/rename` | Rename the current session |
-| `/history` | List recent sessions for this project |
+| `/history` | Browse this project's sessions — title, age, opening keywords, middle-work keywords and inferred status per session; type to filter, `^F` status filter, `Enter` resume, `^D` delete, `^E` export, `^B` fork, `^T` retitle (lists them when headless) |
 | `/session` | Browse and manage all sessions |
 | `/fork` | Fork the session into a new branch |
 

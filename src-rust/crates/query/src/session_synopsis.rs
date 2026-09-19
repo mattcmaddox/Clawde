@@ -18,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 /// Neutral defaults for the remaining `ProviderRequest` fields (stop
 /// sequences, thinking, effort, routing flags). The struct has no `Default`
-/// impl because most fields are required at real call sites.
-fn empty_request_defaults() -> ProviderRequest {
+/// impl because most fields are required at real call sites. Shared with the
+/// session titler, which issues the same shape of one-shot summarisation call.
+pub(crate) fn empty_request_defaults() -> ProviderRequest {
     ProviderRequest {
         model: String::new(),
         messages: Vec::new(),

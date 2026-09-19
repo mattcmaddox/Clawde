@@ -55,12 +55,70 @@ most recent sessions **for that project**.
 **How to use it.**
 
 - Launch Clawde in a project — the welcome screen's right column lists that
-  project's recent sessions with AI-generated titles and timestamps; click
-  one to resume it.
-- `/history` — print an overview of all sessions for the current project
-  with full timestamps and store locations.
+  project's recent sessions with a title and a timestamp; click one to resume
+  it.
+- `/history` — in the TUI, open the interactive session browser; headless
+  (`-p`), print an overview of all sessions for the current project with full
+  timestamps and store locations.
 - `/stats` (optionally `/stats --all`) — aggregated usage across your
   projects.
+
+**How a session gets its title.** Three sources, in order: your own `/rename`,
+otherwise the model-written title from the session-exit titler, otherwise the
+opening words of the session's first prompt. The last one is derived offline
+from the transcript, so sessions recorded before the titler existed still have
+a label instead of `(untitled)`.
+
+**What the browser shows.** Each session occupies four rows:
+
+| Row | Content |
+|---|---|
+| 1 | Title, age, message count, cost. The session you are in is marked `●` and reads `now` |
+| 2 | The most meaningful words of the session's **first** prompt |
+| 3 | The words that describe its **middle** work, excluding row 2's terms |
+| 4 | Inferred status: `… interrupted`, `✗ error`, `✂ compacted`, `✔ commit`, `● uncommitted`, `◦ no edits` |
+
+Above the list, one summary line says what the visible list contains —
+`57 sessions · 3 uncommitted · 2 errored` — so the state of the project reads
+without scrolling. Ages are derived from each transcript's modification time on
+every frame, so a browser left open does not keep showing stale times. A long,
+unfiltered list is grouped under `Today` / `Yesterday` / `This week` / `Earlier`
+headers.
+
+The modal also sizes itself to the terminal: on a tall screen it grows into the
+spare rows (up to 46) so the list shows many more sessions at once, while the
+detail popup stays anchored directly beneath it. On a terminal too short for
+four-row entries the keyword rows move into the popup (two rows per entry), so
+the list keeps showing many sessions rather than two or three.
+
+Rows 2-4 are inferred offline from the transcript (no model call, bounded
+reads), so they are best-effort: a status flag appears only when the sampled
+evidence supports it. The popup under the list carries the untruncated rows
+(plus the AI synopsis, when one was written) and the last messages of the
+selected session. Sessions with no recorded messages at all are skipped.
+
+**Keys.**
+
+| Key | Action |
+|---|---|
+| type | Filter. Every word must match somewhere, in any order; results are ranked (title > status > keywords > transcript) and the matching text is highlighted |
+| `↑` `↓` (`j` `k` in vim normal mode) | Move the selection (wraps) |
+| `Home` / `End` | First / last session |
+| `PgUp` / `PgDn` | Page through the list |
+| `Shift+↑` / `Shift+↓` | Scroll the popup's transcript preview |
+| `Enter` | Resume the selected session |
+| `^F` | Cycle the status filter: all → uncommitted → errors → interrupted → committed → no edits |
+| `^D` | Delete the selected session (asks to confirm; the running session cannot be deleted) |
+| `^E` | Export the selected session (JSON / Markdown / text / clipboard) |
+| `^B` | Resume the selected session as a new branch, leaving the original intact |
+| `^T` | Regenerate the model-written title for the selected session |
+| `^R` | Rename the selected session (same as `/rename`) |
+| `F5` | Reload the list |
+| `Esc` | Close |
+
+Clicking a row selects it; clicking the selected row again resumes it, and the
+mouse wheel scrolls the list. While the list is loading the body says so rather
+than reporting an empty history.
 
 **What it is NOT.**
 
@@ -126,7 +184,7 @@ linear undo stack.
 | `clawde --resume [id]` | Launch and continue a session |
 | `/resume [id]` | Continue a session in-place |
 | `/session [list]` | Inspect the current / recent sessions |
-| `/history` | List all sessions for the current project |
+| `/history` | Browse/resume this project's sessions (interactive in the TUI; a listing headless) |
 | `/new`, `/fork [i]` | Start fresh / branch the conversation |
 | `/rename <title>` | Name a session |
 | `/undo` | Roll back file changes from the last turn |

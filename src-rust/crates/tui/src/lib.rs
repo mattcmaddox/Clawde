@@ -1474,39 +1474,52 @@ mod tests {
     fn test_vim_popup_navigation_uses_jk_and_search_stays_modal() {
         let mut app = make_app();
         app.prompt_input.vim_enabled = true;
-        app.session_browser.open(vec![
+        app.session_browser.open();
+        app.session_browser.set_sessions(vec![
             SessionEntry {
                 id: "a".to_string(),
                 title: "Alpha".to_string(),
                 searchable_text: String::new(),
-                last_updated: "now".to_string(),
+                mtime_ms: 0,
                 message_count: 1,
                 cost_usd: 0.0,
+                opening: String::new(),
+                middle: String::new(),
+                flags: Vec::new(),
                 synopsis_about: String::new(),
                 synopsis_left_off: String::new(),
                 transcript_path: std::path::PathBuf::new(),
+                is_current: false,
             },
             SessionEntry {
                 id: "b".to_string(),
                 title: "Beta".to_string(),
                 searchable_text: String::new(),
-                last_updated: "now".to_string(),
+                mtime_ms: 0,
                 message_count: 2,
                 cost_usd: 0.0,
+                opening: String::new(),
+                middle: String::new(),
+                flags: Vec::new(),
                 synopsis_about: String::new(),
                 synopsis_left_off: String::new(),
                 transcript_path: std::path::PathBuf::new(),
+                is_current: false,
             },
             SessionEntry {
                 id: "c".to_string(),
                 title: "Gamma".to_string(),
                 searchable_text: String::new(),
-                last_updated: "now".to_string(),
+                mtime_ms: 0,
                 message_count: 3,
                 cost_usd: 0.0,
+                opening: String::new(),
+                middle: String::new(),
+                flags: Vec::new(),
                 synopsis_about: String::new(),
                 synopsis_left_off: String::new(),
                 transcript_path: std::path::PathBuf::new(),
+                is_current: false,
             },
         ]);
 
@@ -1544,16 +1557,21 @@ mod tests {
     #[test]
     fn test_popup_search_typing_unchanged_without_vim() {
         let mut app = make_app();
-        app.session_browser.open(vec![SessionEntry {
+        app.session_browser.open();
+        app.session_browser.set_sessions(vec![SessionEntry {
             id: "a".to_string(),
             title: "Alpha".to_string(),
             searchable_text: String::new(),
-            last_updated: "now".to_string(),
+            mtime_ms: 0,
             message_count: 1,
             cost_usd: 0.0,
+            opening: String::new(),
+            middle: String::new(),
+            flags: Vec::new(),
             synopsis_about: String::new(),
             synopsis_left_off: String::new(),
             transcript_path: std::path::PathBuf::new(),
+            is_current: false,
         }]);
         // Without vim, letters filter immediately and j/k stay as filter text.
         app.handle_key_event(key(KeyCode::Char('l')));

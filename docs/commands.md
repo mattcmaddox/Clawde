@@ -222,7 +222,7 @@ Manage active and stored sessions. Subcommands allow listing, switching, deletin
 /session attach <session-id>
 ```
 
-`/history` is an alias for `/session` that opens the session browser in the TUI; the prompt autocomplete shows `/session` as if it had been typed.
+`/history` is a command of its own (not an alias): in the TUI it opens the interactive session browser — filter by typing, `Enter` to resume, `^F` to filter by status, `^D` to delete, `^E` to export, `^B` to fork, `^T` to regenerate the title — and headless it prints a listing. An argument pre-fills the browser's filter (`/history karaoke`).
 
 Aliases are defined per-command in the commands crate (`SlashCommand::aliases`). Every declared alias is picked up automatically as a **hidden alias**: typing its prefix in the prompt suggests the canonical command name, and executing it resolves to the canonical command.
 

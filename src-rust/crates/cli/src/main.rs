@@ -80,7 +80,6 @@ use clawde_core::{
     context::ContextBuilder,
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
-    types::Message,
 };
 use clawde_tools::ToolContext;
 use parking_lot::Mutex as ParkingMutex;
@@ -3653,29 +3652,29 @@ fn reset_autonomy_for_session(tool_ctx: &mut ToolContext, session_id: &str) {
     }
 }
 
+/// Model id for the session-exit one-shot summarisers (session title, session
+/// synopsis): a fast, cheap completion is all either needs.
+///
+/// Prefers a pin into the free chain's Groq upstream. When Groq has no
+/// configured key, falls back to the free Auto route (`free/auto`), which the
+/// composite provider routes across configured upstreams in catalog order. The
+/// string only matters when the selected provider is the free chain; other
+/// providers ignore or resolve it themselves. The pin format is what
+/// `FreeProvider::resolve_route` consumes.
+fn fast_free_model_for_config() -> String {
+    let auth = clawde_core::AuthStore::load();
+    if clawde_api::providers::free::first_free_upstream_key(&auth, "groq").is_some() {
+        "groq/openai/gpt-oss-120b".to_string()
+    } else {
+        "free/auto".to_string()
+    }
+}
+
 /// Resolve the Ollama model this session should release from the remote GPU
 /// on exit. Returns the bare model name (no `ollama/` prefix) when the active
 /// provider is Ollama and a model is set; `None` otherwise. Only the session's
 /// own model is targeted so a shared Ollama server's other models are never
 /// evicted.
-/// Resolve the model id used for the session-exit synopsis call.
-///
-/// Prefers a pin into the free chain's Groq upstream (fast, cheap, ideal for
-/// a two-line summary). When Groq has no configured key, falls back to the
-/// free Auto route (`free/auto`), which the composite provider routes across
-/// configured upstreams in catalog order. The model string only matters when
-/// the selected provider is the free chain; other providers ignore/resolve it.
-fn synopsis_model_for_config(config: &Config, _model_name: &str) -> String {
-    let auth = clawde_core::AuthStore::load();
-    if clawde_api::providers::free::first_free_upstream_key(&auth, "groq").is_some() {
-        // Pin format consumed by FreeProvider::resolve_route.
-        "groq/openai/gpt-oss-120b".to_string()
-    } else {
-        let _ = config;
-        "free/auto".to_string()
-    }
-}
-
 fn exit_ollama_model_target(config: &Config, model_name: &str) -> Option<String> {
     if config.selected_provider_id() != "ollama" {
         return None;
@@ -4166,7 +4165,12 @@ async fn run_interactive(
         app.user_question_rx = Some(rx);
     }
 
-    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+    // Keep project_dir at the repository root, matching every other assignment
+    // to this field (and the CLI's own config build). Transcripts are bucketed
+    // by git root, so assigning the raw cwd here left the session browser and
+    // the welcome screen's recents empty whenever Clawde was launched from a
+    // repository subdirectory.
+    app.config.project_dir = Some(clawde_core::git_utils::project_root(&tool_ctx.working_dir));
     app.attach_turn_diff_state(tool_ctx.file_history.clone(), tool_ctx.current_turn.clone());
     if let Some(manager) = tool_ctx.mcp_manager.clone() {
         app.attach_mcp_manager(manager);
@@ -5848,34 +5852,21 @@ async fn run_interactive(
                             session.updated_at = chrono::Utc::now();
                         }
 
-                        // Update terminal title from session title or first message
+                        // Update terminal title from session title or first message.
+                        //
+                        // The model title written at session exit (see the exit
+                        // path) is what the session lists read. The block that
+                        // used to call the titler here was unreachable — its
+                        // guard tested `session.messages.is_empty()` immediately
+                        // after assigning the new user turn into it — and it
+                        // awaited an Anthropic-only client on the first turn, so
+                        // it is not restored.
                         if session.title.is_some() {
                             clawde_tui::update_terminal_title(session.title.as_deref());
                         } else {
                             // Use a truncated version of the first user message
                             let topic: String = input.chars().take(60).collect();
                             clawde_tui::update_terminal_title(Some(&topic));
-
-                            // Auto-title after first prompt: generate AI title if this is the first message
-                            if session.messages.is_empty() && session.title.is_none() {
-                                let first_msg = Message::user(input.clone());
-                                let title_config =
-                                    clawde_query::session_title::SessionTitleConfig::default();
-                                let cancel_token = CancellationToken::new();
-                                if let Some(title) =
-                                    clawde_query::session_title::generate_title_after_first_prompt(
-                                        &first_msg,
-                                        client.as_ref(),
-                                        &title_config,
-                                        cancel_token,
-                                    )
-                                    .await
-                                {
-                                    session.title = Some(title.clone());
-                                    cmd_ctx.session_title = Some(title.clone());
-                                    clawde_tui::update_terminal_title(Some(&title));
-                                }
-                            }
                         }
 
                         // Start async query
@@ -6345,6 +6336,187 @@ async fn run_interactive(
                     Err(e) => {
                         app.status_message = Some(format!("Failed to resume session: {}", e));
                     }
+                }
+            }
+        }
+
+        // Handle a deletion confirmed in the session browser (Ctrl+D → y).
+        if let Some(session_id) = app.pending_delete_session_id.take() {
+            let short = &session_id[..session_id.len().min(8)];
+            if session_id == session.id {
+                // The store refuses the active session too; the browser already
+                // blocks it, so this is belt-and-braces.
+                app.status_message = Some("Refusing to delete the running session.".to_string());
+            } else {
+                match clawde_core::history::delete_session(&session_id).await {
+                    Ok(()) => {
+                        app.status_message = Some(format!("Deleted session {}.", short));
+                    }
+                    Err(e) => {
+                        app.status_message = Some(format!("Failed to delete session: {}", e));
+                    }
+                }
+            }
+        }
+
+        // Handle exporting a past session from the browser (Ctrl+E). Its
+        // messages go into the override the export dialog reads, so the normal
+        // format picker does the writing.
+        if let Some(session_id) = app.pending_export_session_id.take() {
+            match clawde_core::history::load_session(&session_id).await {
+                Ok(target) => {
+                    if target.messages.is_empty() {
+                        app.status_message =
+                            Some("That session has no messages to export.".to_string());
+                    } else {
+                        // Say which session the dialog is about: the picker
+                        // itself only says "this session", which is the running
+                        // one everywhere else.
+                        let label = target.title.clone().unwrap_or_else(|| {
+                            format!("session {}", &session_id[..session_id.len().min(8)])
+                        });
+                        app.status_message = Some(format!(
+                            "Exporting \"{}\" ({} messages) — pick a format.",
+                            label,
+                            target.messages.len()
+                        ));
+                        app.export_override = Some((target.title.clone(), target.messages.clone()));
+                        app.export_dialog.open();
+                    }
+                }
+                Err(e) => {
+                    app.status_message = Some(format!("Failed to load session: {}", e));
+                }
+            }
+        }
+
+        // Handle "resume as a new branch" from the browser (Ctrl+B): copy the
+        // session under a fresh id and resume into the copy, so the original
+        // transcript stays intact. The resume block below adopts the new id in
+        // the same iteration.
+        if let Some(session_id) = app.pending_fork_session_id.take() {
+            match clawde_core::history::load_session(&session_id).await {
+                Ok(source) => {
+                    let mut forked =
+                        clawde_core::history::ConversationSession::new(source.model.clone());
+                    forked.messages = source.messages.clone();
+                    forked.working_dir = source.working_dir.clone();
+                    forked.effort = source.effort;
+                    forked.fork_point_message_index = Some(source.messages.len());
+                    let label = source.title.clone().unwrap_or_else(|| {
+                        format!("session {}", &source.id[..source.id.len().min(8)])
+                    });
+                    forked.title = Some(format!("{} (fork)", label));
+                    match clawde_core::history::save_session(&forked).await {
+                        Ok(()) => {
+                            let short = &forked.id[..forked.id.len().min(8)];
+                            app.status_message = Some(format!("Forked into {} — resuming.", short));
+                            app.pending_resume_session_id = Some(forked.id.clone());
+                        }
+                        Err(e) => {
+                            app.status_message =
+                                Some(format!("Failed to save the forked session: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.status_message = Some(format!("Failed to load session: {}", e));
+                }
+            }
+        }
+
+        // Handle a regenerated AI title from the browser (Ctrl+T). The same
+        // provider resolution the exit titler uses, so a session named here is
+        // named the same way it would have been at exit.
+        if let Some(session_id) = app.pending_title_session_id.take() {
+            match clawde_core::history::load_session(&session_id).await {
+                Ok(target) => {
+                    let provider = base_query_config
+                        .provider_registry
+                        .as_ref()
+                        .and_then(|reg| reg.get(&clawde_core::ProviderId::new("free")))
+                        .cloned()
+                        .or_else(|| {
+                            base_query_config
+                                .provider_registry
+                                .as_ref()?
+                                .default_provider()
+                                .cloned()
+                        });
+                    let messages = target.messages.clone();
+                    let generated = match provider {
+                        Some(provider) => {
+                            let model = fast_free_model_for_config();
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(20),
+                                clawde_query::session_title::generate_session_title(
+                                    &messages,
+                                    provider.as_ref(),
+                                    &model,
+                                    80,
+                                    CancellationToken::new(),
+                                ),
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                            .or_else(|| clawde_query::session_title::heuristic_title(&messages))
+                        }
+                        None => clawde_query::session_title::heuristic_title(&messages),
+                    };
+                    match generated {
+                        Some(title) if !title.trim().is_empty() => {
+                            let title = title.trim().to_string();
+                            // Persist to the transcript, then mirror it into the
+                            // browser list so the row updates without a reload.
+                            // A failure is surfaced rather than swallowed: the
+                            // row would otherwise look renamed until the next
+                            // load silently reverted it.
+                            let path = app
+                                .session_browser
+                                .sessions
+                                .iter()
+                                .find(|s| s.id == session_id)
+                                .map(|s| s.transcript_path.clone())
+                                .filter(|p| !p.as_os_str().is_empty());
+                            match path {
+                                Some(path) => {
+                                    match clawde_core::session_storage::write_ai_title(
+                                        &path,
+                                        &session_id,
+                                        &title,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            app.session_browser.set_title(&session_id, &title);
+                                            app.status_message =
+                                                Some(format!("Retitled to \"{}\".", title));
+                                        }
+                                        Err(e) => {
+                                            app.status_message = Some(format!(
+                                                "Generated \"{}\" but could not save it: {}",
+                                                title, e
+                                            ));
+                                        }
+                                    }
+                                }
+                                None => {
+                                    app.status_message = Some(
+                                        "No transcript path for that session to save a title to."
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            app.status_message =
+                                Some("Could not derive a title for that session.".to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.status_message = Some(format!("Failed to load session: {}", e));
                 }
             }
         }
@@ -7967,31 +8139,65 @@ async fn run_interactive(
             // loses the title whenever teardown outpaces the provider call. The
             // title is written to the JSONL transcript directly; the session JSON
             // is saved below without waiting for the title to arrive.
-            if session.title.is_none() && session.messages.len() >= 2 {
-                let messages = session.messages.clone();
-                let session_id = session.id.clone();
-                let client = client.clone();
-                let path = path.clone();
-                clawde_core::pending_writes::spawn(async move {
-                    let cancel = CancellationToken::new();
-                    let title_cfg = clawde_query::session_title::SessionTitleConfig::default();
-                    let gen = clawde_query::session_title::generate_session_title(
-                        &messages, &client, &title_cfg, cancel,
-                    );
-                    if let Ok(Some(title)) =
-                        tokio::time::timeout(std::time::Duration::from_secs(8), gen).await
-                    {
-                        let title = title.trim().to_string();
-                        if !title.is_empty() {
-                            let _ = clawde_core::session_storage::write_ai_title(
-                                &path,
-                                &session_id,
-                                &title,
-                            )
-                            .await;
-                        }
-                    }
+            //
+            // The summarisers below share one provider resolution: a live
+            // lookup at exit time (so a model switch mid-session is honoured),
+            // preferring the free chain's Auto route and falling back to the
+            // registry default. This used to be an `AnthropicClient` call,
+            // which silently produced no title at all on the default free-mode
+            // setup — the reason every listed session read `(untitled)`.
+            let exit_summary_provider = base_query_config
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| reg.get(&clawde_core::ProviderId::new("free")))
+                .cloned()
+                .or_else(|| {
+                    base_query_config
+                        .provider_registry
+                        .as_ref()?
+                        .default_provider()
+                        .cloned()
                 });
+            if let Some(provider) = exit_summary_provider.clone() {
+                if session.title.is_none() && session.messages.len() >= 2 {
+                    let messages = session.messages.clone();
+                    let session_id = session.id.clone();
+                    let path = path.clone();
+                    let model = fast_free_model_for_config();
+                    clawde_core::pending_writes::spawn(async move {
+                        let cancel = CancellationToken::new();
+                        let gen = clawde_query::session_title::generate_session_title(
+                            &messages,
+                            provider.as_ref(),
+                            &model,
+                            80,
+                            cancel,
+                        );
+                        // Model title when it lands; a deterministic phrase from
+                        // the opening prompt otherwise, so the entry is always
+                        // written and no row falls back to `(untitled)`.
+                        let title = match tokio::time::timeout(
+                            std::time::Duration::from_secs(8),
+                            gen,
+                        )
+                        .await
+                        {
+                            Ok(Some(title)) => Some(title),
+                            _ => clawde_query::session_title::heuristic_title(&messages),
+                        };
+                        if let Some(title) = title {
+                            let title = title.trim().to_string();
+                            if !title.is_empty() {
+                                let _ = clawde_core::session_storage::write_ai_title(
+                                    &path,
+                                    &session_id,
+                                    &title,
+                                )
+                                .await;
+                            }
+                        }
+                    });
+                }
             }
 
             // Auto-synopsis: one cheap free-chain completion producing two
@@ -8005,23 +8211,8 @@ async fn run_interactive(
                 let messages = session.messages.clone();
                 let session_id = session.id.clone();
                 let path = path.clone();
-                // Resolve a live provider at exit time (covers model switches
-                // made during the session); prefer the free chain's Auto route
-                // which lands on Groq-class fast upstreams when configured.
-                let provider = base_query_config
-                    .provider_registry
-                    .as_ref()
-                    .and_then(|reg| reg.get(&clawde_core::ProviderId::new("free")))
-                    .cloned()
-                    .or_else(|| {
-                        base_query_config
-                            .provider_registry
-                            .as_ref()?
-                            .default_provider()
-                            .cloned()
-                    });
-                if let Some(provider) = provider {
-                    let model = synopsis_model_for_config(&app.config, &app.model_name);
+                if let Some(provider) = exit_summary_provider {
+                    let model = fast_free_model_for_config();
                     clawde_core::pending_writes::spawn(async move {
                         let cancel = CancellationToken::new();
                         let gen = clawde_query::session_synopsis::generate_session_synopsis(

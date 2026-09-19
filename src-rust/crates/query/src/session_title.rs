@@ -1,11 +1,22 @@
-//! Session title generation — short, AI-generated names for conversations.
+//! Session title generation — short names for conversations.
 //!
-//! Called at session exit to populate the `ai-title` transcript entry and
-//! `session.title`, so recent-session listings show meaningful labels without
-//! requiring the user to manually `/rename`.
+//! Called at session exit to populate the `ai-title` transcript entry, so the
+//! recent-session listings show meaningful labels without requiring the user
+//! to manually `/rename`.
+//!
+//! Transport: the model is resolved by the caller (a fast free-chain route,
+//! the same resolution the session synopsizer uses). This module used to call
+//! `AnthropicClient` directly, which meant the titler silently produced
+//! nothing on any non-Anthropic setup — free mode is the default, so no
+//! session ever got a title. Any `LlmProvider` works now.
+//!
+//! Fallback: when the call fails, times out, or returns something implausible,
+//! [`heuristic_title`] distils the opening prompt instead. The caller writes a
+//! title either way, so a session listed in `/history` always has a label.
 
-use clawde_api::{AnthropicClient, CreateMessageRequest};
-use clawde_core::types::Message;
+use crate::session_synopsis::empty_request_defaults;
+use clawde_api::{LlmProvider, ProviderRequest, SystemPrompt};
+use clawde_core::types::{ContentBlock, Message, Role};
 use tokio_util::sync::CancellationToken;
 
 /// Recency window: only the first and last few messages are needed for a title.
@@ -15,32 +26,7 @@ const TRAILING_MESSAGES: usize = 10;
 /// Title cap: the generated title should never exceed this many characters.
 pub const MAX_TITLE_CHARS: usize = 60;
 
-// -----------------------------------------------------------------------
-// Configuration
-// -----------------------------------------------------------------------
-
-/// Configuration for session title generation.
-#[derive(Debug, Clone)]
-pub struct SessionTitleConfig {
-    /// A fast, cheap model — Haiku is ideal for this one-shot summarisation.
-    pub model: String,
-    /// Max tokens to generate (a title needs ~20 tokens).
-    pub max_tokens: u32,
-}
-
-impl Default for SessionTitleConfig {
-    fn default() -> Self {
-        Self {
-            model: "claude-haiku-4-5-20251001".to_string(),
-            max_tokens: 80,
-        }
-    }
-}
-
-// -----------------------------------------------------------------------
-// Prompt
-// -----------------------------------------------------------------------
-
+/// Prompt for the one-shot titler. Kept short: a title needs ~20 tokens.
 fn build_title_prompt(message_count: usize) -> String {
     format!(
         "You are generating a short, descriptive title for a coding conversation \
@@ -56,26 +42,47 @@ fn build_title_prompt(message_count: usize) -> String {
     )
 }
 
-// -----------------------------------------------------------------------
-// Public API
-// -----------------------------------------------------------------------
+/// Trim a generated line to its cap on a word boundary.
+fn clamp_title(line: &str) -> Option<String> {
+    let cleaned: String = line
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '`' | '*') || c.is_whitespace())
+        .to_string();
+    if cleaned.is_empty() {
+        return None;
+    }
+    // An implausibly long line is a hallucinated paragraph, not a title.
+    if cleaned.chars().count() > MAX_TITLE_CHARS * 2 {
+        return None;
+    }
+    Some(cleaned.chars().take(MAX_TITLE_CHARS).collect())
+}
 
-/// Generate a short AI-generated session title from the conversation messages.
+/// Deterministic fallback title: the opening words of the first user prompt.
+/// Returns `None` when there is no user prompt to name the session after.
+pub fn heuristic_title(messages: &[Message]) -> Option<String> {
+    let first_user = messages.iter().find(|m| m.role == Role::User)?;
+    clawde_core::session_digest::title_hint_from_prompt(&first_user.get_all_text())
+}
+
+/// Generate a short session title from the conversation messages.
 ///
-/// Only a small window of messages is sent to the model to keep the call fast
-/// and cheap. Returns `None` when the message list is too short for a
-/// meaningful title or the API call fails.
+/// Only a small window of messages is sent, to keep the call fast and cheap.
+/// Returns `None` when the message list is too short for a meaningful title or
+/// the call fails or returns garbage — the caller then falls back to
+/// [`heuristic_title`].
 pub async fn generate_session_title(
     messages: &[Message],
-    api_client: &AnthropicClient,
-    config: &SessionTitleConfig,
+    provider: &dyn LlmProvider,
+    model: &str,
+    max_tokens: u32,
     cancel: CancellationToken,
 ) -> Option<String> {
     if messages.len() < 2 {
         return None;
     }
 
-    // Build a compact view: first few + last few messages.
+    // Compact head+tail sample, deduped on uuid.
     let mut sample: Vec<Message> = messages.iter().take(LEADING_MESSAGES).cloned().collect();
     let trailing: Vec<Message> = messages
         .iter()
@@ -84,129 +91,42 @@ pub async fn generate_session_title(
         .rev()
         .cloned()
         .collect();
-    // Avoid overlap when the conversation is short.
     for msg in trailing {
         if !sample.iter().any(|s| s.uuid == msg.uuid) {
             sample.push(msg);
         }
     }
-
     sample.push(Message::user(build_title_prompt(messages.len())));
-
-    // Heal orphaned tool_results (same safety net as away_summary).
     let sample = crate::sanitize::sanitize_history(sample);
 
-    let api_messages: Vec<clawde_api::ApiMessage> =
-        sample.iter().map(clawde_api::ApiMessage::from).collect();
-
-    let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
-        .messages(api_messages)
-        .build();
-
-    let call_future = api_client.create_message(request);
+    let request = ProviderRequest {
+        model: model.to_string(),
+        messages: sample,
+        system_prompt: Some(SystemPrompt::Text(
+            "You name coding-agent sessions with one short plain-text title. \
+             Output nothing else."
+                .to_string(),
+        )),
+        tools: Vec::new(),
+        max_tokens,
+        temperature: Some(0.2),
+        ..empty_request_defaults()
+    };
 
     let response = tokio::select! {
         _ = cancel.cancelled() => return None,
-        result = call_future => match result {
+        result = provider.create_message(request) => match result {
             Ok(r) => r,
             Err(_) => return None,
         },
     };
 
-    let text = response.content.iter().find_map(|block| {
-        if block.get("type")?.as_str()? == "text" {
-            block.get("text")?.as_str().map(str::to_owned)
-        } else {
-            None
-        }
+    let text = response.content.iter().find_map(|block| match block {
+        ContentBlock::Text { text } => Some(text.clone()),
+        _ => None,
     })?;
 
-    let title = text
-        .lines()
-        .next()
-        .unwrap_or(&text)
-        .trim()
-        .trim_matches('"');
-
-    if title.is_empty() || title.len() > MAX_TITLE_CHARS * 2 {
-        // Reject implausible outputs (too long = likely a hallucinated paragraph).
-        None
-    } else {
-        let truncated: String = title.chars().take(MAX_TITLE_CHARS).collect();
-        Some(truncated)
-    }
-}
-
-// -----------------------------------------------------------------------
-// Auto-title after first prompt
-// -----------------------------------------------------------------------
-
-/// Generate a session title after the first user prompt.
-/// This is called after the first user message to provide immediate
-/// session naming in the session picker.
-pub async fn generate_title_after_first_prompt(
-    first_message: &Message,
-    api_client: &AnthropicClient,
-    config: &SessionTitleConfig,
-    cancel: CancellationToken,
-) -> Option<String> {
-    // Only generate title for the first user message
-    if first_message.role != clawde_core::types::Role::User {
-        return None;
-    }
-
-    let text = first_message.get_all_text();
-    if text.is_empty() || text.len() < 10 {
-        return None;
-    }
-
-    // Build a simple prompt for title generation from just the first message
-    let prompt = format!(
-        "Generate a short, descriptive title (max {} chars) for this coding task:\n\n{}",
-        MAX_TITLE_CHARS,
-        text.chars().take(200).collect::<String>() // Truncate long messages
-    );
-
-    let api_messages = vec![clawde_api::ApiMessage {
-        role: "user".to_string(),
-        content: serde_json::Value::String(prompt),
-    }];
-
-    let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
-        .messages(api_messages)
-        .build();
-
-    let call_future = api_client.create_message(request);
-
-    let response = tokio::select! {
-        _ = cancel.cancelled() => return None,
-        result = call_future => match result {
-            Ok(r) => r,
-            Err(_) => return None,
-        },
-    };
-
-    let text = response.content.iter().find_map(|block| {
-        if block.get("type")?.as_str()? == "text" {
-            block.get("text")?.as_str().map(str::to_owned)
-        } else {
-            None
-        }
-    })?;
-
-    let title = text
-        .lines()
-        .next()
-        .unwrap_or(&text)
-        .trim()
-        .trim_matches('"');
-
-    if title.is_empty() || title.len() > MAX_TITLE_CHARS * 2 {
-        None
-    } else {
-        let truncated: String = title.chars().take(MAX_TITLE_CHARS).collect();
-        Some(truncated)
-    }
+    clamp_title(text.lines().next().unwrap_or(&text))
 }
 
 // -----------------------------------------------------------------------
@@ -218,33 +138,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_uses_haiku() {
-        let cfg = SessionTitleConfig::default();
-        assert!(cfg.model.contains("haiku"));
-        assert!(cfg.max_tokens <= 100);
-    }
-
-    #[test]
-    fn prompt_mentions_message_count() {
+    fn prompt_mentions_message_count_and_cap() {
         let prompt = build_title_prompt(42);
         assert!(prompt.contains("42"));
-        assert!(prompt.len() > 50);
-    }
-
-    #[tokio::test]
-    async fn short_message_list_returns_none_without_api_call() {
-        let msgs = [Message::user("hello")];
-        // No API client available — the function returns None immediately
-        // for < 2 messages without making any network request.
-        // We can't call the real API in a unit test, but we can verify
-        // the guard logic by calling with a dummy client that won't be reached.
-        // This test only runs the pre-condition check.
-        assert!(msgs.len() < 2);
+        assert!(prompt.contains(&MAX_TITLE_CHARS.to_string()));
     }
 
     #[test]
-    fn first_prompt_title_generation_requires_user_message() {
-        let msg = Message::assistant("hello");
-        assert!(msg.role != clawde_core::types::Role::User);
+    fn clamp_title_strips_quotes_and_caps_length() {
+        assert_eq!(
+            clamp_title("\"Fix flaky auth test\"").as_deref(),
+            Some("Fix flaky auth test")
+        );
+        let long = "x".repeat(MAX_TITLE_CHARS * 2 + 1);
+        assert!(clamp_title(&long).is_none(), "a paragraph is not a title");
+        // Plausible length, over the cap: truncated, not rejected.
+        let over = "word ".repeat(20);
+        let clamped = clamp_title(&over).expect("clamped title");
+        assert_eq!(clamped.chars().count(), MAX_TITLE_CHARS);
+    }
+
+    #[test]
+    fn heuristic_title_uses_the_first_user_prompt() {
+        let messages = vec![
+            Message::user("Fix the flaky auth test in session_browser.rs please"),
+            Message::assistant("ok"),
+        ];
+        let title = heuristic_title(&messages).expect("heuristic title");
+        assert!(title.contains("Fix the flaky auth test"), "got: {title}");
+        assert!(title.chars().count() <= MAX_TITLE_CHARS);
+    }
+
+    #[test]
+    fn heuristic_title_ignores_harness_meta_prompts() {
+        let messages = vec![Message::user("/history popup says untitled")];
+        assert!(heuristic_title(&messages).is_none());
+    }
+
+    #[test]
+    fn heuristic_title_is_absent_without_a_user_turn() {
+        let messages = vec![Message::assistant("hello")];
+        assert!(heuristic_title(&messages).is_none());
     }
 }

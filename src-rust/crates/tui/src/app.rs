@@ -1264,6 +1264,7 @@ pub struct RecentSession {
 pub fn recent_session_label(
     title: Option<String>,
     ai_title: Option<String>,
+    digest_title: Option<String>,
     last_prompt: Option<String>,
 ) -> String {
     /// Cap stored labels so a huge prompt never bloats `App` state; the render
@@ -1283,6 +1284,10 @@ pub fn recent_session_label(
     title
         .and_then(pick)
         .or_else(|| ai_title.and_then(pick))
+        // Deterministic phrase from the opening prompt: preferred over the
+        // last prompt, which describes where the session ended rather than
+        // what it was. Present for every session with a user turn.
+        .or_else(|| digest_title.and_then(pick))
         .or_else(|| last_prompt.and_then(pick))
         .unwrap_or_else(|| "(untitled)".to_string())
 }
@@ -1686,6 +1691,23 @@ pub struct App {
     /// Set by the session browser when the user confirms a rename.
     /// The CLI main loop drains this and persists the new title to disk.
     pub pending_rename: Option<(String, String)>, // (session_id, new_name)
+    /// Set by the session browser when the user confirms a delete. The CLI
+    /// main loop drains this and removes the session's transcript.
+    pub pending_delete_session_id: Option<String>,
+    /// Set by the session browser when the user asks to export a past session.
+    /// The CLI main loop loads its messages, then opens the export dialog.
+    pub pending_export_session_id: Option<String>,
+    /// Set by the session browser when the user asks to resume a past session
+    /// as a new branch. The CLI main loop duplicates it and resumes into the
+    /// copy, leaving the original untouched.
+    pub pending_fork_session_id: Option<String>,
+    /// Set by the session browser when the user asks for a fresh model title on
+    /// a past session. The CLI main loop regenerates and persists it.
+    pub pending_title_session_id: Option<String>,
+    /// Messages + title the export dialog should write, when it was opened from
+    /// the session browser rather than for the current session. Cleared as soon
+    /// as the dialog closes, so `/export` keeps meaning "this session".
+    pub export_override: Option<(Option<String>, Vec<Message>)>,
     /// The most-recent sessions shown in the welcome screen's "Recent activity"
     /// list. Populated once from disk via the background loader below; empty
     /// until it resolves (or when there are genuinely no sessions).
@@ -2374,6 +2396,11 @@ impl App {
             tail_preview_pending_for: None,
             pending_resume_session_id: None,
             pending_rename: None,
+            pending_delete_session_id: None,
+            pending_export_session_id: None,
+            pending_fork_session_id: None,
+            pending_title_session_id: None,
+            export_override: None,
             recent_sessions: Vec::new(),
             // Load recent activity once, lazily, on the first run-loop iteration.
             recent_sessions_pending: true,
@@ -5037,7 +5064,7 @@ impl App {
                 true
             }
             "session" | "resume" => {
-                self.session_browser.open(vec![]);
+                self.session_browser.open();
                 self.session_list_pending = true;
                 true
             }
@@ -5047,7 +5074,7 @@ impl App {
             // (opencode-style), not just print a list. `history <id>` args
             // still fall through to the text command via the args handler.
             "history" => {
-                self.session_browser.open(vec![]);
+                self.session_browser.open();
                 self.session_list_pending = true;
                 true
             }
@@ -5270,7 +5297,7 @@ impl App {
                 true
             }
             "rename" => {
-                self.session_browser.open(vec![]);
+                self.session_browser.open();
                 self.session_list_pending = true;
                 self.session_browser.start_rename();
                 true
@@ -5573,31 +5600,39 @@ impl App {
         use crate::export_dialog::{export_as_json, export_as_markdown, export_as_plain_text};
         use crate::message_copy::copy_to_clipboard;
         let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        // An export started from the session browser carries the past session's
+        // messages; a plain /export means the session being run.
+        let (messages, title): (&[Message], Option<&str>) = match self.export_override.as_ref() {
+            Some((title, messages)) => (messages.as_slice(), title.as_deref()),
+            None => (self.messages.as_slice(), self.session_title.as_deref()),
+        };
         let (filename, content) = match self.export_dialog.selected {
             ExportFormat::Json => {
-                let json = export_as_json(&self.messages, self.session_title.as_deref());
+                let json = export_as_json(messages, title);
                 let s = serde_json::to_string_pretty(&json).unwrap_or_default();
                 (format!("claude-export-{}.json", ts), s)
             }
             ExportFormat::Markdown => {
-                let md = export_as_markdown(&self.messages, self.session_title.as_deref());
+                let md = export_as_markdown(messages, title);
                 (format!("claude-export-{}.md", ts), md)
             }
             ExportFormat::PlainText => {
-                let text = export_as_plain_text(&self.messages, self.session_title.as_deref());
+                let text = export_as_plain_text(messages, title);
                 (format!("claude-export-{}.txt", ts), text)
             }
             ExportFormat::Clipboard => {
-                let md = export_as_markdown(&self.messages, self.session_title.as_deref());
+                let md = export_as_markdown(messages, title);
                 if copy_to_clipboard(&md) {
                     self.status_message = Some("Copied to clipboard!".to_string());
                 } else {
                     self.status_message = Some("Failed to copy to clipboard".to_string());
                 }
                 self.export_dialog.dismiss();
+                self.export_override = None;
                 return Some("clipboard".to_string());
             }
         };
+        self.export_override = None;
         if std::fs::write(&filename, &content).is_ok() {
             self.export_dialog.dismiss();
             Some(filename)
@@ -8384,8 +8419,10 @@ impl App {
             return false;
         }
 
-        // Session browser intercepts navigation and Esc
-        if self.session_browser.visible {
+        // Session browser intercepts navigation and Esc. A dialog it opened on
+        // top (the export picker) owns the keyboard while it is up, otherwise
+        // the browser swallows its Esc/Enter and closes underneath it.
+        if self.session_browser.visible && !self.export_dialog.visible {
             use crate::session_browser::SessionBrowserMode;
             match self
                 .session_browser
@@ -8404,54 +8441,78 @@ impl App {
                 VimSearchKey::Passthrough => {}
             }
             match self.session_browser.mode {
-                SessionBrowserMode::Browse => match key.code {
-                    KeyCode::Esc => self.session_browser.close(),
-                    KeyCode::Enter => {
+                SessionBrowserMode::Browse => match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => self.session_browser.close(),
+                    (KeyCode::Enter, _) => {
                         if let Some(session) = self.session_browser.selected_session().cloned() {
                             self.pending_resume_session_id = Some(session.id);
                             self.session_browser.close();
                         }
                     }
-                    KeyCode::Up => {
-                        self.session_browser.select_prev();
-                        self.session_browser.invalidate_tail();
-                    }
-                    // Always-on j/k in vim normal mode, or while the search
-                    // query is empty (the connect-dialog pattern); letters
-                    // type into it once it has text.
-                    KeyCode::Char('k')
-                        if self.prompt_input.vim_enabled
-                            || self.session_browser.search_query.is_empty() =>
-                    {
-                        self.session_browser.select_prev();
-                        self.session_browser.invalidate_tail();
-                    }
-                    KeyCode::Down => {
-                        self.session_browser.select_next();
-                        self.session_browser.invalidate_tail();
-                    }
-                    KeyCode::Char('j')
-                        if self.prompt_input.vim_enabled
-                            || self.session_browser.search_query.is_empty() =>
-                    {
-                        self.session_browser.select_next();
-                        self.session_browser.invalidate_tail();
-                    }
-                    // Tail preview scrolling: PageUp/Down move the preview
-                    // window inside the focused session's transcript.
-                    KeyCode::PageUp => {
+                    // Tail-preview scrolling keeps a key of its own now that
+                    // PageUp/PageDown page the list.
+                    (KeyCode::Up, KeyModifiers::SHIFT) => {
                         self.session_browser.tail_scroll =
                             self.session_browser.tail_scroll.saturating_sub(5);
                     }
-                    KeyCode::PageDown => {
+                    (KeyCode::Down, KeyModifiers::SHIFT) => {
                         self.session_browser.tail_scroll =
                             self.session_browser.tail_scroll.saturating_add(5);
                     }
-                    KeyCode::Char('r') => self.session_browser.start_rename(),
-                    KeyCode::Backspace if !self.prompt_input.vim_enabled => {
+                    (KeyCode::Up, _) => self.session_browser.select_prev(),
+                    (KeyCode::Down, _) => self.session_browser.select_next(),
+                    (KeyCode::Home, _) => self.session_browser.select_first(),
+                    (KeyCode::End, _) => self.session_browser.select_last(),
+                    (KeyCode::PageDown, _) => self.session_browser.page_down(),
+                    (KeyCode::PageUp, _) => self.session_browser.page_up(),
+                    // Every action key is Ctrl-prefixed so all letters stay
+                    // available to the filter. The old bare `r` meant "refactor"
+                    // could never be typed into the search box.
+                    (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                        self.session_browser.cycle_facet()
+                    }
+                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                        if self.session_browser.request_delete().is_none() {
+                            self.status_message =
+                                Some("The running session cannot be deleted.".to_string());
+                        }
+                    }
+                    (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                        if let Some(session) = self.session_browser.selected_session().cloned() {
+                            self.pending_export_session_id = Some(session.id);
+                        }
+                    }
+                    (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                        if let Some(session) = self.session_browser.selected_session().cloned() {
+                            self.pending_fork_session_id = Some(session.id);
+                        }
+                    }
+                    (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                        if let Some(session) = self.session_browser.selected_session().cloned() {
+                            self.pending_title_session_id = Some(session.id);
+                        }
+                    }
+                    (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                        self.session_browser.start_rename()
+                    }
+                    (KeyCode::F(5), _) => {
+                        self.session_browser.loading = true;
+                        self.session_list_pending = true;
+                    }
+                    // j/k navigate only in vim's normal mode, where typing is
+                    // behind `i`. With vim off every letter — j and k included —
+                    // reaches the filter, so "json" and "katban" are typable;
+                    // the nav guards used to swallow the first character.
+                    (KeyCode::Char('k'), _) if self.prompt_input.vim_enabled => {
+                        self.session_browser.select_prev();
+                    }
+                    (KeyCode::Char('j'), _) if self.prompt_input.vim_enabled => {
+                        self.session_browser.select_next();
+                    }
+                    (KeyCode::Backspace, _) if !self.prompt_input.vim_enabled => {
                         self.session_browser.pop_search_char()
                     }
-                    KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
+                    (KeyCode::Char(c), _) if !self.prompt_input.vim_enabled => {
                         self.session_browser.push_search_char(c)
                     }
                     _ => {}
@@ -8470,7 +8531,9 @@ impl App {
                 SessionBrowserMode::Confirm => match key.code {
                     KeyCode::Esc | KeyCode::Char('n') => self.session_browser.cancel(),
                     KeyCode::Enter | KeyCode::Char('y') => {
-                        self.session_browser.close();
+                        if let Some(id) = self.session_browser.confirm_delete() {
+                            self.pending_delete_session_id = Some(id);
+                        }
                     }
                     _ => {}
                 },
@@ -8560,6 +8623,7 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.export_dialog.dismiss();
+                    self.export_override = None;
                 }
                 KeyCode::Enter => {
                     if let Some(path) = self.perform_export() {
@@ -11817,6 +11881,47 @@ impl App {
             return;
         }
 
+        // ---- Session browser: hover, click, wheel -------------------------
+        // The browser is a dialog, so without this a click inside it does
+        // nothing at all — while the welcome screen's session list is already
+        // click-to-resume. The list geometry comes from the last render.
+        if self.session_browser.visible && !self.export_dialog.visible {
+            let hit = self
+                .session_browser
+                .hit_test(mouse_event.column, mouse_event.row);
+            match (hit, mouse_event.kind) {
+                (Some(idx), MouseEventKind::Moved) => {
+                    self.session_browser.hover_idx = Some(idx);
+                }
+                (None, MouseEventKind::Moved) => {
+                    self.session_browser.hover_idx = None;
+                }
+                (Some(idx), MouseEventKind::Down(MouseButton::Left)) => {
+                    let was_selected = self.session_browser.selected_idx == idx;
+                    self.session_browser.selected_idx = idx;
+                    self.session_browser.invalidate_tail();
+                    // A second click on the focused row resumes it — the
+                    // mouse equivalent of Enter.
+                    if was_selected {
+                        if let Some(session) = self.session_browser.selected_session().cloned() {
+                            self.pending_resume_session_id = Some(session.id);
+                            self.session_browser.close();
+                        }
+                    }
+                    return;
+                }
+                (_, MouseEventKind::ScrollUp) => {
+                    self.session_browser.scroll_by(-3);
+                    return;
+                }
+                (_, MouseEventKind::ScrollDown) => {
+                    self.session_browser.scroll_by(3);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // ---- Dialog interaction: dismiss on click-outside, scroll/click inside ----
         // All dialogs and full-screen overlays intercept mouse events to prevent
         // accidental interaction with the transcript beneath them.  Click-outside
@@ -12876,8 +12981,7 @@ impl App {
         if let Some(ref mut rx) = self.session_list_rx {
             match rx.try_recv() {
                 Ok(entries) => {
-                    self.session_browser.sessions = entries;
-                    self.session_browser.selected_idx = 0;
+                    self.session_browser.set_sessions(entries);
                     self.session_list_rx = None;
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -12946,43 +13050,78 @@ impl App {
         if self.session_list_pending {
             self.session_list_pending = false;
             let root = self.project_root();
+            // The browser marks the session being run so it is never resumed
+            // or deleted by accident; the id travels with the load.
+            let current_session_id = self.session_id.clone();
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.session_list_rx = Some(rx);
             tokio::spawn(async move {
-                let summaries = clawde_core::session_storage::list_sessions(&root)
+                let mut summaries = clawde_core::session_storage::list_sessions(&root)
                     .await
                     .unwrap_or_default();
-                let entries: Vec<crate::session_browser::SessionEntry> = summaries
-                    .into_iter()
-                    .map(|s| {
-                        let last_updated = clawde_core::format_utils::format_relative_time(
-                            s.mtime
-                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64,
-                        );
-                        let title = s
-                            .title
-                            .or(s.ai_title)
-                            .unwrap_or_else(|| "(untitled)".to_string());
-                        let mut searchable_text = title.clone();
-                        if let Some(ref prompt) = s.last_prompt {
+                // Recency order is the list's grouping order, so make it
+                // explicit rather than trusting the directory walk.
+                summaries.sort_by_key(|a| std::cmp::Reverse(a.mtime));
+                let mut entries: Vec<crate::session_browser::SessionEntry> =
+                    Vec::with_capacity(summaries.len());
+                for s in summaries {
+                    let mtime_ms = s
+                        .mtime
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    // Offline digest: opening/middle keyword rows, the
+                    // inferred status row, and — when no model title ever
+                    // landed — a deterministic title. Bounded reads (six
+                    // sample windows), so listing many sessions stays
+                    // cheap.
+                    let digest = clawde_core::session_digest::digest_transcript(&s.path).await;
+                    // A transcript holding no user/assistant turn at all (a
+                    // run that ended before its first message) has no rows and
+                    // nothing to resume — listing it as `(untitled)` with empty
+                    // rows is pure noise. The tail count is checked too, so a
+                    // large session is never dropped by a sampling gap.
+                    if !digest.has_messages() && s.message_count == 0 {
+                        continue;
+                    }
+                    // Title preference: the user's own name, the model's
+                    // title, then the digest's opening phrase — a session
+                    // with any prompt at all gets a label rather than
+                    // `(untitled)`.
+                    let title = s
+                        .title
+                        .or(s.ai_title)
+                        .or_else(|| digest.title_hint().map(str::to_string))
+                        .unwrap_or_else(|| "(untitled)".to_string());
+                    // Search covers every row the user can see, so filtering by
+                    // a keyword found in the opening or middle row matches.
+                    let mut searchable_text = title.clone();
+                    for field in [digest.opening(), digest.middle(), digest.status().as_str()] {
+                        if !field.is_empty() {
                             searchable_text.push('\n');
-                            searchable_text.push_str(prompt);
+                            searchable_text.push_str(field);
                         }
-                        crate::session_browser::SessionEntry {
-                            id: s.session_id.clone(),
-                            title,
-                            searchable_text,
-                            last_updated,
-                            message_count: s.message_count,
-                            cost_usd: 0.0,
-                            synopsis_about: s.synopsis_about.unwrap_or_default(),
-                            synopsis_left_off: s.synopsis_left_off.unwrap_or_default(),
-                            transcript_path: s.path,
-                        }
-                    })
-                    .collect();
+                    }
+                    if let Some(ref prompt) = s.last_prompt {
+                        searchable_text.push('\n');
+                        searchable_text.push_str(prompt);
+                    }
+                    entries.push(crate::session_browser::SessionEntry {
+                        id: s.session_id.clone(),
+                        title,
+                        searchable_text,
+                        mtime_ms,
+                        message_count: s.message_count,
+                        cost_usd: 0.0,
+                        opening: digest.opening().to_string(),
+                        middle: digest.middle().to_string(),
+                        flags: digest.flags().to_vec(),
+                        synopsis_about: s.synopsis_about.unwrap_or_default(),
+                        synopsis_left_off: s.synopsis_left_off.unwrap_or_default(),
+                        transcript_path: s.path,
+                        is_current: s.session_id == current_session_id,
+                    });
+                }
                 let _ = tx.send(entries).await;
             });
         }
@@ -13013,16 +13152,34 @@ impl App {
                 let summaries = clawde_core::session_storage::list_sessions(&root)
                     .await
                     .unwrap_or_default();
-                let recent: Vec<RecentSession> = summaries
-                    .into_iter()
-                    .take(MAX_RECENT)
-                    .map(|s| RecentSession {
+                let mut recent: Vec<RecentSession> = Vec::with_capacity(MAX_RECENT);
+                // The cap is applied after filtering, so skipped junk does not
+                // eat a slot in the list.
+                for s in summaries {
+                    if recent.len() >= MAX_RECENT {
+                        break;
+                    }
+                    // Digest read for the label (the title phrase keeps a
+                    // session whose model title never landed from reading
+                    // `(untitled)`) and to recognise a transcript that never
+                    // recorded a message — the browser drops those, and a
+                    // `(untitled) 0 msgs` row is no more useful here.
+                    let digest = clawde_core::session_digest::digest_transcript(&s.path).await;
+                    if !digest.has_messages() && s.message_count == 0 {
+                        continue;
+                    }
+                    recent.push(RecentSession {
                         session_id: s.session_id,
-                        label: recent_session_label(s.title, s.ai_title, s.last_prompt),
+                        label: recent_session_label(
+                            s.title,
+                            s.ai_title,
+                            digest.title_hint().map(str::to_string),
+                            s.last_prompt,
+                        ),
                         mtime: s.mtime,
                         message_count: s.message_count,
-                    })
-                    .collect();
+                    });
+                }
                 let _ = tx.send(recent).await;
             });
         }
@@ -14675,6 +14832,7 @@ mod tests {
         let label = recent_session_label(
             Some("My Title".to_string()),
             Some("ai title".to_string()),
+            Some("digest phrase".to_string()),
             Some("some prompt".to_string()),
         );
         assert_eq!(label, "My Title");
@@ -14686,6 +14844,7 @@ mod tests {
         let label = recent_session_label(
             None,
             Some("Fix flaky auth test".to_string()),
+            Some("digest phrase".to_string()),
             Some("some prompt".to_string()),
         );
         assert_eq!(label, "Fix flaky auth test");
@@ -14694,6 +14853,7 @@ mod tests {
     #[test]
     fn recent_session_label_falls_back_to_first_prompt_line() {
         let label = recent_session_label(
+            None,
             None,
             None,
             Some("  fix the bug\nand more details".to_string()),
@@ -14705,25 +14865,45 @@ mod tests {
     fn recent_session_label_skips_blank_title_and_untitled_default() {
         // Blank/whitespace titles are ignored in favour of the next candidate.
         assert_eq!(
-            recent_session_label(Some("   ".to_string()), None, Some("do it".to_string())),
+            recent_session_label(
+                Some("   ".to_string()),
+                None,
+                None,
+                Some("do it".to_string())
+            ),
             "do it"
         );
         assert_eq!(
-            recent_session_label(Some(" ".to_string()), Some("ai".to_string()), None),
+            recent_session_label(Some(" ".to_string()), Some("ai".to_string()), None, None),
             "ai"
         );
         // Nothing usable → untitled.
-        assert_eq!(recent_session_label(None, None, None), "(untitled)");
+        assert_eq!(recent_session_label(None, None, None, None), "(untitled)");
         assert_eq!(
-            recent_session_label(Some(String::new()), None, Some("\n\n".to_string())),
+            recent_session_label(String::new().into(), None, None, Some("\n\n".to_string())),
             "(untitled)"
+        );
+    }
+
+    #[test]
+    fn recent_session_label_prefers_digest_phrase_over_last_prompt() {
+        // The digest names what the session *was*; the last prompt only says
+        // where it stopped, so the digest phrase wins.
+        assert_eq!(
+            recent_session_label(
+                None,
+                None,
+                Some("Fix the flaky auth test".to_string()),
+                Some("ok continue".to_string())
+            ),
+            "Fix the flaky auth test"
         );
     }
 
     #[test]
     fn recent_session_label_truncates_long_prompt() {
         let long = "x".repeat(200);
-        let label = recent_session_label(None, None, Some(long));
+        let label = recent_session_label(None, None, None, Some(long));
         assert_eq!(label.chars().count(), 80);
     }
 

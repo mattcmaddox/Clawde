@@ -440,10 +440,16 @@ impl SlashCommand for HistoryCommand {
     }
     fn help(&self) -> &str {
         "Usage: /history [filter]\n\n\
-         In the TUI: opens the interactive session browser. With a filter\n\
-         term, the browser is pre-filtered to sessions whose title or message\n\
-         text contains it (e.g. /history karaoke). Select a row and press\n\
-         Enter to resume that session.\n\n\
+         In the TUI: opens the interactive session browser. Each row shows the\n\
+         session's title and age, the keywords from its first message, the\n\
+         words describing its middle work, and an inferred status (interrupted,\n\
+         errored, committed, uncommitted, no edits).\n\n\
+         Keys: type to filter (every word must match, best match first, matches\n\
+         highlighted), Up/Down or j/k to move, Home/End to jump, PgUp/PgDn to\n\
+         page, Enter to resume, ^F to cycle the status filter, ^D to delete\n\
+         (confirmed), ^E to export, ^B to fork into a new session, ^T to\n\
+         regenerate the model title, ^R to rename, F5 to reload. A filter term\n\
+         given here pre-fills the search box (e.g. /history karaoke).\n\n\
          Headless (--print) or non-TUI: lists the most recent sessions for\n\
          the current project (the git repo root, or the working directory\n\
          when not in a repo), newest first, with timestamps and titles, plus\n\
@@ -471,10 +477,19 @@ impl SlashCommand for HistoryCommand {
         } else {
             for s in sessions.iter().take(15) {
                 let when = clawde_core::format_utils::format_short_absolute_time(s.mtime);
+                // Same label preference as the TUI's session browser: the
+                // deterministic phrase from the opening prompt sits between the
+                // model title and the last prompt, so a session whose titler
+                // never ran is still named rather than listed as `(untitled)`.
+                let digest_title = clawde_core::session_digest::digest_transcript(&s.path)
+                    .await
+                    .title_hint()
+                    .map(str::to_string);
                 let label = s
                     .title
                     .clone()
                     .or_else(|| s.ai_title.clone())
+                    .or(digest_title)
                     .or_else(|| s.last_prompt.clone())
                     .map(|t| {
                         t.lines()
