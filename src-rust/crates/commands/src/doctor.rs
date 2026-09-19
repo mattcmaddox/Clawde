@@ -318,25 +318,22 @@ impl SlashCommand for DoctorCommand {
 
         // ── Tool permissions ─────────────────────────────────────────────────
         lines.push("Tool Permissions".to_string());
-        let all_tool_names: Vec<String> = clawde_tools::all_tools()
-            .iter()
-            .map(|t| t.name().to_string())
-            .collect();
-        let total_tools = all_tool_names.len();
+        let all_tools = clawde_tools::all_tools();
+        let total_tools = all_tools.len();
         let allowed_count = ctx.config.allowed_tools.len();
         let denied_count = ctx.config.disallowed_tools.len();
-        // Tools not in allowed or denied lists require user confirmation
-        let explicit_tools: std::collections::HashSet<&str> = ctx
-            .config
-            .allowed_tools
+        // What actually prompts in Default mode. Counting every tool absent
+        // from the allow/deny lists reported "Require confirmation: 51" for all
+        // 51 built-ins, contradicting the mode line printed above it
+        // (`default (confirm destructive actions)`) and everything the
+        // permission manager does — read-only, non-stateful tools run
+        // unprompted. A count nobody can act on trains the reader to ignore
+        // the line.
+        let auto_approved_count = all_tools
             .iter()
-            .chain(ctx.config.disallowed_tools.iter())
-            .map(|s| s.as_str())
-            .collect();
-        let confirm_count = all_tool_names
-            .iter()
-            .filter(|n| !explicit_tools.contains(n.as_str()))
+            .filter(|t| t.permission_level().is_read_only() && !t.stateful())
             .count();
+        let confirm_count = total_tools.saturating_sub(auto_approved_count);
         let mode_label = match ctx.config.permission_mode {
             clawde_core::PermissionMode::BypassPermissions => {
                 "bypass-permissions (no confirmation required)"
@@ -347,6 +344,9 @@ impl SlashCommand for DoctorCommand {
         };
         lines.push(format!("  • Mode: {mode_label}"));
         lines.push(format!("  • Total built-in tools: {total_tools}"));
+        lines.push(format!(
+            "  • Run without prompting: {auto_approved_count} tool(s) (read-only, not stateful)"
+        ));
         if allowed_count > 0 {
             lines.push(format!(
                 "  ✓ Always allowed: {} tool(s) — {}",
@@ -362,10 +362,7 @@ impl SlashCommand for DoctorCommand {
             ));
         }
         if ctx.config.permission_mode == clawde_core::PermissionMode::Default {
-            lines.push(format!(
-                "  ⚠ Require confirmation: {} tool(s)",
-                confirm_count
-            ));
+            lines.push(format!("  ⚠ Will prompt: {confirm_count} tool(s)"));
         }
         lines.push(String::new());
 
