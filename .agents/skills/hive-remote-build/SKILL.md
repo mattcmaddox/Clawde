@@ -5,7 +5,7 @@ Build Clawde release artifacts (or any heavy Rust build) on **TheHive**, the LAN
 ## What TheHive is (and is not)
 
 - It is a **CPU build box**. Rust compilation is pure CPU + disk work — rustc/LLVM have no GPU codepath, and nothing in Clawde's dependency tree can be offloaded to the RTX 3070. Speed comes from the 16 cores, not the GPU.
-- The GPU's only job on this box is **Ollama inference** (it serves the LAN at `192.168.1.45:11434`). Never describe Hive builds as "GPU builds"; never waste time probing `nvidia-smi` for build purposes. (`nvidia-smi` is also not on the SSH PATH — the WSL driver mount lives at `/usr/lib/wsl/lib/`.)
+- The GPU's day job on this box is **Ollama inference** — but read the dated state note under [GPU and CUDA reality](#gpu-and-cuda-reality-verified-2026-09-19) before assuming it is reachable. Never describe Hive builds as "GPU builds"; never waste time probing `nvidia-smi` for build purposes. (`nvidia-smi` is also not on the SSH PATH — the WSL driver mount lives at `/usr/lib/wsl/lib/`.) GPU *compute* is a separate question and does work on this box — see [GPU and CUDA reality](#gpu-and-cuda-reality-verified-2026-09-19); if you use it, the card is shared with Ollama, so keep the job small and brief.
 
 ## Access
 
@@ -21,14 +21,38 @@ Identity details (fixed 2026-09-17): `~/.ssh/config` previously pinned `Identity
 
 If BatchMode fails, passwordless SSH (key auth) is broken — tell the user to fix it from their own terminal; never attempt password auth from a command (it hangs and leaks the password into shell history).
 
-## Toolchain reality (verified 2026-09-16)
+## Toolchain reality (re-verified 2026-09-19)
 
-- TheHive is **WSL2 (Ubuntu 24.04, glibc 2.39)** with working Docker — its engine is the native WSL `dockerd` (default context, `unix:///var/run/docker.sock`), NOT Docker Desktop.
+- TheHive is **WSL2 (Ubuntu 24.04, glibc 2.39, kernel 6.18.40.1-microsoft-standard-WSL2)** with working Docker — its engine is the native WSL `dockerd` (default context, `unix:///var/run/docker.sock`), NOT Docker Desktop.
 - The old Windows pairing was **cleaned up** (2026-09-16): the stale `credsStore: desktop.exe` in `~/.docker/config.json` (now `config.json.bak-wsl-cleanup`), the dead `desktop-linux` context, and `~/.docker/desktop` logs are gone. Plain `docker` commands work — no `DOCKER_CONFIG` override needed anymore.
 - `docker buildx` 0.30.1 installed at `/usr/libexec/docker/cli-plugins/` (verified).
-- **Bare-metal Rust is NOT installed** (no cargo/rustc/rustup) — install it agent-side if needed for quick builds (see Bare metal below).
+- **Bare-metal Rust IS installed** (corrected 2026-09-19 — the old "NOT installed" note was a PATH artifact). Toolchain `stable-x86_64-unknown-linux-gnu`, `cargo`/`rustc` **1.98.1**, in `~/.cargo/bin` and `~/.rustup`. In a non-interactive SSH session `~/.cargo/bin` is **not on `PATH`**, so `command -v cargo` returns nothing and every cargo one-liner dies with "cargo: not found"; that is what made this look missing. Always `export PATH=$HOME/.cargo/bin:$PATH` first — do not reinstall. The only installed target is `x86_64-unknown-linux-gnu`, so cross builds still need `rustup target add aarch64-unknown-linux-gnu`.
 - Network works; git + HTTPS clone of the repo works; the user has installed the aarch64 cross packages (gcc/libc-dev/g++ cross + mold) via sudo.
 - **sudo requires a password** (`sudo -n` fails) — the agent cannot apt-get anything unattended.
+
+## GPU and CUDA reality (verified 2026-09-19)
+
+The card is an **RTX 3070 (sm_86)**: driver 615.71.08, CUDA UMD 13.4, `/dev/dxg` present. `nvidia-smi` is not on `PATH`; the real binary is `/usr/lib/wsl/lib/nvidia-smi`. The toolkit is CUDA 12.9 at `/usr/local/cuda-12.9` (`nvcc` 12.9.86, with `ptxas`/`fatbinary`/`nvlink`).
+
+What is **absent** — check this before designing anything GPU-side, since each gap forces a different approach:
+
+- `/usr/lib/wsl/lib` (the driver mount / WSL shim) carries `libcuda.so.1` plus debug, encode and monitoring libs only: **no `libcudart`, `libcublas`, `libcurand`, `libnvrtc`, `libnvptxcompiler`, or `libnvidia-ptxjitcompiler.so.1`**.
+- The toolkit's `lib64` (→ `targets/x86_64-linux/lib`) holds only `libcudart*`, `libcudadevrt.a`, `libculibos.a` and `libnvptxcompiler_static.a`: **no `libnvrtc`, no `libcublas`, and no `lib64/stubs/`** — so `-lcuda` and `-lcublas` cannot be linked at build time. Talk to the driver API through dynamic loading (`libloading`, or cudarc's `driver` feature) instead.
+- **No NVRTC**, i.e. no runtime CUDA-C compilation. cudarc's default `nvrtc` feature is only needed for its `Ptx` wrapper type — never call its compile functions.
+- **Vulkan is CPU-only.** `/usr/share/vulkan/icd.d/` carries only Mesa ICDs (`lvp` = lavapipe = software rasterizer, plus radeon/nouveau/intel/asahi); there is no NVIDIA ICD and no D3D12/Dozen ICD. A `wgpu` compute program here passes its own self-checks while executing on the CPU, so it must never be used as evidence of GPU work.
+
+What **works**, exercised by hand on 2026-09-19 with direct driver calls (not inferred from the missing files):
+
+- The **driver API end to end**: `cuInit`, `cuCtxCreate`, `cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernel`, `cuCtxSynchronize` and `cuMemcpyDtoH` all succeeded, and a 4-element saxpy launched from a PTX image *and* from a cubin image returned the expected values. Set `LD_LIBRARY_PATH=/usr/lib/wsl/lib` (`ldconfig` already maps `libcuda.so.1` there; the variable makes the mapping explicit).
+- **PTX JIT works**: a 5206-byte `-arch=compute_86` PTX image loads, resolves and executes correctly, so the absent `libnvidia-ptxjitcompiler.so.1` is **not** a blocker — the WSL shim forwards JIT to the Windows driver. A `-cubin -arch=sm_86` image (9376 bytes) behaves identically and skips the per-process JIT.
+
+So a GPU program here looks like: compile kernels with `nvcc` to PTX or cubin at build time (there is no runtime compiler), load the image through the driver API, ship one binary. One gotcha worth knowing up front: cudarc's build script panics unless you name an explicit CUDA version feature (`cuda-12090` for this toolkit). Anything you run shares the card with Ollama — keep GPU jobs small and short.
+
+**Ollama target:** `192.168.1.45` is Hive's own `eth1` address and it is stable — that address at port 11434 is the one correct target, exactly as `AGENTS.md` says. Never substitute `127.0.0.1`: depending on where you stand it is the dev box's CPU instance or a Windows-side instance, neither of which is this service, and core's online-mode resolver rejects loopback anyway (`is_ollama_network_blocked`). If `192.168.1.45:11434` does not answer, the service is down (see the observation below) — report that instead of working around it; switching hosts, or installing/starting an Ollama, is the user's call, not an agent's.
+
+Observed at the 2026-09-19 check, and the cause is local, not the address: nothing listens on 11434 inside WSL. `/usr/local/bin/ollama` is installed and `/etc/systemd/system/` holds `ollama.service`, `ollama-preload.service` and an `ollama.service.d/override.conf` drop-in — but `systemctl list-unit-files` reports both units **disabled**, so nothing is serving. The address itself is healthy: `192.168.1.45:22` still reaches this WSL's `sshd` (the `hive` SSH alias points at that host). Restoring it needs `sudo`, i.e. a password an agent does not have, so hand it back to the user: `sudo systemctl start ollama` (plus `enable` if it should survive a restart). The HTTP 200 on `127.0.0.1:11434` is a different Ollama served from outside this namespace — precisely the confusion to avoid.
+
+**Scratch discipline:** `$HOME` on this box holds the user's own work (e.g. `~/cudaenv`, and `~/gpu_probe` — a CMake/CUDA C++ project that is *not* related to anything in this repo). Create your own directory, remove it when you are done, and never tidy or delete anything you did not create.
 
 ## Docker vs bare metal — which to use
 
@@ -71,19 +95,31 @@ The container already gets the aarch64 cross toolchain, libc headers (aws-lc-sys
 
 ## Bare metal path (quick checks)
 
-Rust is not installed by default; bootstrap agent-side (no sudo, installs to ~/.cargo, ~/.rustup):
+Rust is already installed (see Toolchain reality above). The only missing piece in a non-interactive SSH session is the `PATH`: cargo lives in `~/.cargo/bin` and is not exported for non-interactive shells.
 
 ```bash
-ssh -o BatchMode=yes hive 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal && ~/.cargo/bin/rustup target add aarch64-unknown-linux-gnu'
+ssh -o BatchMode=yes hive 'export PATH=$HOME/.cargo/bin:$PATH && cd ~/clawde/src-rust && cargo check'
 ```
 
-The user already installed `gcc-aarch64-linux-gnu`, `libc6-dev-arm64-cross`, `g++-aarch64-linux-gnu`, and `mold` via apt, so cross builds work:
+On a freshly rebuilt box only — i.e. when `~/.cargo/bin` is genuinely absent — bootstrap agent-side (no sudo; installs under `~/.cargo` and `~/.rustup`):
 
 ```bash
-ssh -o BatchMode=yes hive 'cd ~/clawde/src-rust && nohup env CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc RUSTFLAGS=-Clink-arg=-fuse-ld=mold cargo build --release --target aarch64-unknown-linux-gnu > /tmp/build.log 2>&1 & echo started'
+ssh -o BatchMode=yes hive 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
 ```
 
-Before any bare-metal build, check `command -v cargo` and `command -v aarch64-linux-gnu-gcc`; install what is missing rather than failing mid-build. Remember: these binaries carry TheHive's glibc 2.39 requirement — quick checks only.
+The user already installed `gcc-aarch64-linux-gnu`, `libc6-dev-arm64-cross`, `g++-aarch64-linux-gnu`, and `mold` via apt — all four are on `PATH` (`/usr/bin`), and the cross libc is at `/usr/aarch64-linux-gnu/lib` — so the host side of a cross build works. The Rust side needs care: only the `x86_64-unknown-linux-gnu` target is installed, so add the aarch64 std once per toolchain:
+
+```bash
+ssh -o BatchMode=yes hive 'export PATH=$HOME/.cargo/bin:$PATH && rustup target add aarch64-unknown-linux-gnu'
+```
+
+Then cross builds work:
+
+```bash
+ssh -o BatchMode=yes hive 'export PATH=$HOME/.cargo/bin:$PATH && cd ~/clawde/src-rust && nohup env CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc RUSTFLAGS=-Clink-arg=-fuse-ld=mold cargo build --release --target aarch64-unknown-linux-gnu > /tmp/build.log 2>&1 & echo started'
+```
+
+Before any bare-metal build, export the cargo `PATH` (above) and check `command -v aarch64-linux-gnu-gcc`; the cross toolchain and mold are already present, so what is usually missing is the `PATH` itself, or the aarch64 std target on a fresh toolchain — fix those rather than failing mid-build. Remember: these binaries carry TheHive's glibc 2.39 requirement — quick checks only.
 
 ## Workspace setup
 
