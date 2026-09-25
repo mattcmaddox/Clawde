@@ -24,7 +24,7 @@ use crate::types::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One external session file this project has already evaluated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,30 +57,77 @@ fn fingerprint_of_file(path: &Path) -> Option<String> {
 
 /// Load the absorption state for a project from disk.
 ///
-/// Returns an empty state if the file doesn't exist or is malformed.
+/// A missing file yields an empty state. A *corrupt* file (truncated by a crash
+/// or a torn concurrent write) is quarantined as `<name>.corrupt` and treated as
+/// empty — but the corruption is logged, because a silently-reset watermark
+/// causes the entire external history to be re-absorbed and duplicated.
 pub fn load_state(state_path: &Path) -> ExternalAbsorptionState {
     if !state_path.exists() {
         return ExternalAbsorptionState::default();
     }
-    match std::fs::read_to_string(state_path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-        Err(_) => ExternalAbsorptionState::default(),
+    let raw = match std::fs::read_to_string(state_path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(
+                path = %state_path.display(),
+                error = %e,
+                "Could not read external import state; treating as empty"
+            );
+            return ExternalAbsorptionState::default();
+        }
+    };
+    match serde_json::from_str(&raw) {
+        Ok(state) => state,
+        Err(e) => {
+            // Quarantine before it is overwritten, so the user can inspect it.
+            let quarantine = state_path.with_extension("json.corrupt");
+            let _ = std::fs::rename(state_path, &quarantine);
+            tracing::warn!(
+                path = %state_path.display(),
+                quarantined = %quarantine.display(),
+                error = %e,
+                "External import state was corrupt; moved aside and reset. \
+                 External history may be re-absorbed this run."
+            );
+            ExternalAbsorptionState::default()
+        }
     }
 }
 
-/// Persist the absorption state to disk atomically (write tmp + rename).
+/// Persist the absorption state to disk atomically: write a per-process unique
+/// temp file, fsync it, then rename over the target and fsync the directory.
+/// The unique temp name prevents two concurrent clawde processes in the same
+/// project from interleaving writes and producing a torn state file.
 pub fn save_state(state: &ExternalAbsorptionState, state_path: &Path) {
     let dir = state_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).ok();
 
     let state_json = match serde_json::to_string_pretty(state) {
         Ok(json) => json,
-        Err(_) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "Could not serialize external import state");
+            return;
+        }
     };
 
-    let tmp_path = state_path.with_extension("json.tmp");
-    if std::fs::write(&tmp_path, &state_json).is_ok() {
-        std::fs::rename(&tmp_path, state_path).ok();
+    // Unique per process so concurrent writers never collide on the temp path.
+    let tmp_path = state_path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let write = std::fs::write(&tmp_path, &state_json).and_then(|_| {
+        // fsync the bytes before the rename publishes them; a crash after
+        // rename must not leave an empty state file.
+        std::fs::File::open(&tmp_path)?.sync_all()
+    });
+    if write.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    if std::fs::rename(&tmp_path, state_path).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    // fsync the parent dir so the rename itself is durable.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
     }
 }
 
@@ -90,23 +137,6 @@ pub fn save_state(state: &ExternalAbsorptionState, state_path: &Path) {
 /// the first run. When the cap is reached the remaining sessions are skipped
 /// (and left eligible for a later run) rather than dropped silently.
 pub const MAX_ABSORBED_MESSAGES: usize = 200;
-
-/// Header that bounds the imported region in the transcript so both the user and
-/// the model can tell prior external conversation apart from the current
-/// session. Prepended once, only when at least one external message is absorbed.
-fn import_header(count: usize) -> Message {
-    Message {
-        role: crate::types::Role::User,
-        content: crate::types::MessageContent::Text(format!(
-            "[Imported prior conversation from other local agents — {count} message(s). \
-             This is background context, not the current session. The current request follows.]"
-        )),
-        uuid: None,
-        cost: None,
-        snapshot_patch: None,
-        turn_meta: None,
-    }
-}
 
 /// Absorb new/changed external session FILES for `cwd` into `state`,
 /// newest-file-first, fingerprinting each file BEFORE parsing it so unchanged
@@ -165,12 +195,27 @@ fn absorb_paths(
             continue;
         }
 
-        if absorbed.len().saturating_add(session.messages.len()) > MAX_ABSORBED_MESSAGES {
+        // Respect the cap, but never starve a session outright. If a single
+        // session is larger than the cap, absorb its most recent `remaining`
+        // turns (recent context is the useful part) instead of skipping it
+        // forever — a long session would otherwise never satisfy the cap and be
+        // re-parsed on every startup, permanently.
+        let remaining = MAX_ABSORBED_MESSAGES.saturating_sub(absorbed.len());
+        if remaining == 0 {
+            // Cap already full from earlier (newer) sessions: leave this one
+            // eligible for a future run.
             skipped += 1;
             continue;
         }
-
-        absorbed.extend(session.messages);
+        let msgs = if session.messages.len() > remaining {
+            let mut m = session.messages;
+            let drop = m.len() - remaining;
+            m.drain(..drop); // keep the most recent tail
+            m
+        } else {
+            session.messages
+        };
+        absorbed.extend(msgs);
         state.sessions.insert(key, AbsorbedEntry { fingerprint });
     }
     (absorbed, skipped)
@@ -188,14 +233,15 @@ fn absorb_paths(
 ///   3. Discover external session FILES (no parsing) across Opencode, Cline,
 ///      Freebuff.
 ///   4. Fingerprint each; absorb new/changed relevant ones up to
-///      [`MAX_ABSORBED_MESSAGES`], newest first, prepending a header that
-///      bounds the imported region.
-///   5. Save the updated state file.
-///   6. Return the Vec<Message> of newly absorbed messages.
+///      [`MAX_ABSORBED_MESSAGES`], newest first.
 ///
-/// Returns an empty Vec if nothing new was absorbed (or on any error) — the
-/// caller treats that as "no extra context to prepend."
-pub fn absorb_new_external_sessions(cwd: &Path) -> Vec<Message> {
+/// Returns `(absorbed_messages, commit)`. The state is NOT persisted here: the
+/// caller must invoke `commit.commit()` only after the session that carries
+/// these messages has been durably saved. Committing eagerly would record the
+/// fingerprint even if the user quits before the session is written, permanently
+/// losing the imported history. If the caller crashes before committing, the
+/// next run simply re-imports (safe direction).
+pub fn absorb_new_external_sessions(cwd: &Path) -> (Vec<Message>, AbsorbCommit) {
     let project = crate::git_utils::project_root(cwd);
     let transcript_bucket = crate::session_storage::transcript_dir(&project);
     let state_path = transcript_bucket.join("external_import_state.json");
@@ -205,30 +251,43 @@ pub fn absorb_new_external_sessions(cwd: &Path) -> Vec<Message> {
     let paths = crate::session_import::discover_all_external_paths();
     let candidate_count = paths.len();
 
-    let (mut absorbed, skipped) = absorb_paths(paths, &cwd_canonical, &mut state);
-
-    if !absorbed.is_empty() {
-        absorbed.insert(0, import_header(absorbed.len()));
-    }
-
-    // Persist updated state for the next startup.
-    if !absorbed.is_empty() || !state.sessions.is_empty() {
-        save_state(&state, &state_path);
-    }
+    let (absorbed, skipped) = absorb_paths(paths, &cwd_canonical, &mut state);
 
     if !absorbed.is_empty() {
         // tracing (not eprintln!) so it is routed through the app's log/event
         // system instead of writing over the TUI alternate screen.
         tracing::info!(
-            messages = absorbed.len().saturating_sub(1), // exclude the header
+            messages = absorbed.len(),
             candidates = candidate_count,
             skipped,
             project = %project.display(),
-            "Absorbed external session history"
+            "Absorbed external session history (pending durable-save commit)"
         );
     }
 
-    absorbed
+    let commit = AbsorbCommit {
+        state,
+        path: state_path,
+    };
+    (absorbed, commit)
+}
+
+/// A pending absorption-state commit. Persist it with [`AbsorbCommit::commit`]
+/// only once the session carrying the absorbed messages has been durably saved.
+pub struct AbsorbCommit {
+    state: ExternalAbsorptionState,
+    path: PathBuf,
+}
+
+impl AbsorbCommit {
+    /// Persist the updated absorption state. Call this AFTER the session
+    /// containing the imported messages is durably saved; otherwise a crash
+    /// between absorb and save would lose the import for good.
+    pub fn commit(self) {
+        if !self.state.sessions.is_empty() {
+            save_state(&self.state, &self.path);
+        }
+    }
 }
 
 #[cfg(test)]

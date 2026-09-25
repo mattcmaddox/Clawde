@@ -2837,6 +2837,7 @@ async fn run_headless(
     // the new prompt/messages supplied to this process. The marker may be far
     // earlier in the transcript; run_query_loop deliberately scans the full
     // history so a trailing tool result cannot deactivate the plan gate.
+    let mut absorb_commit: Option<clawde_core::external_absorb::AbsorbCommit> = None;
     if let Some(session) = resumed_session.as_ref() {
         let mut historical = session.messages.clone();
         historical.append(&mut messages);
@@ -2846,8 +2847,11 @@ async fn run_headless(
         // agents (Opencode, Cline, Freebuff), deduplicating against the per-project
         // absorption state so old history is never re-polled as new. The absorbed
         // messages are prepended to the new turn so the model sees prior context.
-        let absorbed =
+        // The state watermark is only committed after the session is durably saved
+        // (below), so a crash before the save re-imports rather than losing history.
+        let (absorbed, commit) =
             clawde_core::external_absorb::absorb_new_external_sessions(&tool_ctx.working_dir);
+        absorb_commit = Some(commit);
         if !absorbed.is_empty() {
             let mut historical = absorbed;
             historical.append(&mut messages);
@@ -3265,6 +3269,11 @@ async fn run_headless(
     clawde_core::history::save_session(&persisted_session)
         .await
         .context("failed to persist headless session for --resume")?;
+    // The absorbed messages are now durable in the session, so it is safe to
+    // record the external-import watermark (prevents re-import next run).
+    if let Some(commit) = absorb_commit.take() {
+        commit.commit();
+    }
 
     // Final output
     match cli.output_format {
@@ -4254,14 +4263,23 @@ async fn run_interactive(
     // external agents (Opencode, Cline, Freebuff) when the feature is enabled in
     // settings. Deduplicates against the per-project absorption state so old
     // history is never re-polled as new. The absorbed messages are prepended so
-    // the model sees prior context.
+    // the model sees prior context. The watermark is only committed at exit (after
+    // the session carrying them is durably saved), so quitting before the first
+    // turn re-imports next run rather than losing the history.
+    let mut absorb_commit: Option<clawde_core::external_absorb::AbsorbCommit> = None;
     if resume_id.is_none() && config.import_external_sessions_on_start {
-        let absorbed =
+        let (absorbed, commit) =
             clawde_core::external_absorb::absorb_new_external_sessions(&tool_ctx.working_dir);
+        absorb_commit = Some(commit);
         if !absorbed.is_empty() {
             // Prepend absorbed history to the new session's initial messages.
             let mut combined = absorbed;
-            combined.extend(initial_messages);
+            combined.extend(initial_messages.clone());
+            // Seed the session's own transcript too, so the very first session save
+            // (per-turn, 30s autosave, or exit) already carries the imported history.
+            // Without this, quitting before the first turn would drop the absorbed
+            // messages while the watermark is (later) committed — losing them.
+            session.messages = combined.clone();
             initial_messages = combined;
         }
     }
@@ -8230,6 +8248,13 @@ async fn run_interactive(
         &mut transcript_written_id,
     )
     .await;
+    // The imported history is now durable in the session transcript (the exit
+    // sync above mirrors session.messages to disk), so it is safe to record the
+    // external-import watermark. Committing here (not at absorb time) means a
+    // crash before exit re-imports on the next run instead of losing history.
+    if let Some(commit) = absorb_commit.take() {
+        commit.commit();
+    }
     if !session.messages.is_empty() {
         if let Ok(path) =
             clawde_core::session_storage::transcript_path(&transcript_project_root, &session.id)
