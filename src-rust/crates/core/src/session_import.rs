@@ -290,8 +290,8 @@ pub fn import_freebuff_session(path: &Path) -> anyhow::Result<ImportedSession> {
         card.push_str("\n--- identity (excerpt) ---\n");
         card.push_str(&identity);
     }
-    // Redact before the text can become a model message.
-    let card = redact_secrets(&card);
+    // NOTE: no redaction here — `import_one_source` redacts every source's
+    // messages centrally before they can reach a model.
 
     let messages = if card.trim().is_empty() {
         Vec::new()
@@ -354,6 +354,84 @@ impl Default for KnownLocations {
     }
 }
 
+/// A pluggable external-session source.
+///
+/// Each source is a self-contained descriptor: where its data lives, how to
+/// cheaply discover candidate paths, and how to parse one path. The absorb /
+/// history-restore core drives this registry generically, so adding, disabling,
+/// or removing a source never requires touching the core machinery. Freebuff is
+/// one isolated, **off-by-default** entry (its `~/freebuff` folder is agent
+/// scratch, not a dependency Clawde should read by default); set
+/// `default_enabled: true` or add a settings knob to opt in.
+pub struct ExternalSource {
+    /// Stable identifier, also used to look the source up in the registry.
+    pub id: &'static str,
+    /// Root directory where this source stores its data.
+    pub root: PathBuf,
+    /// System-scoped sources (host recon) are relevant to every project and
+    /// bypass the cwd filter; chat-history sources are project-scoped.
+    pub system_scoped: bool,
+    /// Whether this source participates in the default (no-config) import.
+    pub default_enabled: bool,
+    /// Cheap discovery: candidate paths for this source, opening no file.
+    pub discover: fn(&Path) -> Vec<PathBuf>,
+    /// Parse a single discovered path into messages (or `None` if unusable).
+    pub import: fn(&Path) -> Option<ImportedSession>,
+}
+
+/// The active external sources, in catalog order. Callers filter by
+/// `default_enabled` (or an explicit allow-list) before discovering.
+pub fn external_sources() -> Vec<ExternalSource> {
+    let locs = KnownLocations::default();
+    vec![
+        ExternalSource {
+            id: "opencode",
+            root: locs.opencode_projects,
+            system_scoped: false,
+            default_enabled: true,
+            discover: discover_opencode_paths,
+            import: |p| import_opencode_session(p).ok(),
+        },
+        ExternalSource {
+            id: "cline",
+            root: locs.cline_workspace,
+            system_scoped: false,
+            default_enabled: true,
+            discover: discover_cline_paths,
+            import: |p| import_cline_session(p).ok(),
+        },
+        ExternalSource {
+            id: "freebuff",
+            root: locs.freebuff_snapshots,
+            system_scoped: true,
+            // Off by default: `~/freebuff` is agent scratch, not a normal
+            // dependency. Opt in explicitly if you actually want host context.
+            default_enabled: false,
+            discover: discover_freebuff_paths,
+            import: |p| import_freebuff_session(p).ok(),
+        },
+    ]
+}
+
+/// Look up a source descriptor by id.
+pub fn external_source(id: &str) -> Option<ExternalSource> {
+    external_sources().into_iter().find(|s| s.id == id)
+}
+
+/// Whether a source id participates in the default (no-config) import.
+pub fn is_source_default_enabled(id: &str) -> bool {
+    external_source(id)
+        .map(|s| s.default_enabled)
+        .unwrap_or(false)
+}
+
+/// Whether a source id refers to a system-scoped (always-relevant) source.
+pub fn is_system_scoped_source(id: &str) -> bool {
+    external_source(id)
+        .map(|s| s.system_scoped)
+        .unwrap_or(false)
+}
+
 /// Filter a list of imported sessions to those relevant to `cwd`.
 ///
 /// - Sessions whose `working_dir` matches `cwd` or its ancestor/descendant are
@@ -380,8 +458,9 @@ pub fn filter_sessions_by_cwd(sessions: Vec<ImportedSession>, cwd: &Path) -> Vec
 /// `cwd_canonical`. Shared by the bulk filter and the fingerprint-before-parse
 /// absorber so both apply identical scoping rules.
 pub fn session_relevant_to_cwd(session: &ImportedSession, cwd_canonical: &Path) -> bool {
-    // Freebuff snapshots are system-wide context; always include them.
-    if session.source == "freebuff" {
+    // System-scoped sources (e.g. host recon) are relevant to every project.
+    // This is a property of the source in the registry, not a hardcoded name.
+    if is_system_scoped_source(session.source) {
         return true;
     }
     // Sessions without working_dir info cannot be scoped to a project. Exclude
@@ -466,37 +545,41 @@ pub fn discover_freebuff_paths(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// All candidate external session files across every source, as
-/// `(source_id, path)`. Cheap: directory walks only, no file is opened.
+/// All candidate external session paths across the *enabled* sources, as
+/// `(source_id, path)`. Drives the [`ExternalSource`] registry generically and
+/// honours each source's `default_enabled` flag, so a disabled source (e.g.
+/// Freebuff) is invisible to the absorb path. Cheap: directory walks only, no
+/// file is opened.
 pub fn discover_all_external_paths() -> Vec<(&'static str, PathBuf)> {
-    let locs = KnownLocations::default();
     let mut out = Vec::new();
-    for p in discover_opencode_paths(&locs.opencode_projects) {
-        out.push(("opencode", p));
-    }
-    for p in discover_cline_paths(&locs.cline_workspace) {
-        out.push(("cline", p));
-    }
-    for p in discover_freebuff_paths(&locs.freebuff_snapshots) {
-        out.push(("freebuff", p));
+    for source in external_sources() {
+        if !source.default_enabled {
+            continue;
+        }
+        for p in (source.discover)(&source.root) {
+            out.push((source.id, p));
+        }
     }
     out
 }
 
-/// Parse a single external session file, dispatching on `source`. Returns `None`
-/// if the file cannot be parsed into any messages.
+/// Parse a single external session path via the registry, then redact every
+/// imported text message before it can become part of a model request. Returns
+/// `None` if the file cannot be parsed into any messages. Redaction is applied
+/// centrally here — not per-source — so *every* source (not just Freebuff) is
+/// protected from leaking credentials to a provider.
 pub fn import_one_source(source: &str, path: &Path) -> Option<ImportedSession> {
-    let session = match source {
-        "opencode" => import_opencode_session(path).ok()?,
-        "cline" => import_cline_session(path).ok()?,
-        "freebuff" => import_freebuff_session(path).ok()?,
-        _ => return None,
-    };
+    let src = external_source(source)?;
+    let mut session = (src.import)(path)?;
     if session.messages.is_empty() {
-        None
-    } else {
-        Some(session)
+        return None;
     }
+    for msg in &mut session.messages {
+        if let MessageContent::Text(text) = &mut msg.content {
+            *text = redact_secrets(text);
+        }
+    }
+    Some(session)
 }
 
 #[cfg(test)]
@@ -568,13 +651,14 @@ mod tests {
         )
         .unwrap();
 
-        let session = import_freebuff_session(&run).unwrap();
+        let session = import_one_source("freebuff", &run).expect("freebuff import via registry");
         assert_eq!(session.source, "freebuff");
         assert_eq!(session.messages.len(), 1);
         let text = session.messages[0].get_text().unwrap_or("");
         assert!(text.contains("host=drone"), "card names the host: {text}");
         assert!(text.contains("TheDrone"), "identity present: {text}");
-        // The shared password must never survive into a model message.
+        // Central redaction in import_one_source: the shared password must never
+        // survive into a model message.
         assert!(!text.contains("supersecretpw"), "credential leaked: {text}");
         assert!(!text.contains("sshpass"), "sshpass line leaked: {text}");
         assert!(text.contains("REDACTED"), "redaction marker present");
@@ -606,6 +690,45 @@ mod tests {
         assert!(found[0].ends_with("drone/20260629T023103Z"));
         // A missing dir yields nothing.
         assert!(discover_opencode_paths(&oc.path().join("nope")).is_empty());
+    }
+
+    #[test]
+    fn freebuff_is_off_by_default_in_discovery() {
+        // The registry must not discover Freebuff unless explicitly enabled:
+        // `~/freebuff` is agent scratch, not a normal dependency.
+        assert!(
+            !is_source_default_enabled("freebuff"),
+            "freebuff off by default"
+        );
+        assert!(is_source_default_enabled("opencode"));
+        assert!(is_source_default_enabled("cline"));
+        // The source still exists and is system-scoped (opt-in-able), just not on.
+        assert!(is_system_scoped_source("freebuff"));
+    }
+
+    #[test]
+    fn central_redaction_covers_opencode_and_cline() {
+        // Redaction lives in import_one_source, so even chat sources are
+        // protected from leaking a pasted credential to a model provider.
+        let dir = tempdir().unwrap();
+        let oc = dir.path().join("proj_hash");
+        std::fs::create_dir_all(&oc).unwrap();
+        let file = oc.join("history.json");
+        std::fs::write(
+            &file,
+            r#"[{"role":"user","content":"my sshpass \"topsecret123\" for hive"}]"#,
+        )
+        .unwrap();
+        let s = import_one_source("opencode", &file).expect("opencode import");
+        let text = s.messages[0].get_text().unwrap_or("");
+        assert!(
+            !text.contains("topsecret123"),
+            "opencode credential leaked: {text}"
+        );
+        assert!(
+            text.contains("REDACTED"),
+            "opencode redaction marker present"
+        );
     }
 
     fn session(source: &'static str, working_dir: Option<String>) -> ImportedSession {

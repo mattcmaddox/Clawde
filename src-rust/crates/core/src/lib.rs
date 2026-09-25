@@ -2360,17 +2360,18 @@ pub mod config {
         /// Execute-and-verify loop configuration (audit spec Phase 1).
         #[serde(default)]
         pub verify: VerifyConfig,
-        /// Whether to import session history from other agent apps (Opencode,
-        /// Cline, Freebuff) when Clawde starts in a project directory. When
-        /// enabled, Clawde scans the standard locations for the current
-        /// working directory and prepends any matching external conversation
-        /// turns to the new Clawde session transcript.
+        /// Whether to import external session history / host context when Clawde
+        /// starts in a project directory. When enabled, Clawde discovers the
+        /// *default-enabled* external sources (see `session_import::ExternalSource`)
+        /// for the current working directory and prepends matching, redacted
+        /// context to the new Clawde session transcript.
         ///
-        /// Defaults to `true`. Imported context is always scoped to the current
-        /// project and passed through `redact_secrets` before it can reach a
-        /// model provider: Freebuff host-context cards are system-scoped and
-        /// redacted, and Opencode sessions (which record no cwd, so cannot be
-        /// attributed to a project) are excluded. Set to `false` to disable.
+        /// Defaults to `true`, but only sources marked `default_enabled` are
+        /// used: Opencode and Cline are on; Freebuff host-recon is off by
+        /// default (its `~/freebuff` folder is agent scratch, not a normal
+        /// dependency). Imported context is always redacted via
+        /// `redact_secrets` before it can reach a model provider. Set to `false`
+        /// to disable the whole import.
         #[serde(
             default = "external_sessions_default_on",
             rename = "importExternalSessionsOnStart",

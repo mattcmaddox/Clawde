@@ -2843,11 +2843,12 @@ async fn run_headless(
         historical.append(&mut messages);
         messages = historical;
     } else if config.import_external_sessions_on_start {
-        // No resumed session: persistently absorb history from other CWD-local
-        // agents (Opencode, Cline, Freebuff), deduplicating against the per-project
-        // absorption state so old history is never re-polled as new. The absorbed
-        // messages are prepended to the new turn so the model sees prior context.
-        // The state watermark is only committed after the session is durably saved
+        // No resumed session: persistently absorb history/context from the
+        // default-enabled external sources (see session_import::ExternalSource),
+        // deduplicating against the per-project absorption state so old history
+        // is never re-polled as new. The absorbed messages are prepended to the
+        // new turn so the model sees prior context. The state watermark is only
+        // committed after the session is durably saved
         // (below), so a crash before the save re-imports rather than losing history.
         let (absorbed, commit) =
             clawde_core::external_absorb::absorb_new_external_sessions(&tool_ctx.working_dir);
@@ -4259,11 +4260,11 @@ async fn run_interactive(
     if let Some(manager) = tool_ctx.mcp_manager.clone() {
         app.attach_mcp_manager(manager);
     }
-    // If this is a new (non-resumed) session, persistently absorb history from
-    // external agents (Opencode, Cline, Freebuff) when the feature is enabled in
-    // settings. Deduplicates against the per-project absorption state so old
-    // history is never re-polled as new. The absorbed messages are prepended so
-    // the model sees prior context. The watermark is only committed at exit (after
+    // If this is a new (non-resumed) session, persistently absorb history/context
+    // from the default-enabled external sources (see session_import::ExternalSource)
+    // when the feature is enabled in settings. Deduplicates against the per-project
+    // absorption state so old history is never re-polled as new. The absorbed
+    // messages are prepended so the model sees prior context. The watermark is only committed at exit (after
     // the session carrying them is durably saved), so quitting before the first
     // turn re-imports next run rather than losing the history.
     let mut absorb_commit: Option<clawde_core::external_absorb::AbsorbCommit> = None;
