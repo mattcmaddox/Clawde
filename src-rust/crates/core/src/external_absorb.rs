@@ -260,6 +260,13 @@ fn absorb_paths(
             let mut m = session.messages;
             let drop = m.len() - remaining;
             m.drain(..drop); // keep the most recent tail
+            tracing::warn!(
+                source,
+                dropped_head = drop,
+                kept_tail = remaining,
+                "Oversized external session: only the most recent tail is imported; \
+                 the earlier turns are not carried over."
+            );
             m
         } else {
             session.messages
@@ -268,6 +275,36 @@ fn absorb_paths(
         state.sessions.insert(key, AbsorbedEntry { fingerprint });
     }
     (absorbed, skipped)
+}
+
+/// Trim imported messages so they can be safely **prepended** to the live
+/// conversation without breaking provider request validation or re-triggering
+/// the "small model answers the stale question" bug:
+///
+/// * drop leading `Assistant` turns — the first message of an Anthropic /
+///   OpenAI request must be `user`, and `sanitize_history` does not repair a
+///   leading assistant (it passes it through);
+/// * drop a trailing dangling `User` turn — the real user prompt follows the
+///   imported block, and two consecutive user turns get merged (documented
+///   stale-answer hazard).
+///
+/// This is a light touch: it only trims the boundaries, never rewrites content
+/// or merges distinct user messages.
+fn normalize_imported_boundaries(msgs: Vec<Message>) -> Vec<Message> {
+    use crate::types::Role;
+    let mut msgs = msgs;
+    // Drop leading assistant turns.
+    msgs.drain(
+        ..msgs
+            .iter()
+            .take_while(|m| m.role == Role::Assistant)
+            .count(),
+    );
+    // Drop a trailing dangling user turn.
+    while msgs.last().is_some_and(|m| m.role == Role::User) {
+        msgs.pop();
+    }
+    msgs
 }
 
 /// Absorb new/changed external session history for the project containing `cwd`.
@@ -301,6 +338,8 @@ pub fn absorb_new_external_sessions(cwd: &Path) -> (Vec<Message>, AbsorbCommit) 
     let candidate_count = paths.len();
 
     let (absorbed, skipped) = absorb_paths(paths, &cwd_canonical, &mut state);
+    // Make the imported block safe to prepend (see normalize_imported_boundaries).
+    let absorbed = normalize_imported_boundaries(absorbed);
 
     if !absorbed.is_empty() {
         // tracing (not eprintln!) so it is routed through the app's log/event
@@ -468,5 +507,43 @@ mod tests {
         let (absorbed, skipped) = absorb_paths(paths, &cwd, &mut state);
         assert_eq!(absorbed.len(), MAX_ABSORBED_MESSAGES, "capped");
         assert!(skipped >= 1, "at least one file skipped by the cap");
+    }
+
+    fn m(role: crate::types::Role) -> Message {
+        Message {
+            role,
+            content: crate::types::MessageContent::Text("x".into()),
+            uuid: None,
+            cost: None,
+            snapshot_patch: None,
+            turn_meta: None,
+        }
+    }
+
+    #[test]
+    fn normalize_drops_leading_assistant_and_trailing_user() {
+        use crate::types::Role;
+        // Leading assistant (invalid first message) + trailing dangling user
+        // (would merge with the real prompt).
+        let msgs = vec![
+            m(Role::Assistant),
+            m(Role::Assistant),
+            m(Role::User),
+            m(Role::Assistant),
+            m(Role::User),
+        ];
+        let out = normalize_imported_boundaries(msgs);
+        assert_eq!(out.len(), 2, "dropped leading assistants + trailing user");
+        assert_eq!(out[0].role, Role::User, "starts on a user turn");
+        assert_eq!(out[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn normalize_keeps_a_well_formed_block() {
+        use crate::types::Role;
+        let msgs = vec![m(Role::User), m(Role::Assistant)];
+        let out = normalize_imported_boundaries(msgs);
+        assert_eq!(out.len(), 2, "well-formed block untouched");
+        assert_eq!(out[0].role, Role::User);
     }
 }

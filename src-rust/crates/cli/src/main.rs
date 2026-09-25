@@ -3253,6 +3253,9 @@ async fn run_headless(
             Vec::new(),
         )
     });
+    // If the query task panicked / was aborted, final_messages is empty and the
+    // absorbed import is NOT durable; the watermark must not be committed.
+    let final_messages_is_empty = final_messages.is_empty();
 
     // Persist headless sessions as well as interactive ones. This is the
     // process-resume boundary: a later `--resume <id>` loads the exact message
@@ -3270,10 +3273,14 @@ async fn run_headless(
     clawde_core::history::save_session(&persisted_session)
         .await
         .context("failed to persist headless session for --resume")?;
-    // The absorbed messages are now durable in the session, so it is safe to
-    // record the external-import watermark (prevents re-import next run).
+    // Commit the external-import watermark only when the saved session actually
+    // carries the imported messages. If the query task panicked (final_messages
+    // empty) the import is not durable, so do NOT commit — the next run re-imports
+    // (safe direction) instead of losing the history forever.
     if let Some(commit) = absorb_commit.take() {
-        commit.commit();
+        if !final_messages_is_empty {
+            commit.commit();
+        }
     }
 
     // Final output
@@ -5065,6 +5072,10 @@ async fn run_interactive(
                                     messages.clear();
                                     app.replace_messages(Vec::new());
                                     session.messages.clear();
+                                    // /clear discards the imported context, so the
+                                    // pending absorb watermark must NOT be committed at
+                                    // exit (else the import is lost forever).
+                                    absorb_commit = None;
                                     session.updated_at = chrono::Utc::now();
                                     // /clear keeps the session id, so prior
                                     // state events must not replay onto the
@@ -5097,6 +5108,9 @@ async fn run_interactive(
                                     teardown_previous_session(&tool_ctx, &session.id).await;
                                     tool_ctx.session_id = session.id.clone();
                                     reset_autonomy_for_session(&mut tool_ctx, &session.id);
+                                    // /new replaces the session, discarding the imported
+                                    // context; do not commit its watermark at exit.
+                                    absorb_commit = None;
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
                                     // Reset per-turn diff/turn bookkeeping, as
