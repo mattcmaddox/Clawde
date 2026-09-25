@@ -7730,7 +7730,9 @@ pub mod history {
         let db_path = crate::config::Settings::config_dir().join("sessions.db");
         if db_path.exists() {
             if let Ok(store) = crate::SqliteSessionStore::open(&db_path) {
-                let _ = store.delete_session(id);
+                if let Err(e) = store.delete_session(id) {
+                    tracing::warn!("Failed to delete session {} from SQLite index: {}", id, e);
+                }
             }
         }
         Ok(())

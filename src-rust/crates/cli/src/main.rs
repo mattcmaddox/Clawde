@@ -7895,11 +7895,17 @@ async fn run_interactive(
                 {
                     let db_path = clawde_core::config::Settings::config_dir().join("sessions.db");
                     if let Ok(store) = clawde_core::SqliteSessionStore::open(&db_path) {
-                        let _ = store.save_session(
+                        if let Err(e) = store.save_session(
                             &session.id,
                             session.title.as_deref(),
                             &session.model,
-                        );
+                        ) {
+                            tracing::warn!(
+                                "Failed to save session {} to SQLite index: {}",
+                                session.id,
+                                e
+                            );
+                        }
                         for msg in &session.messages {
                             let content_str = match &msg.content {
                                 clawde_core::types::MessageContent::Text(t) => t.clone(),
@@ -7920,7 +7926,7 @@ async fn run_interactive(
                                 clawde_core::types::Role::Assistant => "assistant",
                             };
                             let msg_id = msg.uuid.as_deref().unwrap_or("unknown");
-                            let _ = store.save_message(
+                            if let Err(e) = store.save_message(
                                 &session.id,
                                 msg_id,
                                 role,
@@ -7933,8 +7939,20 @@ async fn run_interactive(
                                 msg.turn_meta
                                     .as_ref()
                                     .and_then(|m| m.completed_at.as_deref()),
-                            );
+                            ) {
+                                tracing::warn!(
+                                    "Failed to save message {} for session {} to SQLite index: {}",
+                                    msg_id,
+                                    session.id,
+                                    e
+                                );
+                            }
                         }
+                    } else {
+                        tracing::warn!(
+                            "Failed to open SQLite session store for session {}",
+                            session.id
+                        );
                     }
                 }
 
