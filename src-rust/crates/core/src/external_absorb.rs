@@ -45,13 +45,41 @@ pub struct ExternalAbsorptionState {
     sessions: HashMap<String, AbsorbedEntry>,
 }
 
-/// Compute a SHA-256 fingerprint of a file's contents, or `None` if the file
-/// cannot be read. Returning `None` (rather than hashing empty bytes) keeps an
-/// unreadable file distinct from a genuinely empty one.
-fn fingerprint_of_file(path: &Path) -> Option<String> {
-    let contents = std::fs::read(path).ok()?;
+/// Compute a content fingerprint for a path, or `None` if it cannot be read.
+///
+/// * A **file** is hashed by its bytes.
+/// * A **directory** (a Freebuff capture-run dir) is hashed from a stable
+///   manifest of its immediate entries' `(name, size, mtime)`, so an unchanged
+///   run is skipped cheaply and a changed run is re-absorbed. This lets the
+///   fingerprint-before-parse flow operate on directory-based sources too.
+///
+/// Returning `None` (rather than hashing empty bytes) keeps an unreadable path
+/// distinct from a genuinely empty one.
+fn fingerprint_of_path(path: &Path) -> Option<String> {
     let mut hasher = Sha256::new();
-    hasher.update(&contents);
+    if path.is_dir() {
+        let mut entries: Vec<(String, u64, u64)> = Vec::new();
+        for entry in std::fs::read_dir(path).ok()?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let meta = entry.metadata().ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            entries.push((name, size, mtime));
+        }
+        entries.sort();
+        for (name, size, mtime) in entries {
+            hasher.update(name.as_bytes());
+            hasher.update(size.to_le_bytes());
+            hasher.update(mtime.to_le_bytes());
+        }
+    } else {
+        hasher.update(&std::fs::read(path).ok()?);
+    }
     Some(format!("{:x}", hasher.finalize()))
 }
 
@@ -160,10 +188,31 @@ fn absorb_paths(
     cwd_canonical: &Path,
     state: &mut ExternalAbsorptionState,
 ) -> (Vec<Message>, usize) {
-    // Newest file first so the cap deterministically keeps recent history.
+    // Newest first so the cap deterministically keeps recent history. For a
+    // directory source (a Freebuff run dir) use the newest child mtime, which
+    // reflects the actual capture time.
+    fn newest_mtime(p: &Path) -> std::time::SystemTime {
+        let Ok(md) = std::fs::metadata(p) else {
+            return std::time::UNIX_EPOCH;
+        };
+        if !md.is_dir() {
+            return md.modified().unwrap_or(std::time::UNIX_EPOCH);
+        }
+        let mut newest = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                    if t > newest {
+                        newest = t;
+                    }
+                }
+            }
+        }
+        newest
+    }
     paths.sort_by(|a, b| {
-        let ma = std::fs::metadata(&a.1).and_then(|m| m.modified()).ok();
-        let mb = std::fs::metadata(&b.1).and_then(|m| m.modified()).ok();
+        let ma = newest_mtime(&a.1);
+        let mb = newest_mtime(&b.1);
         ma.cmp(&mb).reverse().then_with(|| a.1.cmp(&b.1))
     });
 
@@ -171,8 +220,8 @@ fn absorb_paths(
     let mut skipped = 0usize;
     for (source, path) in paths {
         let key = path.to_string_lossy().to_string();
-        // Fingerprint first: an unchanged file is skipped WITHOUT parsing.
-        let Some(fingerprint) = fingerprint_of_file(&path) else {
+        // Fingerprint first: an unchanged source is skipped WITHOUT parsing.
+        let Some(fingerprint) = fingerprint_of_path(&path) else {
             continue;
         };
         if state
@@ -342,12 +391,26 @@ mod tests {
         let dir = tempdir().unwrap();
         let file = dir.path().join("s.json");
         std::fs::write(&file, "old").unwrap();
-        let a = fingerprint_of_file(&file).unwrap();
+        let a = fingerprint_of_path(&file).unwrap();
         std::fs::write(&file, "new").unwrap();
-        let b = fingerprint_of_file(&file).unwrap();
+        let b = fingerprint_of_path(&file).unwrap();
         assert_ne!(a, b);
         // A missing file has no fingerprint (distinct from empty content).
-        assert!(fingerprint_of_file(&dir.path().join("missing")).is_none());
+        assert!(fingerprint_of_path(&dir.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn fingerprint_of_directory_tracks_manifest() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("run");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("_meta.txt"), "host_nick=drone").unwrap();
+        let a = fingerprint_of_path(&sub).unwrap();
+        // Stable across calls when nothing changed.
+        assert_eq!(a, fingerprint_of_path(&sub).unwrap());
+        // Adding a file changes the manifest fingerprint.
+        std::fs::write(sub.join("01-identity.txt"), "TheDrone").unwrap();
+        assert_ne!(a, fingerprint_of_path(&sub).unwrap());
     }
 
     /// Write a valid Cline session.json for `workspace` with `n` user messages.

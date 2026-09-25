@@ -32,6 +32,46 @@ pub struct ImportedSession {
     pub messages: Vec<Message>,
 }
 
+/// Scrub credentials from a block of text before it can become a model message.
+///
+/// Freebuff snapshots document the cluster's shared SSH password in plain text
+/// (`sshpass "…"`, `password '…'`, `REMOTE_PW=…`) and SSH material lives in
+/// files like `10-ssh.txt`. Since imported context is sent to third-party LLM
+/// providers, anything on a line that looks like a secret, key, or token is
+/// replaced with a redaction marker before it can leak. Deliberately
+/// conservative: it may occasionally redact a non-secret, but it will not ship
+/// a live credential to a model.
+pub fn redact_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        let sensitive = [
+            "sshpass",
+            "password",
+            "passwd",
+            "remote_pw",
+            "private key",
+            "begin openssh",
+            "id_rsa",
+            "id_ed25519",
+            "api_key",
+            "apikey",
+            "secret",
+            "token",
+            "credential",
+        ]
+        .iter()
+        .any(|k| lower.contains(k));
+        if sensitive {
+            out.push_str("[REDACTED — credential-like line omitted]\n");
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Opencode importer
 // ---------------------------------------------------------------------------
@@ -182,58 +222,83 @@ pub fn import_cline_session(path: &Path) -> anyhow::Result<ImportedSession> {
 // Freebuff (system reconnaissance snapshots) importer
 // ---------------------------------------------------------------------------
 
-/// Freebuff stores periodic system-state snapshots as `YYYYMMDDTHHMMSS_index.md`
-/// markdown index files under `~/freebuff/snapshots/`. Each index file is a
-/// human-readable report of captured host/network/config state for a category
-/// (e.g. `drone`, `hive`). We treat each index as a single Assistant "snapshot"
-/// message, since it represents a point-in-time system context a developer
-/// might want Clawde to be aware of.
-/// Parse a Freebuff `*_index.md` file into a single Assistant message.
+/// Import a single Freebuff *capture run* for one host.
 ///
-/// If the markdown file begins with `# <title>`, that title is used; otherwise
-/// the filename stem is. The remainder of the file body becomes message text,
-/// prefixed with a `Source: freebuff` header so the model can tell it apart.
+/// `path` is a run directory of the form
+/// `~/freebuff/snapshots/<host>/<UTC ts>/` containing `_meta.txt`,
+/// `_runner.txt`, and numbered context files (`01-identity.txt`, …). This
+/// produces one compact, credential-redacted host-context card. The large
+/// recon dumps (network/listeners/processes/mounts) are intentionally NOT
+/// imported: they are tens of kilobytes each and low-signal for a coding
+/// assistant. Identity + capture metadata is the useful, bounded subset.
 pub fn import_freebuff_session(path: &Path) -> anyhow::Result<ImportedSession> {
-    let raw = std::fs::read_to_string(path)?;
-    let stem = path
-        .file_stem()
+    if !path.is_dir() {
+        anyhow::bail!("freebuff run path is not a directory: {}", path.display());
+    }
+    // Run timestamp is the directory name; host is its parent.
+    let run_ts = path
+        .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("freebuff-session")
+        .unwrap_or("unknown")
+        .to_string();
+    let host = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
         .to_string();
 
-    // Pull a title from a leading "# ..." line if present.
-    let mut title = stem.clone();
-    let mut body_start = 0usize;
-    for (i, line) in raw.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("# ") {
-            title = trimmed.trim_start_matches("# ").trim().to_string();
-            body_start = i + 1;
-        } else if trimmed.is_empty() {
-            continue;
-        } else {
-            break;
+    // Parse a `key=value` meta file into a small map.
+    fn kv(path: &Path) -> std::collections::HashMap<String, String> {
+        let mut m = std::collections::HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for line in text.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    m.insert(k.trim().to_string(), v.trim().to_string());
+                }
+            }
+        }
+        m
+    }
+    let meta = kv(&path.join("_meta.txt"));
+    let runner = kv(&path.join("_runner.txt"));
+
+    // Bounded identity excerpt (hostname / OS / kernel), redacted.
+    let mut identity = String::new();
+    if let Ok(text) = std::fs::read_to_string(path.join("01-identity.txt")) {
+        for line in text.lines().take(40) {
+            identity.push_str(line);
+            identity.push('\n');
         }
     }
-    let body = if body_start < raw.lines().count() {
-        raw.lines()
-            .skip(body_start)
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string()
-    } else {
-        String::new()
-    };
 
-    let content_text = format!("Source: freebuff ({})\nTitle: {}\n\n{}", stem, title, body);
+    let mode = runner.get("mode").cloned().unwrap_or_default();
+    let status = runner
+        .get("capture_status")
+        .cloned()
+        .unwrap_or_else(|| "unknown".into());
+    let os = meta
+        .get("host_nick")
+        .cloned()
+        .unwrap_or_else(|| host.clone());
 
-    let messages = if content_text.trim().is_empty() || body.is_empty() {
+    let mut card = format!(
+        "Freebuff host snapshot — host={host} run={run_ts}\n\
+         capture_mode={mode} status={status} os_label={os}\n"
+    );
+    if !identity.trim().is_empty() {
+        card.push_str("\n--- identity (excerpt) ---\n");
+        card.push_str(&identity);
+    }
+    // Redact before the text can become a model message.
+    let card = redact_secrets(&card);
+
+    let messages = if card.trim().is_empty() {
         Vec::new()
     } else {
         vec![Message {
             role: Role::Assistant,
-            content: MessageContent::Text(content_text),
+            content: MessageContent::Text(card),
             uuid: None,
             cost: None,
             snapshot_patch: None,
@@ -241,21 +306,17 @@ pub fn import_freebuff_session(path: &Path) -> anyhow::Result<ImportedSession> {
         }]
     };
 
-    // Freebuff snapshots are captured for a project directory.
-    // The freebuff tool itself runs from ~/freebuff, but snapshots are
-    // intended to represent system state that may be relevant to any
-    // project the user is working on. We set working_dir to the freebuff
-    // snapshots root so it can be matched against the cwd during filtering.
+    // Freebuff snapshots are system context relevant to any project. Anchor the
+    // working_dir at the snapshots root so the importer's cwd filter always
+    // includes it (and treat it as unscoped host context).
     let working_dir = std::fs::canonicalize(path).ok().and_then(|p| {
-        let parent = p.parent()?;
-        let grand = parent.parent()?;
-        Some(grand.display().to_string())
+        p.parent()
+            .and_then(|q| q.parent())
+            .map(|r| r.display().to_string())
     });
 
-    let project_hash = stem.split('_').next().unwrap_or("unknown").to_string();
-
     Ok(ImportedSession {
-        name: format!("freebuff-{}", &project_hash[..project_hash.len().min(12)]),
+        name: format!("freebuff-{host}-{run_ts}"),
         working_dir,
         source: "freebuff",
         source_path: path.to_path_buf(),
@@ -376,21 +437,30 @@ pub fn discover_cline_paths(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Freebuff: `<dir>/*_index.md` snapshot reports.
+/// Freebuff: the per-host capture-run directories under
+/// `<dir>/<host>/<UTC ts>/`, each holding `_meta.txt`, `_runner.txt`, and the
+/// numbered context files. Returns those run directories (not the top-level
+/// `*_index.md` report), because the run dirs are where the real per-host
+/// snapshot data lives.
 pub fn discover_freebuff_paths(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
     };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        let is_index = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.contains("_index"))
-            .unwrap_or(false);
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") && is_index {
-            out.push(path);
+    for host_entry in rd.flatten() {
+        let host_dir = host_entry.path();
+        if !host_dir.is_dir() {
+            continue;
+        }
+        let Ok(runs) = std::fs::read_dir(&host_dir) else {
+            continue;
+        };
+        for run in runs.flatten() {
+            let run_dir = run.path();
+            // A run dir is identified by containing _meta.txt.
+            if run_dir.is_dir() && run_dir.join("_meta.txt").is_file() {
+                out.push(run_dir);
+            }
         }
     }
     out
@@ -477,21 +547,37 @@ mod tests {
     }
 
     #[test]
-    fn imports_freebuff_session() {
+    fn imports_freebuff_run_dir_as_redacted_host_card() {
         let dir = tempdir().unwrap();
-        let snapshots_dir = dir.path().join("snapshots");
-        std::fs::create_dir_all(&snapshots_dir).unwrap();
-        let file = snapshots_dir.join("20260629T023103Z_index.md");
-        let content = "# Drone Capture Report\n\n| Host | Path | Status |\n|------|------|--------|\n| drone | OK |\n";
-        std::fs::write(&file, content).unwrap();
+        let run = dir.path().join("drone").join("20260629T023103Z");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(
+            run.join("_meta.txt"),
+            "host_nick=drone\nsnapshot_ts=2026-06-29T02:31:03Z\n",
+        )
+        .unwrap();
+        std::fs::write(
+            run.join("_runner.txt"),
+            "whoami=churl\nhost_nick=drone\nmode=local\ncapture_status=ok\n",
+        )
+        .unwrap();
+        // Identity plus a line that must be redacted before reaching a model.
+        std::fs::write(
+            run.join("01-identity.txt"),
+            "## hostname/OS\nTheDrone\nPRETTY_NAME=\"Ubuntu 24.04\"\nsshpass \"supersecretpw\" via ssh hive\n",
+        )
+        .unwrap();
 
-        let session = import_freebuff_session(&file).unwrap();
+        let session = import_freebuff_session(&run).unwrap();
         assert_eq!(session.source, "freebuff");
         assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].role, Role::Assistant);
         let text = session.messages[0].get_text().unwrap_or("");
-        assert!(text.contains("Source: freebuff"));
-        assert!(text.contains("Title: Drone Capture Report"));
+        assert!(text.contains("host=drone"), "card names the host: {text}");
+        assert!(text.contains("TheDrone"), "identity present: {text}");
+        // The shared password must never survive into a model message.
+        assert!(!text.contains("supersecretpw"), "credential leaked: {text}");
+        assert!(!text.contains("sshpass"), "sshpass line leaked: {text}");
+        assert!(text.contains("REDACTED"), "redaction marker present");
     }
 
     #[test]
@@ -508,11 +594,16 @@ mod tests {
         std::fs::create_dir_all(ws.join("roben.cline")).unwrap();
         std::fs::write(ws.join("roben.cline").join("session.json"), "{}").unwrap();
         assert_eq!(discover_cline_paths(cl.path()).len(), 1);
-        // freebuff: <dir>/<ts>_index.md
+        // freebuff: per-host run dirs containing _meta.txt (not the top-level index)
         let fb = tempdir().unwrap();
-        std::fs::write(fb.path().join("20260101T000000Z_index.md"), "# x").unwrap();
-        std::fs::write(fb.path().join("notes.md"), "ignored").unwrap();
-        assert_eq!(discover_freebuff_paths(fb.path()).len(), 1);
+        let run = fb.path().join("drone").join("20260629T023103Z");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("_meta.txt"), "host_nick=drone\n").unwrap();
+        // A top-level index file is NOT a discoverable run source anymore.
+        std::fs::write(fb.path().join("20260629T023103Z_index.md"), "# x").unwrap();
+        let found = discover_freebuff_paths(fb.path());
+        assert_eq!(found.len(), 1, "only the run dir is discovered");
+        assert!(found[0].ends_with("drone/20260629T023103Z"));
         // A missing dir yields nothing.
         assert!(discover_opencode_paths(&oc.path().join("nope")).is_empty());
     }
