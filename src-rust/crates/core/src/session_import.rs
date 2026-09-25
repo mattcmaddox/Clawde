@@ -109,31 +109,6 @@ pub fn import_opencode_session(path: &Path) -> anyhow::Result<ImportedSession> {
     })
 }
 
-/// Walk an Opencode projects directory and import each `history.json`.
-pub fn discover_opencode_sessions(dir: &Path) -> anyhow::Result<Vec<ImportedSession>> {
-    let mut out = Vec::new();
-    if !dir.is_dir() {
-        return Ok(out);
-    }
-    // Opencode layout: <dir>/{project_hash}/history.json
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let project_dir = entry.path();
-        if !project_dir.is_dir() {
-            continue;
-        }
-        let history = project_dir.join("history.json");
-        if history.exists() {
-            if let Ok(imported) = import_opencode_session(&history) {
-                if !imported.messages.is_empty() {
-                    out.push(imported);
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------------
 // Cline importer
 // ---------------------------------------------------------------------------
@@ -201,37 +176,6 @@ pub fn import_cline_session(path: &Path) -> anyhow::Result<ImportedSession> {
         source_path: path.to_path_buf(),
         messages,
     })
-}
-
-/// Walk a Cline workspaceStorage directory for `roben.cline/session.json`
-/// files and import each.
-pub fn discover_cline_sessions(dir: &Path) -> anyhow::Result<Vec<ImportedSession>> {
-    let mut out = Vec::new();
-    if !dir.is_dir() {
-        return Ok(out);
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let ws_dir = entry.path();
-        if !ws_dir.is_dir() {
-            continue;
-        }
-        let session_path = ws_dir.join("roben.cline").join("session.json");
-        if session_path.exists() {
-            if let Ok(imported) = import_cline_session(&session_path) {
-                if !imported.messages.is_empty() {
-                    out.push(imported);
-                }
-            }
-        }
-    }
-    out.sort_by(|a, b| {
-        b.source_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .cmp(&a.source_path.parent().and_then(|p| p.file_name()))
-    });
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -319,40 +263,6 @@ pub fn import_freebuff_session(path: &Path) -> anyhow::Result<ImportedSession> {
     })
 }
 
-/// Walk a Freebuff snapshots directory and import each `*_index.md` file.
-pub fn discover_freebuff_sessions(dir: &Path) -> anyhow::Result<Vec<ImportedSession>> {
-    let mut out = Vec::new();
-    if !dir.is_dir() {
-        return Ok(out);
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        if !path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.contains("_index"))
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        if let Ok(imported) = import_freebuff_session(&path) {
-            if !imported.messages.is_empty() {
-                out.push(imported);
-            }
-        }
-    }
-    // Sort by timestamp embedded in filename (newest first for consistent display)
-    out.sort_by(|a, b| b.source_path.file_stem().cmp(&a.source_path.file_stem()));
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------------
 // Unified discovery helpers
 // ---------------------------------------------------------------------------
@@ -383,69 +293,6 @@ impl Default for KnownLocations {
     }
 }
 
-/// Result of discovering sessions from a single source app.
-#[derive(Debug, Clone)]
-pub struct DiscoveredSource {
-    pub source: &'static str,
-    pub dir: PathBuf,
-    pub sessions: Vec<String>,
-}
-
-/// Discover importable sessions from all known external apps.
-///
-/// Returns one entry per source app, listing the human-readable names of
-/// every session that was successfully parsed, along with the directory that
-/// was scanned.
-pub fn discover_all_external_sessions() -> Vec<DiscoveredSource> {
-    let locs = KnownLocations::default();
-
-    let opencode_sessions = discover_opencode_sessions(&locs.opencode_projects)
-        .map(|sessions| sessions.iter().map(|s| s.name.clone()).collect())
-        .unwrap_or_default();
-
-    let cline_sessions = discover_cline_sessions(&locs.cline_workspace)
-        .map(|sessions| sessions.iter().map(|s| s.name.clone()).collect())
-        .unwrap_or_default();
-
-    let freebuff_sessions = discover_freebuff_sessions(&locs.freebuff_snapshots)
-        .map(|sessions| sessions.iter().map(|s| s.name.clone()).collect())
-        .unwrap_or_default();
-
-    vec![
-        DiscoveredSource {
-            source: "opencode",
-            dir: locs.opencode_projects,
-            sessions: opencode_sessions,
-        },
-        DiscoveredSource {
-            source: "cline",
-            dir: locs.cline_workspace,
-            sessions: cline_sessions,
-        },
-        DiscoveredSource {
-            source: "freebuff",
-            dir: locs.freebuff_snapshots,
-            sessions: freebuff_sessions,
-        },
-    ]
-}
-
-/// Import every externally discoverable session, returning a flat list.
-pub fn import_all_external_sessions() -> Vec<ImportedSession> {
-    let locs = KnownLocations::default();
-    let mut all = Vec::new();
-    if let Ok(sessions) = discover_opencode_sessions(&locs.opencode_projects) {
-        all.extend(sessions);
-    }
-    if let Ok(sessions) = discover_cline_sessions(&locs.cline_workspace) {
-        all.extend(sessions);
-    }
-    if let Ok(sessions) = discover_freebuff_sessions(&locs.freebuff_snapshots) {
-        all.extend(sessions);
-    }
-    all
-}
-
 /// Filter a list of imported sessions to those relevant to `cwd`.
 ///
 /// - Sessions whose `working_dir` matches `cwd` or its ancestor/descendant are
@@ -462,37 +309,124 @@ pub fn import_all_external_sessions() -> Vec<ImportedSession> {
 ///   until then, scoping beats coverage.
 pub fn filter_sessions_by_cwd(sessions: Vec<ImportedSession>, cwd: &Path) -> Vec<ImportedSession> {
     let cwd_canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-
     sessions
         .into_iter()
-        .filter(|s| {
-            // Freebuff snapshots are system-wide context; always include them.
-            if s.source == "freebuff" {
-                return true;
-            }
-            // Sessions without working_dir info cannot be scoped to a project.
-            // Exclude them rather than leaking unrelated projects' history.
-            let Some(wd) = s.working_dir.as_ref() else {
-                return false;
-            };
-            std::fs::canonicalize(wd)
-                .ok()
-                .map(|wd| {
-                    wd == cwd_canonical
-                        || cwd_canonical.starts_with(&wd)
-                        || wd.starts_with(&cwd_canonical)
-                })
-                .unwrap_or(false)
-        })
+        .filter(|s| session_relevant_to_cwd(s, &cwd_canonical))
         .collect()
 }
 
-/// Convenience entry point: discover, import, and filter external sessions
-/// relevant to `cwd`. This is the single function called at startup if
-/// `Settings::import_external_sessions_on_start` is enabled.
-pub fn import_sessions_for_cwd(cwd: &Path) -> Vec<ImportedSession> {
-    let sessions = import_all_external_sessions();
-    filter_sessions_by_cwd(sessions, cwd)
+/// Whether a single imported session is relevant to the (already canonicalized)
+/// `cwd_canonical`. Shared by the bulk filter and the fingerprint-before-parse
+/// absorber so both apply identical scoping rules.
+pub fn session_relevant_to_cwd(session: &ImportedSession, cwd_canonical: &Path) -> bool {
+    // Freebuff snapshots are system-wide context; always include them.
+    if session.source == "freebuff" {
+        return true;
+    }
+    // Sessions without working_dir info cannot be scoped to a project. Exclude
+    // them rather than leaking unrelated projects' history.
+    let Some(wd) = session.working_dir.as_ref() else {
+        return false;
+    };
+    std::fs::canonicalize(wd)
+        .ok()
+        .map(|wd| {
+            wd == cwd_canonical || cwd_canonical.starts_with(&wd) || wd.starts_with(cwd_canonical)
+        })
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Path-only discovery (fingerprint-before-parse)
+//
+// These locate candidate session FILES without opening/parsing them. The
+// absorber uses them to fingerprint each file first and skip unchanged ones
+// without paying the parse cost — the whole point of the "absorb once, never
+// re-poll old as new" design. Parsing happens only for new/changed files, via
+// `import_one_source`.
+// ---------------------------------------------------------------------------
+
+/// Opencode: `<dir>/{project_hash}/history.json`.
+pub fn discover_opencode_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let history = entry.path().join("history.json");
+        if history.is_file() {
+            out.push(history);
+        }
+    }
+    out
+}
+
+/// Cline: `<dir>/{ws_hash}/roben.cline/session.json`.
+pub fn discover_cline_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let session = entry.path().join("roben.cline").join("session.json");
+        if session.is_file() {
+            out.push(session);
+        }
+    }
+    out
+}
+
+/// Freebuff: `<dir>/*_index.md` snapshot reports.
+pub fn discover_freebuff_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let is_index = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.contains("_index"))
+            .unwrap_or(false);
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") && is_index {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// All candidate external session files across every source, as
+/// `(source_id, path)`. Cheap: directory walks only, no file is opened.
+pub fn discover_all_external_paths() -> Vec<(&'static str, PathBuf)> {
+    let locs = KnownLocations::default();
+    let mut out = Vec::new();
+    for p in discover_opencode_paths(&locs.opencode_projects) {
+        out.push(("opencode", p));
+    }
+    for p in discover_cline_paths(&locs.cline_workspace) {
+        out.push(("cline", p));
+    }
+    for p in discover_freebuff_paths(&locs.freebuff_snapshots) {
+        out.push(("freebuff", p));
+    }
+    out
+}
+
+/// Parse a single external session file, dispatching on `source`. Returns `None`
+/// if the file cannot be parsed into any messages.
+pub fn import_one_source(source: &str, path: &Path) -> Option<ImportedSession> {
+    let session = match source {
+        "opencode" => import_opencode_session(path).ok()?,
+        "cline" => import_cline_session(path).ok()?,
+        "freebuff" => import_freebuff_session(path).ok()?,
+        _ => return None,
+    };
+    if session.messages.is_empty() {
+        None
+    } else {
+        Some(session)
+    }
 }
 
 #[cfg(test)]
@@ -561,16 +495,26 @@ mod tests {
     }
 
     #[test]
-    fn discover_finds_three_sources() {
-        // discover_all_external_sessions scans real HOME-based paths, which may
-        // include existing snapshots on this machine. Verify the structural
-        // contract instead: three source buckets are always returned.
-        let results = discover_all_external_sessions();
-        assert_eq!(results.len(), 3);
-        let sources: Vec<&str> = results.iter().map(|r| r.source).collect();
-        assert!(sources.contains(&"opencode"));
-        assert!(sources.contains(&"cline"));
-        assert!(sources.contains(&"freebuff"));
+    fn path_discovery_finds_candidate_files() {
+        // opencode: <dir>/{project}/history.json
+        let oc = tempdir().unwrap();
+        let proj = oc.path().join("proj_hash");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("history.json"), "[]").unwrap();
+        assert_eq!(discover_opencode_paths(oc.path()).len(), 1);
+        // cline: <dir>/{ws}/roben.cline/session.json
+        let cl = tempdir().unwrap();
+        let ws = cl.path().join("ws1");
+        std::fs::create_dir_all(ws.join("roben.cline")).unwrap();
+        std::fs::write(ws.join("roben.cline").join("session.json"), "{}").unwrap();
+        assert_eq!(discover_cline_paths(cl.path()).len(), 1);
+        // freebuff: <dir>/<ts>_index.md
+        let fb = tempdir().unwrap();
+        std::fs::write(fb.path().join("20260101T000000Z_index.md"), "# x").unwrap();
+        std::fs::write(fb.path().join("notes.md"), "ignored").unwrap();
+        assert_eq!(discover_freebuff_paths(fb.path()).len(), 1);
+        // A missing dir yields nothing.
+        assert!(discover_opencode_paths(&oc.path().join("nope")).is_empty());
     }
 
     fn session(source: &'static str, working_dir: Option<String>) -> ImportedSession {

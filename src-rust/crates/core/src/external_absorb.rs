@@ -26,19 +26,18 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// One absorbed external session's tracking record.
+/// One external session file this project has already evaluated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AbsorbedEntry {
-    /// SHA-256 of the session file's contents at time of absorption.
+    /// SHA-256 of the session file's contents at the time it was evaluated
+    /// (absorbed into this project, or ruled irrelevant to it).
     #[serde(rename = "fp")]
     fingerprint: String,
-    /// Number of messages parsed from this session file.
-    #[serde(rename = "count")]
-    message_count: usize,
 }
 
-/// Per-project absorption state. Maps external session file paths to their
-/// last-absorbed fingerprints.
+/// Per-project absorption state. Maps external session file paths to the
+/// fingerprint last evaluated for *this* project, so an unchanged file is
+/// skipped without re-parsing it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExternalAbsorptionState {
     /// Keyed by source file path (to_string_lossy).
@@ -46,14 +45,14 @@ pub struct ExternalAbsorptionState {
     sessions: HashMap<String, AbsorbedEntry>,
 }
 
-/// Compute a SHA-256 fingerprint of a file's contents.
-fn fingerprint_of_file(path: &Path) -> String {
+/// Compute a SHA-256 fingerprint of a file's contents, or `None` if the file
+/// cannot be read. Returning `None` (rather than hashing empty bytes) keeps an
+/// unreadable file distinct from a genuinely empty one.
+fn fingerprint_of_file(path: &Path) -> Option<String> {
+    let contents = std::fs::read(path).ok()?;
     let mut hasher = Sha256::new();
-    if let Ok(contents) = std::fs::read(path) {
-        hasher.update(&contents);
-    }
-    let result = hasher.finalize();
-    format!("{:x}", result)
+    hasher.update(&contents);
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 /// Load the absorption state for a project from disk.
@@ -92,60 +91,87 @@ pub fn save_state(state: &ExternalAbsorptionState, state_path: &Path) {
 /// (and left eligible for a later run) rather than dropped silently.
 pub const MAX_ABSORBED_MESSAGES: usize = 200;
 
-/// Absorb new/changed sessions into `state`, newest-file-first, up to
-/// [`MAX_ABSORBED_MESSAGES`]. Returns the absorbed messages and the number of
-/// sessions skipped because the cap was reached.
+/// Header that bounds the imported region in the transcript so both the user and
+/// the model can tell prior external conversation apart from the current
+/// session. Prepended once, only when at least one external message is absorbed.
+fn import_header(count: usize) -> Message {
+    Message {
+        role: crate::types::Role::User,
+        content: crate::types::MessageContent::Text(format!(
+            "[Imported prior conversation from other local agents — {count} message(s). \
+             This is background context, not the current session. The current request follows.]"
+        )),
+        uuid: None,
+        cost: None,
+        snapshot_patch: None,
+        turn_meta: None,
+    }
+}
+
+/// Absorb new/changed external session FILES for `cwd` into `state`,
+/// newest-file-first, fingerprinting each file BEFORE parsing it so unchanged
+/// files cost only a hash (never a JSON parse). Returns the absorbed messages
+/// and the number of files skipped because the message cap was reached.
 ///
-/// Ordering is by source-file mtime (newest first) so the cap deterministically
-/// keeps the most recent history; ties break on the source path so repeated runs
-/// absorb the same set. A cap-skipped session's fingerprint is *not* recorded,
-/// so it stays eligible on a later run instead of being silently lost.
-fn absorb_sessions_capped(
-    mut sessions: Vec<crate::session_import::ImportedSession>,
+/// Per file:
+///   - unreadable → skipped entirely;
+///   - fingerprint already recorded for this project (unchanged) → skipped
+///     without parsing (the "absorb once" guarantee);
+///   - new/changed → parse just this file; if relevant to `cwd`, absorb up to
+///     [`MAX_ABSORBED_MESSAGES`] and record its fingerprint; if irrelevant to
+///     this project, record its fingerprint WITHOUT absorbing, so it is never
+///     re-parsed here but stays evaluable in the project it belongs to (which
+///     has its own state file).
+///
+/// A cap-skipped file's fingerprint is *not* recorded, so it stays eligible on a
+/// later run instead of being silently lost.
+fn absorb_paths(
+    mut paths: Vec<(&'static str, std::path::PathBuf)>,
+    cwd_canonical: &Path,
     state: &mut ExternalAbsorptionState,
 ) -> (Vec<Message>, usize) {
-    sessions.sort_by(|a, b| {
-        let ma = std::fs::metadata(&a.source_path)
-            .and_then(|m| m.modified())
-            .ok();
-        let mb = std::fs::metadata(&b.source_path)
-            .and_then(|m| m.modified())
-            .ok();
-        // Newest first.
-        ma.cmp(&mb)
-            .reverse()
-            .then_with(|| a.source_path.cmp(&b.source_path))
+    // Newest file first so the cap deterministically keeps recent history.
+    paths.sort_by(|a, b| {
+        let ma = std::fs::metadata(&a.1).and_then(|m| m.modified()).ok();
+        let mb = std::fs::metadata(&b.1).and_then(|m| m.modified()).ok();
+        ma.cmp(&mb).reverse().then_with(|| a.1.cmp(&b.1))
     });
 
     let mut absorbed: Vec<Message> = Vec::new();
     let mut skipped = 0usize;
-    for session in sessions {
-        let key = session.source_path.to_string_lossy().to_string();
-        let fingerprint = fingerprint_of_file(&session.source_path);
-
-        // Unchanged since last absorption — skip silently.
-        // This is the "don't keep polling old history as new" guard.
-        if let Some(entry) = state.sessions.get(&key) {
-            if entry.fingerprint == fingerprint {
-                continue;
-            }
+    for (source, path) in paths {
+        let key = path.to_string_lossy().to_string();
+        // Fingerprint first: an unchanged file is skipped WITHOUT parsing.
+        let Some(fingerprint) = fingerprint_of_file(&path) else {
+            continue;
+        };
+        if state
+            .sessions
+            .get(&key)
+            .is_some_and(|e| e.fingerprint == fingerprint)
+        {
+            continue;
         }
 
-        // Respect the cap; leave the session eligible for a later run.
+        // New or changed: parse just this file.
+        let Some(session) = crate::session_import::import_one_source(source, &path) else {
+            continue;
+        };
+
+        if !crate::session_import::session_relevant_to_cwd(&session, cwd_canonical) {
+            // Irrelevant to this project: record so it is not re-parsed here,
+            // but leave it evaluable in its own project (separate state file).
+            state.sessions.insert(key, AbsorbedEntry { fingerprint });
+            continue;
+        }
+
         if absorbed.len().saturating_add(session.messages.len()) > MAX_ABSORBED_MESSAGES {
             skipped += 1;
             continue;
         }
 
-        // New file or changed file: re-absorb fully.
-        absorbed.extend(session.messages.iter().cloned());
-        state.sessions.insert(
-            key,
-            AbsorbedEntry {
-                fingerprint,
-                message_count: session.messages.len(),
-            },
-        );
+        absorbed.extend(session.messages);
+        state.sessions.insert(key, AbsorbedEntry { fingerprint });
     }
     (absorbed, skipped)
 }
@@ -157,42 +183,45 @@ fn absorb_sessions_capped(
 ///
 /// Steps:
 ///   1. Resolve the project root (git root, fallback to cwd canonicalized).
-///   2. Load the existing absorption state from
+///   2. Load the per-project absorption state from
 ///      `~/.clawde/projects/{b64(project)}/external_import_state.json`.
-///   3. Discover all external sessions (Opencode, Cline, Freebuff) scoped to cwd.
-///   4. For each, compute a fingerprint; skip if unchanged, else re-absorb (up to
-///      [`MAX_ABSORBED_MESSAGES`], newest first).
+///   3. Discover external session FILES (no parsing) across Opencode, Cline,
+///      Freebuff.
+///   4. Fingerprint each; absorb new/changed relevant ones up to
+///      [`MAX_ABSORBED_MESSAGES`], newest first, prepending a header that
+///      bounds the imported region.
 ///   5. Save the updated state file.
 ///   6. Return the Vec<Message> of newly absorbed messages.
 ///
 /// Returns an empty Vec if nothing new was absorbed (or on any error) — the
 /// caller treats that as "no extra context to prepend."
 pub fn absorb_new_external_sessions(cwd: &Path) -> Vec<Message> {
-    // Resolve project root. Use git_utils if available, fallback to canonicalized cwd.
     let project = crate::git_utils::project_root(cwd);
-
-    // State file lives in the project's transcript bucket.
     let transcript_bucket = crate::session_storage::transcript_dir(&project);
     let state_path = transcript_bucket.join("external_import_state.json");
-
     let mut state = load_state(&state_path);
 
-    let sessions = crate::session_import::import_sessions_for_cwd(cwd);
-    let session_count = sessions.len();
+    let cwd_canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let paths = crate::session_import::discover_all_external_paths();
+    let candidate_count = paths.len();
 
-    let (absorbed, skipped) = absorb_sessions_capped(sessions, &mut state);
+    let (mut absorbed, skipped) = absorb_paths(paths, &cwd_canonical, &mut state);
+
+    if !absorbed.is_empty() {
+        absorbed.insert(0, import_header(absorbed.len()));
+    }
 
     // Persist updated state for the next startup.
-    if !absorbed.is_empty() {
+    if !absorbed.is_empty() || !state.sessions.is_empty() {
         save_state(&state, &state_path);
     }
 
     if !absorbed.is_empty() {
-        // tracing (not eprintln!) so this is routed through the app's log/event
+        // tracing (not eprintln!) so it is routed through the app's log/event
         // system instead of writing over the TUI alternate screen.
         tracing::info!(
-            messages = absorbed.len(),
-            sessions = session_count,
+            messages = absorbed.len().saturating_sub(1), // exclude the header
+            candidates = candidate_count,
             skipped,
             project = %project.display(),
             "Absorbed external session history"
@@ -205,35 +234,32 @@ pub fn absorb_new_external_sessions(cwd: &Path) -> Vec<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
-    /// Helper: create a state file with one pre-absorbed session.
-    fn write_state(dir: &Path, file_path: &str, fp: &str, count: usize) {
-        let state = ExternalAbsorptionState {
+    fn state_with(fp: &str, key: &str) -> ExternalAbsorptionState {
+        ExternalAbsorptionState {
             sessions: HashMap::from([(
-                file_path.to_string(),
+                key.to_string(),
                 AbsorbedEntry {
                     fingerprint: fp.to_string(),
-                    message_count: count,
                 },
             )]),
-        };
-        save_state(&state, &dir.join("external_import_state.json"));
+        }
     }
 
     #[test]
     fn loads_state_from_disk() {
         let dir = tempdir().unwrap();
-        write_state(dir.path(), "/some/file.json", "abc123", 5);
+        save_state(
+            &state_with("abc123", "/some/file.json"),
+            &dir.path().join("external_import_state.json"),
+        );
         let state = load_state(&dir.path().join("external_import_state.json"));
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(
             state.sessions.get("/some/file.json").unwrap().fingerprint,
             "abc123"
-        );
-        assert_eq!(
-            state.sessions.get("/some/file.json").unwrap().message_count,
-            5
         );
     }
 
@@ -247,85 +273,78 @@ mod tests {
     #[test]
     fn handles_malformed_state_gracefully() {
         let dir = tempdir().unwrap();
-        let bad_path = dir.path().join("external_import_state.json");
-        std::fs::write(&bad_path, "{ this is not valid json").unwrap();
-        let state = load_state(&bad_path);
-        assert!(state.sessions.is_empty());
+        let bad = dir.path().join("external_import_state.json");
+        std::fs::write(&bad, "{ not valid json").unwrap();
+        assert!(load_state(&bad).sessions.is_empty());
     }
 
     #[test]
-    fn fingerprint_changes_when_content_changes() {
+    fn fingerprint_changes_when_content_changes_and_none_when_unreadable() {
         let dir = tempdir().unwrap();
-        let file = dir.path().join("session.json");
-        std::fs::write(&file, "old content").unwrap();
-        let fp1 = fingerprint_of_file(&file);
-
-        std::fs::write(&file, "new content").unwrap();
-        let fp2 = fingerprint_of_file(&file);
-
-        assert_ne!(fp1, fp2);
+        let file = dir.path().join("s.json");
+        std::fs::write(&file, "old").unwrap();
+        let a = fingerprint_of_file(&file).unwrap();
+        std::fs::write(&file, "new").unwrap();
+        let b = fingerprint_of_file(&file).unwrap();
+        assert_ne!(a, b);
+        // A missing file has no fingerprint (distinct from empty content).
+        assert!(fingerprint_of_file(&dir.path().join("missing")).is_none());
     }
 
-    #[test]
-    fn fingerprint_is_stable_for_unchanged_content() {
-        let dir = tempdir().unwrap();
-        let file = dir.path().join("session.json");
-        std::fs::write(&file, "same content").unwrap();
-        let fp1 = fingerprint_of_file(&file);
-        let fp2 = fingerprint_of_file(&file);
-        assert_eq!(fp1, fp2);
-    }
-
-    /// Build an ImportedSession backed by a real temp file with `n` messages.
-    fn fake_session(dir: &Path, name: &str, n: usize) -> crate::session_import::ImportedSession {
+    /// Write a valid Cline session.json for `workspace` with `n` user messages.
+    fn write_cline(dir: &Path, name: &str, workspace: &Path, n: usize) -> PathBuf {
         let file = dir.join(name);
-        std::fs::write(&file, format!("content-{name}")).unwrap();
-        let messages = (0..n)
-            .map(|i| Message {
-                role: crate::types::Role::User,
-                content: crate::types::MessageContent::Text(format!("m{i}")),
-                uuid: None,
-                cost: None,
-                snapshot_patch: None,
-                turn_meta: None,
-            })
+        let msgs: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"role":"user","text":"m{i}"}}"#))
             .collect();
-        crate::session_import::ImportedSession {
-            name: name.to_string(),
-            working_dir: None,
-            source: "cline",
-            source_path: file,
-            messages,
-        }
+        let body = format!(
+            r#"{{"workspacePath":{:?},"conversation":[{}]}}"#,
+            workspace.display().to_string(),
+            msgs.join(",")
+        );
+        std::fs::write(&file, body).unwrap();
+        file
     }
 
     #[test]
-    fn absorb_respects_message_cap_and_skips_the_rest() {
+    fn absorb_absorbs_relevant_session_then_skips_it_as_unchanged() {
         let dir = tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let file = write_cline(dir.path(), "s.json", &cwd, 3);
         let mut state = ExternalAbsorptionState::default();
-        // 3 sessions x 100 messages = 300 > cap(200).
-        let sessions = vec![
-            fake_session(dir.path(), "a.json", 100),
-            fake_session(dir.path(), "b.json", 100),
-            fake_session(dir.path(), "c.json", 100),
-        ];
-        let (absorbed, skipped) = absorb_sessions_capped(sessions, &mut state);
-        assert_eq!(absorbed.len(), 200, "capped at MAX_ABSORBED_MESSAGES");
-        assert_eq!(skipped, 1, "one session skipped by the cap");
-        // Skipped session left eligible (no fingerprint recorded).
-        assert_eq!(state.sessions.len(), 2, "only absorbed sessions recorded");
-    }
-
-    #[test]
-    fn absorb_skips_unchanged_sessions() {
-        let dir = tempdir().unwrap();
-        let mut state = ExternalAbsorptionState::default();
-        let sessions = vec![fake_session(dir.path(), "a.json", 5)];
-        let (absorbed, _) = absorb_sessions_capped(sessions.clone(), &mut state);
-        assert_eq!(absorbed.len(), 5);
-        // Same content -> fingerprint unchanged -> nothing re-absorbed.
-        let sessions2 = vec![fake_session(dir.path(), "a.json", 5)];
-        let (absorbed2, _) = absorb_sessions_capped(sessions2, &mut state);
+        let paths = vec![("cline", file.clone())];
+        let (absorbed, skipped) = absorb_paths(paths.clone(), &cwd, &mut state);
+        assert_eq!(absorbed.len(), 3, "relevant session absorbed");
+        assert_eq!(skipped, 0);
+        // Second run: unchanged fingerprint -> not re-absorbed (fingerprint-before-parse).
+        let (absorbed2, _) = absorb_paths(paths, &cwd, &mut state);
         assert_eq!(absorbed2.len(), 0, "unchanged session not re-absorbed");
+    }
+
+    #[test]
+    fn absorb_routes_out_irrelevant_session_without_absorbing() {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let other = tempdir().unwrap();
+        let file = write_cline(dir.path(), "s.json", other.path(), 3);
+        let mut state = ExternalAbsorptionState::default();
+        let (absorbed, _) = absorb_paths(vec![("cline", file)], &cwd, &mut state);
+        assert_eq!(absorbed.len(), 0, "other-project session not absorbed");
+        // But its fingerprint IS recorded so it is not re-parsed for this project.
+        assert_eq!(state.sessions.len(), 1);
+    }
+
+    #[test]
+    fn absorb_respects_message_cap() {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let a = write_cline(dir.path(), "a.json", &cwd, 100);
+        let b = write_cline(dir.path(), "b.json", &cwd, 100);
+        let c = write_cline(dir.path(), "c.json", &cwd, 100);
+        let mut state = ExternalAbsorptionState::default();
+        let paths = vec![("cline", a), ("cline", b), ("cline", c)];
+        let (absorbed, skipped) = absorb_paths(paths, &cwd, &mut state);
+        assert_eq!(absorbed.len(), MAX_ABSORBED_MESSAGES, "capped");
+        assert!(skipped >= 1, "at least one file skipped by the cap");
     }
 }
