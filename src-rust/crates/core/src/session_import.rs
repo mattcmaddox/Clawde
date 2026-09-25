@@ -361,8 +361,9 @@ impl Default for KnownLocations {
 /// history-restore core drives this registry generically, so adding, disabling,
 /// or removing a source never requires touching the core machinery. Freebuff is
 /// one isolated, **off-by-default** entry (its `~/freebuff` folder is agent
-/// scratch, not a dependency Clawde should read by default); set
-/// `default_enabled: true` or add a settings knob to opt in.
+/// scratch, not a dependency Clawde should read by default). Opt in from
+/// `settings.json` by listing it in `externalImportSources`
+/// (e.g. `["opencode", "cline", "freebuff"]`) — no code change needed.
 pub struct ExternalSource {
     /// Stable identifier, also used to look the source up in the registry.
     pub id: &'static str,
@@ -550,10 +551,21 @@ pub fn discover_freebuff_paths(dir: &Path) -> Vec<PathBuf> {
 /// honours each source's `default_enabled` flag, so a disabled source (e.g.
 /// Freebuff) is invisible to the absorb path. Cheap: directory walks only, no
 /// file is opened.
-pub fn discover_all_external_paths() -> Vec<(&'static str, PathBuf)> {
+/// Discovery filtered by an explicit allow-list of source ids.
+///
+/// `allow` of `None` uses each source's `default_enabled`. `Some(ids)` is
+/// exclusive: only the listed sources participate, which is how a user opts
+/// into a non-default source (e.g. `freebuff`) from `settings.json` without a
+/// code change and rebuild. Unknown ids are ignored (a typo degrades to
+/// importing nothing rather than erroring at startup).
+pub fn discover_all_external_paths_for(allow: Option<&[String]>) -> Vec<(&'static str, PathBuf)> {
     let mut out = Vec::new();
     for source in external_sources() {
-        if !source.default_enabled {
+        let enabled = match allow {
+            Some(ids) => ids.iter().any(|id| id == source.id),
+            None => source.default_enabled,
+        };
+        if !enabled {
             continue;
         }
         for p in (source.discover)(&source.root) {
@@ -773,5 +785,44 @@ mod tests {
         assert!(kept_sources.contains(&"freebuff"));
         // Exactly the cwd-matching cline session + freebuff survive.
         assert_eq!(kept.len(), 2, "kept: {kept_sources:?}");
+    }
+
+    #[test]
+    fn allow_list_opts_in_a_non_default_source() {
+        // Freebuff is off by default; an allow-list that names it must enable it
+        // and exclude sources that were not named.
+        let allow = vec!["freebuff".to_string()];
+        let ids: std::collections::BTreeSet<&'static str> =
+            discover_all_external_paths_for(Some(&allow))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+        // On a machine with no freebuff data this is simply empty, which is
+        // still correct: no unlisted source may appear.
+        assert!(
+            ids.iter().all(|id| *id == "freebuff"),
+            "only allow-listed sources may be discovered, got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn allow_list_excludes_unlisted_sources() {
+        let allow = vec!["cline".to_string()];
+        let ids: std::collections::BTreeSet<&'static str> =
+            discover_all_external_paths_for(Some(&allow))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+        assert!(
+            !ids.contains("opencode"),
+            "unlisted default-enabled source leaked into discovery: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_allow_list_ids_are_ignored() {
+        // A typo must degrade to importing nothing, not error at startup.
+        let allow = vec!["not-a-source".to_string()];
+        assert!(discover_all_external_paths_for(Some(&allow)).is_empty());
     }
 }

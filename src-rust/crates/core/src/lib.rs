@@ -2378,6 +2378,18 @@ pub mod config {
             alias = "import_external_sessions_on_start"
         )]
         pub import_external_sessions_on_start: bool,
+        /// Explicit allow-list of external import sources, e.g.
+        /// `["opencode", "cline", "freebuff"]`. When absent, each source's own
+        /// default applies (Opencode and Cline on, Freebuff off). When present
+        /// it is exclusive — only the listed ids are imported — which is how a
+        /// user opts into a non-default source such as `freebuff` without a
+        /// code change. Unknown ids are ignored.
+        #[serde(
+            default,
+            rename = "externalImportSources",
+            alias = "external_import_sources"
+        )]
+        pub external_import_sources: Option<Vec<String>>,
         /// Opt-in read-only semantic verification after writing turns. This is
         /// separate from the deterministic test/lint verifier and remains off
         /// by default until a semantic runner is explicitly injected.
@@ -4085,6 +4097,10 @@ pub mod config {
                 auto_compact: over.config.auto_compact || base.config.auto_compact,
                 import_external_sessions_on_start: over.config.import_external_sessions_on_start
                     || base.config.import_external_sessions_on_start,
+                external_import_sources: over
+                    .config
+                    .external_import_sources
+                    .or(base.config.external_import_sources),
                 compact_threshold: if over.config.compact_threshold != 0.0 {
                     over.config.compact_threshold
                 } else {

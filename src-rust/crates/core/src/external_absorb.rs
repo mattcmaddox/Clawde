@@ -271,10 +271,48 @@ fn absorb_paths(
         } else {
             session.messages
         };
+        // Role boundaries only make sense for imported *conversation* history.
+        // System-scoped host context (Freebuff) is a single assistant-role
+        // context card, not a dialogue; trimming its boundaries would delete it
+        // entirely. It is still safe to prepend because the real user prompt
+        // follows it and providers accept a leading assistant preamble when it
+        // is not the very first message of the request.
+        let msgs = if crate::session_import::is_system_scoped_source(source) {
+            frame_system_context(msgs)
+        } else {
+            normalize_imported_boundaries(msgs)
+        };
         absorbed.extend(msgs);
         state.sessions.insert(key, AbsorbedEntry { fingerprint });
     }
     (absorbed, skipped)
+}
+
+/// Wrap system-scoped host context so the combined history stays valid.
+///
+/// Host-context cards are model-authored prose (an `Assistant` turn), and they
+/// are prepended ahead of the real user prompt. A request whose *first* message
+/// is an assistant turn is rejected by Anthropic, so the block is framed with a
+/// short synthetic user turn. The result is
+/// `user(frame) -> assistant(card) -> user(real prompt)`, which satisfies both
+/// the "first message must be user" rule and the no-consecutive-user-turns rule.
+fn frame_system_context(msgs: Vec<Message>) -> Vec<Message> {
+    use crate::types::Role;
+    if msgs.is_empty() {
+        return msgs;
+    }
+    let mut out = Vec::with_capacity(msgs.len() + 1);
+    out.push(crate::types::Message::user(
+        "Host context captured from this machine (imported automatically):",
+    ));
+    out.extend(msgs);
+    // A host-context block must not END on a user turn either, or it would sit
+    // adjacent to the real prompt. Trim the card list (never the frame) so the
+    // frame->card->prompt shape is preserved.
+    while out.len() > 1 && out.last().is_some_and(|m| m.role == Role::User) {
+        out.pop();
+    }
+    out
 }
 
 /// Trim imported messages so they can be safely **prepended** to the live
@@ -328,18 +366,28 @@ fn normalize_imported_boundaries(msgs: Vec<Message>) -> Vec<Message> {
 /// losing the imported history. If the caller crashes before committing, the
 /// next run simply re-imports (safe direction).
 pub fn absorb_new_external_sessions(cwd: &Path) -> (Vec<Message>, AbsorbCommit) {
+    absorb_new_external_sessions_for(cwd, None)
+}
+
+/// As [`absorb_new_external_sessions`], but with an explicit allow-list of
+/// external source ids. `Some(ids)` is exclusive; `None` uses each source's
+/// default-enabled flag.
+pub fn absorb_new_external_sessions_for(
+    cwd: &Path,
+    allow: Option<&[String]>,
+) -> (Vec<Message>, AbsorbCommit) {
     let project = crate::git_utils::project_root(cwd);
     let transcript_bucket = crate::session_storage::transcript_dir(&project);
     let state_path = transcript_bucket.join("external_import_state.json");
     let mut state = load_state(&state_path);
 
     let cwd_canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let paths = crate::session_import::discover_all_external_paths();
+    let paths = crate::session_import::discover_all_external_paths_for(allow);
     let candidate_count = paths.len();
 
+    // Per-session boundary normalization happens inside absorb_paths, so that
+    // system-scoped host context is exempt (see the call site there).
     let (absorbed, skipped) = absorb_paths(paths, &cwd_canonical, &mut state);
-    // Make the imported block safe to prepend (see normalize_imported_boundaries).
-    let absorbed = normalize_imported_boundaries(absorbed);
 
     if !absorbed.is_empty() {
         // tracing (not eprintln!) so it is routed through the app's log/event
@@ -452,11 +500,17 @@ mod tests {
         assert_ne!(a, fingerprint_of_path(&sub).unwrap());
     }
 
-    /// Write a valid Cline session.json for `workspace` with `n` user messages.
+    /// Write a valid Cline session.json for `workspace` with `n` messages that
+    /// alternate user/assistant, the way a real transcript does. A block of
+    /// same-role messages is not representative and would be trimmed by
+    /// `normalize_imported_boundaries`.
     fn write_cline(dir: &Path, name: &str, workspace: &Path, n: usize) -> PathBuf {
         let file = dir.join(name);
         let msgs: Vec<String> = (0..n)
-            .map(|i| format!(r#"{{"role":"user","text":"m{i}"}}"#))
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                format!(r#"{{"role":"{role}","text":"m{i}"}}"#)
+            })
             .collect();
         let body = format!(
             r#"{{"workspacePath":{:?},"conversation":[{}]}}"#,
@@ -471,11 +525,17 @@ mod tests {
     fn absorb_absorbs_relevant_session_then_skips_it_as_unchanged() {
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_path_buf();
+        // 3 alternating messages = user/assistant/user; the trailing dangling
+        // user turn is trimmed so it cannot merge with the real prompt.
         let file = write_cline(dir.path(), "s.json", &cwd, 3);
         let mut state = ExternalAbsorptionState::default();
         let paths = vec![("cline", file.clone())];
         let (absorbed, skipped) = absorb_paths(paths.clone(), &cwd, &mut state);
-        assert_eq!(absorbed.len(), 3, "relevant session absorbed");
+        assert_eq!(
+            absorbed.len(),
+            2,
+            "relevant session absorbed, trailing user trimmed"
+        );
         assert_eq!(skipped, 0);
         // Second run: unchanged fingerprint -> not re-absorbed (fingerprint-before-parse).
         let (absorbed2, _) = absorb_paths(paths, &cwd, &mut state);
@@ -536,6 +596,19 @@ mod tests {
         assert_eq!(out.len(), 2, "dropped leading assistants + trailing user");
         assert_eq!(out[0].role, Role::User, "starts on a user turn");
         assert_eq!(out[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn system_host_context_is_framed_not_dropped() {
+        use crate::types::Role;
+        // A host-context card is assistant-authored. It must survive (it is not
+        // a conversation to trim) and be framed so the request starts on a user
+        // turn.
+        let card = vec![m(Role::Assistant)];
+        let out = frame_system_context(card);
+        assert_eq!(out.len(), 2, "frame + card");
+        assert_eq!(out[0].role, Role::User, "request must start on a user turn");
+        assert_eq!(out[1].role, Role::Assistant, "card preserved");
     }
 
     #[test]

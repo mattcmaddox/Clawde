@@ -2850,8 +2850,10 @@ async fn run_headless(
         // new turn so the model sees prior context. The state watermark is only
         // committed after the session is durably saved
         // (below), so a crash before the save re-imports rather than losing history.
-        let (absorbed, commit) =
-            clawde_core::external_absorb::absorb_new_external_sessions(&tool_ctx.working_dir);
+        let (absorbed, commit) = clawde_core::external_absorb::absorb_new_external_sessions_for(
+            &tool_ctx.working_dir,
+            config.external_import_sources.as_deref(),
+        );
         absorb_commit = Some(commit);
         if !absorbed.is_empty() {
             let mut historical = absorbed;
@@ -4276,8 +4278,10 @@ async fn run_interactive(
     // turn re-imports next run rather than losing the history.
     let mut absorb_commit: Option<clawde_core::external_absorb::AbsorbCommit> = None;
     if resume_id.is_none() && config.import_external_sessions_on_start {
-        let (absorbed, commit) =
-            clawde_core::external_absorb::absorb_new_external_sessions(&tool_ctx.working_dir);
+        let (absorbed, commit) = clawde_core::external_absorb::absorb_new_external_sessions_for(
+            &tool_ctx.working_dir,
+            config.external_import_sources.as_deref(),
+        );
         absorb_commit = Some(commit);
         if !absorbed.is_empty() {
             // Prepend absorbed history to the new session's initial messages.
