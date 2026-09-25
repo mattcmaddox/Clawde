@@ -1289,6 +1289,29 @@ fn resolve_intent_tool_name(raw: &str, known_tools: &[Box<dyn Tool>]) -> Option<
     None
 }
 
+/// Strip text-encoded tool-call markup from a message for **display**.
+///
+/// When a model writes a tool call as prose (`<tool_call>shell<arg_key>command
+/// </arg_key><arg_value>ls</arg_value></tool_call>`, `[TOOL_CALLS][…]`,
+/// `<|tool_calls_begin|>…`, or a bare `{"name":…}` payload), the query loop
+/// lifts it into real `ToolUse` blocks and the tags are excised from the copy
+/// sent to the model. The live TUI, however, accumulates text deltas as they
+/// stream — before that lift runs — so the raw markup ends up in the rendered
+/// transcript even though the tools executed correctly.
+///
+/// This removes those spans from the user-visible text only. It never affects
+/// what is sent to a provider, and a well-formed message is returned unchanged.
+pub fn strip_prose_tool_markup(text: &str) -> String {
+    let intents = extract_tool_call_intents(text);
+    if intents.is_empty() {
+        return text.to_string();
+    }
+    let spans: Vec<(usize, usize)> = intents.iter().map(|(s, e, _)| (*s, *e)).collect();
+    // The lift can leave trailing whitespace where a tag was excised; tidy the
+    // edges without touching the model's actual words.
+    splice_out_spans(text, &spans).trim().to_string()
+}
+
 /// Remove the byte spans `spans` from `text`, keeping everything else. Spans
 /// must be sorted and non-overlapping (which `extract_tool_call_intents`
 /// guarantees). Returns the text with consumed regions excised.
@@ -6151,7 +6174,7 @@ mod text_tool_lift_tests {
     use super::{
         detect_prose_tool_intent, extract_prose_tool_calls, extract_tool_call_intents,
         lift_text_tool_calls, normalize_prose_tool_name, parse_prose_tool_call_tag,
-        parse_text_tool_payloads, resolve_intent_tool_name,
+        parse_text_tool_payloads, resolve_intent_tool_name, strip_prose_tool_markup,
     };
     use async_trait::async_trait;
     use clawde_core::types::ContentBlock;
@@ -6212,6 +6235,27 @@ mod text_tool_lift_tests {
         let parsed = parse_text_tool_payloads(fenced);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].0, "Write");
+    }
+
+    #[test]
+    fn strip_prose_tool_markup_removes_tags_but_keeps_prose() {
+        // The TUI accumulates streamed text before the lift runs, so it shows
+        // the raw markup. Display stripping must remove the call and keep the
+        // model's explanation.
+        let raw = "Let me check that.\n<tool_call>Bash<arg_key>command</arg_key><arg_value>ls -la</arg_value></tool_call>\nDone.";
+        let out = strip_prose_tool_markup(raw);
+        assert!(!out.contains("tool_call"), "markup removed: {out:?}");
+        assert!(!out.contains("arg_value"), "arg tags removed: {out:?}");
+        assert!(out.contains("Let me check that."), "prose kept: {out:?}");
+    }
+
+    #[test]
+    fn strip_prose_tool_markup_leaves_clean_text_untouched() {
+        let clean = "The build is green and all 537 tests pass.";
+        assert_eq!(strip_prose_tool_markup(clean), clean);
+        // Inline backticks and angle brackets in prose are not tool calls.
+        let tricky = "Use `cargo test` and pass a < b to compare.";
+        assert_eq!(strip_prose_tool_markup(tricky), tricky);
     }
 
     #[test]

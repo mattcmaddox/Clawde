@@ -3015,9 +3015,14 @@ impl App {
             });
         }
         if !parsed.visible_text.is_empty() {
-            blocks.push(ContentBlock::Text {
-                text: parsed.visible_text,
-            });
+            // Text deltas are rendered live, before the query loop lifts a
+            // prose tool call into a real ToolUse block — so the raw
+            // `<tool_call>…` markup would otherwise sit in the transcript
+            // even though the tools ran. Strip it for display only.
+            let visible = clawde_query::strip_prose_tool_markup(&parsed.visible_text);
+            if !visible.trim().is_empty() {
+                blocks.push(ContentBlock::Text { text: visible });
+            }
         }
 
         let msg = match blocks.len() {
