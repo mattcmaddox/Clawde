@@ -2841,6 +2841,18 @@ async fn run_headless(
         let mut historical = session.messages.clone();
         historical.append(&mut messages);
         messages = historical;
+    } else if config.import_external_sessions_on_start {
+        // No resumed session: persistently absorb history from other CWD-local
+        // agents (Opencode, Cline, Freebuff), deduplicating against the per-project
+        // absorption state so old history is never re-polled as new. The absorbed
+        // messages are prepended to the new turn so the model sees prior context.
+        let absorbed =
+            clawde_core::external_absorb::absorb_new_external_sessions(&tool_ctx.working_dir);
+        if !absorbed.is_empty() {
+            let mut historical = absorbed;
+            historical.append(&mut messages);
+            messages = historical;
+        }
     }
 
     // --prefill: inject a partial assistant turn before the query so the model
@@ -3813,7 +3825,7 @@ async fn run_interactive(
         session
     };
     let mut last_auto_save = std::time::Instant::now();
-    let initial_messages = session.messages.clone();
+    let mut initial_messages = session.messages.clone();
     // Project root for the directory-scoped JSONL transcript (git repo root,
     // or the working dir when not in a repo) and the cwd stamped on entries.
     let transcript_project_root = clawde_core::git_utils::project_root(&tool_ctx.working_dir);
@@ -4237,6 +4249,21 @@ async fn run_interactive(
     app.attach_turn_diff_state(tool_ctx.file_history.clone(), tool_ctx.current_turn.clone());
     if let Some(manager) = tool_ctx.mcp_manager.clone() {
         app.attach_mcp_manager(manager);
+    }
+    // If this is a new (non-resumed) session, persistently absorb history from
+    // external agents (Opencode, Cline, Freebuff) when the feature is enabled in
+    // settings. Deduplicates against the per-project absorption state so old
+    // history is never re-polled as new. The absorbed messages are prepended so
+    // the model sees prior context.
+    if resume_id.is_none() && config.import_external_sessions_on_start {
+        let absorbed =
+            clawde_core::external_absorb::absorb_new_external_sessions(&tool_ctx.working_dir);
+        if !absorbed.is_empty() {
+            // Prepend absorbed history to the new session's initial messages.
+            let mut combined = absorbed;
+            combined.extend(initial_messages);
+            initial_messages = combined;
+        }
     }
     app.replace_messages(initial_messages.clone());
 

@@ -34,7 +34,11 @@ pub use modes::{
 
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
 pub mod session_digest;
+pub mod session_import;
 pub mod session_storage;
+
+// Cross-agent session history absorption with persistence + dedup watermarking.
+pub mod external_absorb;
 
 // SQLite-backed session storage (faster alternative to JSONL).
 pub mod sqlite_storage;
@@ -2356,6 +2360,19 @@ pub mod config {
         /// Execute-and-verify loop configuration (audit spec Phase 1).
         #[serde(default)]
         pub verify: VerifyConfig,
+        /// Whether to import session history from other agent apps (Opencode,
+        /// Cline, Freebuff) when Clawde starts in a project directory. When
+        /// enabled, Clawde scans the standard locations for the current
+        /// working directory and prepends any matching external conversation
+        /// turns to the new Clawde session transcript. Defaults to `false`
+        /// (no import) to keep Clawde hermetic by default; set to `true` or
+        /// omit (once it becomes the zero-config default) to opt in.
+        #[serde(
+            default,
+            rename = "importExternalSessionsOnStart",
+            alias = "import_external_sessions_on_start"
+        )]
+        pub import_external_sessions_on_start: bool,
         /// Opt-in read-only semantic verification after writing turns. This is
         /// separate from the deterministic test/lint verifier and remains off
         /// by default until a semantic runner is explicitly injected.
@@ -4057,6 +4074,8 @@ pub mod config {
                 output_style: over.config.output_style.or(base.config.output_style),
                 free_task_sort: over.config.free_task_sort.or(base.config.free_task_sort),
                 auto_compact: over.config.auto_compact || base.config.auto_compact,
+                import_external_sessions_on_start: over.config.import_external_sessions_on_start
+                    || base.config.import_external_sessions_on_start,
                 compact_threshold: if over.config.compact_threshold != 0.0 {
                     over.config.compact_threshold
                 } else {
