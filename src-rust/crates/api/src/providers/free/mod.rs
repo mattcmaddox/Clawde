@@ -39,8 +39,10 @@ use serde::{Deserialize, Serialize}; // Sub-modules split out of this file to ke
 mod capacity;
 mod catalog;
 mod discovery;
+mod tool_gate;
 
 use capacity::CapacityState;
+use tool_gate::ToolDialectState;
 
 // Internal const shared with the catalog's cloudflare entry and the
 // cloudflare chat probe below.
@@ -2525,6 +2527,11 @@ pub struct FreeProvider {
     /// Fresh rate-limit observations used only to demote near-exhausted
     /// upstreams. Kept separate from credential health and cooldown state.
     capacity: Arc<Mutex<CapacityState>>,
+    /// Rolling per-upstream tally of structured-vs-prose tool-call answers.
+    /// Tool-bearing routing demotes upstreams that habitually answer with
+    /// non-native (prose) tool calls, steering the chain toward lanes that
+    /// actually emit structured calls.
+    tool_dialect: Arc<Mutex<ToolDialectState>>,
 }
 
 #[derive(Debug)]

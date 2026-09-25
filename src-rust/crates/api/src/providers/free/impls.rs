@@ -144,6 +144,7 @@ impl FreeProvider {
             capacity: Arc::new(Mutex::new(
                 CapacityState::new(n).with_persistence(upstream_ids, None),
             )),
+            tool_dialect: Arc::new(Mutex::new(ToolDialectState::new(n))),
         }
     }
 
@@ -204,6 +205,7 @@ impl FreeProvider {
             profiles: Arc::new(ProviderProfiles::load()),
             latencies: Arc::new(Mutex::new(latencies)),
             capacity: Arc::new(Mutex::new(capacity)),
+            tool_dialect: Arc::new(Mutex::new(ToolDialectState::new(n))),
         }
     }
 
@@ -463,6 +465,16 @@ impl FreeProvider {
         // task preference and catalog order intact within each capacity tier,
         // including adjacent primary/fallback model rows.
         if !matches!(route, Route::Pinned { .. }) {
+            // Routing gate: for tool-bearing requests, demote upstreams that
+            // habitually answer with non-native (prose) tool calls so the chain
+            // prefers lanes that emit structured calls. Stable sort keeps the
+            // prose-prone entries in catalog order among themselves and leaves
+            // clean lanes ahead; this only biases ordering, it never drops a
+            // lane (it stays available as a fallback).
+            if has_tools {
+                let dialect = self.tool_dialect.lock().unwrap();
+                plan.sort_by_key(|(idx, _)| u8::from(dialect.is_prose_prone(*idx)));
+            }
             let capacity = self.capacity.lock().unwrap();
             plan.sort_by_key(|(idx, _)| {
                 capacity.rank(*idx, local_quota_for(self.chain[*idx].upstream.id))
@@ -1357,6 +1369,9 @@ struct RetryingFreeStream {
     retry_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     /// The upstream to retry after the delay fires: (chain_idx, model).
     retry_target: Option<(usize, String)>,
+    /// Shared structured-vs-prose tool-call tally used by the routing gate to
+    /// demote prose-prone upstreams on future tool-bearing requests.
+    tool_dialect: Arc<Mutex<ToolDialectState>>,
 }
 
 impl RetryingFreeStream {
@@ -1383,6 +1398,7 @@ impl RetryingFreeStream {
         cooldown: Arc<Mutex<CooldownState>>,
         latencies: Arc<Mutex<LatencyState>>,
         capacity: Arc<Mutex<CapacityState>>,
+        tool_dialect: Arc<Mutex<ToolDialectState>>,
         routing: RoutingConfig,
         profiles: Arc<ProviderProfiles>,
         request: ProviderRequest,
@@ -1440,6 +1456,7 @@ impl RetryingFreeStream {
             same_upstream_retries: HashMap::new(),
             retry_sleep: None,
             retry_target: None,
+            tool_dialect,
         }
     }
 
@@ -1834,6 +1851,27 @@ impl RetryingFreeStream {
         self.attempt_text.trim().is_empty()
             && self.attempt_thinking.trim().is_empty()
             && self.attempt_tool_count == 0
+    }
+
+    /// Observe how the current attempt answered a tool-bearing request, feeding
+    /// the routing gate. A native tool call counts as `structured`; a
+    /// text-only answer that contains a non-native (prose) tool call counts as
+    /// `prose`; a plain text answer carries no dialect signal and is skipped.
+    fn record_tool_dialect_observation(&mut self) {
+        if !FreeProvider::request_has_tools(&self.request) {
+            return;
+        }
+        let idx = self.current_idx;
+        let observed = if self.attempt_tool_count > 0 {
+            Some(false) // structured
+        } else if super::tool_gate::text_has_non_native_tool_call(&self.attempt_text) {
+            Some(true) // prose
+        } else {
+            None
+        };
+        if let Some(prose) = observed {
+            self.tool_dialect.lock().unwrap().record(idx, prose);
+        }
     }
 
     /// Credit a successful dispatch to the current upstream at the completion
@@ -2294,6 +2332,14 @@ impl Stream for RetryingFreeStream {
                     // the empty-completion re-dispatch path when polled to
                     // `None`, and otherwise remain uncounted.
                     if matches!(evt, StreamEvent::MessageStop) {
+                        // Routing gate: learn whether this upstream answers
+                        // tool-bearing requests with a structured call or a
+                        // non-native (prose) one. Recorded before the empty /
+                        // refusal verdicts so every completed tool attempt is
+                        // observed. This only updates the routing signal; it
+                        // never suppresses the response (the query loop lifts a
+                        // prose call), and the tally biases *future* plans.
+                        self.record_tool_dialect_observation();
                         // Interactive consumers (the query loop) break on
                         // MessageStop and drop the stream — they never poll to
                         // `None`, which is where the empty-completion
@@ -2984,6 +3030,7 @@ impl LlmProvider for FreeProvider {
                         self.cooldown.clone(),
                         self.latencies.clone(),
                         self.capacity.clone(),
+                        self.tool_dialect.clone(),
                         self.routing.clone(),
                         self.profiles.clone(),
                         request,
@@ -4209,6 +4256,17 @@ mod tests {
         }
     }
 
+    fn tool_request(model: &str) -> ProviderRequest {
+        ProviderRequest {
+            tools: vec![clawde_core::types::ToolDefinition {
+                name: "Bash".to_string(),
+                description: "run".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            ..dummy_request(model)
+        }
+    }
+
     // ---- task-based routing (audit spec Phase 2) -------------------------
 
     fn task_provider(ids: &[&'static str]) -> FreeProvider {
@@ -4954,6 +5012,39 @@ mod tests {
         let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
         assert_eq!(plan[0].0, 1, "faster upstream leads when trusted rates tie");
         assert_eq!(plan[1].0, 0);
+    }
+
+    #[test]
+    fn tool_routing_gate_demotes_prose_prone_upstream() {
+        // Two tool-capable upstreams. On a tool-bearing request the default plan
+        // leads with groq (task-preferred). Mark groq prose-prone: the routing
+        // gate must push it behind the clean sambanova lane (it stays as a
+        // fallback, never dropped).
+        let provider = FreeProvider::with_routing(
+            vec![entry("sambanova", true), entry("groq", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        let req = tool_request("free/auto");
+        // Control: before any observation, groq leads (default preference).
+        let baseline = provider.attempt_plan(&Route::Auto, Some(&req));
+        assert_eq!(baseline[0].0, 1, "groq leads before the gate");
+        // Record three prose tool answers from groq (idx 1) -> prose-prone.
+        {
+            let mut d = provider.tool_dialect.lock().unwrap();
+            for _ in 0..3 {
+                d.record(1, true);
+            }
+        }
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        assert_eq!(
+            plan[0].0, 0,
+            "prose-prone groq demoted behind clean sambanova"
+        );
+        assert_eq!(plan[1].0, 1, "prose-prone upstream stays as fallback");
+        // The gate is tool-scoped: a text-only request ignores it.
+        let text_plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
+        assert_eq!(text_plan[0].0, 1, "text-only routing keeps default order");
     }
 
     #[test]
