@@ -801,7 +801,14 @@ fn parse_text_tool_payloads(text: &str) -> Vec<(String, serde_json::Value)> {
 /// as a "dead turn". This detector recognises the prose dialects so the loop
 /// can nudge the model back onto structured calling instead of halting.
 /// Returns the canonical short tag name (e.g. `execute_bash`) on detection.
-fn detect_prose_tool_intent(text: &str) -> Option<&str> {
+fn detect_prose_tool_intent(text: &str) -> Option<&'static str> {
+    // Canonical: any recognized non-native tool-call dialect counts as intent,
+    // even if it could not be lifted (e.g. it names a tool not advertised this
+    // turn). This is what stops unknown dialects from ending the turn silently.
+    if let Some((_, _, first)) = extract_tool_call_intents(text).into_iter().next() {
+        return Some(first.dialect);
+    }
+    // Legacy: recognizable-but-unparseable tool tags, so the loop still nudges.
     const TAGS: &[&str] = &[
         "execute_bash",
         "bash",
@@ -901,13 +908,16 @@ fn normalize_prose_tool_name(name: &str) -> Option<&str> {
     }
 }
 
-/// Map a prose arg key onto the canonical key the clawde tool's schema expects
-/// (the AgentSkills dialect is a different vocabulary from clawde's). Unknown
-/// keys pass through unchanged — the tool's own validation path still applies.
+/// Map a prose arg key onto the canonical key the clawde tool's schema expects.
+/// Clawde file tools take `file_path` (not `path`) and Bash takes `command`, so
+/// the model-dialect aliases are normalized *toward* those. `file_path` passes
+/// through unchanged. Unknown keys pass through — the tool's own validation
+/// path still applies.
 fn normalize_prose_arg_key(key: &str) -> String {
     match key.trim() {
         "cmd" => "command".to_string(),
-        "file_path" | "filepath" => "path".to_string(),
+        // Some dialects spell the file argument `path`; clawde wants `file_path`.
+        "path" | "filepath" | "filePath" => "file_path".to_string(),
         other => other.to_string(),
     }
 }
@@ -942,17 +952,372 @@ fn parse_prose_tool_call_tag(inner: &str) -> Option<(String, Vec<(String, String
     Some((name, args))
 }
 
-/// Lift well-formed prose `<tool_call>…</tool_call>` sections (the AgentSkills /
-/// Claude-Code dialect, e.g. `<tool_call>shell<arg_key>command</arg_key>…`) into
-/// real ToolUse blocks so the loop *executes* them instead of nudging repeatedly.
+/// One tool call the model expressed in a non-native (text) form.
+#[derive(Debug)]
+struct ToolCallIntent {
+    /// Raw tool name exactly as the model wrote it.
+    name: String,
+    /// Declared arguments (values kept as strings for the arg_key dialect).
+    input: serde_json::Value,
+    /// Which wire dialect this was parsed from (for telemetry + detect labels).
+    dialect: &'static str,
+}
+
+/// Find `<[ZWSP]tag>` in `hay`, returning `(start, end_after_tag)`. The
+/// zero-width space is optional because some local templates emit
+/// `<\u{200b}tool_call>` and others the plain ASCII form.
+fn find_angle_tag(hay: &str, tag: &str) -> Option<(usize, usize)> {
+    let mut idx = 0usize;
+    while let Some(rel) = hay[idx..].find('<') {
+        let s = idx + rel;
+        let mut j = s + 1;
+        if hay[j..].starts_with('\u{200B}') {
+            j += '\u{200B}'.len_utf8();
+        }
+        if hay[j..].starts_with(tag) {
+            let after = j + tag.len();
+            if hay[after..].starts_with('>') {
+                return Some((s, after + 1));
+            }
+        }
+        idx = s + 1;
+    }
+    None
+}
+
+/// Find a literal special-token wrapper such as `<|tool_calls_begin|>`.
+fn find_token(hay: &str, token: &str) -> Option<(usize, usize)> {
+    hay.find(token).map(|i| (i, i + token.len()))
+}
+
+/// Parse a JSON object as a tool call: `{"name":…, "arguments"|"parameters":…}`.
+fn parse_json_tool_obj(s: &str) -> Option<(String, serde_json::Value)> {
+    let obj = serde_json::from_str::<serde_json::Value>(s.trim())
+        .ok()?
+        .as_object()?
+        .clone();
+    let name = obj.get("name").and_then(|n| n.as_str())?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let args = obj
+        .get("arguments")
+        .or_else(|| obj.get("parameters"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !args.is_object() {
+        return None;
+    }
+    Some((name, args))
+}
+
+/// String-aware balanced scan for a `[…]`/`{…}` region starting at `start`.
+/// Returns `(end_after_close, region_text)`.
+fn balanced_region(text: &str, start: usize) -> Option<(usize, &str)> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'[' | b'{' => depth += 1,
+                b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((i + 1, &text[start..i + 1]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Advance a byte index to the start of the next UTF-8 character. The scanners
+/// below index by byte, so every forward step must land on a char boundary or
+/// slicing panics when the text contains multi-byte characters (em-dash, ZWSP).
+fn next_char_boundary(s: &str, i: usize) -> usize {
+    let mut j = (i + 1).min(s.len());
+    while j < s.len() && !s.is_char_boundary(j) {
+        j += 1;
+    }
+    j
+}
+
+/// Match a Qwen/Hermes `funcs.N.name[…] funcs.N.arguments[…]` special-token
+/// block, returning every declared call in it.
+fn parse_funcs_token_block(inner: &str) -> Vec<ToolCallIntent> {
+    let mut names: Vec<(usize, String)> = Vec::new();
+    let mut args: Vec<(usize, serde_json::Value)> = Vec::new();
+    let mut i = 0usize;
+    while i < inner.len() {
+        if inner[i..].starts_with("funcs.") {
+            let rest = &inner[i + "funcs.".len()..];
+            if let Some(dot) = rest.find('.') {
+                let idx: usize = match rest[..dot].parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        i = next_char_boundary(inner, i);
+                        continue;
+                    }
+                };
+                let tail = &rest[dot + 1..];
+                if let Some(after) = tail.strip_prefix("name[") {
+                    if let Some(close) = after.find(']') {
+                        names.push((idx, after[..close].to_string()));
+                        i += "funcs.".len() + dot + "name[".len() + close + 1;
+                        continue;
+                    }
+                } else if let Some(after) = tail.strip_prefix("arguments[") {
+                    if let Some(close) = after.find(']') {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&after[..close]) {
+                            if v.is_object() {
+                                args.push((idx, v));
+                            }
+                        }
+                        i += "funcs.".len() + dot + "arguments[".len() + close + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        i = next_char_boundary(inner, i);
+    }
+    names
+        .into_iter()
+        .filter_map(|(idx, name)| {
+            args.iter()
+                .find(|(ai, _)| *ai == idx)
+                .map(|(_, input)| ToolCallIntent {
+                    name,
+                    input: input.clone(),
+                    dialect: "funcs_token",
+                })
+        })
+        .collect()
+}
+
+/// Extract every tool call the model expressed as text, across all known
+/// non-native dialects, in one left-to-right non-overlapping pass.
 ///
-/// Unlike `lift_text_tool_calls` — which demands the WHOLE message be a single
-/// clean JSON payload — this scans *inside* prose and removes only the tags,
-/// preserving the surrounding explanation. Each call executes only when its
-/// normalised tool name is one this turn actually advertised, so a model can
-/// never trigger a tool clawde did not expose. Arguments pass through verbatim
-/// (with known key aliases normalised); the normal permission + validation path
-/// still applies — Bash is high-risk and gated like any structured call.
+/// Dialects recognised:
+///  * `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`
+///    (AgentSkills / Claude-Code), ZWSP-optional;
+///  * `<tool_call>{"name":…}</tool_call>` (JSON payload wrapped);
+///  * `[TOOL_CALLS][{…},…]` (Qwen/Hermes array);
+///  * `<|tool_calls_begin|>funcs.N.…<|tool_calls_end|>` (special tokens);
+///  * a bare `{"name":…}` JSON object anywhere (in-prose / fenced).
+///
+/// Returns `(start, end, intent)` spans over `text`; spans never overlap, so a
+/// caller can splice out consumed regions while keeping the explanation. Names
+/// are returned RAW — the caller resolves them against the turn's advertised
+/// tools before executing.
+fn extract_tool_call_intents(text: &str) -> Vec<(usize, usize, ToolCallIntent)> {
+    let mut out: Vec<(usize, usize, ToolCallIntent)> = Vec::new();
+    let mut i = 0usize;
+    while i < text.len() {
+        let rest = &text[i..];
+
+        // 1/2. <tool_call>…</tool_call> (JSON payload or arg_key)
+        if let Some((os, oe)) = find_angle_tag(rest, "tool_call") {
+            let after_open = &rest[oe..];
+            if let Some((cs, ce)) = find_angle_tag(after_open, "/tool_call") {
+                let inner = &after_open[..cs];
+                // The wrapper span starts at the open tag (i + os), NOT the scan
+                // cursor, so surrounding prose before the tag is preserved.
+                let span = (i + os, i + oe + ce);
+                let mut matched = false;
+                // JSON payload first: for `{"name":…}` inner content the arg_key
+                // parser would otherwise greedily claim the whole JSON as a name.
+                if let Some((name, input)) = parse_json_tool_obj(inner) {
+                    out.push((
+                        span.0,
+                        span.1,
+                        ToolCallIntent {
+                            name,
+                            input,
+                            dialect: "json_tag",
+                        },
+                    ));
+                    matched = true;
+                } else if let Some((raw_name, pairs)) = parse_prose_tool_call_tag(inner) {
+                    let mut m = serde_json::Map::new();
+                    for (k, v) in pairs {
+                        m.insert(normalize_prose_arg_key(&k), serde_json::Value::String(v));
+                    }
+                    out.push((
+                        span.0,
+                        span.1,
+                        ToolCallIntent {
+                            name: raw_name,
+                            input: serde_json::Value::Object(m),
+                            dialect: "arg_key",
+                        },
+                    ));
+                    matched = true;
+                }
+                if matched {
+                    i = span.1;
+                } else if os == 0 {
+                    i = next_char_boundary(text, i);
+                } else {
+                    i += os; // os points at an ASCII '<', a safe boundary
+                }
+                continue;
+            }
+            if os == 0 {
+                i = next_char_boundary(text, i);
+            } else {
+                i += os;
+            }
+            continue;
+        }
+
+        // 3. [TOOL_CALLS][…]
+        if rest.starts_with("[TOOL_CALLS]") {
+            let arr_start = i + "[TOOL_CALLS]".len();
+            if let Some(off) = text[arr_start..].find('[') {
+                let bstart = arr_start + off;
+                if let Some((bend, region)) = balanced_region(text, bstart) {
+                    if let Ok(serde_json::Value::Array(items)) =
+                        serde_json::from_str::<serde_json::Value>(region)
+                    {
+                        let mut matched = false;
+                        for item in items {
+                            if let serde_json::Value::Object(o) = item {
+                                if let Some(name) = o.get("name").and_then(|n| n.as_str()) {
+                                    let args = o
+                                        .get("arguments")
+                                        .or_else(|| o.get("parameters"))
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!({}));
+                                    if args.is_object() {
+                                        out.push((
+                                            i,
+                                            bend,
+                                            ToolCallIntent {
+                                                name: name.to_string(),
+                                                input: args,
+                                                dialect: "tool_calls_array",
+                                            },
+                                        ));
+                                        matched = true;
+                                    }
+                                }
+                            }
+                        }
+                        if matched {
+                            i = bend;
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += "[TOOL_CALLS]".len();
+            continue;
+        }
+
+        // 4. <|tool_calls_begin|>…<|tool_calls_end|>
+        if let Some((bs, be)) = find_token(rest, "<|tool_calls_begin|>") {
+            let after_begin = &rest[be..];
+            if let Some((es, ee)) = find_token(after_begin, "<|tool_calls_end|>") {
+                let inner = &after_begin[..es];
+                let calls = parse_funcs_token_block(inner);
+                if !calls.is_empty() {
+                    let span = (i + bs, i + be + ee);
+                    for c in calls {
+                        out.push((span.0, span.1, c));
+                    }
+                    i = span.1;
+                    continue;
+                }
+            }
+        }
+
+        // 5. bare JSON tool object (in prose / fenced code)
+        if rest.starts_with('{') {
+            if let Some((bend, region)) = balanced_region(rest, 0) {
+                if let Some((name, input)) = parse_json_tool_obj(region) {
+                    out.push((
+                        i,
+                        i + bend,
+                        ToolCallIntent {
+                            name,
+                            input,
+                            dialect: "json_inline",
+                        },
+                    ));
+                    i += bend;
+                    continue;
+                }
+            }
+        }
+
+        i = next_char_boundary(text, i);
+    }
+    out
+}
+
+/// Resolve a raw intent name to a canonical tool actually advertised this turn.
+/// Prefers a known alias (`shell`→`Bash`), else the raw name if it is itself an
+/// advertised tool. Returns `None` when the tool was not offered, so a model can
+/// never trigger a tool clawde did not expose.
+fn resolve_intent_tool_name(raw: &str, known_tools: &[Box<dyn Tool>]) -> Option<String> {
+    if let Some(canon) = normalize_prose_tool_name(raw) {
+        if known_tools.iter().any(|t| t.name() == canon) {
+            return Some(canon.to_string());
+        }
+    }
+    let trimmed = raw.trim();
+    if known_tools.iter().any(|t| t.name() == trimmed) {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+/// Remove the byte spans `spans` from `text`, keeping everything else. Spans
+/// must be sorted and non-overlapping (which `extract_tool_call_intents`
+/// guarantees). Returns the text with consumed regions excised.
+fn splice_out_spans(text: &str, spans: &[(usize, usize)]) -> String {
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    for (s, e) in spans {
+        if *s < last {
+            continue;
+        }
+        out.push_str(&text[last..*s]);
+        last = *e;
+    }
+    out.push_str(&text[last.min(text.len())..]);
+    out
+}
+
+/// Lift every well-formed prose tool call the model expressed as text into real
+/// ToolUse blocks so the loop *executes* them instead of ending the turn.
+///
+/// This is the single canonical entry point: it runs `extract_tool_call_intents`
+/// over each text block, keeps only intents whose tool this turn advertised (via
+/// `resolve_intent_tool_name`), excises the consumed tag spans, and appends the
+/// resulting ToolUse blocks. The surrounding explanation is preserved. The normal
+/// permission + validation path still applies — Bash is high-risk and gated
+/// exactly like a structured call. Returns the number of lifted calls.
 fn extract_prose_tool_calls(
     content_blocks: &mut Vec<ContentBlock>,
     known_tools: &[Box<dyn Tool>],
@@ -962,45 +1327,27 @@ fn extract_prose_tool_calls(
         let ContentBlock::Text { text } = block else {
             continue;
         };
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text.as_str();
-        while let Some(start) = rest.find("<tool_call>") {
-            // Keep everything before the tag.
-            out.push_str(&rest[..start]);
-            let after = &rest[start + "<tool_call>".len()..];
-            let Some(end) = after.find("</tool_call>") else {
-                break;
-            };
-            let inner = &after[..end];
-            rest = &after[end + "</tool_call>".len()..];
-
-            let Some((raw_name, arg_pairs)) = parse_prose_tool_call_tag(inner) else {
-                // Unparseable — leave the tag in place untouched.
-                out.push_str(&format!("<tool_call>{inner}"));
+        let intents = extract_tool_call_intents(text);
+        if intents.is_empty() {
+            continue;
+        }
+        // Only excise the spans we actually lifted; keep the rest verbatim.
+        let mut consumed: Vec<(usize, usize)> = Vec::new();
+        for (start, end, intent) in &intents {
+            let Some(canonical) = resolve_intent_tool_name(&intent.name, known_tools) else {
                 continue;
             };
-            let Some(canonical) = normalize_prose_tool_name(&raw_name) else {
-                out.push_str(&format!("<tool_call>{inner}"));
-                continue;
-            };
-            if !known_tools.iter().any(|t| t.name() == canonical) {
-                // Tool not advertised this turn — do not execute; keep the tag.
-                out.push_str(&format!("<tool_call>{inner}"));
-                continue;
-            }
-            let mut args = serde_json::Map::new();
-            for (k, v) in arg_pairs {
-                args.insert(normalize_prose_arg_key(&k), serde_json::Value::String(v));
-            }
+            consumed.push((*start, *end));
             lifted.push(ContentBlock::ToolUse {
                 id: format!("txtcall_{}", uuid::Uuid::new_v4()),
-                name: canonical.to_string(),
-                input: serde_json::Value::Object(args),
+                name: canonical,
+                input: intent.input.clone(),
                 thought_signature: None,
             });
         }
-        out.push_str(rest);
-        *text = out;
+        if !consumed.is_empty() {
+            *text = splice_out_spans(text, &consumed);
+        }
     }
     let count = lifted.len();
     if count > 0 {
@@ -4695,7 +5042,18 @@ async fn run_query_loop_inner(
                     // screen ("agent randomly stops"). Surface a placeholder
                     // so the user always sees *some* assistant output and
                     // knows the turn really ended.
-                    if content_blocks.is_empty() {
+                    // Root dead-end guard: a turn must produce *visible* output.
+                    // A turn whose only content is Thinking blocks is non-empty
+                    // but renders nothing (thinking is collapsed), which used to
+                    // look like a silent halt. Fire the placeholder whenever
+                    // there is no visible text and no tool call — this covers
+                    // both the truly-empty case and the thinking-only case.
+                    let has_visible_output = content_blocks.iter().any(|b| match b {
+                        ContentBlock::Text { text } => !text.trim().is_empty(),
+                        ContentBlock::ToolUse { .. } => true,
+                        _ => false,
+                    });
+                    if !has_visible_output {
                         // Attribute the placeholder to the upstream that
                         // actually served (and failed) the turn — free/auto
                         // sweeps fall through several upstreams internally, so
@@ -5791,8 +6149,9 @@ impl StreamHandler for ChannelStreamHandler {
 #[cfg(test)]
 mod text_tool_lift_tests {
     use super::{
-        detect_prose_tool_intent, extract_prose_tool_calls, lift_text_tool_calls,
-        normalize_prose_tool_name, parse_prose_tool_call_tag, parse_text_tool_payloads,
+        detect_prose_tool_intent, extract_prose_tool_calls, extract_tool_call_intents,
+        lift_text_tool_calls, normalize_prose_tool_name, parse_prose_tool_call_tag,
+        parse_text_tool_payloads, resolve_intent_tool_name,
     };
     use async_trait::async_trait;
     use clawde_core::types::ContentBlock;
@@ -5913,14 +6272,16 @@ mod text_tool_lift_tests {
     }
 
     #[test]
-    fn prose_tool_intent_ignores_plain_text_and_clean_json() {
-        // Ordinary prose, inline shell code, and clean JSON payloads (which the
-        // lift path already handles) must NOT be treated as prose tool intent.
+    fn prose_tool_intent_ignores_plain_text_but_recognizes_clean_json() {
+        // Ordinary prose and inline shell code must NOT be treated as tool intent.
         assert_eq!(detect_prose_tool_intent("just a normal sentence"), None);
         assert_eq!(detect_prose_tool_intent("Run `ls -R` to list files."), None);
+        // A clean JSON tool payload IS a recognized tool intent now (the canonical
+        // detector sees it), so the loop handles it rather than halting. The lift
+        // path executes it when the tool is advertised.
         assert_eq!(
             detect_prose_tool_intent(r#"{"name": "Write", "arguments": {}}"#),
-            None
+            Some("json_inline")
         );
         assert_eq!(
             detect_prose_tool_intent("Under the hood, bash wraps it."),
@@ -6021,6 +6382,136 @@ mod text_tool_lift_tests {
             text.contains("<tool_call>"),
             "unadvertised call kept in text"
         );
+    }
+
+    fn todo_write_tool() -> FakeTool {
+        FakeTool { name: "TodoWrite" }
+    }
+
+    fn lift_one(text: &str, known: &[Box<dyn Tool>]) -> Option<ContentBlock> {
+        let mut blocks = vec![ContentBlock::Text { text: text.into() }];
+        extract_prose_tool_calls(&mut blocks, known);
+        blocks
+            .into_iter()
+            .find(|b| matches!(b, ContentBlock::ToolUse { .. }))
+    }
+
+    fn command_of(block: &ContentBlock) -> String {
+        let ContentBlock::ToolUse { input, .. } = block else {
+            panic!("not a tool")
+        };
+        input["command"].as_str().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn read_arg_normalizes_to_clawde_file_path_field() {
+        // Clawde's Read tool requires `file_path`; a model writing the dialect
+        // `path`/`filePath` must still land on that exact field name.
+        for key in ["path", "filePath", "filepath"] {
+            let known = [Box::new(FakeTool { name: "Read" }) as Box<dyn Tool>];
+            let text = format!(
+                "<tool_call>Read<arg_key>{key}</arg_key><arg_value>/tmp/a</arg_value></tool_call>"
+            );
+            let lifted = lift_one(&text, &known).expect("Read lifted");
+            let ContentBlock::ToolUse { input, .. } = lifted else {
+                panic!("not a tool")
+            };
+            assert_eq!(input["file_path"], "/tmp/a", "key {key} -> file_path");
+        }
+    }
+
+    #[test]
+    fn lifts_tool_calls_array_dialect() {
+        let known = [Box::new(bash_tool()) as Box<dyn Tool>];
+        let text =
+            "Listing.\n[TOOL_CALLS][{\"name\":\"shell\",\"arguments\":{\"command\":\"ls -R\"}}]";
+        let lifted = lift_one(text, &known).expect("array dialect lifted to Bash");
+        assert_eq!(command_of(&lifted), "ls -R");
+    }
+
+    #[test]
+    fn lifts_funcs_special_token_dialect() {
+        let known = [Box::new(bash_tool()) as Box<dyn Tool>];
+        let text = "Checking.\n<|tool_calls_begin|>funcs.0.name[shell]funcs.0.arguments[{\"command\":\"pwd\"}]<|tool_calls_end|>";
+        let lifted = lift_one(text, &known).expect("funcs token dialect lifted");
+        assert_eq!(command_of(&lifted), "pwd");
+    }
+
+    #[test]
+    fn lifts_bare_json_in_prose_and_fenced_json() {
+        let known = [Box::new(bash_tool()) as Box<dyn Tool>];
+        // Bare JSON embedded in prose.
+        let in_prose = "Let me check. {\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}";
+        let lifted = lift_one(in_prose, &known).expect("bare in-prose JSON lifted");
+        assert_eq!(command_of(&lifted), "ls");
+        // JSON inside a markdown fence.
+        let fenced = "```json\n{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\"}}\n```";
+        let lifted = lift_one(fenced, &known).expect("fenced JSON lifted");
+        assert_eq!(command_of(&lifted), "pwd");
+    }
+
+    #[test]
+    fn lifts_json_wrapped_in_tool_call_tag() {
+        let known = [Box::new(bash_tool()) as Box<dyn Tool>];
+        let text = "Working.\n<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"date\"}}</tool_call>";
+        let lifted = lift_one(text, &known).expect("wrapped JSON lifted");
+        assert_eq!(command_of(&lifted), "date");
+    }
+
+    #[test]
+    fn lifts_zero_width_space_tool_call_tag() {
+        let known = [Box::new(bash_tool()) as Box<dyn Tool>];
+        // The ZWSP variant some local templates emit.
+        let text =
+            "<tool_call>shell<arg_key>command</arg_key><arg_value>echo hi</arg_value></tool_call>";
+        let lifted = lift_one(text, &known).expect("ZWSP tag lifted");
+        assert_eq!(command_of(&lifted), "echo hi");
+    }
+
+    #[test]
+    fn resolve_accepts_canonical_name_not_in_alias_map() {
+        // "TodoWrite" is not in the alias map but is an advertised tool, so it
+        // must resolve by exact name (this is how real clawde tools lift).
+        let known = [Box::new(todo_write_tool()) as Box<dyn Tool>];
+        assert_eq!(
+            resolve_intent_tool_name("TodoWrite", &known),
+            Some("TodoWrite".to_string())
+        );
+        assert_eq!(resolve_intent_tool_name("Nope", &known), None);
+    }
+
+    #[test]
+    fn detect_fires_for_recognized_dialect_naming_unadvertised_tool() {
+        // Even though it cannot be lifted (Write not advertised), the canonical
+        // detector recognizes the dialect so the loop nudges instead of halting.
+        let known = [Box::new(bash_tool()) as Box<dyn Tool>];
+        let text = "Let me write. {\"name\":\"Write\",\"arguments\":{\"path\":\"/a\"}}";
+        assert_eq!(
+            extract_prose_tool_calls(&mut vec![ContentBlock::Text { text: text.into() }], &known),
+            0
+        );
+        assert!(detect_prose_tool_intent(text).is_some());
+        // Plain prose with no tool intent: no detect.
+        assert_eq!(detect_prose_tool_intent("just a normal sentence"), None);
+    }
+
+    #[test]
+    fn extract_intents_reports_dialects_and_non_overlapping_spans() {
+        let text = "a [TOOL_CALLS][{\"name\":\"Bash\",\"arguments\":{}}] b {\"name\":\"Bash\",\"arguments\":{}} c";
+        let spans = extract_tool_call_intents(text);
+        assert!(spans.len() >= 2);
+        // spans are ordered and non-overlapping
+        for w in spans.windows(2) {
+            assert!(w[0].1 <= w[1].0, "spans overlap: {:?} {:?}", w[0], w[1]);
+        }
+        // splicing consumes both calls, keeps the surrounding prose
+        let cut: Vec<(usize, usize)> = spans.iter().map(|(s, e, _)| (*s, *e)).collect();
+        let cleaned = super::splice_out_spans(text, &cut);
+        assert!(cleaned.starts_with("a "));
+        assert!(cleaned.contains(" b "));
+        assert!(cleaned.contains(" c"));
+        assert!(!cleaned.contains("TOOL_CALLS"));
+        assert!(!cleaned.contains("\"name\""));
     }
 }
 
