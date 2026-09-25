@@ -672,6 +672,22 @@ const MAX_STEPS_DEGRADATION_MSG: &str =
 /// text so the message history stays well-formed.
 const TOOL_CANCELLED_MSG: &str = "Tool execution was cancelled by the user before it completed.";
 
+/// Cap on how many times a single run will nudge a model that keeps emitting
+/// tool calls as prose text (e.g. `<execute_bash>…</execute_bash>`) instead of
+/// structured calls against the advertised tools. Low bound so a model that
+/// genuinely cannot do structured calling can't bounce the loop into an
+/// unbounded correct-and-retry.
+const PROSE_TOOL_NUDGE_CAP: u32 = 2;
+
+/// Injected user prompt when a model writes a tool invocation as prose text
+/// instead of requesting it through structured tool calling. The offending tag
+/// name is appended at the call site for clarity.
+const PROSE_TOOL_NUDGE_MSG: &str = "Note: your last response tried to run a tool by writing a \
+ literal tag in plain text, but Clawde only executes tools you request through the \
+ structured tool-calling form against the tools advertised to you. Do NOT write tool \
+ invocations as literal <tag> text. Re-issue the tool call using the proper structured \
+ tool-calling mechanism, then continue the task.";
+
 /// Tool calls between goal re-anchoring reminders. Every N tool calls the
 /// query loop restates the current task at the end of the request context so
 /// the model doesn't drift from its original objective as context fills with
@@ -772,6 +788,34 @@ fn parse_text_tool_payloads(text: &str) -> Vec<(String, serde_json::Value)> {
     parse_single(trimmed).into_iter().collect()
 }
 
+/// Detect a model writing a tool invocation as prose text instead of a
+/// structured tool call against the advertised tools.
+///
+/// `lift_text_tool_calls` repairs a single narrow dialect (broken local
+/// servers that return a clean JSON payload as content). Many other models —
+/// Google Gemini included — occasionally emit a tool call using a *different
+/// agent's* inline convention as visible text, most commonly Claude-Code tags
+/// such as `<execute_bash>ls -R</execute_bash>` or `<tool name="Bash">`. The
+/// harness cannot execute those (there is no `execute_bash` tool and the tags
+/// are not structured calls), so without a guard the turn would silently end
+/// as a "dead turn". This detector recognises the prose dialects so the loop
+/// can nudge the model back onto structured calling instead of halting.
+/// Returns the canonical short tag name (e.g. `execute_bash`) on detection.
+fn detect_prose_tool_intent(text: &str) -> Option<&str> {
+    const TAGS: &[&str] = &[
+        "execute_bash",
+        "bash",
+        "tool_call",
+        "tool",
+        "function_calls",
+        "antml:function_calls",
+        "antml:invoke",
+    ];
+    TAGS.iter()
+        .find(|tag| text.contains(&format!("<{tag}>")) || text.contains(&format!("<{tag} ")))
+        .copied()
+}
+
 /// Lift a text-encoded tool call into a real ToolUse block.
 ///
 /// Some OpenAI-compatible local servers (observed on Ollama 0.33.x serving
@@ -834,6 +878,134 @@ fn lift_text_tool_calls(
         }
     }
     *content_blocks = rebuilt;
+    count
+}
+
+/// Exceptionally well-known prose tool-name aliases (AgentSkills / Claude-Code
+/// dialect) mapped onto the canonical Clawde tool they correspond to. Returns
+/// `None` for a name we don't recognise so callers skip it rather than execute
+/// an unadvertised tool.
+fn normalize_prose_tool_name(name: &str) -> Option<&str> {
+    match name.to_ascii_lowercase().as_str() {
+        "bash" | "shell" | "execute_bash" | "run" => Some("Bash"),
+        "read" | "view" | "cat" => Some("Read"),
+        "write" | "create" => Some("Write"),
+        "edit" | "str_replace_editor" => Some("Edit"),
+        "grep" | "search_files" | "search" => Some("Grep"),
+        "glob" | "find" => Some("Glob"),
+        "web_fetch" | "fetch" | "web" => Some("WebFetch"),
+        "web_search" => Some("WebSearch"),
+        "todo_write" | "todo" => Some("TodoWrite"),
+        "ask" | "ask_user" | "askuserquestion" => Some("AskUserQuestion"),
+        _ => None,
+    }
+}
+
+/// Map a prose arg key onto the canonical key the clawde tool's schema expects
+/// (the AgentSkills dialect is a different vocabulary from clawde's). Unknown
+/// keys pass through unchanged — the tool's own validation path still applies.
+fn normalize_prose_arg_key(key: &str) -> String {
+    match key.trim() {
+        "cmd" => "command".to_string(),
+        "file_path" | "filepath" => "path".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Parse a single AgentSkills / Claude-Code `<tool_call>NAME<arg_key>K</arg_key>
+/// <arg_value>V</arg_value>…</tool_call>` *interior* (between the tags). Returns
+/// the raw tool name and its argument pairs as strings.
+fn parse_prose_tool_call_tag(inner: &str) -> Option<(String, Vec<(String, String)>)> {
+    let trimmed = inner.trim_start();
+    let (name, rest) = match trimmed.find("<arg_key>") {
+        Some(i) => (&trimmed[..i], &trimmed[i..]),
+        None => (trimmed, ""),
+    };
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args: Vec<(String, String)> = Vec::new();
+    let mut rest = rest;
+    while let Some(start) = rest.find("<arg_key>") {
+        let after_open = &rest[start + "<arg_key>".len()..];
+        let key_end = after_open.find("</arg_key>")?;
+        let key = after_open[..key_end].trim().to_string();
+        let after_key = &after_open[key_end + "</arg_key>".len()..];
+        let val_open = after_key.find("<arg_value>")?;
+        let after_val = &after_key[val_open + "<arg_value>".len()..];
+        let val_end = after_val.find("</arg_value>")?;
+        let value = after_val[..val_end].trim().to_string();
+        args.push((key, value));
+        rest = &after_val[val_end + "</arg_value>".len()..];
+    }
+    Some((name, args))
+}
+
+/// Lift well-formed prose `<tool_call>…</tool_call>` sections (the AgentSkills /
+/// Claude-Code dialect, e.g. `<tool_call>shell<arg_key>command</arg_key>…`) into
+/// real ToolUse blocks so the loop *executes* them instead of nudging repeatedly.
+///
+/// Unlike `lift_text_tool_calls` — which demands the WHOLE message be a single
+/// clean JSON payload — this scans *inside* prose and removes only the tags,
+/// preserving the surrounding explanation. Each call executes only when its
+/// normalised tool name is one this turn actually advertised, so a model can
+/// never trigger a tool clawde did not expose. Arguments pass through verbatim
+/// (with known key aliases normalised); the normal permission + validation path
+/// still applies — Bash is high-risk and gated like any structured call.
+fn extract_prose_tool_calls(
+    content_blocks: &mut Vec<ContentBlock>,
+    known_tools: &[Box<dyn Tool>],
+) -> usize {
+    let mut lifted: Vec<ContentBlock> = Vec::new();
+    for block in content_blocks.iter_mut() {
+        let ContentBlock::Text { text } = block else {
+            continue;
+        };
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find("<tool_call>") {
+            // Keep everything before the tag.
+            out.push_str(&rest[..start]);
+            let after = &rest[start + "<tool_call>".len()..];
+            let Some(end) = after.find("</tool_call>") else {
+                break;
+            };
+            let inner = &after[..end];
+            rest = &after[end + "</tool_call>".len()..];
+
+            let Some((raw_name, arg_pairs)) = parse_prose_tool_call_tag(inner) else {
+                // Unparseable — leave the tag in place untouched.
+                out.push_str(&format!("<tool_call>{inner}"));
+                continue;
+            };
+            let Some(canonical) = normalize_prose_tool_name(&raw_name) else {
+                out.push_str(&format!("<tool_call>{inner}"));
+                continue;
+            };
+            if !known_tools.iter().any(|t| t.name() == canonical) {
+                // Tool not advertised this turn — do not execute; keep the tag.
+                out.push_str(&format!("<tool_call>{inner}"));
+                continue;
+            }
+            let mut args = serde_json::Map::new();
+            for (k, v) in arg_pairs {
+                args.insert(normalize_prose_arg_key(&k), serde_json::Value::String(v));
+            }
+            lifted.push(ContentBlock::ToolUse {
+                id: format!("txtcall_{}", uuid::Uuid::new_v4()),
+                name: canonical.to_string(),
+                input: serde_json::Value::Object(args),
+                thought_signature: None,
+            });
+        }
+        out.push_str(rest);
+        *text = out;
+    }
+    let count = lifted.len();
+    if count > 0 {
+        content_blocks.extend(lifted);
+    }
     count
 }
 
@@ -1980,6 +2152,10 @@ async fn run_query_loop_inner(
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
+    // Bounded corrective nudges for prose tool-call dead turns (a model writing
+    // `<execute_bash>` as text instead of a structured call). `PROSE_TOOL_NUDGE_CAP`
+    // bounds this so a model that can't do structured calling can't loop forever.
+    let mut prose_tool_nudges: u32 = 0;
     // One bounded model fallback is allowed after the primary model repeatedly
     // exhausts its output budget; otherwise surface the partial response.
     let mut max_tokens_fallback_used = false;
@@ -4284,6 +4460,78 @@ async fn run_query_loop_inner(
                             "Lifted text-encoded tool call(s) into native tool_use blocks"
                         );
                     }
+                    // Prose <tool_call> dialect (AgentSkills / Claude-Code): lift
+                    // well-formed prose tool calls into executable blocks too, so a
+                    // model that writes tools as tags still gets them *run* instead
+                    // of only being nudged. Appends ToolUse blocks (which the
+                    // tool-use branch below executes) and strips the tags from text.
+                    let prose_calls = extract_prose_tool_calls(&mut content_blocks, tools);
+                    if prose_calls > 0 {
+                        info!(
+                            count = prose_calls,
+                            "Lifted AgentSkills-style prose <tool_call> section(s) into native tool_use blocks"
+                        );
+                    }
+
+                    // Prose tool-call recovery (dead-turn guard). A model that
+                    // writes its tool call as text — e.g. Claude-Code style
+                    // `<execute_bash>ls -R</execute_bash>` from Gemini — got
+                    // nothing lifted and will execute nothing; the loop would
+                    // otherwise end the turn silently and the user stares at a
+                    // "halt". Nudge the model (bounded by PROSE_TOOL_NUDGE_CAP)
+                    // onto the advertised structured tool calls and retry.
+                    if lifted_calls == 0
+                        && !content_blocks
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                        && prose_tool_nudges < PROSE_TOOL_NUDGE_CAP
+                    {
+                        let prose_text: String = content_blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if let Some(tag) = detect_prose_tool_intent(&prose_text) {
+                            prose_tool_nudges += 1;
+                            info!(
+                                provider = %provider_id_str,
+                                model = %model_id_str,
+                                tag,
+                                turn,
+                                "Prose tool-call dead turn (<{tag}> in text) — nudging the model to use structured tool calls"
+                            );
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::Status(format!(
+                                    "Model wrote a tool call as prose (<{tag}>); nudging it to use the provided tools…"
+                                )));
+                            }
+                            messages.push(Message::user(format!(
+                                "{PROSE_TOOL_NUDGE_MSG}\n\nOffending tag: <{tag}>"
+                            )));
+                            turn -= 1; // don't count the dead retry against the turn budget
+                            continue;
+                        }
+                    }
+
+                    // Tool-call dialect telemetry for this turn: how its tool calls
+                    // were produced (structured vs repaired prose/json). Recorded on
+                    // the assistant message so tooling can spot and steer away from
+                    // model/provider lanes that habitually emit prose tool calls.
+                    let tool_dialect = if prose_calls > 0 {
+                        Some("prose".to_string())
+                    } else if lifted_calls > 0 {
+                        Some("json".to_string())
+                    } else if content_blocks
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                    {
+                        Some("structured".to_string())
+                    } else {
+                        None
+                    };
 
                     let mut assistant_msg = Message {
                         role: clawde_core::types::Role::Assistant,
@@ -4295,6 +4543,7 @@ async fn run_query_loop_inner(
                             upstream_id: actual_upstream_id.clone(),
                             started_at: Some(turn_started_wall.clone()),
                             completed_at: Some(clawde_core::types::now_rfc3339_ms()),
+                            tool_dialect,
                         }),
                     };
 
@@ -4738,6 +4987,7 @@ async fn run_query_loop_inner(
             upstream_id: None,
             started_at: Some(turn_started_wall.clone()),
             completed_at: Some(clawde_core::types::now_rfc3339_ms()),
+            tool_dialect: None,
         });
 
         // Budget guard: abort the loop if the configured USD cap is exceeded.
@@ -5540,7 +5790,10 @@ impl StreamHandler for ChannelStreamHandler {
 
 #[cfg(test)]
 mod text_tool_lift_tests {
-    use super::{lift_text_tool_calls, parse_text_tool_payloads};
+    use super::{
+        detect_prose_tool_intent, extract_prose_tool_calls, lift_text_tool_calls,
+        normalize_prose_tool_name, parse_prose_tool_call_tag, parse_text_tool_payloads,
+    };
     use async_trait::async_trait;
     use clawde_core::types::ContentBlock;
     use clawde_tools::{PermissionLevel, Tool};
@@ -5639,6 +5892,135 @@ mod text_tool_lift_tests {
             },
         ];
         assert_eq!(lift_text_tool_calls(&mut multi, &known), 0);
+    }
+
+    #[test]
+    fn prose_tool_intent_detects_claude_code_tags() {
+        assert_eq!(
+            detect_prose_tool_intent("Let me check:\n<execute_bash>\nls -R\n</execute_bash>"),
+            Some("execute_bash")
+        );
+        assert_eq!(detect_prose_tool_intent("<bash>pwd</bash>"), Some("bash"));
+        assert_eq!(
+            detect_prose_tool_intent("I'll use the tool.\n<tool name=\"Bash\">ls</tool>"),
+            Some("tool")
+        );
+        // With space attributes, the opener `<tool name=…>` is matched.
+        assert_eq!(
+            detect_prose_tool_intent("<tool name=\"Bash\">ls</tool>"),
+            Some("tool")
+        );
+    }
+
+    #[test]
+    fn prose_tool_intent_ignores_plain_text_and_clean_json() {
+        // Ordinary prose, inline shell code, and clean JSON payloads (which the
+        // lift path already handles) must NOT be treated as prose tool intent.
+        assert_eq!(detect_prose_tool_intent("just a normal sentence"), None);
+        assert_eq!(detect_prose_tool_intent("Run `ls -R` to list files."), None);
+        assert_eq!(
+            detect_prose_tool_intent(r#"{"name": "Write", "arguments": {}}"#),
+            None
+        );
+        assert_eq!(
+            detect_prose_tool_intent("Under the hood, bash wraps it."),
+            None
+        );
+        // A word only ever equals a tool when it appears as a <tag>, not bare.
+        assert_eq!(
+            detect_prose_tool_intent("please run execute_bash for me"),
+            None
+        );
+    }
+
+    fn bash_tool() -> FakeTool {
+        FakeTool { name: "Bash" }
+    }
+
+    #[test]
+    fn normalize_prose_tool_name_maps_aliases() {
+        assert_eq!(normalize_prose_tool_name("Bash"), Some("Bash"));
+        assert_eq!(normalize_prose_tool_name("shell"), Some("Bash"));
+        assert_eq!(normalize_prose_tool_name("execute_bash"), Some("Bash"));
+        assert_eq!(normalize_prose_tool_name("view"), Some("Read"));
+        assert_eq!(normalize_prose_tool_name("search"), Some("Grep"));
+        assert_eq!(normalize_prose_tool_name("mystery_tool"), None);
+    }
+
+    #[test]
+    fn parse_prose_tool_call_tag_extracts_name_and_args() {
+        let (name, args) = parse_prose_tool_call_tag(
+            "shell<arg_key>command</arg_key><arg_value>ls -R</arg_value><arg_key>description</arg_key><arg_value>x y</arg_value>",
+        )
+        .expect("parses a well-formed section");
+        assert_eq!(name, "shell");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], ("command".to_string(), "ls -R".to_string()));
+        assert_eq!(args[1], ("description".to_string(), "x y".to_string()));
+        assert!(parse_prose_tool_call_tag("   ").is_none());
+    }
+
+    #[test]
+    fn extract_prose_tool_calls_lifts_shell_tag_into_bash() {
+        let known = [Box::new(bash_tool()) as Box<dyn Tool>];
+        let mut blocks = vec![ContentBlock::Text {
+            text: "Let me check:\n<tool_call>shell<arg_key>command</arg_key><arg_value>ls -R</arg_value></tool_call>\nDone"
+                .into(),
+        }];
+        assert_eq!(extract_prose_tool_calls(&mut blocks, &known), 1);
+        // The tag is stripped from the prose, keeping the explanation.
+        let ContentBlock::Text { text } = &blocks[0] else {
+            panic!("first block should be text");
+        };
+        assert!(text.contains("Let me check"));
+        assert!(text.contains("Done"));
+        assert!(
+            !text.contains("<tool_call>"),
+            "tag removed from text: {text}"
+        );
+        // A ToolUse for Bash was appended with the command arguments.
+        let tool = blocks
+            .iter()
+            .find(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "Bash"))
+            .expect("Bash ToolUse appended");
+        let ContentBlock::ToolUse { input, .. } = tool else {
+            unreachable!()
+        };
+        assert_eq!(input["command"], "ls -R");
+    }
+
+    #[test]
+    fn extract_prose_tool_calls_normalizes_cmd_alias_and_skips_unadvertised() {
+        let known = [Box::new(bash_tool()) as Box<dyn Tool>];
+        // `cmd` alias maps to `command`.
+        let mut blocks = vec![ContentBlock::Text {
+            text: "<tool_call>bash<arg_key>cmd</arg_key><arg_value>pwd</arg_value></tool_call>"
+                .into(),
+        }];
+        assert_eq!(extract_prose_tool_calls(&mut blocks, &known), 1);
+        let tool = blocks
+            .iter()
+            .find(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "Bash"))
+            .expect("Bash ToolUse appended");
+        let ContentBlock::ToolUse { input, .. } = tool else {
+            unreachable!()
+        };
+        assert_eq!(input["command"], "pwd");
+
+        // A tool that isn't advertised this turn is left untouched (never executed).
+        let mut blocks = vec![ContentBlock::Text {
+            text:
+                "<tool_call>write<arg_key>path</arg_key><arg_value>/tmp/a</arg_value></tool_call>"
+                    .into(),
+        }];
+        assert_eq!(extract_prose_tool_calls(&mut blocks, &known), 0);
+        let ContentBlock::Text { text } = &blocks[0] else {
+            panic!("should remain a text block");
+        };
+        assert!(
+            text.contains("<tool_call>"),
+            "unadvertised call kept in text"
+        );
     }
 }
 

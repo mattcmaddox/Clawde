@@ -420,6 +420,16 @@ pub mod types {
         /// RFC 3339 millisecond timestamp when the turn completed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub completed_at: Option<String>,
+        /// How this turn's tool calls were produced: `structured` (native
+        /// provider call), `json` (full-message JSON payload repaired by
+        /// `lift_text_tool_calls`), or `prose` (a literal `<tool_call>` tag
+        /// lifted into an executable call by `extract_prose_tool_calls`).
+        /// Unset for pure-text turns. Lets tooling identify model/provider
+        /// lanes that habitually emit prose tool calls instead of the
+        /// structured form, so those lanes can be steered onto structured
+        /// calling or deprioritised for tool-bearing requests.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_dialect: Option<String>,
     }
 
     /// Current UTC time as an RFC 3339 string with millisecond precision.

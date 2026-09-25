@@ -488,6 +488,14 @@ impl GoogleProvider {
         }
         if let Some(tools) = tools_value {
             body.insert("tools".to_string(), tools);
+            // Force Gemini into structured function calling whenever tools are
+            // advertised, so a capable model emits `functionCall` parts instead
+            // of falling back to prose tool tags (`<execute_bash>` / `<tool_call>`)
+            // that the harness then has to detect/repair (and cannot safely run).
+            body.insert(
+                "toolConfig".to_string(),
+                json!({ "functionCallingConfig": { "mode": "ANY" } }),
+            );
         }
 
         let mut value = Value::Object(body);
@@ -1199,6 +1207,28 @@ mod tests {
             json!("search")
         );
         assert_eq!(contents[2]["parts"][0]["text"], json!("after"));
+    }
+
+    #[test]
+    fn build_request_body_forces_function_calling_mode_when_tools_present() {
+        let provider = GoogleProvider::new("test".to_string());
+        let mut request = test_request(vec![Message::user("hi")]);
+        request.tools = vec![clawde_core::types::ToolDefinition {
+            name: "Bash".to_string(),
+            description: "Run a shell command".to_string(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let body = provider.build_request_body(&request);
+        // Tools advertised → force structured function calling so the model emits
+        // `functionCall` parts instead of prose tool tags the harness must repair.
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["mode"],
+            json!("ANY")
+        );
+        // No tools advertised → no toolConfig, so a plain text turn isn't forced
+        // to call a function.
+        let plain = provider.build_request_body(&test_request(vec![Message::user("hi")]));
+        assert!(plain.get("toolConfig").is_none());
     }
 
     #[test]

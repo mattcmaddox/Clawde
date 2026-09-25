@@ -2615,6 +2615,7 @@ mod tests {
             upstream_id: Some("groq".to_string()),
             started_at: Some("2026-08-19T00:00:00.000Z".to_string()),
             completed_at: Some("2026-08-19T00:00:05.000Z".to_string()),
+            tool_dialect: None,
         });
         msg.cost = Some(clawde_core::types::MessageCost {
             cost_usd: 0.0123,
