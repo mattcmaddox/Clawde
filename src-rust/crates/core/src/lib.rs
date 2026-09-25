@@ -2364,11 +2364,15 @@ pub mod config {
         /// Cline, Freebuff) when Clawde starts in a project directory. When
         /// enabled, Clawde scans the standard locations for the current
         /// working directory and prepends any matching external conversation
-        /// turns to the new Clawde session transcript. Defaults to `false`
-        /// (no import) to keep Clawde hermetic by default; set to `true` or
-        /// omit (once it becomes the zero-config default) to opt in.
+        /// turns to the new Clawde session transcript.
+        ///
+        /// Defaults to `true`. Imported context is always scoped to the current
+        /// project and passed through `redact_secrets` before it can reach a
+        /// model provider: Freebuff host-context cards are system-scoped and
+        /// redacted, and Opencode sessions (which record no cwd, so cannot be
+        /// attributed to a project) are excluded. Set to `false` to disable.
         #[serde(
-            default,
+            default = "external_sessions_default_on",
             rename = "importExternalSessionsOnStart",
             alias = "import_external_sessions_on_start"
         )]
@@ -2736,7 +2740,11 @@ pub mod config {
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct Settings {
-        #[serde(default)]
+        /// The main config block. Defaults to `Config::default()` with external
+        /// session/host-context import enabled (Freebuff host context on by
+        /// default); a settings file can set
+        /// `importExternalSessionsOnStart: false` to disable.
+        #[serde(default = "default_config_with_external_import_on")]
         pub config: Config,
         pub version: Option<u32>,
         #[serde(default)]
@@ -4391,6 +4399,23 @@ pub mod config {
         result
     }
 
+    /// Serde default for [`Config::import_external_sessions_on_start`].
+    /// External session/host-context import is on unless a settings file
+    /// explicitly sets `importExternalSessionsOnStart: false`.
+    pub fn external_sessions_default_on() -> bool {
+        true
+    }
+
+    /// Default [`Config`] for [`Settings`] deserialization: the derived
+    /// `Config::default()` with external session/host-context import enabled, so
+    /// Freebuff host context is imported unless a settings file turns it off.
+    pub fn default_config_with_external_import_on() -> Config {
+        Config {
+            import_external_sessions_on_start: true,
+            ..Default::default()
+        }
+    }
+
     #[cfg(test)]
     mod request_timeout_tests {
         use super::*;
@@ -5884,6 +5909,22 @@ pub mod config {
             assert_eq!(s.config.verify.max_retries, 3);
             assert!(s.config.verify.auto_lint);
             assert_eq!(s.config.verify.timeout_secs, 180);
+        }
+
+        #[test]
+        fn external_session_import_defaults_on_but_is_overridable() {
+            // `config` key entirely absent → on (Freebuff host context default on).
+            let s: Settings = serde_json::from_str("{}").expect("empty settings parse");
+            assert!(s.config.import_external_sessions_on_start);
+            // `config` present but flag absent → still on (per-field default).
+            let s: Settings =
+                serde_json::from_str(r#"{"config": {}}"#).expect("config block parses");
+            assert!(s.config.import_external_sessions_on_start);
+            // Explicitly disabled → off.
+            let s: Settings =
+                serde_json::from_str(r#"{"config": {"importExternalSessionsOnStart": false}}"#)
+                    .expect("explicit disable parses");
+            assert!(!s.config.import_external_sessions_on_start);
         }
 
         #[test]
