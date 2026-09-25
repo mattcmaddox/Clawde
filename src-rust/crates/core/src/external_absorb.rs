@@ -48,7 +48,7 @@ pub struct ExternalAbsorptionState {
 /// Compute a content fingerprint for a path, or `None` if it cannot be read.
 ///
 /// * A **file** is hashed by its bytes.
-/// * A **directory** (a Freebuff capture-run dir) is hashed from a stable
+/// * A **directory** (a Freebuff chat dir) is hashed from a stable
 ///   manifest of its immediate entries' `(name, size, mtime)`, so an unchanged
 ///   run is skipped cheaply and a changed run is re-absorbed. This lets the
 ///   fingerprint-before-parse flow operate on directory-based sources too.
@@ -189,7 +189,7 @@ fn absorb_paths(
     state: &mut ExternalAbsorptionState,
 ) -> (Vec<Message>, usize) {
     // Newest first so the cap deterministically keeps recent history. For a
-    // directory source (a Freebuff run dir) use the newest child mtime, which
+    // directory source (a Freebuff chat dir) use the newest child mtime, which
     // reflects the actual capture time.
     fn newest_mtime(p: &Path) -> std::time::SystemTime {
         let Ok(md) = std::fs::metadata(p) else {
@@ -218,6 +218,11 @@ fn absorb_paths(
 
     let mut absorbed: Vec<Message> = Vec::new();
     let mut skipped = 0usize;
+    // Oversized-session truncation is summarized once, after the loop: one
+    // warning per chat would bury the TUI under a wall of noise when a project
+    // has many long transcripts.
+    let mut truncated = 0usize;
+    let mut dropped_turns = 0usize;
     for (source, path) in paths {
         let key = path.to_string_lossy().to_string();
         // Fingerprint first: an unchanged source is skipped WITHOUT parsing.
@@ -260,23 +265,16 @@ fn absorb_paths(
             let mut m = session.messages;
             let drop = m.len() - remaining;
             m.drain(..drop); // keep the most recent tail
-            tracing::warn!(
-                source,
-                dropped_head = drop,
-                kept_tail = remaining,
-                "Oversized external session: only the most recent tail is imported; \
-                 the earlier turns are not carried over."
-            );
+            truncated += 1;
+            dropped_turns += drop;
             m
         } else {
             session.messages
         };
         // Role boundaries only make sense for imported *conversation* history.
-        // System-scoped host context (Freebuff) is a single assistant-role
-        // context card, not a dialogue; trimming its boundaries would delete it
-        // entirely. It is still safe to prepend because the real user prompt
-        // follows it and providers accept a leading assistant preamble when it
-        // is not the very first message of the request.
+        // System-scoped sources (host recon) emit a single assistant-role
+        // context card rather than a dialogue, so trimming their boundaries
+        // would delete the import entirely. Framing keeps the request valid.
         let msgs = if crate::session_import::is_system_scoped_source(source) {
             frame_system_context(msgs)
         } else {
@@ -284,6 +282,14 @@ fn absorb_paths(
         };
         absorbed.extend(msgs);
         state.sessions.insert(key, AbsorbedEntry { fingerprint });
+    }
+    if truncated > 0 {
+        tracing::warn!(
+            sessions = truncated,
+            dropped_turns,
+            "Some external sessions exceeded the import cap; only their most \
+             recent turns were imported."
+        );
     }
     (absorbed, skipped)
 }
@@ -355,7 +361,7 @@ fn normalize_imported_boundaries(msgs: Vec<Message>) -> Vec<Message> {
 ///   2. Load the per-project absorption state from
 ///      `~/.clawde/projects/{b64(project)}/external_import_state.json`.
 ///   3. Discover external session FILES (no parsing) across Opencode, Cline,
-///      Freebuff.
+///      any source.
 ///   4. Fingerprint each; absorb new/changed relevant ones up to
 ///      [`MAX_ABSORBED_MESSAGES`], newest first.
 ///

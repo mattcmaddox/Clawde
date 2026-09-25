@@ -2367,11 +2367,12 @@ pub mod config {
         /// context to the new Clawde session transcript.
         ///
         /// Defaults to `true`, but only sources marked `default_enabled` are
-        /// used: Opencode and Cline are on; Freebuff host-recon is off by
-        /// default (its `~/freebuff` folder is agent scratch, not a normal
-        /// dependency). Imported context is always redacted via
-        /// `redact_secrets` before it can reach a model provider. Set to `false`
-        /// to disable the whole import.
+        /// sources are project-scoped: each external session is attributed to
+        /// the project it ran in, so only this project's history is absorbed.
+        /// Imported text is always redacted via `redact_secrets` before it can
+        /// reach a model provider. Narrow the set with
+        /// [`Config::external_import_sources`]. Set to `false` to disable the
+        /// whole import.
         #[serde(
             default = "external_sessions_default_on",
             rename = "importExternalSessionsOnStart",
@@ -2380,10 +2381,10 @@ pub mod config {
         pub import_external_sessions_on_start: bool,
         /// Explicit allow-list of external import sources, e.g.
         /// `["opencode", "cline", "freebuff"]`. When absent, each source's own
-        /// default applies (Opencode and Cline on, Freebuff off). When present
+        /// default applies (Opencode, Cline, and Freebuff on). When present
         /// it is exclusive — only the listed ids are imported — which is how a
-        /// user opts into a non-default source such as `freebuff` without a
-        /// code change. Unknown ids are ignored.
+        /// user narrows or re-enables a source without a code change. Unknown
+        /// ids are ignored.
         #[serde(
             default,
             rename = "externalImportSources",
@@ -2754,7 +2755,7 @@ pub mod config {
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct Settings {
         /// The main config block. Defaults to `Config::default()` with external
-        /// session/host-context import enabled (Freebuff host context on by
+        /// session/host-context import enabled (external history import on by
         /// default); a settings file can set
         /// `importExternalSessionsOnStart: false` to disable.
         #[serde(default = "default_config_with_external_import_on")]
@@ -4425,7 +4426,7 @@ pub mod config {
 
     /// Default [`Config`] for [`Settings`] deserialization: the derived
     /// `Config::default()` with external session/host-context import enabled, so
-    /// Freebuff host context is imported unless a settings file turns it off.
+    /// External session history is imported unless a settings file turns it off.
     pub fn default_config_with_external_import_on() -> Config {
         Config {
             import_external_sessions_on_start: true,
@@ -5930,7 +5931,7 @@ pub mod config {
 
         #[test]
         fn external_session_import_defaults_on_but_is_overridable() {
-            // `config` key entirely absent → on (Freebuff host context default on).
+            // `config` key entirely absent → on (external history import default on).
             let s: Settings = serde_json::from_str("{}").expect("empty settings parse");
             assert!(s.config.import_external_sessions_on_start);
             // `config` present but flag absent → still on (per-field default).

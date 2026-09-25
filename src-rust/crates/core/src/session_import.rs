@@ -6,13 +6,14 @@
 //
 // - Opencode:    ~/.local/share/opencode/projects/{project_hash}/history.json
 // - Cline:       ~/.config/Code/User/workspaceStorage/{ws_hash}/roben.cline/session.json
-// - Freebuff:    ~/freebuff/snapshots/{date}/recon.json (+ snapshot.txt)
+// - Freebuff:    ~/.config/manicode/projects/{slug}/chats/{chatId}/chat-messages.json
+//                (the Freebuff/Codebuff agent; NOT the unrelated ~/freebuff recon script)
 //
 // Each importer produces a list of Clawde `Message` objects plus metadata
 // (working directory, original source) suitable for creating a new
 // `ConversationSession`.
 
-use crate::types::{Message, MessageContent, Role};
+use crate::types::{ContentBlock, Message, MessageContent, Role, ToolResultContent};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -219,105 +220,263 @@ pub fn import_cline_session(path: &Path) -> anyhow::Result<ImportedSession> {
 }
 
 // ---------------------------------------------------------------------------
-// Freebuff (system reconnaissance snapshots) importer
+// Freebuff / Codebuff chat importer
 // ---------------------------------------------------------------------------
+//
+// Freebuff (the agent binary shipped as `~/.config/manicode/freebuff`, formerly
+// Manicode / Codebuff) persists per-chat transcripts at:
+//
+//     ~/.config/manicode/projects/<project-slug>/chats/<chatId>/
+//         chat-messages.json   # ChatMessage[]
+//         run-state.json       # sessionState.fileContext.projectRoot + cwd
+//
+// `chatId` is the chat's start time as ISO-8601 with `:` replaced by `-` for
+// filesystem safety (e.g. `2026-07-11T22-49-27.735Z`). `run-state.json` is what
+// makes a chat attributable to a project, so it is the locate key.
+//
+// This is NOT the `~/freebuff` host-recon script, which shares the name but is
+// an unrelated tool with no conversation history.
 
-/// Import a single Freebuff *capture run* for one host.
+/// One rendered block within a Freebuff chat message.
+#[derive(Debug, Deserialize)]
+struct FbBlock {
+    #[serde(default, rename = "type")]
+    block_type: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default, rename = "toolCallId")]
+    tool_call_id: Option<String>,
+    #[serde(default, rename = "toolName")]
+    tool_name: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+/// One message in a Freebuff transcript.
+#[derive(Debug, Deserialize)]
+struct FbMessage {
+    #[serde(default)]
+    variant: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    blocks: Option<Vec<FbBlock>>,
+    // NB: `timestamp` is a human-facing wall-clock label (e.g. `06:50 PM`), not
+    // a parseable date; the chat id carries the authoritative start time, so it
+    // is deliberately not deserialized.
+}
+
+#[derive(Debug, Deserialize)]
+struct FbRunState {
+    #[serde(default, rename = "sessionState")]
+    session_state: Option<FbSessionState>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FbSessionState {
+    #[serde(default, rename = "fileContext")]
+    file_context: Option<FbFileContext>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FbFileContext {
+    #[serde(default, rename = "projectRoot")]
+    project_root: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// Hard ceiling on the size of a transcript we will parse at all.
 ///
-/// `path` is a run directory of the form
-/// `~/freebuff/snapshots/<host>/<UTC ts>/` containing `_meta.txt`,
-/// `_runner.txt`, and numbered context files (`01-identity.txt`, …). This
-/// produces one compact, credential-redacted host-context card. The large
-/// recon dumps (network/listeners/processes/mounts) are intentionally NOT
-/// imported: they are tens of kilobytes each and low-signal for a coding
-/// assistant. Identity + capture metadata is the useful, bounded subset.
-pub fn import_freebuff_session(path: &Path) -> anyhow::Result<ImportedSession> {
-    if !path.is_dir() {
-        anyhow::bail!("freebuff run path is not a directory: {}", path.display());
+/// The import only ever keeps the most recent [`MAX_ABSORBED_MESSAGES`] turns,
+/// so a multi-megabyte transcript contributes little beyond its tail while
+/// costing seconds of JSON parsing on every cold start (Freebuff chats here run
+/// to ~15 MB). Skipping is logged, and the fingerprint is still recorded so the
+/// file is not re-examined in this project; a later run in its own project, or a
+/// future raise of the cap, can still pick it up.
+const MAX_TRANSCRIPT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Cap on a single tool result carried into the transcript. Tool output is
+/// frequently an entire file; a few hundred KB of it would crowd out the
+/// actual conversation.
+const MAX_TOOL_RESULT_CHARS: usize = 4_000;
+
+/// Cap on a single text block. Assistant turns in Freebuff transcripts
+/// routinely carry 30k+ characters (full file contents echoed back); without a
+/// bound a handful of chats exhausts the context window before the real
+/// conversation starts.
+const MAX_TEXT_CHARS: usize = 4_000;
+
+/// Read the project root a chat belongs to, from its `run-state.json`.
+fn freebuff_chat_project_root(chat_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(chat_dir.join("run-state.json")).ok()?;
+    let state: FbRunState = serde_json::from_str(&raw).ok()?;
+    let ctx = state.session_state?.file_context?;
+    ctx.project_root.or(ctx.cwd)
+}
+
+/// Truncate oversized text (a tool result or an assistant text block) to a
+/// byte budget, marking that it was cut. Slices on a char boundary so
+/// multi-byte content is never split mid-codepoint.
+fn clamp_text(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
     }
-    // Run timestamp is the directory name; host is its parent.
-    let run_ts = path
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n… [truncated, {} bytes total]",
+        &text[..end],
+        text.len()
+    )
+}
+
+/// Import a single Freebuff/Codebuff chat directory.
+///
+/// `path` is `…/chats/<chatId>/`. Produces real `Message`s with tool calls
+/// preserved as `ToolUse` / `ToolResult` blocks, which no other external source
+/// provides.
+pub fn import_freebuff_chat(path: &Path) -> anyhow::Result<ImportedSession> {
+    if !path.is_dir() {
+        anyhow::bail!("freebuff chat path is not a directory: {}", path.display());
+    }
+    let messages_path = path.join("chat-messages.json");
+    match std::fs::metadata(&messages_path) {
+        Ok(md) if md.len() > MAX_TRANSCRIPT_BYTES => {
+            tracing::info!(
+                path = %messages_path.display(),
+                bytes = md.len(),
+                "Skipping oversized external transcript"
+            );
+            return Ok(ImportedSession {
+                name: format!(
+                    "freebuff-{}",
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                ),
+                working_dir: freebuff_chat_project_root(path),
+                source: "freebuff",
+                source_path: path.to_path_buf(),
+                messages: Vec::new(),
+            });
+        }
+        Err(e) => anyhow::bail!("cannot stat {}: {e}", messages_path.display()),
+        Ok(_) => {}
+    }
+    let raw = std::fs::read_to_string(&messages_path)?;
+    let msgs: Vec<FbMessage> = serde_json::from_str(&raw)?;
+
+    // The chat id is the start timestamp with ':' replaced by '-'.
+    let chat_id = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let host = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
 
-    // Parse a `key=value` meta file into a small map.
-    fn kv(path: &Path) -> std::collections::HashMap<String, String> {
-        let mut m = std::collections::HashMap::new();
-        if let Ok(text) = std::fs::read_to_string(path) {
-            for line in text.lines() {
-                if let Some((k, v)) = line.split_once('=') {
-                    m.insert(k.trim().to_string(), v.trim().to_string());
+    let mut messages: Vec<Message> = Vec::new();
+    // Tool results accumulate and are flushed as one user turn after the
+    // assistant turn that requested them, preserving the tool_use/tool_result
+    // adjacency every provider requires.
+    let mut pending_results: Vec<ContentBlock> = Vec::new();
+
+    let flush_results = |pending: &mut Vec<ContentBlock>, out: &mut Vec<Message>| {
+        if pending.is_empty() {
+            return;
+        }
+        out.push(Message::user_blocks(std::mem::take(pending)));
+    };
+
+    for m in &msgs {
+        let role = match m.variant.as_deref().map(str::to_lowercase).as_deref() {
+            Some("user") => Role::User,
+            Some("ai") | Some("assistant") => Role::Assistant,
+            _ => continue,
+        };
+
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        // A user turn always flushes any tool results owed from the previous
+        // assistant turn first, so ordering is preserved.
+        if role == Role::User {
+            flush_results(&mut pending_results, &mut messages);
+        }
+
+        for b in m.blocks.iter().flatten() {
+            match b.block_type.as_deref() {
+                Some("text") => {
+                    if let Some(text) = &b.content {
+                        if !text.trim().is_empty() {
+                            blocks.push(ContentBlock::Text {
+                                text: clamp_text(text, MAX_TEXT_CHARS),
+                            });
+                        }
+                    }
+                }
+                Some("tool") => {
+                    let call_id = b
+                        .tool_call_id
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| format!("freebuff-tool-{}", blocks.len()));
+                    let name = b.tool_name.clone().unwrap_or_else(|| "tool".into());
+                    // A tool block that carries output is both the call and its
+                    // result: emit the call on the assistant side and stash the
+                    // result for the following user turn.
+                    if role == Role::Assistant {
+                        blocks.push(ContentBlock::ToolUse {
+                            id: call_id.clone(),
+                            name,
+                            input: b.input.clone().unwrap_or(serde_json::json!({})),
+                            thought_signature: None,
+                        });
+                    }
+                    if let Some(out) = &b.output {
+                        pending_results.push(ContentBlock::ToolResult {
+                            tool_use_id: call_id,
+                            content: ToolResultContent::Text(clamp_text(
+                                out,
+                                MAX_TOOL_RESULT_CHARS,
+                            )),
+                            is_error: None,
+                        });
+                    }
+                }
+                // `agent`, `mode-divider`, `ask-user` and friends are UI chrome
+                // or already reflected in the text; they carry no history value.
+                _ => {}
+            }
+        }
+
+        // Fall back to the flat `content` field when there are no usable blocks.
+        if blocks.is_empty() && pending_results.is_empty() {
+            if let Some(text) = &m.content {
+                if !text.trim().is_empty() {
+                    blocks.push(ContentBlock::Text {
+                        text: clamp_text(text, MAX_TEXT_CHARS),
+                    });
                 }
             }
         }
-        m
-    }
-    let meta = kv(&path.join("_meta.txt"));
-    let runner = kv(&path.join("_runner.txt"));
 
-    // Bounded identity excerpt (hostname / OS / kernel), redacted.
-    let mut identity = String::new();
-    if let Ok(text) = std::fs::read_to_string(path.join("01-identity.txt")) {
-        for line in text.lines().take(40) {
-            identity.push_str(line);
-            identity.push('\n');
+        if blocks.is_empty() {
+            continue;
         }
+        messages.push(match role {
+            Role::User => Message::user_blocks(blocks),
+            Role::Assistant => Message::assistant_blocks(blocks),
+        });
     }
-
-    let mode = runner.get("mode").cloned().unwrap_or_default();
-    let status = runner
-        .get("capture_status")
-        .cloned()
-        .unwrap_or_else(|| "unknown".into());
-    let os = meta
-        .get("host_nick")
-        .cloned()
-        .unwrap_or_else(|| host.clone());
-
-    let mut card = format!(
-        "Freebuff host snapshot — host={host} run={run_ts}\n\
-         capture_mode={mode} status={status} os_label={os}\n"
-    );
-    if !identity.trim().is_empty() {
-        card.push_str("\n--- identity (excerpt) ---\n");
-        card.push_str(&identity);
-    }
-    // NOTE: no redaction here — `import_one_source` redacts every source's
-    // messages centrally before they can reach a model.
-
-    let messages = if card.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![Message {
-            role: Role::Assistant,
-            content: MessageContent::Text(card),
-            uuid: None,
-            cost: None,
-            snapshot_patch: None,
-            turn_meta: None,
-        }]
-    };
-
-    // Freebuff snapshots are system context relevant to any project. Anchor the
-    // working_dir at the snapshots root so the importer's cwd filter always
-    // includes it (and treat it as unscoped host context).
-    let working_dir = std::fs::canonicalize(path).ok().and_then(|p| {
-        p.parent()
-            .and_then(|q| q.parent())
-            .map(|r| r.display().to_string())
-    });
+    flush_results(&mut pending_results, &mut messages);
 
     Ok(ImportedSession {
-        name: format!("freebuff-{host}-{run_ts}"),
-        working_dir,
+        name: format!("freebuff-{chat_id}"),
+        // Attribute the chat to the project it ran in; this is the locate key
+        // that scopes the import to the current working directory.
+        working_dir: freebuff_chat_project_root(path),
         source: "freebuff",
         source_path: path.to_path_buf(),
         messages,
@@ -332,7 +491,8 @@ pub fn import_freebuff_session(path: &Path) -> anyhow::Result<ImportedSession> {
 pub struct KnownLocations {
     pub opencode_projects: PathBuf,
     pub cline_workspace: PathBuf,
-    pub freebuff_snapshots: PathBuf,
+    /// Freebuff / Codebuff chat root: `~/.config/manicode/projects`.
+    pub freebuff_projects: PathBuf,
 }
 
 impl Default for KnownLocations {
@@ -349,7 +509,7 @@ impl Default for KnownLocations {
                 .join("Code")
                 .join("User")
                 .join("workspaceStorage"),
-            freebuff_snapshots: home.join("freebuff").join("snapshots"),
+            freebuff_projects: home.join(".config").join("manicode").join("projects"),
         }
     }
 }
@@ -359,11 +519,9 @@ impl Default for KnownLocations {
 /// Each source is a self-contained descriptor: where its data lives, how to
 /// cheaply discover candidate paths, and how to parse one path. The absorb /
 /// history-restore core drives this registry generically, so adding, disabling,
-/// or removing a source never requires touching the core machinery. Freebuff is
-/// one isolated, **off-by-default** entry (its `~/freebuff` folder is agent
-/// scratch, not a dependency Clawde should read by default). Opt in from
-/// `settings.json` by listing it in `externalImportSources`
-/// (e.g. `["opencode", "cline", "freebuff"]`) — no code change needed.
+/// or removing a source never requires touching the core machinery. All three
+/// registered sources (Opencode, Cline, Freebuff) are project-scoped and on by
+/// default; narrow the set from `settings.json` with `externalImportSources`.
 pub struct ExternalSource {
     /// Stable identifier, also used to look the source up in the registry.
     pub id: &'static str,
@@ -403,13 +561,13 @@ pub fn external_sources() -> Vec<ExternalSource> {
         },
         ExternalSource {
             id: "freebuff",
-            root: locs.freebuff_snapshots,
-            system_scoped: true,
-            // Off by default: `~/freebuff` is agent scratch, not a normal
-            // dependency. Opt in explicitly if you actually want host context.
-            default_enabled: false,
-            discover: discover_freebuff_paths,
-            import: |p| import_freebuff_session(p).ok(),
+            root: locs.freebuff_projects,
+            // Project-scoped conversation history, like Opencode and Cline: a
+            // chat is attributed to the project recorded in its run-state.json.
+            system_scoped: false,
+            default_enabled: true,
+            discover: discover_freebuff_chats,
+            import: |p| import_freebuff_chat(p).ok(),
         },
     ]
 }
@@ -521,36 +679,31 @@ pub fn discover_cline_paths(dir: &Path) -> Vec<PathBuf> {
 /// `<dir>/<host>/<UTC ts>/`, each holding `_meta.txt`, `_runner.txt`, and the
 /// numbered context files. Returns those run directories (not the top-level
 /// `*_index.md` report), because the run dirs are where the real per-host
-/// snapshot data lives.
-pub fn discover_freebuff_paths(dir: &Path) -> Vec<PathBuf> {
+/// Discover Freebuff / Codebuff chat directories under a projects root.
+///
+/// Layout is `<root>/<project-slug>/chats/<chatId>/`, and a chat directory is
+/// identified by containing `chat-messages.json`. Walks two levels and opens no
+/// transcript, so it stays cheap enough for the fingerprint-before-parse path.
+pub fn discover_freebuff_chats(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
+    let Ok(projects) = std::fs::read_dir(dir) else {
         return out;
     };
-    for host_entry in rd.flatten() {
-        let host_dir = host_entry.path();
-        if !host_dir.is_dir() {
-            continue;
-        }
-        let Ok(runs) = std::fs::read_dir(&host_dir) else {
+    for project in projects.flatten() {
+        let chats_dir = project.path().join("chats");
+        let Ok(chats) = std::fs::read_dir(&chats_dir) else {
             continue;
         };
-        for run in runs.flatten() {
-            let run_dir = run.path();
-            // A run dir is identified by containing _meta.txt.
-            if run_dir.is_dir() && run_dir.join("_meta.txt").is_file() {
-                out.push(run_dir);
+        for chat in chats.flatten() {
+            let chat_dir = chat.path();
+            if chat_dir.is_dir() && chat_dir.join("chat-messages.json").is_file() {
+                out.push(chat_dir);
             }
         }
     }
     out
 }
 
-/// All candidate external session paths across the *enabled* sources, as
-/// `(source_id, path)`. Drives the [`ExternalSource`] registry generically and
-/// honours each source's `default_enabled` flag, so a disabled source (e.g.
-/// Freebuff) is invisible to the absorb path. Cheap: directory walks only, no
-/// file is opened.
 /// Discovery filtered by an explicit allow-list of source ids.
 ///
 /// `allow` of `None` uses each source's `default_enabled`. `Some(ids)` is
@@ -642,41 +795,6 @@ mod tests {
     }
 
     #[test]
-    fn imports_freebuff_run_dir_as_redacted_host_card() {
-        let dir = tempdir().unwrap();
-        let run = dir.path().join("drone").join("20260629T023103Z");
-        std::fs::create_dir_all(&run).unwrap();
-        std::fs::write(
-            run.join("_meta.txt"),
-            "host_nick=drone\nsnapshot_ts=2026-06-29T02:31:03Z\n",
-        )
-        .unwrap();
-        std::fs::write(
-            run.join("_runner.txt"),
-            "whoami=churl\nhost_nick=drone\nmode=local\ncapture_status=ok\n",
-        )
-        .unwrap();
-        // Identity plus a line that must be redacted before reaching a model.
-        std::fs::write(
-            run.join("01-identity.txt"),
-            "## hostname/OS\nTheDrone\nPRETTY_NAME=\"Ubuntu 24.04\"\nsshpass \"supersecretpw\" via ssh hive\n",
-        )
-        .unwrap();
-
-        let session = import_one_source("freebuff", &run).expect("freebuff import via registry");
-        assert_eq!(session.source, "freebuff");
-        assert_eq!(session.messages.len(), 1);
-        let text = session.messages[0].get_text().unwrap_or("");
-        assert!(text.contains("host=drone"), "card names the host: {text}");
-        assert!(text.contains("TheDrone"), "identity present: {text}");
-        // Central redaction in import_one_source: the shared password must never
-        // survive into a model message.
-        assert!(!text.contains("supersecretpw"), "credential leaked: {text}");
-        assert!(!text.contains("sshpass"), "sshpass line leaked: {text}");
-        assert!(text.contains("REDACTED"), "redaction marker present");
-    }
-
-    #[test]
     fn path_discovery_finds_candidate_files() {
         // opencode: <dir>/{project}/history.json
         let oc = tempdir().unwrap();
@@ -690,32 +808,22 @@ mod tests {
         std::fs::create_dir_all(ws.join("roben.cline")).unwrap();
         std::fs::write(ws.join("roben.cline").join("session.json"), "{}").unwrap();
         assert_eq!(discover_cline_paths(cl.path()).len(), 1);
-        // freebuff: per-host run dirs containing _meta.txt (not the top-level index)
+        // freebuff: <root>/<slug>/chats/<chatId>/chat-messages.json
         let fb = tempdir().unwrap();
-        let run = fb.path().join("drone").join("20260629T023103Z");
-        std::fs::create_dir_all(&run).unwrap();
-        std::fs::write(run.join("_meta.txt"), "host_nick=drone\n").unwrap();
-        // A top-level index file is NOT a discoverable run source anymore.
-        std::fs::write(fb.path().join("20260629T023103Z_index.md"), "# x").unwrap();
-        let found = discover_freebuff_paths(fb.path());
-        assert_eq!(found.len(), 1, "only the run dir is discovered");
-        assert!(found[0].ends_with("drone/20260629T023103Z"));
+        let chat = fb
+            .path()
+            .join("myproj")
+            .join("chats")
+            .join("2026-07-11T22-49-27.735Z");
+        std::fs::create_dir_all(&chat).unwrap();
+        std::fs::write(chat.join("chat-messages.json"), "[]").unwrap();
+        // A project dir with no chats/ is not a discoverable source.
+        std::fs::create_dir_all(fb.path().join("empty-proj")).unwrap();
+        let found = discover_freebuff_chats(fb.path());
+        assert_eq!(found.len(), 1, "only the chat dir is discovered");
+        assert!(found[0].ends_with("2026-07-11T22-49-27.735Z"));
         // A missing dir yields nothing.
         assert!(discover_opencode_paths(&oc.path().join("nope")).is_empty());
-    }
-
-    #[test]
-    fn freebuff_is_off_by_default_in_discovery() {
-        // The registry must not discover Freebuff unless explicitly enabled:
-        // `~/freebuff` is agent scratch, not a normal dependency.
-        assert!(
-            !is_source_default_enabled("freebuff"),
-            "freebuff off by default"
-        );
-        assert!(is_source_default_enabled("opencode"));
-        assert!(is_source_default_enabled("cline"));
-        // The source still exists and is system-scoped (opt-in-able), just not on.
-        assert!(is_system_scoped_source("freebuff"));
     }
 
     #[test]
@@ -773,8 +881,11 @@ mod tests {
             session("cline", Some(cwd.display().to_string())),
             // Different project -> excluded.
             session("cline", Some(other.path().display().to_string())),
-            // System-wide snapshots -> always included.
+            // Another project's freebuff chat -> excluded, like any other
+            // project-scoped source.
             session("freebuff", Some("/definitely/not/cwd".to_string())),
+            // This project's freebuff chat -> included.
+            session("freebuff", Some(cwd.display().to_string())),
         ];
         let kept = filter_sessions_by_cwd(sessions, cwd);
         let kept_sources: Vec<&str> = kept.iter().map(|s| s.source).collect();
@@ -782,9 +893,181 @@ mod tests {
             !kept_sources.contains(&"opencode"),
             "unscopable session must not be imported (cross-project leak)"
         );
-        assert!(kept_sources.contains(&"freebuff"));
-        // Exactly the cwd-matching cline session + freebuff survive.
+        // The cwd-matching cline session + the cwd-matching freebuff chat.
         assert_eq!(kept.len(), 2, "kept: {kept_sources:?}");
+        assert_eq!(kept_sources.iter().filter(|s| **s == "freebuff").count(), 1);
+    }
+
+    /// Build a fake Freebuff chat dir: `projects/<slug>/chats/<chatId>/`.
+    fn write_freebuff_chat(
+        root: &Path,
+        slug: &str,
+        chat_id: &str,
+        project_root: &str,
+        msgs: &str,
+    ) -> PathBuf {
+        let chat = root.join(slug).join("chats").join(chat_id);
+        std::fs::create_dir_all(&chat).unwrap();
+        std::fs::write(chat.join("chat-messages.json"), msgs).unwrap();
+        std::fs::write(
+            chat.join("run-state.json"),
+            format!(r#"{{"sessionState":{{"fileContext":{{"projectRoot":"{project_root}"}}}}}}"#),
+        )
+        .unwrap();
+        chat
+    }
+
+    #[test]
+    fn imports_freebuff_chat_with_tool_calls_preserved() {
+        let dir = tempdir().unwrap();
+        let msgs = r#"[
+            {"variant":"user","content":"add a test","timestamp":"06:50 PM"},
+            {"variant":"ai","content":"","blocks":[
+                {"type":"text","content":"On it."},
+                {"type":"tool","toolCallId":"U1","toolName":"read_files","input":{"paths":["a.py"]},"output":"print(1)"},
+                {"type":"mode-divider","mode":"LITE"}
+            ]},
+            {"variant":"user","content":"thanks","timestamp":"06:51 PM"}
+        ]"#;
+        let chat = write_freebuff_chat(
+            dir.path(),
+            "proj",
+            "2026-07-11T22-49-27.735Z",
+            "/work/proj",
+            msgs,
+        );
+        let s = import_freebuff_chat(&chat).unwrap();
+        assert_eq!(s.source, "freebuff");
+        assert_eq!(
+            s.working_dir.as_deref(),
+            Some("/work/proj"),
+            "cwd from run-state"
+        );
+        assert_eq!(
+            s.name, "freebuff-2026-07-11T22-49-27.735Z",
+            "chat id is the timestamp"
+        );
+        // user, assistant, tool-result user turn, user
+        assert_eq!(s.messages.len(), 4, "got {} msgs", s.messages.len());
+        assert_eq!(s.messages[0].role, crate::types::Role::User);
+
+        // The assistant turn keeps the tool call as a real ToolUse block.
+        let MessageContent::Blocks(blocks) = &s.messages[1].content else {
+            panic!("assistant turn should carry blocks");
+        };
+        assert!(
+            blocks.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolUse { name, id, .. } if name == "read_files" && id == "U1"
+            )),
+            "tool call preserved as ToolUse: {blocks:?}"
+        );
+        // The result lands in the following user turn, paired by id.
+        let MessageContent::Blocks(results) = &s.messages[2].content else {
+            panic!("tool results should be a user turn");
+        };
+        assert!(
+            results.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "U1"
+            )),
+            "tool result paired by id"
+        );
+    }
+
+    #[test]
+    fn freebuff_chat_skips_ui_chrome_and_empty_turns() {
+        let dir = tempdir().unwrap();
+        // `agent` / `mode-divider` / `ask-user` blocks and empty variants carry
+        // no history value and must not become messages.
+        let msgs = r#"[
+            {"variant":"ai","content":"","blocks":[{"type":"mode-divider","mode":"LITE"}]},
+            {"variant":"system","content":"ignored"},
+            {"variant":"ai","blocks":[{"type":"text","content":"real"}]}
+        ]"#;
+        let chat = write_freebuff_chat(dir.path(), "p", "2026-01-01T00-00-00.000Z", "/w", msgs);
+        let s = import_freebuff_chat(&chat).unwrap();
+        assert_eq!(s.messages.len(), 1, "only the real turn survives");
+        let MessageContent::Blocks(b) = &s.messages[0].content else {
+            panic!("expected blocks");
+        };
+        assert!(matches!(&b[0], ContentBlock::Text { text } if text == "real"));
+    }
+
+    #[test]
+    fn freebuff_text_and_tool_output_are_bounded() {
+        let dir = tempdir().unwrap();
+        let big = "x".repeat(MAX_TEXT_CHARS * 3);
+        let msgs = format!(
+            r#"[{{"variant":"ai","blocks":[{{"type":"text","content":"{big}"}},
+                 {{"type":"tool","toolCallId":"T","toolName":"read_files","output":"{big}"}}]}}]"#
+        );
+        let chat = write_freebuff_chat(dir.path(), "p", "2026-01-01T00-00-00.000Z", "/w", &msgs);
+        let s = import_freebuff_chat(&chat).unwrap();
+        let MessageContent::Blocks(b) = &s.messages[0].content else {
+            panic!("expected blocks");
+        };
+        for blk in b {
+            let len = match blk {
+                ContentBlock::Text { text } => text.len(),
+                ContentBlock::ToolUse { input, .. } => {
+                    // output is in the result turn, not here
+                    let _ = input;
+                    0
+                }
+                _ => 0,
+            };
+            assert!(len <= MAX_TEXT_CHARS + 64, "text block bounded, got {len}");
+        }
+        // And the tool result is bounded in the following user turn.
+        let MessageContent::Blocks(r) = &s.messages[1].content else {
+            panic!("expected result turn");
+        };
+        if let ContentBlock::ToolResult { content, .. } = &r[0] {
+            let ToolResultContent::Text(t) = content else {
+                panic!("expected text result");
+            };
+            assert!(t.len() <= MAX_TOOL_RESULT_CHARS + 64, "result bounded");
+        }
+    }
+
+    #[test]
+    fn discovers_freebuff_chat_dirs_only() {
+        let dir = tempdir().unwrap();
+        let chat = write_freebuff_chat(
+            dir.path(),
+            "myproj",
+            "2026-07-11T22-49-27.735Z",
+            "/work",
+            "[]",
+        );
+        // A project with no chats/ dir, and a chats/ dir with a non-chat dir.
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        std::fs::create_dir_all(dir.path().join("myproj").join("chats").join("not-a-chat"))
+            .unwrap();
+        let found = discover_freebuff_chats(dir.path());
+        assert_eq!(found.len(), 1, "only real chat dirs: {found:?}");
+        assert_eq!(found[0], chat);
+        assert!(discover_freebuff_chats(&dir.path().join("nope")).is_empty());
+    }
+
+    #[test]
+    fn all_registered_sources_are_project_scoped_and_default_on() {
+        // Every source in the registry is cwd-scoped conversation history, so
+        // a default import can never pull another project's history in, and all
+        // of them are on unless the user narrows the set in settings.
+        for id in ["opencode", "cline", "freebuff"] {
+            assert!(
+                is_source_default_enabled(id),
+                "{id} should be default-enabled"
+            );
+            assert!(
+                !is_system_scoped_source(id),
+                "{id} must be project-scoped, not system-wide"
+            );
+        }
+        // An unknown id is neither.
+        assert!(!is_source_default_enabled("not-a-source"));
     }
 
     #[test]
