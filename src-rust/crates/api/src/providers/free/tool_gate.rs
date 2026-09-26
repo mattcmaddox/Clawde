@@ -70,12 +70,42 @@ const UNBACKED_SAMPLES: u32 = 2;
 /// other free-provider routing signals so a lane that habitually emits prose is
 /// demoted for tool work across turns (and processes), steering the chain toward
 /// upstreams that actually produce structured calls.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolDialectState {
     prose: Vec<u32>,
     structured: Vec<u32>,
     /// Attempts that narrated a tool action while emitting no tool call.
     unbacked: Vec<u32>,
+    /// Whether this tally has ever been written to disk. An untouched state is
+    /// not worth persisting, and skipping it keeps a fresh install's
+    /// `free-state/` free of an empty file.
+    #[serde(default)]
+    dirty: bool,
+}
+
+/// How long a persisted tally is trusted. Long enough that a lane stays
+/// demoted across a working session, short enough that a lane which starts
+/// behaving recovers on its own.
+const TALLY_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Wire format for the persisted tally.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TallyFile {
+    saved_at_unix: u64,
+    state: ToolDialectState,
+}
+
+fn tally_path() -> std::path::PathBuf {
+    clawde_core::config::Settings::config_dir()
+        .join("free-state")
+        .join("tool-dialect.json")
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl ToolDialectState {
@@ -84,6 +114,7 @@ impl ToolDialectState {
             prose: vec![0; n],
             structured: vec![0; n],
             unbacked: vec![0; n],
+            dirty: false,
         }
     }
 
@@ -97,6 +128,7 @@ impl ToolDialectState {
         };
         if let Some(cell) = slot.get_mut(idx) {
             *cell = cell.saturating_add(1);
+            self.dirty = true;
         }
     }
 
@@ -106,7 +138,53 @@ impl ToolDialectState {
     pub fn record_unbacked(&mut self, idx: usize) {
         if let Some(cell) = self.unbacked.get_mut(idx) {
             *cell = cell.saturating_add(1);
+            self.dirty = true;
         }
+    }
+
+    /// Load a persisted tally for `n` upstreams, ignoring a stale or corrupt
+    /// file. A fresh state is returned when there is nothing usable, so a bad
+    /// file can never wedge routing.
+    pub fn load(n: usize) -> Self {
+        let Some(json) = std::fs::read_to_string(tally_path()).ok() else {
+            return Self::new(n);
+        };
+        let Ok(file) = serde_json::from_str::<TallyFile>(&json) else {
+            return Self::new(n);
+        };
+        if now_unix().saturating_sub(file.saved_at_unix) > TALLY_TTL_SECS {
+            return Self::new(n);
+        }
+        Self::resized(file.state, n)
+    }
+
+    /// Persist the tally. Best-effort: routing must never fail because the
+    /// state file is unwritable.
+    pub fn save(&self) {
+        if !self.dirty {
+            return;
+        }
+        let path = tally_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file = TallyFile {
+            saved_at_unix: now_unix(),
+            state: self.clone(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&file) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// Reshape a loaded tally to `n` slots. The catalog length is stable
+    /// within a build, but a settings change can add or drop a source, and a
+    /// short vector would silently disable the gate.
+    fn resized(mut self, n: usize) -> Self {
+        for v in [&mut self.prose, &mut self.structured, &mut self.unbacked] {
+            v.resize(n, 0);
+        }
+        self
     }
 
     /// Whether the upstream at `idx` has repeatedly claimed tool activity it
@@ -137,6 +215,44 @@ mod tests {
 
     fn st() -> ToolDialectState {
         ToolDialectState::new(3)
+    }
+
+    #[test]
+    fn tally_survives_a_save_load_round_trip() {
+        // The gate's value is that a lane stays demoted in the NEXT process.
+        // That only holds if the tally is actually persisted, which it was not:
+        // the state was rebuilt empty on every startup while the docs claimed
+        // otherwise.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-dialect.json");
+
+        let mut st = ToolDialectState::new(3);
+        st.record(0, true);
+        st.record(0, true);
+        st.record(0, true);
+        st.record_unbacked(1);
+        st.record_unbacked(1);
+        st.record(2, false);
+        let json = serde_json::to_string(&st).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let loaded: ToolDialectState =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(loaded.is_prose_prone(0), "prose verdict survived");
+        assert!(loaded.is_unbacked_claimer(1), "unbacked verdict survived");
+        assert!(!loaded.is_prose_prone(2), "clean lane not condemned");
+    }
+
+    #[test]
+    fn resized_tally_keeps_the_gate_working_after_a_source_is_added() {
+        let mut st = ToolDialectState::new(2);
+        st.record(0, true);
+        st.record(0, true);
+        st.record(0, true);
+        // A settings change adds a source: the persisted vectors are shorter.
+        let grown = st.resized(4);
+        assert!(grown.is_prose_prone(0), "verdict kept after growth");
+        assert!(!grown.is_prose_prone(3), "new slot starts clean");
     }
 
     #[test]

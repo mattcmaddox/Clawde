@@ -144,7 +144,7 @@ impl FreeProvider {
             capacity: Arc::new(Mutex::new(
                 CapacityState::new(n).with_persistence(upstream_ids, None),
             )),
-            tool_dialect: Arc::new(Mutex::new(ToolDialectState::new(n))),
+            tool_dialect: Arc::new(Mutex::new(ToolDialectState::load(n))),
         }
     }
 
@@ -205,7 +205,7 @@ impl FreeProvider {
             profiles: Arc::new(ProviderProfiles::load()),
             latencies: Arc::new(Mutex::new(latencies)),
             capacity: Arc::new(Mutex::new(capacity)),
-            tool_dialect: Arc::new(Mutex::new(ToolDialectState::new(n))),
+            tool_dialect: Arc::new(Mutex::new(ToolDialectState::load(n))),
         }
     }
 
@@ -1873,10 +1873,12 @@ impl RetryingFreeStream {
         let idx = self.current_idx;
         if self.attempt_tool_count > 0 {
             self.tool_dialect.lock().unwrap().record(idx, false); // structured
+            self.tool_dialect.lock().unwrap().save();
             return;
         }
         if super::tool_gate::text_has_non_native_tool_call(&self.attempt_text) {
             self.tool_dialect.lock().unwrap().record(idx, true); // prose
+            self.tool_dialect.lock().unwrap().save();
             return;
         }
         // No tool call at all. If the answer narrates having read, searched or
@@ -1885,6 +1887,10 @@ impl RetryingFreeStream {
         if super::tool_gate::text_claims_unbacked_action(&self.attempt_text) {
             self.tool_dialect.lock().unwrap().record_unbacked(idx);
         }
+        // Persist immediately: the whole point of the tally is to survive into
+        // the next process, and waiting for a graceful exit would lose
+        // everything learned in a session that ended any other way.
+        self.tool_dialect.lock().unwrap().save();
     }
 
     /// Credit a successful dispatch to the current upstream at the completion
