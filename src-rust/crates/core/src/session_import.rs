@@ -740,11 +740,70 @@ pub fn import_one_source(source: &str, path: &Path) -> Option<ImportedSession> {
         return None;
     }
     for msg in &mut session.messages {
-        if let MessageContent::Text(text) = &mut msg.content {
-            *text = redact_secrets(text);
-        }
+        redact_message(msg);
     }
     Some(session)
+}
+
+/// Scrub credential-like content from every text-carrying part of a message.
+///
+/// The naive `MessageContent::Text` match this replaces missed every
+/// `Blocks` message — including the tool-heavy transcripts the Freebuff
+/// importer produces — so text inside a block could reach a provider
+/// unredacted. This walks the block tree instead of assuming a shape, so a
+/// variant added later is covered by construction rather than by remembering
+/// to extend a match.
+fn redact_message(msg: &mut Message) {
+    match &mut msg.content {
+        MessageContent::Text(text) => *text = redact_secrets(text),
+        MessageContent::Blocks(blocks) => {
+            for block in blocks.iter_mut() {
+                redact_block(block);
+            }
+        }
+    }
+}
+
+fn redact_block(block: &mut ContentBlock) {
+    match block {
+        ContentBlock::Text { text } => *text = redact_secrets(text),
+        ContentBlock::ToolResult {
+            content: ToolResultContent::Text(t),
+            ..
+        } => *t = redact_secrets(t),
+        ContentBlock::ToolResult {
+            content: ToolResultContent::Blocks(inner),
+            ..
+        } => {
+            for b in inner.iter_mut() {
+                redact_block(b);
+            }
+        }
+        // Tool input is a JSON value the model produced; scrub its string
+        // leaves so a pasted credential in an argument cannot travel.
+        ContentBlock::ToolUse { input, .. } => redact_json_strings(input),
+        ContentBlock::UserLocalCommandOutput { output, .. } => *output = redact_secrets(output),
+        ContentBlock::Thinking { thinking, .. } => *thinking = redact_secrets(thinking),
+        _ => {}
+    }
+}
+
+/// Recursively redact every string leaf of a JSON value.
+fn redact_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => *s = redact_secrets(s),
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_json_strings(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                redact_json_strings(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1068,6 +1127,36 @@ mod tests {
         }
         // An unknown id is neither.
         assert!(!is_source_default_enabled("not-a-source"));
+    }
+
+    #[test]
+    fn redaction_covers_block_and_tool_content() {
+        // The old Text-only match missed every Blocks message, which is exactly
+        // what the Freebuff importer produces — so a credential inside a tool
+        // result or an argument could reach a provider unredacted.
+        let mut msg = Message::user_blocks(vec![
+            ContentBlock::Text {
+                text: "here is the config".into(),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: ToolResultContent::Text("sshpass \"hunter2\" ssh hive@10.0.0.1".into()),
+                is_error: None,
+            },
+            ContentBlock::ToolUse {
+                id: "t2".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({
+                    "command": "echo hi",
+                    "note": "password = hunter2"
+                }),
+                thought_signature: None,
+            },
+        ]);
+        redact_message(&mut msg);
+        let blob = format!("{:?}", msg.content);
+        assert!(!blob.contains("hunter2"), "secret survived: {blob}");
+        assert!(blob.contains("here is the config"), "benign text kept");
     }
 
     #[test]

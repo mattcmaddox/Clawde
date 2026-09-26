@@ -2854,6 +2854,17 @@ async fn run_headless(
             &tool_ctx.working_dir,
             config.external_import_sources.as_deref(),
         );
+        // When nothing new was absorbed but history was already imported for
+        // this project, say so. Silence reads as "no history exists", and the
+        // model then reports having no prior context — which is a deliberate
+        // dedup, not a failure.
+        if absorbed.is_empty() && commit.already_absorbed() > 0 {
+            tracing::info!(
+                sessions = commit.already_absorbed(),
+                "External history for this project was already imported in an \
+                 earlier session; not re-adding it"
+            );
+        }
         absorb_commit = Some(commit);
         if !absorbed.is_empty() {
             let mut historical = absorbed;
@@ -4282,6 +4293,17 @@ async fn run_interactive(
             &tool_ctx.working_dir,
             config.external_import_sources.as_deref(),
         );
+        // When nothing new was absorbed but history was already imported for
+        // this project, say so. Silence reads as "no history exists", and the
+        // model then reports having no prior context — which is a deliberate
+        // dedup, not a failure.
+        if absorbed.is_empty() && commit.already_absorbed() > 0 {
+            tracing::info!(
+                sessions = commit.already_absorbed(),
+                "External history for this project was already imported in an \
+                 earlier session; not re-adding it"
+            );
+        }
         absorb_commit = Some(commit);
         if !absorbed.is_empty() {
             // Prepend absorbed history to the new session's initial messages.

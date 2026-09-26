@@ -24,6 +24,34 @@ pub(crate) fn text_has_non_native_tool_call(text: &str) -> bool {
     text.contains("\"name\"") && text.contains("\"arguments\"")
 }
 
+/// Phrases a model uses to *describe* a tool interaction it never performed.
+/// Observed on a weak free lane: asked to read an existing file, it replied
+/// "I verified this by searching…" and rendered a fabricated `<content>` block,
+/// with no tool call in the turn. Cheap substring check, same spirit as the
+/// dialect scan above.
+const FALSE_ACTION_MARKERS: &[&str] = &[
+    "i verified",
+    "i searched",
+    "i checked the file",
+    "i read the file",
+    "let me verify",
+    "after reading the file",
+    "as shown in the file contents",
+    "the file does not exist",
+    "file not found in the project",
+];
+
+/// Whether the text narrates a tool interaction that produced no tool call.
+///
+/// This is a distinct failure from [`text_has_non_native_tool_call`]: there the
+/// model *did* try to call a tool but encoded it as prose (recoverable by the
+/// lift). Here it makes no call at all yet writes as though it did, so the user
+/// reads fabricated tool output as fact.
+pub(crate) fn text_claims_unbacked_action(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    FALSE_ACTION_MARKERS.iter().any(|m| lower.contains(m))
+}
+
 /// Minimum completed tool-bearing attempts before an upstream's prose rate is
 /// trusted enough to demote it. Prevents a single stray prose call from
 /// condemning a healthy lane.
@@ -32,6 +60,10 @@ const MIN_TOOL_SAMPLES: u32 = 3;
 /// Percentage of tool-bearing attempts that must be prose before an upstream is
 /// considered prose-prone for routing.
 const PROSE_PCT: u32 = 60;
+
+/// Fewer unbacked-claim samples are needed than prose samples: a fabricated
+/// tool result misleads the user, whereas prose is only untidy.
+const UNBACKED_SAMPLES: u32 = 2;
 
 /// Rolling per-upstream tally of how an upstream answers tool-bearing requests:
 /// a structured tool call vs a non-native (prose) one. Persisted alongside the
@@ -42,6 +74,8 @@ const PROSE_PCT: u32 = 60;
 pub struct ToolDialectState {
     prose: Vec<u32>,
     structured: Vec<u32>,
+    /// Attempts that narrated a tool action while emitting no tool call.
+    unbacked: Vec<u32>,
 }
 
 impl ToolDialectState {
@@ -49,6 +83,7 @@ impl ToolDialectState {
         Self {
             prose: vec![0; n],
             structured: vec![0; n],
+            unbacked: vec![0; n],
         }
     }
 
@@ -63,6 +98,26 @@ impl ToolDialectState {
         if let Some(cell) = slot.get_mut(idx) {
             *cell = cell.saturating_add(1);
         }
+    }
+
+    /// Record that a tool-bearing attempt narrated an action but produced no
+    /// tool call. Counted separately from prose: this lane emitted nothing the
+    /// lift could recover, which is strictly worse.
+    pub fn record_unbacked(&mut self, idx: usize) {
+        if let Some(cell) = self.unbacked.get_mut(idx) {
+            *cell = cell.saturating_add(1);
+        }
+    }
+
+    /// Whether the upstream at `idx` has repeatedly claimed tool activity it
+    /// never performed. Demoted for tool work on a lower bar than prose-prone
+    /// because a fabricated tool result is actively misleading, whereas prose
+    /// is merely untidy.
+    pub fn is_unbacked_claimer(&self, idx: usize) -> bool {
+        let total = self.prose.get(idx).copied().unwrap_or(0)
+            + self.structured.get(idx).copied().unwrap_or(0);
+        self.unbacked.get(idx).copied().unwrap_or(0) >= UNBACKED_SAMPLES
+            && self.unbacked.get(idx).copied().unwrap_or(0) * 2 >= total.max(1)
     }
 
     /// Whether the upstream at `idx` is prose-prone enough to demote for
@@ -82,6 +137,40 @@ mod tests {
 
     fn st() -> ToolDialectState {
         ToolDialectState::new(3)
+    }
+
+    #[test]
+    fn detects_unbacked_action_claims() {
+        // Observed on a weak free lane: claimed to have searched for a file
+        // that existed and rendered a fabricated <content> block, with no tool
+        // call in the turn at all.
+        assert!(text_claims_unbacked_action(
+            "Could not execute it because a.py does not exist. I verified this by searching."
+        ));
+        assert!(text_claims_unbacked_action(
+            "Let me verify the contents first."
+        ));
+        // A normal answer that merely uses the word is not a claim.
+        assert!(!text_claims_unbacked_action("The test suite is green."));
+        assert!(!text_claims_unbacked_action(
+            "Here is the file: <content>x=1</content>"
+        ));
+    }
+
+    #[test]
+    fn unbacked_claimer_needs_a_repeat_offender() {
+        let mut st = ToolDialectState::new(2);
+        // One strike is not enough — it could be a one-off.
+        st.record_unbacked(0);
+        assert!(!st.is_unbacked_claimer(0), "single sample must not demote");
+        st.record_unbacked(0);
+        assert!(st.is_unbacked_claimer(0), "repeat claimer is demoted");
+        // A lane that actually calls tools is never flagged, however it reads.
+        let mut ok = ToolDialectState::new(2);
+        ok.record(1, false);
+        ok.record(1, false);
+        ok.record(1, false);
+        assert!(!ok.is_unbacked_claimer(1));
     }
 
     #[test]

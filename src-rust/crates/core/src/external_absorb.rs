@@ -187,7 +187,7 @@ fn absorb_paths(
     mut paths: Vec<(&'static str, std::path::PathBuf)>,
     cwd_canonical: &Path,
     state: &mut ExternalAbsorptionState,
-) -> (Vec<Message>, usize) {
+) -> (Vec<Message>, usize, usize) {
     // Newest first so the cap deterministically keeps recent history. For a
     // directory source (a Freebuff chat dir) use the newest child mtime, which
     // reflects the actual capture time.
@@ -223,6 +223,10 @@ fn absorb_paths(
     // has many long transcripts.
     let mut truncated = 0usize;
     let mut dropped_turns = 0usize;
+    // Candidates whose fingerprint already matched: history that exists but is
+    // deliberately not re-imported. Surfaced so the caller can tell the user
+    // "already imported" instead of leaving them to assume none was found.
+    let mut already = 0usize;
     for (source, path) in paths {
         let key = path.to_string_lossy().to_string();
         // Fingerprint first: an unchanged source is skipped WITHOUT parsing.
@@ -234,6 +238,7 @@ fn absorb_paths(
             .get(&key)
             .is_some_and(|e| e.fingerprint == fingerprint)
         {
+            already += 1;
             continue;
         }
 
@@ -291,7 +296,7 @@ fn absorb_paths(
              recent turns were imported."
         );
     }
-    (absorbed, skipped)
+    (absorbed, skipped, already)
 }
 
 /// Wrap system-scoped host context so the combined history stays valid.
@@ -393,7 +398,7 @@ pub fn absorb_new_external_sessions_for(
 
     // Per-session boundary normalization happens inside absorb_paths, so that
     // system-scoped host context is exempt (see the call site there).
-    let (absorbed, skipped) = absorb_paths(paths, &cwd_canonical, &mut state);
+    let (absorbed, skipped, already) = absorb_paths(paths, &cwd_canonical, &mut state);
 
     if !absorbed.is_empty() {
         // tracing (not eprintln!) so it is routed through the app's log/event
@@ -410,6 +415,7 @@ pub fn absorb_new_external_sessions_for(
     let commit = AbsorbCommit {
         state,
         path: state_path,
+        already_absorbed: already,
     };
     (absorbed, commit)
 }
@@ -419,9 +425,19 @@ pub fn absorb_new_external_sessions_for(
 pub struct AbsorbCommit {
     state: ExternalAbsorptionState,
     path: PathBuf,
+    /// External sessions that matched an already-recorded fingerprint and were
+    /// therefore skipped. Zero on a project's first import; non-zero on every
+    /// later run, which is the signal that history exists but was not re-added.
+    already_absorbed: usize,
 }
 
 impl AbsorbCommit {
+    /// How many external sessions were skipped because their fingerprint was
+    /// already recorded for this project.
+    pub fn already_absorbed(&self) -> usize {
+        self.already_absorbed
+    }
+
     /// Persist the updated absorption state. Call this AFTER the session
     /// containing the imported messages is durably saved; otherwise a crash
     /// between absorb and save would lose the import for good.
@@ -536,7 +552,7 @@ mod tests {
         let file = write_cline(dir.path(), "s.json", &cwd, 3);
         let mut state = ExternalAbsorptionState::default();
         let paths = vec![("cline", file.clone())];
-        let (absorbed, skipped) = absorb_paths(paths.clone(), &cwd, &mut state);
+        let (absorbed, skipped, _) = absorb_paths(paths.clone(), &cwd, &mut state);
         assert_eq!(
             absorbed.len(),
             2,
@@ -544,7 +560,7 @@ mod tests {
         );
         assert_eq!(skipped, 0);
         // Second run: unchanged fingerprint -> not re-absorbed (fingerprint-before-parse).
-        let (absorbed2, _) = absorb_paths(paths, &cwd, &mut state);
+        let (absorbed2, _, _) = absorb_paths(paths, &cwd, &mut state);
         assert_eq!(absorbed2.len(), 0, "unchanged session not re-absorbed");
     }
 
@@ -555,7 +571,7 @@ mod tests {
         let other = tempdir().unwrap();
         let file = write_cline(dir.path(), "s.json", other.path(), 3);
         let mut state = ExternalAbsorptionState::default();
-        let (absorbed, _) = absorb_paths(vec![("cline", file)], &cwd, &mut state);
+        let (absorbed, _, _) = absorb_paths(vec![("cline", file)], &cwd, &mut state);
         assert_eq!(absorbed.len(), 0, "other-project session not absorbed");
         // But its fingerprint IS recorded so it is not re-parsed for this project.
         assert_eq!(state.sessions.len(), 1);
@@ -570,7 +586,7 @@ mod tests {
         let c = write_cline(dir.path(), "c.json", &cwd, 100);
         let mut state = ExternalAbsorptionState::default();
         let paths = vec![("cline", a), ("cline", b), ("cline", c)];
-        let (absorbed, skipped) = absorb_paths(paths, &cwd, &mut state);
+        let (absorbed, skipped, _) = absorb_paths(paths, &cwd, &mut state);
         assert_eq!(absorbed.len(), MAX_ABSORBED_MESSAGES, "capped");
         assert!(skipped >= 1, "at least one file skipped by the cap");
     }

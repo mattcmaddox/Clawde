@@ -473,7 +473,16 @@ impl FreeProvider {
             // lane (it stays available as a fallback).
             if has_tools {
                 let dialect = self.tool_dialect.lock().unwrap();
-                plan.sort_by_key(|(idx, _)| u8::from(dialect.is_prose_prone(*idx)));
+                // Two ranks, not a bool: a lane that fabricates tool results
+                // outranks one that merely writes calls as prose, so the worst
+                // behaviour sorts last.
+                plan.sort_by_key(|(idx, _)| {
+                    if dialect.is_unbacked_claimer(*idx) {
+                        2
+                    } else {
+                        u8::from(dialect.is_prose_prone(*idx))
+                    }
+                });
             }
             let capacity = self.capacity.lock().unwrap();
             plan.sort_by_key(|(idx, _)| {
@@ -1862,15 +1871,19 @@ impl RetryingFreeStream {
             return;
         }
         let idx = self.current_idx;
-        let observed = if self.attempt_tool_count > 0 {
-            Some(false) // structured
-        } else if super::tool_gate::text_has_non_native_tool_call(&self.attempt_text) {
-            Some(true) // prose
-        } else {
-            None
-        };
-        if let Some(prose) = observed {
-            self.tool_dialect.lock().unwrap().record(idx, prose);
+        if self.attempt_tool_count > 0 {
+            self.tool_dialect.lock().unwrap().record(idx, false); // structured
+            return;
+        }
+        if super::tool_gate::text_has_non_native_tool_call(&self.attempt_text) {
+            self.tool_dialect.lock().unwrap().record(idx, true); // prose
+            return;
+        }
+        // No tool call at all. If the answer narrates having read, searched or
+        // verified something, it is claiming work it never did — strictly
+        // worse than prose, and invisible to the dialect signal above.
+        if super::tool_gate::text_claims_unbacked_action(&self.attempt_text) {
+            self.tool_dialect.lock().unwrap().record_unbacked(idx);
         }
     }
 
