@@ -1301,15 +1301,39 @@ fn resolve_intent_tool_name(raw: &str, known_tools: &[Box<dyn Tool>]) -> Option<
 ///
 /// This removes those spans from the user-visible text only. It never affects
 /// what is sent to a provider, and a well-formed message is returned unchanged.
+///
+/// Deliberately narrower than the lift itself: only spans that look like an
+/// actual **invocation** are removed. A model that merely *discusses* the markup
+/// — "the XML tag `<tool_call>` marks an invocation" — must keep it, or the
+/// explanation is left dangling mid-sentence. An invocation names a tool or
+/// carries arguments; a bare mention does neither.
 pub fn strip_prose_tool_markup(text: &str) -> String {
-    let intents = extract_tool_call_intents(text);
-    if intents.is_empty() {
+    let spans: Vec<(usize, usize)> = extract_tool_call_intents(text)
+        .into_iter()
+        .filter(|(_, _, intent)| looks_like_invocation(intent))
+        .map(|(start, end, _)| (start, end))
+        .collect();
+    if spans.is_empty() {
         return text.to_string();
     }
-    let spans: Vec<(usize, usize)> = intents.iter().map(|(s, e, _)| (*s, *e)).collect();
     // The lift can leave trailing whitespace where a tag was excised; tidy the
     // edges without touching the model's actual words.
     splice_out_spans(text, &spans).trim().to_string()
+}
+
+/// Whether a parsed intent is a real tool invocation rather than prose that
+/// merely mentions the markup.
+fn looks_like_invocation(intent: &ToolCallIntent) -> bool {
+    // Structured dialects (JSON payload, special tokens, `[TOOL_CALLS]`) are
+    // unambiguous — their payload only appears when a call is being made.
+    if intent.dialect != "arg_key" {
+        return true;
+    }
+    // The arg_key dialect also matches a bare `<tool_call>` mention. Require
+    // either a named tool or at least one argument before treating it as a call.
+    let named = !intent.name.trim().is_empty();
+    let has_args = intent.input.as_object().is_some_and(|m| !m.is_empty());
+    named || has_args
 }
 
 /// Remove the byte spans `spans` from `text`, keeping everything else. Spans
@@ -6247,6 +6271,29 @@ mod text_tool_lift_tests {
         assert!(!out.contains("tool_call"), "markup removed: {out:?}");
         assert!(!out.contains("arg_value"), "arg tags removed: {out:?}");
         assert!(out.contains("Let me check that."), "prose kept: {out:?}");
+    }
+
+    #[test]
+    fn strip_keeps_markup_the_model_is_only_discussing() {
+        // Regression: asked to explain the tag, a model wrote
+        // "The XML tag <tool_call> is used for…". Stripping the bare mention
+        // left "The XML tag `" — a dangling, nonsensical sentence.
+        let prose =
+            "I understand the issue now. The XML tag <tool_call> is used for tool invocation.";
+        let out = strip_prose_tool_markup(prose);
+        assert!(
+            out.contains("tool_call"),
+            "a bare mention must survive: {out:?}"
+        );
+        assert_eq!(out, prose, "mention text is untouched");
+    }
+
+    #[test]
+    fn strip_still_removes_a_named_invocation() {
+        let raw = "Checking.\n<tool_call>Bash<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>";
+        let out = strip_prose_tool_markup(raw);
+        assert!(!out.contains("tool_call"), "invocation removed: {out:?}");
+        assert!(out.contains("Checking."), "prose kept");
     }
 
     #[test]
