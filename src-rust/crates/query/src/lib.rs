@@ -666,6 +666,35 @@ const MAX_STEPS_DEGRADATION_MSG: &str =
      summarize what you accomplished, what remains unfinished, and exactly where \
      you stopped, so the work can be resumed later.";
 
+/// Turns of headroom at which the loop warns the model that its step budget is
+/// nearly spent. Two leaves one turn to land the edit in flight and one to
+/// summarize, instead of being cut off mid-write.
+const BUDGET_WARNING_TURNS: u32 = 2;
+
+/// Request-only pin injected near the end of a step window. The bounded
+/// continuation windows and the tool-less summary turn keep the *transcript*
+/// recoverable, but they cannot undo a half-applied multi-file edit — a run that
+/// was mid-`BatchEdit` when the window expired left the tree part-written
+/// (observed on `trimux`, 2026-09-26). So the model is told to stop opening new
+/// fronts while it still has turns left to close the one it is on.
+fn step_budget_warning_pin(remaining: u32) -> String {
+    let plural = if remaining == 1 { "" } else { "s" };
+    format!(
+        "[Step budget] Only {remaining} turn{plural} left in this run. Do not start new \
+         work or open another multi-file refactor. Finish the edit already in flight, \
+         leave every file you touched in a working state, then state what changed and \
+         what remains."
+    )
+}
+
+/// Turns left in the current window, including this one, when the warning is due.
+/// `None` while there is still slack. `saturating_sub` keeps an over-run window
+/// (the degradation turn) at one rather than wrapping.
+fn budget_warning_remaining(turn: u32, max_turns: u32) -> Option<u32> {
+    let remaining = max_turns.saturating_sub(turn) + 1;
+    (remaining <= BUDGET_WARNING_TURNS).then_some(remaining)
+}
+
 /// Content stored in the synthetic `tool_result` for a tool that was abandoned
 /// mid-flight because the query loop was cancelled (issue #218). Every
 /// outstanding `tool_use` still receives a matching `tool_result` carrying this
@@ -2576,6 +2605,9 @@ async fn run_query_loop_inner(
     const MAX_STEP_CONTINUATIONS: u32 = 2;
     let mut max_step_continuations = 0u32;
     let mut degradation_done = false;
+    // Whether the near-the-limit warning has already been issued for the current
+    // step window. Reset whenever the window restarts so each window gets one.
+    let mut budget_warning_issued = false;
     // Automatic retries for the current logical completion. This survives
     // stall/error retries and is reset after a completed turn is emitted.
     let mut request_retries = 0u32;
@@ -2780,6 +2812,8 @@ async fn run_query_loop_inner(
             retries_left = 2;
             request_retries = 0;
             last_recovery_error = None;
+            // New window, new warning budget.
+            budget_warning_issued = false;
             goal_turn_start = std::time::Instant::now();
             observability_started_at = std::time::Instant::now();
             turn_started_wall = clawde_core::types::now_rfc3339_ms();
@@ -3451,6 +3485,25 @@ async fn run_query_loop_inner(
             }
         }
 
+        // Step-budget warning. Fired once per window, as soon as the remaining
+        // turns drop to `BUDGET_WARNING_TURNS`, so the model can land the work in
+        // flight rather than discovering the limit mid-edit. Request-only, like
+        // the re-anchor above; the degradation turn already carries its own
+        // instruction and must not also see this one.
+        let mut step_budget_pin = None;
+        if !degradation_turn && !budget_warning_issued {
+            if let Some(remaining_turns) = budget_warning_remaining(turn, effective_max_turns) {
+                budget_warning_issued = true;
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status(format!(
+                        "Step budget almost spent ({remaining_turns} turn(s) left) — \
+                         asking the model to land the work in flight."
+                    )));
+                }
+                step_budget_pin = Some(step_budget_warning_pin(remaining_turns));
+            }
+        }
+
         // Build a provider-safe request view. The durable transcript remains
         // untouched; only completed older rounds may be omitted.
         let request_context = build_request_context(
@@ -3480,6 +3533,10 @@ async fn run_query_loop_inner(
         }
         if let Some(ref reanchor) = goal_reanchor_pin {
             api_messages.push(ApiMessage::from(&Message::user(reanchor.clone())));
+        }
+        // Most urgent instruction goes last, where attention is strongest.
+        if let Some(ref budget) = step_budget_pin {
+            api_messages.push(ApiMessage::from(&Message::user(budget.clone())));
         }
         // Max-steps degradation: the final summary turn is dispatched with NO
         // tool definitions so the model can only produce text (issue #230).
@@ -4190,6 +4247,11 @@ async fn run_query_loop_inner(
                     }
                     if let Some(ref reanchor) = goal_reanchor_pin {
                         provider_messages.push(Message::user(reanchor.clone()));
+                    }
+                    // Mirrors the Anthropic-shaped request above: the budget
+                    // warning is the last thing the model reads.
+                    if let Some(ref budget) = step_budget_pin {
+                        provider_messages.push(Message::user(budget.clone()));
                     }
 
                     let provider_request = clawde_api::ProviderRequest {
@@ -10941,5 +11003,56 @@ mod instruction_pin_tests {
             pin.len()
         );
         assert!(pin.ends_with('…'), "got: {}", pin);
+    }
+
+    // -------------------------------------------------------------------
+    // Step-budget warning (near-the-limit handoff nudge)
+    // -------------------------------------------------------------------
+
+    /// The warning must not fire while the window still has slack.
+    #[test]
+    fn budget_warning_is_silent_with_slack() {
+        assert_eq!(budget_warning_remaining(1, 10), None);
+        assert_eq!(budget_warning_remaining(7, 10), None);
+        // Three turns left is still slack: two is the documented threshold.
+        assert_eq!(budget_warning_remaining(8, 10), None);
+    }
+
+    /// It fires on the last two turns of the window, counting inclusively.
+    #[test]
+    fn budget_warning_fires_for_the_final_two_turns() {
+        assert_eq!(budget_warning_remaining(9, 10), Some(2));
+        assert_eq!(budget_warning_remaining(10, 10), Some(1));
+    }
+
+    /// Single-turn budgets and over-run windows stay sane rather than wrapping.
+    #[test]
+    fn budget_warning_handles_short_and_overrun_windows() {
+        assert_eq!(budget_warning_remaining(1, 1), Some(1));
+        assert_eq!(budget_warning_remaining(0, 0), Some(1));
+        // Past the limit: the degradation turn guards on `!degradation_turn`, but
+        // the arithmetic itself must not underflow.
+        assert_eq!(budget_warning_remaining(11, 10), Some(1));
+        assert_eq!(budget_warning_remaining(u32::MAX, 10), Some(1));
+    }
+
+    /// The pin tells the model exactly what to do with the turns it has left.
+    #[test]
+    fn budget_warning_pin_asks_for_a_clean_landing() {
+        let pin = step_budget_warning_pin(2);
+        assert!(pin.contains("Only 2 turns left"), "got: {pin}");
+        assert!(pin.contains("Do not start new work"), "got: {pin}");
+        assert!(
+            pin.contains("Finish the edit already in flight"),
+            "got: {pin}"
+        );
+        assert!(pin.contains("working state"), "got: {pin}");
+
+        // Singular reads correctly.
+        assert!(
+            step_budget_warning_pin(1).contains("Only 1 turn left"),
+            "got: {}",
+            step_budget_warning_pin(1)
+        );
     }
 }

@@ -386,11 +386,7 @@ pub async fn teardown_session(session_id: &str) {
 /// directory, then rename over the destination. A crash or disk-full mid-write
 /// can never leave the destination truncated or half-written.
 pub(crate) async fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    let tmp = path.with_file_name(format!(".{}.clawde-tmp-{}", file_name, std::process::id()));
+    let tmp = atomic_tmp_path(path);
 
     tokio::fs::write(&tmp, contents).await?;
     // Preserve the original file's permissions (e.g. the executable bit on
@@ -405,6 +401,81 @@ pub(crate) async fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std
             Err(e)
         }
     }
+}
+
+/// Monotonic counter for unique temp filenames. Two writes racing in the same
+/// process must never share a `.clawde-tmp-*` path: the first `rename` moves the
+/// second writer's scratch file away, so the second `rename` fails with ENOENT.
+/// That surfaced as `Failed to write file <path>: No such file or directory
+/// (os error 2)` whenever one turn issued several edits against the same file
+/// (observed on `trimux` during the 2026-09-26 evaluation). Same guard — and
+/// same reason — as `AUTH_TMP_SEQ` / `SETTINGS_TMP_SEQ` in `clawde-core`.
+static WRITE_ATOMIC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Scratch path used by [`write_atomic`]. Unique per call, in the destination's
+/// own directory so the final `rename` stays on one filesystem.
+///
+/// The destination is deliberately NOT canonicalized: resolving a symlinked
+/// target could point the `rename` at another mount and turn a currently-working
+/// write into an EXDEV failure.
+fn atomic_tmp_path(path: &std::path::Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    path.with_file_name(format!(
+        ".{}.clawde-tmp-{}-{}",
+        file_name,
+        std::process::id(),
+        WRITE_ATOMIC_SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Most match sites to name in a "must be unique" error before eliding.
+const MATCH_SITES_LISTED: usize = 5;
+
+/// One-based line numbers where `needle` begins in `haystack`.
+///
+/// Used to tell the model *where* an ambiguous `old_string` matched. Without
+/// this, `Edit`/`BatchEdit` only report a count, the model re-reads the file and
+/// guesses — and a guess that still is not unique costs another whole turn
+/// (observed repeatedly on `trimux`, 2026-09-26).
+pub(crate) fn match_line_numbers(haystack: &str, needle: &str) -> Vec<usize> {
+    let mut lines = Vec::new();
+    if needle.is_empty() {
+        return lines;
+    }
+    let mut offset = 0usize;
+    while let Some(pos) = haystack[offset..].find(needle) {
+        let absolute = offset + pos;
+        let line = haystack[..absolute].matches('\n').count() + 1;
+        lines.push(line);
+        // Advance past this match so overlapping repeats are counted the same
+        // way `str::matches` counts them.
+        offset = absolute + needle.len();
+        if offset >= haystack.len() {
+            break;
+        }
+    }
+    lines
+}
+
+/// Render [`match_line_numbers`] as `line 12, 40, 88`, eliding long lists.
+pub(crate) fn describe_match_lines(haystack: &str, needle: &str) -> String {
+    let lines = match_line_numbers(haystack, needle);
+    if lines.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<String> = lines
+        .iter()
+        .take(MATCH_SITES_LISTED)
+        .map(|l| l.to_string())
+        .collect();
+    let mut rendered = format!("line {}", shown.join(", "));
+    if lines.len() > MATCH_SITES_LISTED {
+        rendered.push_str(&format!(", … (+{} more)", lines.len() - MATCH_SITES_LISTED));
+    }
+    rendered
 }
 
 /// A cloneable handle for injecting notification messages into the next agent turn.
@@ -1912,5 +1983,117 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "executable bit preserved");
         assert_eq!(count_atomic_tmp_files(dir.path()), 0);
+    }
+
+    /// Two writes aimed at one destination must never share a scratch path. When
+    /// they did, the first `rename` moved the second writer's temp file away and
+    /// the second `rename` failed with ENOENT — reported to the model as
+    /// `Failed to write file <path>: No such file or directory (os error 2)`
+    /// when a single turn fired several edits at the same file.
+    #[test]
+    fn atomic_tmp_paths_are_unique_per_call() {
+        let dest = std::path::Path::new("/tmp/same-destination.txt");
+        let first = atomic_tmp_path(dest);
+        let second = atomic_tmp_path(dest);
+
+        assert_ne!(
+            first, second,
+            "concurrent writes to one file must not share a temp path"
+        );
+        // Same directory as the destination, so the rename stays on one
+        // filesystem.
+        assert_eq!(first.parent(), dest.parent());
+        assert_eq!(second.parent(), dest.parent());
+    }
+
+    /// End-to-end half of the same bug: many overlapping writes to a single
+    /// destination must all report success. Pre-fix, the shared temp name made
+    /// the losers fail with ENOENT.
+    #[tokio::test]
+    async fn concurrent_writes_to_one_file_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contended.txt");
+
+        for round in 0..8u32 {
+            let mut tasks = Vec::new();
+            for writer in 0..16u32 {
+                let path = path.clone();
+                tasks.push(tokio::spawn(async move {
+                    let payload = format!("round-{round}-writer-{writer}");
+                    let outcome = write_atomic(&path, payload.as_bytes()).await;
+                    (payload, outcome)
+                }));
+            }
+
+            let mut payloads = Vec::new();
+            for task in tasks {
+                let (payload, outcome) = task.await.unwrap();
+                assert!(
+                    outcome.is_ok(),
+                    "round {round}: concurrent write of {payload} failed: {:?}",
+                    outcome.err()
+                );
+                payloads.push(payload);
+            }
+
+            let landed = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                payloads.contains(&landed),
+                "landed content must be exactly one writer's payload, got {landed:?}"
+            );
+        }
+
+        assert_eq!(
+            count_atomic_tmp_files(dir.path()),
+            0,
+            "no scratch files may survive the concurrent writes"
+        );
+    }
+
+    // ---- match-site reporting (Edit / BatchEdit ambiguity errors) -----------
+
+    /// The ambiguity error has to say *where* the matches are, otherwise the
+    /// model re-reads the file and guesses — and a wrong guess burns a turn.
+    #[test]
+    fn match_line_numbers_locates_every_match() {
+        let source = "alpha\nbeta\nalpha\ngamma\nalpha\n";
+        assert_eq!(match_line_numbers(source, "alpha"), vec![1, 3, 5]);
+        assert_eq!(match_line_numbers(source, "gamma"), vec![4]);
+        // Lines are one-based, and a match at the very top is line 1.
+        assert_eq!(match_line_numbers("alpha\n", "alpha"), vec![1]);
+    }
+
+    /// No match (or an empty needle) reports nothing rather than panicking.
+    #[test]
+    fn match_line_numbers_handles_absent_and_empty_needles() {
+        assert!(match_line_numbers("alpha\n", "missing").is_empty());
+        assert!(match_line_numbers("alpha\n", "").is_empty());
+    }
+
+    /// Consecutive matches on one line are each counted, matching how
+    /// `str::matches(..).count()` (the uniqueness check) counts them.
+    #[test]
+    fn match_line_numbers_counts_repeats_within_a_line() {
+        let source = "let x = 1; let x = 2;\n";
+        assert_eq!(match_line_numbers(source, "let x"), vec![1, 1]);
+    }
+
+    /// Long lists elide so one error cannot flood the context window.
+    #[test]
+    fn describe_match_lines_elides_long_lists() {
+        let source = "hit\n".repeat(9);
+        let described = describe_match_lines(&source, "hit");
+        assert!(
+            described.starts_with("line 1, 2, 3, 4, 5"),
+            "got: {described}"
+        );
+        assert!(described.ends_with("(+4 more)"), "got: {described}");
+    }
+
+    /// A short list is printed in full, and an absent needle prints nothing.
+    #[test]
+    fn describe_match_lines_prints_short_lists_and_empty() {
+        assert_eq!(describe_match_lines("a\nb\na\n", "a"), "line 1, 3");
+        assert_eq!(describe_match_lines("a\n", "zzz"), "");
     }
 }

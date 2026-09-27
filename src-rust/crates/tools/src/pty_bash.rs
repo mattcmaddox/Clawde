@@ -149,6 +149,40 @@ fn apply_restored_env(cmd: &mut portable_pty::CommandBuilder, env_vars: &HashMap
     }
 }
 
+/// Pager environment defaults for agent-driven commands.
+///
+/// The wrapper always runs under a real PTY, so `isatty(1)` is true. Programs
+/// that page their output on a tty (`git diff`, `git log`, `git show`, `man`,
+/// `systemctl status`, `journalctl`, `bat`, `delta`) therefore hand off to the
+/// system pager — `/usr/bin/pager` → `less` on Debian — and then block forever
+/// waiting for a keypress. Nothing ever writes to the PTY master (the tool only
+/// *reads* it), so the child can only escape via the turn timeout, and the
+/// whole agent turn stalls (observed on `git diff <file>` during the trimux
+/// evaluation, 2026-09-26).
+///
+/// These are set BEFORE [`apply_restored_env`] so an explicit `export
+/// GIT_PAGER=…` from the user's shell still wins — the defaults only cover the
+/// unset case.
+#[cfg(unix)]
+const NONINTERACTIVE_PAGER_ENV: [(&str, &str); 6] = [
+    ("PAGER", "cat"),
+    // `git` consults GIT_PAGER ahead of any `pager.<cmd>` / `core.pager` config.
+    ("GIT_PAGER", "cat"),
+    ("SYSTEMD_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("BAT_PAGER", "cat"),
+    ("DELTA_PAGER", "cat"),
+];
+
+/// Apply the pager defaults above. Must be called before `apply_restored_env`
+/// so a user-exported pager variable overrides the default.
+#[cfg(unix)]
+fn apply_noninteractive_pager_env(cmd: &mut portable_pty::CommandBuilder) {
+    for (k, v) in NONINTERACTIVE_PAGER_ENV {
+        cmd.env(k, v);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Background execution (identical to bash.rs — no PTY needed for background)
 // ---------------------------------------------------------------------------
@@ -393,6 +427,9 @@ async fn run_in_pty(
     let mut cmd = CommandBuilder::new("bash");
     cmd.args(["-c", script]);
     cmd.cwd(working_dir);
+    // Pager defaults first: a PTY makes every pager-using command block on a
+    // keypress nothing ever sends (see `NONINTERACTIVE_PAGER_ENV`).
+    apply_noninteractive_pager_env(&mut cmd);
     // Restored shell vars go through the child's ENVIRONMENT, never its argv (#211).
     apply_restored_env(&mut cmd, env_vars);
 
@@ -923,6 +960,46 @@ mod tests {
         }
     }
 
+    /// A pager-using command must never block the turn: the PTY child inherits
+    /// `PAGER`/`GIT_PAGER`/… pinned to `cat`, so `git diff` prints and exits
+    /// instead of handing off to `less` and waiting for a keypress nothing
+    /// sends. Regression test for the `git diff` deadlock.
+    #[test]
+    fn pager_env_defaults_suppress_interactive_pagers() {
+        use portable_pty::CommandBuilder;
+
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.args(["-c", "true"]);
+        apply_noninteractive_pager_env(&mut cmd);
+
+        for (key, value) in NONINTERACTIVE_PAGER_ENV {
+            assert_eq!(
+                cmd.get_env(key),
+                Some(OsStr::new(value)),
+                "{key} must be pinned to {value} so a tty does not engage a pager"
+            );
+        }
+    }
+
+    /// An explicit `export GIT_PAGER=…` from the user wins: the defaults are
+    /// applied first, then the persisted shell env is layered on top.
+    #[test]
+    fn restored_pager_export_overrides_the_default() {
+        use portable_pty::CommandBuilder;
+
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.args(["-c", "true"]);
+        apply_noninteractive_pager_env(&mut cmd);
+
+        let mut env_vars = HashMap::new();
+        env_vars.insert("GIT_PAGER".to_string(), "delta".to_string());
+        apply_restored_env(&mut cmd, &env_vars);
+
+        assert_eq!(cmd.get_env("GIT_PAGER"), Some(OsStr::new("delta")));
+        // Untouched defaults survive.
+        assert_eq!(cmd.get_env("PAGER"), Some(OsStr::new("cat")));
+    }
+
     // -----------------------------------------------------------------------
     // Execution tests (#220 / #184) — exercise the live PTY path end-to-end.
     // -----------------------------------------------------------------------
@@ -1064,6 +1141,97 @@ mod tests {
             elapsed < Duration::from_secs(10),
             "execute should return promptly after the direct child exits, took {:?}",
             elapsed
+        );
+    }
+
+    /// End-to-end regression test for the `git diff` deadlock: the pager
+    /// environment must reach the *actually spawned* PTY child, not just a
+    /// `CommandBuilder` built in a unit test. Before the fix, `git diff` inside
+    /// the PTY handed off to `less` and blocked until the turn timeout because
+    /// nothing ever writes to the PTY master.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn spawned_child_sees_pager_pinned_to_cat() {
+        let tool = PtyBashTool;
+        let ctx = allow_all_context();
+
+        let input = json!({
+            "command": "printf 'PAGER=%s GIT_PAGER=%s\\n' \"${PAGER:-unset}\" \"${GIT_PAGER:-unset}\"",
+            "timeout": 15_000u64,
+        });
+
+        let result = tool.execute(input, &ctx).await;
+
+        assert!(
+            !result.is_error,
+            "printing the pager vars should succeed, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("PAGER=cat GIT_PAGER=cat"),
+            "spawned PTY child must inherit PAGER=cat/GIT_PAGER=cat; got: {}",
+            result.content
+        );
+    }
+
+    /// The observable half of the same bug: a command that would page on a tty
+    /// must return output instead of stalling. `git log` uses `less` whenever
+    /// stdout is a tty and the output exceeds one screen.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn pager_using_command_does_not_stall_the_turn() {
+        let tool = PtyBashTool;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+        };
+        if run(&["init", "-q"]).is_err() {
+            // No git on PATH — nothing to assert here.
+            return;
+        }
+        let _ = run(&["config", "user.email", "test@example.com"]);
+        let _ = run(&["config", "user.name", "Test"]);
+        // Enough commits that `git log` output far exceeds one screen.
+        for i in 0..40 {
+            std::fs::write(repo.join("f.txt"), format!("{i}\n")).expect("write fixture");
+            let _ = run(&["add", "f.txt"]);
+            let _ = run(&["commit", "-q", "-m", &format!("commit number {i}")]);
+        }
+
+        let mut ctx = allow_all_context();
+        ctx.working_dir = repo.to_path_buf();
+        // A unique session id: the persistent shell state is keyed per session,
+        // and the sibling PTY tests share this process — a stale cwd from one of
+        // them would silently override `working_dir` here.
+        ctx.session_id = format!("pty-bash-pager-{}", repo.display());
+
+        let input = json!({
+            "command": "git log --oneline",
+            "timeout": 20_000u64,
+        });
+
+        let started = std::time::Instant::now();
+        let result = tool.execute(input, &ctx).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            !result.is_error,
+            "git log should not page; got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("commit number 39"),
+            "expected the log body, got: {}",
+            result.content
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "git log must not block on a pager, took {elapsed:?}"
         );
     }
 }

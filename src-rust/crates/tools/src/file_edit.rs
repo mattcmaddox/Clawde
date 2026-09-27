@@ -122,9 +122,10 @@ impl Tool for FileEditTool {
         }
 
         if count > 1 && !params.replace_all {
+            let sites = crate::describe_match_lines(&normalized, &old_string);
             return ToolResult::error(format!(
-                "old_string appears {} times in {}. Either provide a larger string \
-                 with more surrounding context to make it unique, or set replace_all \
+                "old_string appears {} times in {} ({sites}). Either provide a larger \
+                 string with more surrounding context to make it unique, or set replace_all \
                  to true to replace every occurrence.",
                 count,
                 path.display()
@@ -319,6 +320,13 @@ mod tests {
             .await;
         assert!(res.is_error, "expected error for duplicate old_string");
         assert!(res.content.contains("appears"));
+        // The report must locate the matches — that is what lets the model fix
+        // the ambiguity in one step instead of re-reading and guessing.
+        assert!(
+            res.content.contains("line 1, 2"),
+            "ambiguity error should name the matching lines, got: {}",
+            res.content
+        );
     }
 
     #[tokio::test]

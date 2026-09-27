@@ -159,8 +159,10 @@ impl Tool for BatchEditTool {
                 continue;
             }
             if count > 1 {
+                let sites = crate::describe_match_lines(&normalized, &old_string);
                 pre_check_errors.push(format!(
-                    "Edit {}: old_string appears {} times in {} (must be unique)",
+                    "Edit {}: old_string appears {} times in {} ({sites}) — add \
+                     surrounding context to make it unique",
                     i,
                     count,
                     path.display()
@@ -349,5 +351,38 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().contains(".clawde-tmp-"));
         assert!(!tmp_left, "atomic write must not leave a temp file behind");
+    }
+
+    /// The pre-check abort must locate the ambiguous matches, not just count
+    /// them — otherwise the model re-reads the file and guesses, and a guess
+    /// that is still ambiguous costs another whole turn.
+    #[tokio::test]
+    async fn batch_edit_ambiguity_error_names_the_matching_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup.txt");
+        std::fs::write(&path, "header\nrepeat\nmid\nrepeat\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = BatchEditTool
+            .execute(
+                json!({
+                    "edits": [
+                        { "file_path": path.to_string_lossy(), "old_string": "repeat", "new_string": "REPEAT" }
+                    ]
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(res.is_error, "ambiguous edit must abort: {}", res.content);
+        assert!(
+            res.content.contains("line 2, 4"),
+            "aborted batch should name the matching lines, got: {}",
+            res.content
+        );
+        // Abort must be all-or-nothing: the file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "header\nrepeat\nmid\nrepeat\n"
+        );
     }
 }
