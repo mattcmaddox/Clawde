@@ -179,14 +179,17 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         // fallback when the lightning worker is capacity-starved.
         default_model: "nvidia/nemotron-3.5-lightning-30b-a3b",
         model_family: "nemotron-lightning",
-        note: "Nemotron 3.5 Lightning 30B — 2 keys",
+        note: "Nemotron 3.5 Lightning 30B — org-wide $30/hour cap",
         tool_calling: true,
         vision: false,
         thinking: true,
         max_tokens_cap: Some(8_192),
         context_window: 128_000,
         specialty: "strong generalist",
-        usage: "2 keys · 8K",
+        // Not a per-model rate limit: the ceiling is an organization-wide dollar
+        // cap that resets hourly, and NVIDIA returns no limit headers at all.
+        // The token picker shows this instead of a request count it cannot know.
+        usage: "$30/hr org cap",
         // The lightning worker is the fast lane and is routinely
         // capacity-starved (503 "ResourceExhausted" or 25-75s responses vs the
         // 30s upstream timeout). Fall back to the always-warm 20B sibling on the

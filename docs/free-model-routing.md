@@ -687,3 +687,43 @@ indistinguishable from a bug: "retired" separates *the provider is down* from
 
 `upstream_key_health` was not the right home for this — it is per-provider, so
 in free mode it yields a single "free" row rather than one per upstream.
+
+---
+
+## 11. NVIDIA: the limit is a dollar cap, not a rate limit
+
+The account reports **"your organization has a resource usage limit of $30.00
+per hour"** (org `mattcmaddox-0-zz1i`). That single fact resolves several open
+questions and invalidates one measurement.
+
+NVIDIA's hosted API returns **no rate-limit or spend headers**. A 200 response
+carries only `Nvcf-Reqid` and `Nvcf-Status: fulfilled`. So:
+
+- There is no proactive signal to read. Clawde can only learn the state from an
+  error, which is why the liveness cache is dispatch-fed.
+- Draining 1200+ requests at `max_tokens=2` never tripped anything. That is
+  consistent with a *spend* cap, not a request-rate cap — the earlier "ceiling
+  above the probe cap" reading was the wrong inference from the same fact.
+
+Routing consequences, all recorded in the profile:
+
+| property | value | why |
+| --- | --- | --- |
+| `limit_scope` | `per-key` (unchanged) | the cap is organization-wide dollars, not a per-model bucket |
+| `no_credits_is_terminal` | `false` | the cap **resets hourly**, so it is a periodic quota, never terminal |
+| `terminal_ttl_secs` | `3600` | see below |
+
+### The 403 risk, and why the TTL is now per-provider
+
+Still unverified: the status NVIDIA returns on exhaustion. The docs and forum
+pages are stale or unrelated. If it is **403** rather than 429, the liveness
+gate classifies it `Unauthorized` — correct for a revoked key, but six times too
+long for an hourly reset against a flat 6-hour terminal TTL.
+
+So `terminal_ttl_secs` is now a per-profile field. Erring short is safe: a
+still-broken upstream is simply re-marked on the next attempt. Erring long
+silently removes capacity for hours, which is the failure users notice.
+
+The next time the $30 cap is actually hit, the observed status is what pins the
+mapping. That is the one measurement still outstanding here, and it is not
+obtainable without spending the cap.

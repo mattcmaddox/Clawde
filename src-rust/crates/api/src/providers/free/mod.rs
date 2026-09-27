@@ -3042,6 +3042,17 @@ pub struct ProviderCooldownProfile {
     /// wasted request.
     #[serde(default)]
     pub no_credits_is_terminal: bool,
+    /// How long a `Gone` / `Unauthorized` verdict is trusted before a dispatch
+    /// may re-test the upstream. Defaults to 6 hours.
+    ///
+    /// Per-provider because the same status can mean very different things. A
+    /// revoked API key is terminal; NVIDIA's organization-wide $30/hour spend
+    /// cap resets every hour, so trusting a terminal verdict for 6 hours would
+    /// strand a healthy upstream for six times longer than necessary. Erring
+    /// short is safe — a still-broken upstream is simply re-marked — while
+    /// erring long silently removes capacity.
+    #[serde(default = "default_terminal_ttl_secs")]
+    pub terminal_ttl_secs: u64,
     /// Optional notes about this provider's limits
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
@@ -3051,6 +3062,11 @@ pub struct ProviderCooldownProfile {
 /// `"per-model"`. See [`ProviderCooldownProfile::limit_scope`].
 fn default_limit_scope() -> String {
     "per-key".to_string()
+}
+
+/// Default trust window for a terminal liveness verdict (6 hours).
+fn default_terminal_ttl_secs() -> u64 {
+    6 * 60 * 60
 }
 
 /// Cached cooldown profiles.
@@ -3074,6 +3090,7 @@ impl Default for ProviderCooldownProfile {
             respects_retry_after: false,
             limit_scope: default_limit_scope(),
             no_credits_is_terminal: false,
+            terminal_ttl_secs: default_terminal_ttl_secs(),
             notes: None,
         }
     }

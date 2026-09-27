@@ -15,7 +15,8 @@
       "server_error_cooldown_secs": 60,
       "max_cooldown_secs": 600,
       "respects_retry_after": false,
-      "notes": "RPM: ~40. Often missing Retry-After. Be conservative. UNVERIFIED limit_scope: NVIDIA's API reference carries no per-model limits table, so this stays per-key. Verify with scripts/probes/limit-scope-probe.py before changing."
+      "terminal_ttl_secs": 3600,
+      "notes": "VERIFIED 2026-09-27. NVIDIA's hosted API does NOT expose rate-limit or spend headers: a 200 response carries only Nvcf-Reqid and Nvcf-Status. So there is no proactive signal to read and exhaustion is only observable from the error itself. The account's ceiling is an ORGANIZATION dollar cap - $30.00 per hour, shared by every key and every model in the org - not a per-model RPM/TPM bucket, which is why limit_scope stays per-key and no_credits_is_terminal stays false: the cap RESETS HOURLY, so it is a periodic quota, never a terminal state. Draining 1200+ requests at max_tokens=2 never tripped it, consistent with a spend cap rather than a request rate. UNKNOWN: the exact status NVIDIA returns on exhaustion is unverified - the docs and forum pages are stale. If it is 403 rather than 429, the liveness gate would mark it Unauthorized and suppress it for TERMINAL_TTL_SECS (6h), which is six times too long for an hourly reset."
     },
     "cerebras": {
       "rate_limit_cooldown_secs": 120,
