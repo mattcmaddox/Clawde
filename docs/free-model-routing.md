@@ -571,3 +571,58 @@ This is the "model-dependent quota" case from the top of this section, and the
 Neither bug is fixed here. Bug 1 is a small, well-scoped change to
 `parse_error_response` plus the cooldown path. Bug 2 is one JSON field, gated on
 the same verification as the other `limit_scope` entries.
+
+---
+
+## 9. Catalog dispatch verification (measured 2026-09-27)
+
+`scripts/probes/verify-catalog-models.py` sends one minimal request per
+upstream using the real key, base url and headers, and reports the status. A
+429 counts as healthy: the model exists and only the free quota is spent.
+
+| upstream | status | verdict |
+| --- | --- | --- |
+| poolside | 200 | OK |
+| nvidia | 200 | OK — the `nemotron-3.5-lightning` fix works |
+| cerebras | 402 | **NO-CREDITS** — see below |
+| google | 200 | OK |
+| groq | 200 | OK |
+| sambanova | 429 | OK (rate-limited = exists) |
+| cline | 429 | OK — the `cline-free/` + `X-CLIENT-TYPE` fix works |
+| mistral | 429 | OK (rate-limited = exists) |
+| opencode-zen | 200 | OK |
+| zai | 429 | OK (rate-limited = exists) |
+| cloudflare | 200 | OK |
+| openrouter | — | no key configured, not checked |
+
+**10/12 healthy.** Both catalog fixes made earlier are confirmed end to end.
+
+### Cerebras is not a free tier
+
+```
+HTTP 402 {"message":"Payment required to access this resource. Visit your
+billing tab.","code":"payment_required"}
+```
+
+Its docs answer the question directly: *"Is there a permanently free tier? No.
+The Free Trial is time- and credit-bounded: $5 in credits that expire 30 days
+after they're granted."* So the earlier `limit_scope: per-model` work for
+cerebras is correct **for an account with credits** and irrelevant for one
+without. The upstream will never answer again without payment.
+
+### The gap this leaves
+
+The 402 becomes `ProviderError::Other { status: 402 }`, whose
+`recovery_class` is `QuotaExhausted`, so `may_fallback` is true and the chain
+falls through correctly. But it is not a *decisive* liveness signal, so the
+gate does not suppress it: **cerebras costs one failed request every turn
+forever.**
+
+Suppressing it needs the gate to treat "this account has no credits" as
+terminal, and the current taxonomy cannot express that safely. Mapping
+`QuotaExhausted` to `Unauthorized` would disable the whole upstream on a 402 —
+which is right for cerebras and **wrong for Cline**, where a 402 means the
+request was routed to a paid model id while the account's free models work
+fine. The cline carve-out in `classify_exhaust` exists for exactly this
+reason. Distinguishing them needs a per-upstream signal, not a global rule, so
+this is left open rather than guessed at.
