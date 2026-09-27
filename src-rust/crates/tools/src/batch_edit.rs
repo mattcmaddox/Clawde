@@ -159,9 +159,9 @@ impl Tool for BatchEditTool {
                 continue;
             }
             if count > 1 {
-                let sites = crate::describe_match_lines(&normalized, &old_string);
+                let sites = crate::match_sites_clause(&normalized, &old_string);
                 pre_check_errors.push(format!(
-                    "Edit {}: old_string appears {} times in {} ({sites}) — add \
+                    "Edit {}: old_string appears {} times in {}{sites} — add \
                      surrounding context to make it unique",
                     i,
                     count,

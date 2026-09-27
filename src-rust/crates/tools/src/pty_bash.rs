@@ -116,6 +116,16 @@ fn extract_exports_from_command(command: &str) -> HashMap<String, String> {
 // vars are handed to the child through its ENVIRONMENT via `apply_restored_env`
 // (portable_pty `CommandBuilder::env`), so secret values never touch a command line.
 #[cfg(unix)]
+/// The PTY's stdin is pointed at `/dev/null` (see `build_wrapper_script`) so a
+/// command that tries to *read* input gets EOF immediately instead of blocking
+/// on a tty that nothing ever writes to. That is the primary fix, and it needs
+/// no heuristics: `read`, a bare `cat`, a REPL, or a library prompting for a
+/// token all exit at once, and the user sees the program's own diagnostic
+/// (`sudo: no tty present…`, `read: …`) rather than a synthesized guess.
+///
+/// It does *not* cover a program that opens `/dev/tty` itself, which bypasses
+/// the fd 0 redirect entirely — verified: such a process still blocks. That
+/// residue is what the silence heuristic below exists to catch.
 fn build_wrapper_script(command: &str, state: &ShellState, base_cwd: &PathBuf) -> String {
     let effective_cwd = state.cwd.as_ref().unwrap_or(base_cwd);
     let cwd_escaped: String = effective_cwd.to_string_lossy().replace('\'', "'\\''");
@@ -124,6 +134,7 @@ fn build_wrapper_script(command: &str, state: &ShellState, base_cwd: &PathBuf) -
         r#"set -e
 cd '{cwd}'
 set +e
+exec 0</dev/null
 {user_cmd}
 __CC_EXIT_CODE=$?
 echo '{sentinel}'
@@ -348,6 +359,7 @@ fn strip_ansi(s: &str) -> String {
 
 /// Outcome of a single foreground PTY run.
 #[cfg(unix)]
+#[derive(Debug)]
 enum PtyOutcome {
     /// The command finished; carries (raw PTY output, exit code).
     Completed(String, i32),
@@ -355,6 +367,10 @@ enum PtyOutcome {
     TimedOut,
     /// The PTY could not be set up / the command could not be spawned.
     Failed(String),
+    /// The command went silent after printing what looks like a prompt, so it
+    /// was blocked on input the read-only PTY can never supply. Carries the
+    /// prompt fragment it stopped at, plus the output produced before that.
+    BlockedOnInput { prompt: String, output: String },
 }
 
 /// Guard that guarantees the PTY child is killed if the running future is
@@ -472,9 +488,15 @@ async fn run_in_pty(
     let mut guard = PtyKillGuard::new(killer);
 
     match tokio::time::timeout(timeout, read_handle).await {
-        Ok(Ok((output, exit_code))) => {
+        Ok(Ok(PtyDrive::Completed(output, exit_code))) => {
             guard.disarm();
             PtyOutcome::Completed(output, exit_code)
+        }
+        Ok(Ok(PtyDrive::BlockedOnInput { output, prompt })) => {
+            // The read thread already killed and reaped the child, so there is
+            // nothing left for the guard to do.
+            guard.disarm();
+            PtyOutcome::BlockedOnInput { prompt, output }
         }
         Ok(Err(e)) => {
             guard.disarm();
@@ -493,6 +515,79 @@ async fn run_in_pty(
 /// child has exited even while a detached grandchild still holds the pty open.
 #[cfg(unix)]
 const PTY_POLL_INTERVAL_MS: i32 = 20;
+
+/// How long an interactive PTY command may produce no output before silence is
+/// treated as "blocked on a prompt".
+///
+/// The PTY master is read-only by design (only `try_clone_reader` is taken, so
+/// the agent never types into a child process), which means a command that asks
+/// a question can never be answered and would otherwise block for the entire
+/// turn timeout — 120s by default — with nothing on screen to explain it. This
+/// bounds that to seconds instead. It is deliberately generous because it only
+/// applies to the interactive PTY path; the plain non-PTY bash tool is
+/// untouched.
+#[cfg(unix)]
+const PTY_PROMPT_SILENCE_MS: u64 = 10_000;
+
+/// Longest trailing fragment [`tail_looks_like_prompt`] will consider. A real
+/// prompt is short; a progress bar or log stream is not.
+#[cfg(unix)]
+const PTY_PROMPT_MAX_CHARS: usize = 120;
+
+/// Does the tail of `output` look like a program waiting for an answer?
+///
+/// Silence alone is never enough: a large `tar`, a `sleep`, a quiet test suite
+/// and a `cargo` progress bar are all legitimately silent, and killing those
+/// would break real work. So this also requires the *shape* of a prompt — a
+/// short, unterminated trailing fragment (no closing newline) that reads like a
+/// question. That is what an interactive prompt actually looks like on a tty:
+/// it writes the question and then waits with the cursor sitting mid-line.
+#[cfg(unix)]
+fn tail_looks_like_prompt(output: &str) -> bool {
+    // The fragment after the last newline, with carriage returns stripped: a
+    // progress bar redraws in place with `\r`, which would otherwise read as one
+    // long unterminated tail.
+    let tail = output.rsplit('\n').next().unwrap_or_default();
+    let tail = tail.trim_end_matches('\r').trim();
+    if tail.is_empty() || tail.chars().count() > PTY_PROMPT_MAX_CHARS {
+        return false;
+    }
+    // Require real words, so a bare `>` or `: ` does not count as a prompt.
+    if !tail.chars().any(char::is_alphabetic) {
+        return false;
+    }
+    let lower = tail.to_ascii_lowercase();
+    // Explicit yes/no affordances, in either bracketing style.
+    if lower.contains("[y/n]") || lower.contains("(y/n)") {
+        return true;
+    }
+    const PROMPT_WORDS: [&str; 8] = [
+        "password",
+        "passphrase",
+        "username",
+        "continue",
+        "proceed",
+        "overwrite",
+        "confirm",
+        "yes/no",
+    ];
+    if PROMPT_WORDS.iter().any(|w| lower.contains(w)) {
+        return true;
+    }
+    // A trailing question or label marker: "Password for user: ", "Are you
+    // sure? ", "user@host's password:".
+    matches!(tail.chars().last(), Some(':') | Some('?') | Some('>'))
+}
+
+/// Result of driving a PTY child to completion.
+#[cfg(unix)]
+enum PtyDrive {
+    /// The direct child exited on its own; carries (output, exit code).
+    Completed(String, i32),
+    /// The child was killed because it went silent after emitting what looks
+    /// like a prompt. Carries the output so far and the prompt it stopped at.
+    BlockedOnInput { output: String, prompt: String },
+}
 
 /// Wait up to `timeout_ms` for `fd` to become readable. Returns `true` when the
 /// caller should attempt a read — data ready, EOF/hangup, or a poll error we'd
@@ -533,13 +628,15 @@ fn drive_pty_child(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     mut reader: Box<dyn std::io::Read + Send>,
     master_fd: Option<std::os::unix::io::RawFd>,
-) -> (String, i32) {
+) -> PtyDrive {
     use std::io::Read;
 
     let mut output = String::new();
     let mut buf = [0u8; 4096];
     const MAX_BYTES: usize = 2 * 1024 * 1024;
     let mut total = 0usize;
+    // When we last saw bytes from the child, for prompt-blocked detection.
+    let mut last_output_at = std::time::Instant::now();
 
     // Set once the direct child has exited. We then drain any already-buffered
     // pty output and stop — we never block waiting for EOF that a detached
@@ -564,6 +661,7 @@ fn drive_pty_child(
                         break;
                     }
                     output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    last_output_at = std::time::Instant::now();
                     continue; // keep draining while bytes remain
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -583,7 +681,27 @@ fn drive_pty_child(
                 // bytes; the `child_exited` guard above then breaks us out.
                 child_exited = true;
             }
-            Ok(None) => {}   // still running
+            Ok(None) => {
+                // Alive, but nothing to read. If it has been silent long enough
+                // AND the tail reads like a question, it is blocked on input
+                // that a read-only PTY can never supply. Kill it now and report
+                // why, instead of burning the whole turn timeout (120s by
+                // default) and returning a bare "timed out".
+                if last_output_at.elapsed() >= Duration::from_millis(PTY_PROMPT_SILENCE_MS)
+                    && tail_looks_like_prompt(&output)
+                {
+                    let _ = child.kill();
+                    // Reap, so a killed child does not linger as a zombie.
+                    let _ = child.wait();
+                    let prompt = output
+                        .rsplit('\n')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    return PtyDrive::BlockedOnInput { output, prompt };
+                }
+            } // still running
             Err(_) => break, // can't observe the child — bail rather than spin
         }
     }
@@ -592,7 +710,7 @@ fn drive_pty_child(
         Ok(status) => status.exit_code() as i32,
         Err(_) => -1,
     };
-    (output, exit_code)
+    PtyDrive::Completed(output, exit_code)
 }
 
 // ---------------------------------------------------------------------------
@@ -881,6 +999,33 @@ impl Tool for PtyBashTool {
                     truncate_output(output, exit_code)
                 }
                 PtyOutcome::Failed(e) => ToolResult::error(format!("PTY execution failed: {}", e)),
+                PtyOutcome::BlockedOnInput { prompt, output } => {
+                    // Name the prompt the command stopped at, plus whatever it
+                    // managed to print first, so the user can see the cause
+                    // instead of an unexplained stall or a bare timeout.
+                    let context = strip_ansi(&output);
+                    let tail: Vec<&str> = context.lines().rev().take(20).collect();
+                    let mut message = format!(
+                        "Command is waiting for input and cannot continue — the agent's \
+                         terminal never answers prompts. It stopped at: {}",
+                        if prompt.is_empty() {
+                            "(no prompt text)"
+                        } else {
+                            &prompt
+                        }
+                    );
+                    if !tail.is_empty() {
+                        let mut shown: Vec<&str> = tail;
+                        shown.reverse();
+                        message.push_str("\n\nOutput before it blocked:\n");
+                        message.push_str(&shown.join("\n"));
+                    }
+                    message.push_str(
+                        "\n\nRe-run it non-interactively: pass a flag that skips the \
+                         prompt, pre-authenticate, or set CI=1 / DEBIAN_FRONTEND=noninteractive.",
+                    );
+                    ToolResult::error(message)
+                }
                 PtyOutcome::TimedOut => {
                     ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
                 }
@@ -1233,5 +1378,236 @@ mod tests {
             elapsed < Duration::from_secs(15),
             "git log must not block on a pager, took {elapsed:?}"
         );
+    }
+
+    // ---- prompt-blocked detection ------------------------------------------
+
+    /// Real prompts on a tty are recognized. Each of these would otherwise hang
+    /// for the full 120s turn timeout with nothing on screen.
+    #[test]
+    fn prompt_shaped_tails_are_detected() {
+        for out in [
+            "[sudo] password for churl: ",
+            "user@github.com's password: ",
+            "Enter passphrase for key '/home/churl/.ssh/id_ed25519': ",
+            "Username for 'https://github.com': ",
+            "Overwrite file? [y/N] ",
+            "Proceed? [y/N] ",
+            "Are you sure you want to continue",
+            "File exists. Overwrite? (y/n) ",
+            "continue? ",
+        ] {
+            assert!(
+                tail_looks_like_prompt(out),
+                "should be treated as a prompt: {out:?}"
+            );
+        }
+    }
+
+    /// The false-positive guard — this is the whole reason silence alone is not
+    /// enough. Legitimately silent work must be left alone: a `sleep`, a big
+    /// `tar`, a quiet test run, and a `cargo` progress bar all look similar from
+    /// the outside, and killing those would break real work.
+    #[test]
+    fn silent_but_legitimate_work_is_not_mistaken_for_a_prompt() {
+        // Longer than the prompt tail limit: log spam, not a question.
+        let log_spam = "x".repeat(PTY_PROMPT_MAX_CHARS + 1);
+        for out in [
+            "",
+            "\n",
+            "   \n",
+            // Progress bar redraws in place with `\r` and never emits a newline.
+            "   Compiling serde v1.0.200\r   Compiling tokio v1.38.0\r",
+            "downloading 45%\r",
+            // Finished cleanly on a line boundary: not waiting for anything.
+            "build succeeded\n",
+            log_spam.as_str(),
+            // Punctuation-only tail carries no question.
+            "> ",
+            ": ",
+        ] {
+            assert!(
+                !tail_looks_like_prompt(out),
+                "must NOT be treated as a prompt: {out:?}"
+            );
+        }
+    }
+
+    /// A prompt that follows real output is still found — the check looks at
+    /// only the fragment after the last newline.
+    #[test]
+    fn prompt_is_found_after_earlier_output() {
+        let out = "Cloning into 'repo'...\nremote: Enumerating objects\nPassword for 'https://x': ";
+        assert!(tail_looks_like_prompt(out));
+    }
+
+    /// A prompt preceded by a `\r`-redrawn progress bar is still found, since
+    /// only the trailing `\r` is stripped rather than the whole line.
+    #[test]
+    fn prompt_is_found_after_a_carriage_return_redraw() {
+        let out = "Building 90%\rPassword for 'https://x': ";
+        assert!(tail_looks_like_prompt(out));
+    }
+
+    /// The real thing, end to end, through the tool: a command that asks a
+    /// question and then waits must be killed and the user must be told why,
+    /// rather than the turn freezing and then reporting a bare timeout. This
+    /// exercises the production `PTY_PROMPT_SILENCE_MS`, so it genuinely waits
+    /// out the grace period — the point is that it returns in seconds.
+    #[tokio::test]
+    async fn blocked_command_is_killed_and_explained() {
+        let tool = PtyBashTool;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ctx = allow_all_context();
+        ctx.working_dir = dir.path().to_path_buf();
+        // Unique session id: shell state is keyed per session and sibling PTY
+        // tests share this process, so a stale cwd would leak in.
+        ctx.session_id = format!("pty-bash-blocked-{}", dir.path().display());
+
+        let input = json!({
+            "command": "printf 'Password for user: '; sleep 300",
+            "timeout": 120_000u64,
+        });
+
+        let started = std::time::Instant::now();
+        let result = tool.execute(input, &ctx).await;
+        let elapsed = started.elapsed();
+
+        // The whole point: seconds, not the full 120s timeout.
+        assert!(
+            elapsed < Duration::from_secs(25),
+            "should have failed fast, took {elapsed:?}"
+        );
+        assert!(result.is_error, "expected an error result");
+        // The user-facing text has to name the cause, not just say "timed out".
+        assert!(
+            result.content.contains("waiting for input"),
+            "error should explain the block, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Password for user"),
+            "error should quote the prompt it stopped at, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Re-run it non-interactively"),
+            "error should say what to do instead, got: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("timed out"),
+            "this is not a timeout, it is a blocked prompt: {}",
+            result.content
+        );
+    }
+
+    /// A long silent command that is NOT a prompt must still be allowed to run
+    /// to completion. This is the regression guard for the false-positive risk:
+    /// the detector must not shorten ordinary work.
+    #[tokio::test]
+    async fn slow_silent_command_is_allowed_to_finish() {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_in_pty(
+                "sleep 3; printf 'done\\n'",
+                "/tmp",
+                &HashMap::new(),
+                Duration::from_secs(55),
+            ),
+        )
+        .await
+        .expect("should complete within its own timeout");
+
+        match outcome {
+            PtyOutcome::Completed(out, code) => {
+                assert_eq!(code, 0, "stderr/stdout was: {out}");
+                assert!(out.contains("done"), "got: {out}");
+            }
+            other => panic!("slow silent command must not be killed, got {other:?}"),
+        }
+    }
+
+    /// The primary fix: the wrapper must point fd 0 at `/dev/null` so a command
+    /// that reads stdin gets EOF instead of blocking on a tty nobody writes to.
+    /// It has to come before the user command, otherwise it protects nothing.
+    #[test]
+    fn wrapper_points_stdin_at_devnull_before_the_user_command() {
+        let state = ShellState::new();
+        let script = build_wrapper_script("echo hi", &state, &PathBuf::from("/tmp"));
+        let redirect = script
+            .find("exec 0</dev/null")
+            .expect("wrapper must redirect stdin from /dev/null");
+        let user_cmd = script
+            .find("echo hi")
+            .expect("wrapper must still contain the user command");
+        assert!(
+            redirect < user_cmd,
+            "the redirect must precede the user command, got:\n{script}"
+        );
+    }
+
+    /// End to end: a command that reads stdin now returns promptly with the
+    /// program's own EOF behaviour, instead of hanging for the turn timeout.
+    /// This is the case the text heuristic alone could never catch — a bare
+    /// `read` prints no prompt to match against.
+    #[tokio::test]
+    async fn command_that_reads_stdin_gets_eof_instead_of_hanging() {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_in_pty(
+                "printf 'Value: '; read v; echo \"got=[$v]\"",
+                "/tmp",
+                &HashMap::new(),
+                Duration::from_secs(120),
+            ),
+        )
+        .await
+        .expect("read must EOF rather than block for the turn timeout");
+
+        match outcome {
+            // Either the command completed (read EOF'd) or the backstop caught
+            // it. What must NOT happen is a 120s stall.
+            PtyOutcome::Completed(out, _) => {
+                assert!(out.contains("got=[]"), "read should see EOF: {out}");
+            }
+            PtyOutcome::BlockedOnInput { prompt, .. } => {
+                assert!(prompt.contains("Value"), "got prompt: {prompt:?}");
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    /// A program that opens `/dev/tty` directly bypasses the fd 0 redirect and
+    /// still blocks — verified experimentally. That residue is precisely what
+    /// the silence heuristic is for, so this test pins the two layers together:
+    /// the redirect handles fd-0 readers, the heuristic handles the rest.
+    #[tokio::test]
+    async fn dev_tty_reader_is_still_caught_by_the_backstop() {
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(40),
+            run_in_pty(
+                // Reads the controlling terminal, not fd 0 — fd 0 is /dev/null.
+                "exec 3</dev/tty; printf 'sudo password: '; read line <&3",
+                "/tmp",
+                &HashMap::new(),
+                Duration::from_secs(120),
+            ),
+        )
+        .await
+        .expect("must not wait for the full turn timeout");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "backstop should have fired, took {:?}",
+            started.elapsed()
+        );
+        match outcome {
+            PtyOutcome::BlockedOnInput { prompt, .. } => {
+                assert!(prompt.contains("sudo password"), "got prompt: {prompt:?}");
+            }
+            other => panic!("expected the backstop to catch it, got {other:?}"),
+        }
     }
 }

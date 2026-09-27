@@ -440,6 +440,13 @@ const MATCH_SITES_LISTED: usize = 5;
 /// this, `Edit`/`BatchEdit` only report a count, the model re-reads the file and
 /// guesses — and a guess that still is not unique costs another whole turn
 /// (observed repeatedly on `trimux`, 2026-09-26).
+///
+/// Requires a non-empty `needle`; an empty one returns no sites. That
+/// deliberately diverges from `str::matches`, which reports exactly one
+/// (empty) match for `""`. Every caller rejects an empty `old_string` before it
+/// counts, so the divergence is unreachable — and returning no sites is the
+/// safe answer, because the alternative would report a line number that is
+/// really just "the whole file".
 pub(crate) fn match_line_numbers(haystack: &str, needle: &str) -> Vec<usize> {
     let mut lines = Vec::new();
     if needle.is_empty() {
@@ -476,6 +483,21 @@ pub(crate) fn describe_match_lines(haystack: &str, needle: &str) -> String {
         rendered.push_str(&format!(", … (+{} more)", lines.len() - MATCH_SITES_LISTED));
     }
     rendered
+}
+
+/// A ready-to-interpolate ` (line 2, 4)` clause, or an empty string when the
+/// sites could not be determined.
+///
+/// Stops a caller that reaches the ambiguity branch with an empty `old_string`
+/// from rendering a dangling `appears 3 times in f.txt ()` — the count in that
+/// message comes from `str::matches`, which *does* report matches for `""`.
+pub(crate) fn match_sites_clause(haystack: &str, needle: &str) -> String {
+    let described = describe_match_lines(haystack, needle);
+    if described.is_empty() {
+        String::new()
+    } else {
+        format!(" ({described})")
+    }
 }
 
 /// A cloneable handle for injecting notification messages into the next agent turn.
@@ -2095,5 +2117,70 @@ mod tests {
     fn describe_match_lines_prints_short_lists_and_empty() {
         assert_eq!(describe_match_lines("a\nb\na\n", "a"), "line 1, 3");
         assert_eq!(describe_match_lines("a\n", "zzz"), "");
+    }
+
+    /// Pin the one intentional divergence from `str::matches`, so it stays a
+    /// documented contract rather than something a future reader rediscovers.
+    /// An empty needle makes `str::matches` report `len + 1` matches (one before
+    /// every character plus one at the end), which is why every call site must
+    /// reject an empty `old_string` before it counts. Our helper answers "no
+    /// sites" instead, and the clause collapses, so a caller that ever lost that
+    /// guard could not emit a dangling `()`.
+    #[test]
+    fn empty_needle_reports_no_sites_and_renders_no_clause() {
+        assert_eq!("".matches("").count(), 1);
+        assert_eq!("abc".matches("").count(), 4);
+        assert!(match_line_numbers("abc", "").is_empty());
+        assert_eq!(match_sites_clause("abc", ""), "");
+        assert_eq!(match_sites_clause("a\na\n", "a"), " (line 1, 2)");
+    }
+
+    /// The uniqueness decision uses `str::matches(..).count()`; the error text
+    /// lists sites from [`match_line_numbers`]. If the two ever disagreed, the
+    /// message would contradict itself ("appears 2 times (line 5)"). This walks
+    /// a deterministic cross-product of texts and non-empty needles — the
+    /// documented precondition — and asserts they always agree.
+    #[test]
+    fn match_site_count_always_agrees_with_str_matches() {
+        let texts = [
+            "",
+            "a",
+            "\n",
+            "a\na",
+            "a\na\na\n",
+            "aa",
+            "aaaa",
+            "aabaa",
+            "ab\nab\nab",
+            "line1\nline2\nline1\nline3\nline1\n",
+            "x\r\nx\r\nx",
+        ];
+        let needles = ["a", "aa", "ab", "x", "line1", "\n", "a\n", "aabaa", "zzz"];
+
+        for text in texts {
+            for needle in needles {
+                let counted = text.matches(needle).count();
+                let listed = match_line_numbers(text, needle).len();
+                assert_eq!(
+                    counted, listed,
+                    "str::matches and match_line_numbers disagree for \
+                     text={text:?} needle={needle:?}"
+                );
+            }
+        }
+    }
+
+    /// The listed lines must actually contain the needle — otherwise the model
+    /// is sent to a line that does not hold the match.
+    #[test]
+    fn every_listed_line_really_contains_the_needle() {
+        let text = "alpha\nbeta\nalpha\ngamma\nalpha\ndelta alpha\n";
+        for line_no in match_line_numbers(text, "alpha") {
+            let line = text.lines().nth(line_no - 1).expect("line exists");
+            assert!(
+                line.contains("alpha"),
+                "reported line {line_no} ({line:?}) does not contain the needle"
+            );
+        }
     }
 }

@@ -122,9 +122,9 @@ impl Tool for FileEditTool {
         }
 
         if count > 1 && !params.replace_all {
-            let sites = crate::describe_match_lines(&normalized, &old_string);
+            let sites = crate::match_sites_clause(&normalized, &old_string);
             return ToolResult::error(format!(
-                "old_string appears {} times in {} ({sites}). Either provide a larger \
+                "old_string appears {} times in {}{sites}. Either provide a larger \
                  string with more surrounding context to make it unique, or set replace_all \
                  to true to replace every occurrence.",
                 count,
