@@ -145,6 +145,7 @@ impl FreeProvider {
                 CapacityState::new(n).with_persistence(upstream_ids, None),
             )),
             tool_dialect: Arc::new(Mutex::new(ToolDialectState::load(n))),
+            liveness: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -206,6 +207,7 @@ impl FreeProvider {
             latencies: Arc::new(Mutex::new(latencies)),
             capacity: Arc::new(Mutex::new(capacity)),
             tool_dialect: Arc::new(Mutex::new(ToolDialectState::load(n))),
+            liveness: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -467,7 +469,7 @@ impl FreeProvider {
         let mut plan: Vec<(usize, String)> = plan
             .into_iter()
             .filter(|(idx, _)| {
-                let state = crate::providers::free::liveness_of(self.chain[*idx].upstream.id);
+                let state = self.liveness_of(self.chain[*idx].upstream.id);
                 if state.is_usable() {
                     return true;
                 }
@@ -488,6 +490,20 @@ impl FreeProvider {
         // task preference and catalog order intact within each capacity tier,
         // including adjacent primary/fallback model rows.
         if !matches!(route, Route::Pinned { .. }) {
+            // Proactive quota switching. A per-model cap is recorded against
+            // the exact (upstream, model) pair that hit it, so demote exactly
+            // those rows and let the upstream's *other* models move up. This is
+            // what makes a Cline daily cap on `deepseek-v4.1-flash` promote
+            // `gemini-3.8-flash` on the same account instead of waiting for the
+            // failure to repeat. Rows are demoted, never dropped: the cap resets
+            // and the model must return to the plan.
+            let capped: Vec<(String, String)> = self.capped_models();
+            if !capped.is_empty() {
+                plan.sort_by_key(|(idx, model)| {
+                    let uid = self.chain[*idx].upstream.id;
+                    u8::from(capped.iter().any(|(id, m)| id == uid && m == model))
+                });
+            }
             // Routing gate: for tool-bearing requests, demote upstreams that
             // habitually answer with non-native (prose) tool calls so the chain
             // prefers lanes that emit structured calls. Stable sort keeps the
@@ -1094,21 +1110,108 @@ impl FreeProvider {
     /// `err` is `None` for success. Only decisive statuses are recorded;
     /// anything else leaves the cache alone so a transient blip cannot mark a
     /// healthy upstream as retired.
+    /// Record a liveness verdict on this provider's own store.
+    fn record_liveness(&self, upstream_id: &str, model: &str, state: Liveness) {
+        let mut store = match self.liveness.lock() {
+            Ok(store) => store,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(existing) = store.iter_mut().find(|r| r.upstream_id == upstream_id) {
+            let terminal_still_valid =
+                matches!(existing.state, Liveness::Gone | Liveness::Unauthorized)
+                    && now.saturating_sub(existing.observed_at_unix)
+                        < crate::providers::free::TERMINAL_TTL_SECS
+                    && !matches!(state, Liveness::Dispatchable);
+            if terminal_still_valid {
+                return;
+            }
+            existing.model = model.to_string();
+            existing.state = state;
+            existing.observed_at_unix = now;
+            return;
+        }
+        store.push(crate::providers::free::LivenessRecord {
+            upstream_id: upstream_id.to_string(),
+            model: model.to_string(),
+            state,
+            observed_at_unix: now,
+        });
+    }
+
+    /// This provider's cached liveness verdict for an upstream.
+    fn liveness_of(&self, upstream_id: &str) -> Liveness {
+        match self.liveness.lock() {
+            Ok(store) => store
+                .iter()
+                .find(|r| r.upstream_id == upstream_id)
+                .map(|r| r.state)
+                .unwrap_or(Liveness::Unknown),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .iter()
+                .find(|r| r.upstream_id == upstream_id)
+                .map(|r| r.state)
+                .unwrap_or(Liveness::Unknown),
+        }
+    }
+
+    /// `(upstream_id, model)` pairs currently capped, for quota switching.
+    fn capped_models(&self) -> Vec<(String, String)> {
+        match self.liveness.lock() {
+            Ok(store) => store
+                .iter()
+                .filter(|r| matches!(r.state, Liveness::RateLimited { .. }))
+                .map(|r| (r.upstream_id.clone(), r.model.clone()))
+                .collect(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .iter()
+                .filter(|r| matches!(r.state, Liveness::RateLimited { .. }))
+                .map(|r| (r.upstream_id.clone(), r.model.clone()))
+                .collect(),
+        }
+    }
+
+    /// Point this provider at the process-wide liveness store so the TUI and
+    /// the startup log can read what dispatch observed. Call once, at
+    /// registration.
+    pub fn share_liveness(mut self) -> Self {
+        self.liveness = crate::providers::free::shared_liveness_store();
+        self
+    }
+
     fn observe_liveness(&self, idx: usize, model: &str, err: Option<&ProviderError>) {
+        use crate::provider_error::RecoveryClass;
+        let upstream_id = self.chain[idx].upstream.id;
         let state = match err {
             None => Liveness::Dispatchable,
             Some(err) => match err.recovery_class() {
-                crate::provider_error::RecoveryClass::ModelUnavailable => Liveness::Gone,
-                crate::provider_error::RecoveryClass::InvalidCredential => Liveness::Unauthorized,
-                crate::provider_error::RecoveryClass::RateLimited => Liveness::RateLimited {
+                RecoveryClass::ModelUnavailable => Liveness::Gone,
+                RecoveryClass::InvalidCredential => Liveness::Unauthorized,
+                RecoveryClass::RateLimited => Liveness::RateLimited {
                     retry_after_secs: err.retry_after_secs(),
                 },
+                // Out of credits. This is only evidence that the whole upstream
+                // is finished when the provider's profile says so: cerebras'
+                // $5 trial never refills, while a Cline 402 just means a paid
+                // model id was requested and its free models still work.
+                RecoveryClass::QuotaExhausted
+                    if crate::providers::free::cooldown_profiles()
+                        .profile_for(upstream_id)
+                        .no_credits_is_terminal =>
+                {
+                    Liveness::Unauthorized
+                }
                 // Quota, 5xx, context overflow, and everything else are not
                 // evidence about whether the model exists.
                 _ => return,
             },
         };
-        crate::providers::free::record_liveness(self.chain[idx].upstream.id, model, state);
+        self.record_liveness(upstream_id, model, state);
     }
 
     fn record_failure(&self, idx: usize, task: TaskType) {
@@ -5097,19 +5200,12 @@ mod tests {
         assert_eq!(plan[1].0, 0);
     }
 
-    /// The liveness cache is process-global, so tests that mutate it must not
-    /// run concurrently with any other test that builds a plan — otherwise a
-    /// `Gone` recorded for one upstream silently changes another's plan. This
-    /// mirrors the crate's ENV_LOCK convention for process-global test state.
-    static LIVENESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A liveness gate exists because a retired model is not a rate limit:
     /// NVIDIA answers HTTP 410 for `openai/gpt-oss-120b` and Cline answers 403
     /// for models the account may not use. Either way the upstream must leave
     /// the plan rather than burn a request on every turn.
     #[test]
     fn retired_upstream_is_dropped_from_the_plan() {
-        let _guard = LIVENESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let provider = FreeProvider::with_routing(
             vec![entry("groq", true), entry("sambanova", true)],
             RoutingConfig::default(),
@@ -5125,8 +5221,7 @@ mod tests {
             "an unprobed upstream must stay in the plan"
         );
 
-        crate::providers::free::clear_liveness();
-        crate::providers::free::record_liveness("groq", "llama-3.3-70b", Liveness::Gone);
+        provider.record_liveness("groq", "llama-3.3-70b", Liveness::Gone);
         let after = provider.attempt_plan(&Route::Auto, Some(&req));
         assert!(
             !after
@@ -5140,8 +5235,6 @@ mod tests {
                 .any(|(idx, _)| provider.chain[*idx].upstream.id == "sambanova"),
             "the healthy lane must survive"
         );
-
-        crate::providers::free::clear_liveness();
     }
 
     /// `RateLimited` is NOT a reason to drop the upstream: on a per-model
@@ -5149,15 +5242,13 @@ mod tests {
     /// carry their own daily cap).
     #[test]
     fn rate_limited_upstream_stays_in_the_plan() {
-        let _guard = LIVENESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let provider = FreeProvider::with_routing(
             vec![entry("cline", true), entry("groq", true)],
             RoutingConfig::default(),
             false,
         );
         let req = dummy_request("free/auto");
-        crate::providers::free::clear_liveness();
-        crate::providers::free::record_liveness(
+        provider.record_liveness(
             "cline",
             "cline-free/deepseek-v4.1-flash",
             Liveness::RateLimited {
@@ -5170,25 +5261,179 @@ mod tests {
                 .any(|(idx, _)| provider.chain[*idx].upstream.id == "cline"),
             "a per-model cap must not remove the whole upstream"
         );
-        crate::providers::free::clear_liveness();
     }
 
     /// A transport failure is not evidence a model is retired. Disabling on it
     /// would take the whole chain down during a network blip.
     #[test]
     fn indeterminate_probe_does_not_disable_the_upstream() {
-        let _guard = LIVENESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let provider =
             FreeProvider::with_routing(vec![entry("groq", true)], RoutingConfig::default(), false);
         let req = dummy_request("free/auto");
-        crate::providers::free::clear_liveness();
-        crate::providers::free::record_liveness("groq", "whatever", Liveness::Indeterminate);
+        provider.record_liveness("groq", "whatever", Liveness::Indeterminate);
         let plan = provider.attempt_plan(&Route::Auto, Some(&req));
         assert!(
             !plan.is_empty(),
             "an unreachable probe must not disable the chain"
         );
-        crate::providers::free::clear_liveness();
+    }
+
+    /// The 402 carve-out. cerebras has no free tier that refills, so its 402 is
+    /// terminal and the upstream must leave the plan. Cline's 402 only means a
+    /// *paid* model id was requested while its free models keep working, so the
+    /// same signal must NOT disable that lane. The difference is the profile's
+    /// `no_credits_is_terminal`, not a global rule.
+    /// Proactive quota switching: a per-model cap on one model must push the
+    /// upstream's OTHER models ahead of it, without dropping anything. Cline's
+    /// six free models each carry their own daily cap, so this is the case that
+    /// matters: capping one must promote the rest on the same account.
+    #[test]
+    fn a_capped_model_is_demoted_but_its_siblings_are_promoted() {
+        let provider = FreeProvider::with_routing(
+            vec![entry("cline", true), entry("groq", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        let req = dummy_request("free/auto");
+        let before: Vec<String> = provider
+            .attempt_plan(&Route::Auto, Some(&req))
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
+        // Cap the model cline actually serves, not whatever sorts first, so the
+        // record is guaranteed to match a plan row.
+        let capped_model = provider.chain[0]
+            .effective_model
+            .clone()
+            .unwrap_or_else(|| provider.chain[0].upstream.default_model.to_string());
+        assert!(
+            before.contains(&capped_model),
+            "fixture must serve {capped_model}, got {before:?}"
+        );
+        assert!(before.len() > 1, "chain needs a sibling row to promote");
+
+        provider.record_liveness(
+            "cline",
+            &capped_model,
+            Liveness::RateLimited {
+                retry_after_secs: Some(75_000),
+            },
+        );
+
+        let after: Vec<String> = provider
+            .attempt_plan(&Route::Auto, Some(&req))
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "a capped model is demoted, never dropped - the cap resets"
+        );
+        assert!(
+            after.last() == Some(&capped_model),
+            "the capped model must sort last, got {after:?}"
+        );
+        assert!(
+            after.iter().any(|m| m != &capped_model),
+            "a sibling model must be promoted ahead of it"
+        );
+    }
+
+    /// A global cap (`Gone` / `Unauthorized`) is NOT a per-model demotion and
+    /// must not be confused with one: those drop the upstream entirely, which
+    /// the liveness gate already handles.
+    #[test]
+    fn a_global_liveness_verdict_is_not_treated_as_a_model_cap() {
+        let provider = FreeProvider::with_routing(
+            vec![entry("cline", true), entry("groq", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        let req = dummy_request("free/auto");
+        let model = provider.chain[0]
+            .effective_model
+            .clone()
+            .unwrap_or_default();
+        provider.record_liveness("cline", &model, Liveness::Gone);
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        assert!(
+            !plan
+                .iter()
+                .any(|(idx, _)| provider.chain[*idx].upstream.id == "cline"),
+            "a retired model removes the whole upstream, not just that row"
+        );
+    }
+
+    #[test]
+    fn out_of_credits_is_terminal_only_where_the_profile_says_so() {
+        let profiles = crate::providers::free::cooldown_profiles();
+        assert!(
+            profiles.profile_for("cerebras").no_credits_is_terminal,
+            "cerebras has no free tier; its 402 must suppress the upstream"
+        );
+        assert!(
+            !profiles.profile_for("cline").no_credits_is_terminal,
+            "cline's free models work at zero balance; a 402 must not disable it"
+        );
+        // The default is the conservative direction.
+        assert!(
+            !profiles.defaults.no_credits_is_terminal,
+            "unknown upstreams must not treat 402 as terminal"
+        );
+    }
+
+    /// End to end: a cerebras-shaped 402 suppresses the lane, a cline-shaped
+    /// 402 does not.
+    #[test]
+    fn a_402_suppresses_cerebras_but_not_cline() {
+        let provider = FreeProvider::with_routing(
+            vec![entry("cerebras", true), entry("groq", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        let paid_model = ProviderError::Other {
+            provider: ProviderId::new("cerebras"),
+            message: "Payment required to access this resource.".into(),
+            status: Some(402),
+            body: Some("{\"code\":\"payment_required\"}".into()),
+        };
+        provider.observe_liveness(0, "gpt-oss-120b", Some(&paid_model));
+        assert_eq!(
+            provider.liveness_of("cerebras"),
+            Liveness::Unauthorized,
+            "cerebras 402 is terminal"
+        );
+
+        let cline_provider =
+            FreeProvider::with_routing(vec![entry("cline", true)], RoutingConfig::default(), false);
+        let cline_402 = ProviderError::Other {
+            provider: ProviderId::new("cline"),
+            message: "Insufficient balance. Your Cline Credits balance is $-0.00".into(),
+            status: Some(402),
+            body: Some("{\"code\":\"insufficient_credits\"}".into()),
+        };
+        cline_provider.observe_liveness(0, "some/paid-model", Some(&cline_402));
+        assert_eq!(
+            cline_provider.liveness_of("cline"),
+            Liveness::Unknown,
+            "a cline 402 must leave the upstream usable"
+        );
+
+        let req = dummy_request("free/auto");
+        assert!(
+            !provider
+                .attempt_plan(&Route::Auto, Some(&req))
+                .iter()
+                .any(|(idx, _)| provider.chain[*idx].upstream.id == "cerebras"),
+            "cerebras must be gone from the plan"
+        );
+        assert!(
+            !cline_provider
+                .attempt_plan(&Route::Auto, Some(&req))
+                .is_empty(),
+            "cline must stay in the plan"
+        );
     }
 
     #[test]

@@ -282,6 +282,29 @@ pub fn render_context_viz(
                     ));
                 }
             }
+            // Liveness verdict for the model this upstream actually serves.
+            // Shown so a suppressed upstream explains itself: a chain that
+            // quietly gets shorter is indistinguishable from a bug, and
+            // "retired" is the difference between "provider is down" and
+            // "our catalog is stale". `Dispatchable` and `Unknown` render
+            // nothing so a healthy chain is unchanged.
+            match clawde_api::providers::free::liveness_of(upstream_id) {
+                clawde_api::providers::free::Liveness::Gone => spans.push(Span::styled(
+                    " (model retired)".to_string(),
+                    Style::default().fg(Color::Red),
+                )),
+                clawde_api::providers::free::Liveness::Unauthorized => spans.push(Span::styled(
+                    " (model blocked)".to_string(),
+                    Style::default().fg(Color::Red),
+                )),
+                clawde_api::providers::free::Liveness::RateLimited { .. } => {
+                    spans.push(Span::styled(
+                        " (capped)".to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                _ => {}
+            }
             lines.push(Line::from(spans));
 
             // Detail line: fallback-chain priority and key-ring state, so

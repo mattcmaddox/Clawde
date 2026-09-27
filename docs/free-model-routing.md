@@ -626,3 +626,64 @@ request was routed to a paid model id while the account's free models work
 fine. The cline carve-out in `classify_exhaust` exists for exactly this
 reason. Distinguishing them needs a per-upstream signal, not a global rule, so
 this is left open rather than guessed at.
+
+---
+
+## 10. The 402 carve-out, quota switching, and surfacing it
+
+### Per-upstream credit signal
+
+`402` is ambiguous and the two live cases need opposite answers, so it is now a
+per-provider field rather than a global rule:
+
+| upstream | 402 means | `no_credits_is_terminal` |
+| --- | --- | --- |
+| cerebras | the $5 trial is gone and never refills | `true` — upstream is suppressed |
+| cline | a *paid* model id was requested; free models still work | `false` — upstream stays |
+
+Default is `false`: a wrongly-disabled upstream is worse than a wasted request.
+Two tests pin the asymmetry, one on the profile data and one end to end
+(a cerebras-shaped 402 removes the lane, a cline-shaped 402 does not).
+
+`ProviderProfiles::load()` re-parses the embedded JSON on every call, which is
+too hot for the liveness path, so `cooldown_profiles()` caches it in a
+`OnceLock`.
+
+### Proactive quota switching
+
+A per-model cap is recorded against the exact `(upstream, model)` pair that hit
+it. The plan builder demotes exactly those rows, so the upstream's *other*
+models move up — a Cline daily cap on `deepseek-v4.1-flash` promotes
+`gemini-3.8-flash` on the same account instead of waiting for the failure to
+repeat. Rows are demoted, never dropped, because the cap resets.
+
+This is a stable sort, so it biases ordering without disturbing task
+preference or the capacity ranking within each tier.
+
+### Liveness is instance-scoped
+
+The store started life process-global, and the parallel test runner made that
+actively harmful: one test's `Gone` silently reordered another test's plan,
+producing four unrelated failures. It is now a `FreeProvider` field, like every
+other routing signal. Production calls `share_liveness()` at registration so
+the TUI and the startup log still see one shared view; a freshly constructed
+provider starts empty. The `LIVENESS_LOCK` test mutex is gone as a result.
+
+### Surfacing it in the TUI
+
+`/ctx-viz` renders a tag beside the model for each upstream, next to the
+existing cooldown annotations:
+
+```
+● Cerebras    gpt-oss-120b  (model blocked)
+● Groq        openai/gpt-oss-120b
+● Cline       cline-free/deepseek-v4.1-flash  (capped)
+```
+
+`retired` / `blocked` are red, `capped` is yellow, and a healthy chain renders
+exactly as before. The point is that a chain which quietly gets shorter is
+indistinguishable from a bug: "retired" separates *the provider is down* from
+*our catalog is stale*.
+
+`upstream_key_health` was not the right home for this — it is per-provider, so
+in free mode it yields a single "free" row rather than one per upstream.

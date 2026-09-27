@@ -23,6 +23,7 @@
       "max_cooldown_secs": 600,
       "respects_retry_after": true,
       "limit_scope": "per-model",
+      "no_credits_is_terminal": true,
       "notes": "Verified 2026-09-27: 'Rate limits apply at the organization level, not the user level, and vary based on the model'. The Limits-by-Tier table is keyed by model id (gpt-oss-120b 5 RPM/30K uncached TPM, qwen-3.8-27b 1 RPM/5K uncached TPM), and both the uncached and total TPM buckets are per model — a 429 body says which bucket was exceeded. CAVEAT: there is NO permanently free tier any more. The 'Free Trial' is $5 of credits expiring in 30 days, and it requires a verified payment method. A 402 here means the trial expired, and auth/credit failures are always global cooldowns, so this upstream will eventually hard-fail rather than degrade."
     },
     "poolside": {
@@ -75,7 +76,7 @@
       "server_error_cooldown_secs": 15,
       "max_cooldown_secs": 180,
       "respects_retry_after": true,
-      "notes": "MIXED scope, left per-key. RPM is per TASK TYPE (Text Generation 300 RPM, Summarization 1500, Embeddings 3000, ASR 720) with some per-model overrides such as @cf/baai/bge-large-en-v1.5 at 1500; paid-model limits 'apply per account, per model'. But the 10K neurons/day quota is cumulative per account, and a single limit_scope string cannot express both — so this stays per-key until learned per-model bucket state lands. Returns error codes 3036/3040."
+      "notes": "MIXED scope, and verified 2026-09-27 that it CANNOT be per-model. Two independent limits: (1) RPM is per TASK TYPE (Text Generation 300/min, Summarization 1500, Text Embeddings 3000, ASR 720) with a few per-model overrides - so it is not even keyed by model. (2) The 10,000 Neurons/day free allocation is CUMULATIVE PER ACCOUNT, resets 00:00 UTC, and a neuron is a compute unit whose cost differs per model, so exhaustion is a whole-account event. Pricing page: 'Some models require a paid billing method' lists kimi-k2.6/k2.7-code, glm-5.2/5.3/5.3-flash, deepseek-v4-flash-0731 and deepseek-v4-pro-0813 - the catalog probe model @cf/qwen/qwen3-30b-a3b-fp8 is NOT among them. left per-key deliberately: a neuron exhaustion is cumulative, so scoping the cooldown to one model would leave the account hammering the same exhausted pool."
     },
     "huggingface": {
       "rate_limit_cooldown_secs": 60,

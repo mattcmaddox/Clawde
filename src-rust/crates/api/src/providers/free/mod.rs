@@ -967,6 +967,15 @@ pub fn liveness_records() -> Vec<LivenessRecord> {
     }
 }
 
+/// The process-wide liveness store, shared by the production chain and read by
+/// the TUI. Tests use their own provider-scoped store instead.
+static SHARED_LIVENESS: OnceLock<Arc<Mutex<Vec<LivenessRecord>>>> = OnceLock::new();
+
+/// Handle to the process-wide liveness store.
+pub fn shared_liveness_store() -> Arc<Mutex<Vec<LivenessRecord>>> {
+    Arc::clone(SHARED_LIVENESS.get_or_init(|| Arc::new(Mutex::new(Vec::new()))))
+}
+
 /// Drop all cached observations. Exposed for `clawde --refresh`.
 pub fn clear_liveness() {
     if let Ok(mut store) = liveness_store().lock() {
@@ -2684,6 +2693,15 @@ pub struct FreeProvider {
     /// non-native (prose) tool calls, steering the chain toward lanes that
     /// actually emit structured calls.
     tool_dialect: Arc<Mutex<ToolDialectState>>,
+    /// Per-upstream model liveness: `Gone` / `Unauthorized` drop the upstream
+    /// from the plan, `RateLimited` demotes just the capped model row.
+    ///
+    /// Instance-scoped rather than purely process-global. Every other signal
+    /// here is instance-scoped too, and a global would make one test's verdict
+    /// silently reorder another test's plan under the parallel runner.
+    /// Production shares one store via [`Self::share_liveness`] so the TUI can
+    /// read it; a freshly constructed provider starts empty.
+    liveness: Arc<Mutex<Vec<LivenessRecord>>>,
 }
 
 #[derive(Debug)]
@@ -3005,6 +3023,25 @@ pub struct ProviderCooldownProfile {
     /// serialized default and the documented one.
     #[serde(default = "default_limit_scope")]
     pub limit_scope: String,
+    /// Whether an out-of-credits error means the *whole account* is finished
+    /// with this provider, or only the requested model.
+    ///
+    /// `402` is genuinely ambiguous, and the two live cases need opposite
+    /// answers:
+    ///
+    /// - **cerebras** — `402 payment_required`. Its docs state there is no
+    ///   permanently free tier: the $5 trial is credit- and time-bounded, so a
+    ///   402 will never clear. Marking the upstream blocked saves one failed
+    ///   request every turn, forever.
+    /// - **cline** — `402 insufficient_credits` means the request was routed to
+    ///   a *paid* model id. The account's `cline-free/*` models keep working at
+    ///   zero balance, so treating 402 as terminal here would disable a healthy
+    ///   lane.
+    ///
+    /// Default `false` because a wrongly-disabled upstream is worse than a
+    /// wasted request.
+    #[serde(default)]
+    pub no_credits_is_terminal: bool,
     /// Optional notes about this provider's limits
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
@@ -3016,6 +3053,18 @@ fn default_limit_scope() -> String {
     "per-key".to_string()
 }
 
+/// Cached cooldown profiles.
+///
+/// `ProviderProfiles::load()` re-parses the embedded JSON on every call, which
+/// is fine at chain-build time but far too hot for the liveness path — that
+/// runs on every dispatch outcome. Loaded once.
+static CACHED_PROFILES: OnceLock<ProviderProfiles> = OnceLock::new();
+
+/// The process-wide cooldown profiles, parsed once.
+pub fn cooldown_profiles() -> &'static ProviderProfiles {
+    CACHED_PROFILES.get_or_init(ProviderProfiles::load)
+}
+
 impl Default for ProviderCooldownProfile {
     fn default() -> Self {
         Self {
@@ -3024,6 +3073,7 @@ impl Default for ProviderCooldownProfile {
             max_cooldown_secs: 600,
             respects_retry_after: false,
             limit_scope: default_limit_scope(),
+            no_credits_is_terminal: false,
             notes: None,
         }
     }

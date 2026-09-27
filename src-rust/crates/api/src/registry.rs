@@ -301,7 +301,10 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         chain,
         routing.unwrap_or_default(),
         FreeProvider::ENABLE_EMPTY_COOLDOWN_PERSISTENCE,
-    );
+    )
+    // Share the process-wide liveness store so the TUI and this startup log
+    // can read what dispatch observed. Tests get an isolated store instead.
+    .share_liveness();
     // Store free model defaults for the TUI /ctx-viz overlay
     crate::providers::free::store_free_model_defaults(provider.free_model_defaults());
     Some(Arc::new(provider) as Arc<dyn LlmProvider>)
