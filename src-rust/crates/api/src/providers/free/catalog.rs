@@ -172,12 +172,14 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         id: "nvidia",
         title: "NVIDIA NIM",
         key_url: "build.nvidia.com",
-        // NVIDIA retired the llama-3.3-70b family (DEPRECATION 08/25/2026 per
-        // its own catalog API); gpt-oss-120b is the current free flagship and
-        // the discovery default pick (NVIDIA_PREFERRED_FREE).
-        default_model: "openai/gpt-oss-120b",
-        model_family: "gpt-oss-120b",
-        note: "GPT-OSS 120B — 2 keys",
+        // NVIDIA retired `openai/gpt-oss-120b` (HTTP 410, EOL 2026-09-03 —
+        // verified by live probe). `nvidia/nemotron-3.5-lightning-30b-a3b` is
+        // the current free flagship; `openai/gpt-oss-20b` is the same
+        // strong-generalist family Clawde pins elsewhere and answers as a
+        // fallback when the lightning worker is capacity-starved.
+        default_model: "nvidia/nemotron-3.5-lightning-30b-a3b",
+        model_family: "nemotron-lightning",
+        note: "Nemotron 3.5 Lightning 30B — 2 keys",
         tool_calling: true,
         vision: false,
         thinking: true,
@@ -185,10 +187,10 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         context_window: 128_000,
         specialty: "strong generalist",
         usage: "2 keys · 8K",
-        // The free tier's 120B worker is routinely capacity-starved (503
-        // "ResourceExhausted" or 25-75s responses vs the 30s upstream
-        // timeout). Fall back to the always-warm 20B sibling on the same key
-        // before giving up on NVIDIA entirely.
+        // The lightning worker is the fast lane and is routinely
+        // capacity-starved (503 "ResourceExhausted" or 25-75s responses vs the
+        // 30s upstream timeout). Fall back to the always-warm 20B sibling on the
+        // same key before giving up on NVIDIA entirely.
         fallback_models: &["openai/gpt-oss-20b"],
     },
     FreeUpstream {
@@ -284,9 +286,16 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         id: "cline",
         title: "Cline",
         key_url: "app.cline.bot/settings",
-        default_model: "deepseek/deepseek-v4-flash",
-        model_family: "deepseek-v4-flash",
-        note: "live free-model API — auto-discovers best model at startup (currently deepseek-v4-flash)",
+        // Verified 2026-09-27. The old `deepseek/deepseek-v4-flash` id returned
+        // HTTP 500 "empty response content" — it authenticated and generated
+        // nothing. The real free models are the `cline-free/`-prefixed ids from
+        // the recommended-models `free` array, and they work at zero credit
+        // balance as long as the request carries `X-CLIENT-TYPE: cline-sdk`
+        // (sent in production). Each has its own daily cap, so a cap on one
+        // leaves the others usable.
+        default_model: "cline-free/deepseek-v4.1-flash",
+        model_family: "deepseek-v4.1-flash",
+        note: "live free-model API — per-model daily caps, auto-discovers at startup",
         tool_calling: true,
         vision: false,
         thinking: true,

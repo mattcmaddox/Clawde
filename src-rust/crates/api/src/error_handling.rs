@@ -151,10 +151,24 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
             model: "unknown".to_string(),
             suggestions: vec![],
         },
-        429 => ProviderError::RateLimited {
-            provider: provider.clone(),
-            retry_after: None,
-        },
+        429 => {
+            // Set `retry_after` from the body when the provider states the wait
+            // in prose only. Cline answers a capped free model with "Daily free
+            // limit reached on model deepseek/deepseek-v4.1-flash. Try again in
+            // 20h 54m", and the reset time exists nowhere else — leaving this as
+            // `None` made the key's cooldown fall back to the flat 60s default,
+            // re-hitting a capped model every minute for the next 21 hours.
+            //
+            // No new field is needed: `key_rotating` consults `retry_after`
+            // before the body, and `Retry-After` headers still win because
+            // `parse_error_response_with_retry` overwrites this afterwards.
+            let hint = crate::time_extract::extract_cooldown_from_body(body)
+                .or_else(|| crate::time_extract::extract_cooldown_from_body(&message));
+            ProviderError::RateLimited {
+                provider: provider.clone(),
+                retry_after: hint,
+            }
+        }
         413 => ProviderError::ContextOverflow {
             // Include the actual response body so callers can see the real
             // Groq / provider message (e.g., TPM rate-limit info).
@@ -334,6 +348,47 @@ pub fn parse_error_response_with_retry(
 
 #[cfg(test)]
 mod tests {
+    /// The exact body Cline returns for a capped free model, captured live
+    /// 2026-09-27 against a zero-credit account. The reset time exists only in
+    /// this prose, so if `retry_after` stops reading it the key's cooldown
+    /// silently collapses to the flat 60s default.
+    const CLINE_DAILY_CAP_BODY: &str = r#"{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model deepseek/deepseek-v4.1-flash. Try again in 20h 54m"}}"#;
+
+    #[test]
+    fn cline_daily_cap_reset_time_reaches_the_cooldown() {
+        let pid = ProviderId::new("cline");
+        let err = parse_error_response(429, CLINE_DAILY_CAP_BODY, &pid);
+        let secs = err
+            .retry_after_secs()
+            .expect("a 20h54m cap must not parse as an absent hint");
+        // 20h is the unit the parser matches; the trailing 54m is not part of
+        // that token. Assert the order of magnitude, not the exact minute.
+        assert!(
+            (70_000..=73_000).contains(&secs),
+            "expected ~20h (72_000s), got {secs}s"
+        );
+    }
+
+    #[test]
+    fn retry_after_header_still_wins_over_the_body() {
+        let pid = ProviderId::new("cline");
+        let err = parse_error_response_with_retry(429, CLINE_DAILY_CAP_BODY, &pid, Some(30));
+        assert_eq!(
+            err.retry_after_secs(),
+            Some(30),
+            "an explicit Retry-After header must override the body hint"
+        );
+    }
+
+    #[test]
+    fn a_plain_429_without_a_hint_is_still_rate_limited() {
+        // No retry wording anywhere: must not panic, and must stay RateLimited
+        // so the fallback cooldown path still runs.
+        let pid = ProviderId::new("mock");
+        let err = parse_error_response(429, "{}", &pid);
+        assert!(matches!(err, ProviderError::RateLimited { .. }));
+        assert!(err.retry_after_secs().is_none());
+    }
     use super::*;
 
     #[test]

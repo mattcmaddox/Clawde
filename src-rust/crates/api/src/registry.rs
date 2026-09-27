@@ -278,6 +278,22 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         .collect();
     crate::providers::free::store_free_model_lists(model_lists);
 
+    // Report any upstream the liveness gate is currently suppressing, so a
+    // chain that is shorter than expected explains itself in the log instead of
+    // silently routing around a retired or blocked model.
+    for record in crate::providers::free::liveness_records() {
+        if record.state.is_usable() {
+            continue;
+        }
+        tracing::warn!(
+            "free chain: {} is {} (model {}); its plan rows are suppressed \
+             until a probe sees it recover",
+            record.upstream_id,
+            record.state.label(),
+            record.model
+        );
+    }
+
     if chain.is_empty() {
         return None;
     }

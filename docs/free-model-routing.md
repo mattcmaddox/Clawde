@@ -361,3 +361,213 @@ configurable window; clear on disable) for `telemetry-state` and an opt-out.
 - OmniRoute guide (v3.8.49) — https://arjavjain.org/posts/how-to-use-claude-code-with-omniroute-for-free
 - litellm-local-config — https://github.com/gaiagent0/litellm-local-config
 - LiteLLM cooldown internals — https://zread.ai/BerriAI/litellm/18-failover-and-cooldown-mechanisms
+
+---
+
+## 8. Does rotating to a second key ever help? (MEASURED 2026-09-27)
+
+`KeyRotatingProvider` responds to a rate limit by benching one key and
+dispatching the request on the next. For several major providers the vendor docs
+claim the quota is *not* per key:
+
+| Provider | Docs say the quota is keyed to | Quote |
+| --- | --- | --- |
+| Groq | Organization | "Rate limits apply at the organization level, not individual users" |
+| Google | Project | "Rate limits are applied per project, not per API key" |
+| OpenRouter | Global | "Making additional accounts or API keys will not affect your rate limits, as we govern capacity globally" |
+| Cerebras | Organization | "Rate limits apply at the organization level, not the user level" |
+| Mistral | Organization | "API rate limits define how much traffic your Organization can send" |
+
+If true, rotating spends one real request per stored key to rediscover that the
+next key is throttled too, and adds load to an account already refusing work.
+
+### The measurement refutes this, at least for Groq
+
+`scripts/probes/limit-scope-probe.py` drives key A to a 429 on model A, then
+immediately retries **the same model on key B**, then **a different model on
+key A**. Run twice against the real configured Groq keys, identical both times:
+
+```
+groq: quota=DISTINCT (rotation works); limit=per-model
+      took 30 reqs to 429
+      keyB / same model  = success     <- independent quota
+      keyA / other model = success     <- per-model, not cumulative
+      x-ratelimit-limit-tokens 8000, x-ratelimit-limit-requests 1000
+      x-ratelimit-reset-tokens 547ms
+```
+
+**Two of the stored Groq keys have independent quotas**, even though the docs
+say limits apply "at the organization level". So on Groq the key ring is doing
+real work: rotation genuinely escapes a rate limit. The doc claim does not hold
+for this configuration, and it is the configuration the feature is used in.
+
+This also confirms `limit_scope: per-model` for Groq independently of any doc
+reading: a key exhausted on `gpt-oss-120b` served `gpt-oss-20b` immediately.
+
+### Found while measuring: the NVIDIA catalog entry is dead
+
+`FREE_CATALOG` names `openai/gpt-oss-120b` as NVIDIA's `default_model` and
+`NVIDIA_PREFERRED_FREE` picks it first for discovery. NVIDIA's API answers:
+
+```
+HTTP 410 {"detail":"The model 'openai/gpt-oss-120b' has reached its end of
+life on 2026-09-03T08:00:00Z and is no longer available."}
+```
+
+So chain position 3 currently dispatches to a model that has been gone for
+about three weeks. `qwen/qwen3-next-80b-a3b-instruct` is 410 as well. Live and
+responding on the configured key: `openai/gpt-oss-20b`,
+`nvidia/nemotron-3.5-lightning-30b-a3b`, `nvidia/nemotron-3-ultra-550b-a55b`.
+
+This is a separate bug from limit scoping and is **not fixed here** — fixing it
+means picking NVIDIA's current free flagship, which needs the discovery path
+that already exists (`NVIDIA_PREFERRED_FREE` in `free/discovery.rs`) to be
+correct rather than hand-editing the catalog. It is called out because it was
+found by the probe, not by reading the catalog.
+
+### Providers that could not be measured
+
+All inconclusive for a stated reason, not a guess:
+
+| Provider | Why |
+| --- | --- |
+| NVIDIA | Catalog default is EOL (below). With a live model (`openai/gpt-oss-20b`) the drain completed 150 requests without a single 429, so the free-tier ceiling is above that. |
+| Cloudflare | No 429 after 400 requests on `@cf/meta/llama-3.2-3b-instruct`, nor after 150 on the catalog probe model `@cf/qwen/qwen3-30b-a3b-fp8`. The documented 300 RPM text-generation ceiling was not reached. |
+| Cline | HTTP 402 `insufficient_credits`, balance `-$0.00`. |
+| Google, OpenRouter, Mistral, Cerebras, SambaNova, Poolside | Fewer than 2 stored keys, so there is nothing to compare. |
+
+The probe reports INCONCLUSIVE rather than a verdict whenever the key was never
+actually seen to return 429, or when the comparison model turned out to be
+unusable (404/410). A "success" on key B is only meaningful once key A has
+provably been throttled.
+
+### Conclusion
+
+**Rotation is not wasteful. Do not add a per-provider `quota_scope` flag.**
+
+A `quota_scope` field on the cooldown profile was implemented and then reverted.
+Reverting was correct, and the measurement is why: the premise was not merely
+unproven, it is false for the one provider measurable here. Two further reasons
+would have applied regardless:
+
+1. It was wrong for Mistral. Mistral was labelled `per-key` and used as the
+   "independent keys" test exemplar while the same doc page said the opposite.
+2. The axis is the user's key set, not the provider. Quota sharing depends on how
+   many Organizations/Projects the stored keys span — and Google's docs note all
+   keys created in AI Studio live in one project, so the shared case is the
+   *default*. A per-provider constant would then bench a healthy second account.
+
+Note the Cline 402 result validates an existing design decision: 402 is
+deliberately not an exhaust signal (`classify_exhaust`), so a negative balance
+does not bench a key or rotate. Without that carve-out this run would have
+marked both Cline keys dead over a billing problem.
+
+Re-run with `python3 scripts/probes/limit-scope-probe.py` (consumes free-tier
+quota; needs 2+ keys for the provider). Add the provider's model pair to
+`MODELS` after checking the live `/models` listing — hardcoded ids rot, which is
+how the first groq attempt failed on a retired `llama-3.3-70b-versatile`.
+
+### Found while measuring: Cline free models DO work at 0 credits — with a header
+
+Measured 2026-09-27 against the configured Cline key, balance `-$0.00`.
+
+`https://api.cline.bot/api/v1/ai/cline/recommended-models` returns a `free`
+array of 6 models, which is what `fetch_cline_free_models` reads:
+
+```
+stealth/pixel-canary                 cline-free/mimo-v2.6-flash
+stealth/space-bunny-alpha            cline-free/deepseek-v4.1-flash
+cline-free/gemini-3.8-flash          cline-free/muse-spark-1.3-contributor
+```
+
+**All six are usable at zero credits**, provided the request carries
+`X-CLIENT-TYPE: cline-sdk`. Clawde already sends this in production
+(`CLINE_SDK_CLIENT_TYPE`, `openai_compat_providers.rs`). Without it every free
+id returns:
+
+```
+HTTP 403  "cline-free/deepseek-v4.1-flash is only available via Cline product surfaces"
+```
+
+That 403 is an auth wall on *the request shape*, not a statement that free
+models are API-unavailable. It is an easy and wrong conclusion to draw.
+
+Measured outcomes, all at `$-0.00` balance, with the header:
+
+| model id | result |
+| --- | --- |
+| `cline-free/deepseek-v4.1-flash` | 429 `INFERENCE_CAP_ERROR` — "Daily free limit reached ... Try again in 20h 54m" |
+| `cline-free/mimo-v2.6-flash` | 429 `INFERENCE_CAP_ERROR` — daily free limit reached |
+| `cline-free/gemini-3.8-flash` | 429 `INFERENCE_CAP_ERROR` — daily free limit reached |
+| `cline-free/muse-spark-1.3-contributor` | 429 `INFERENCE_CAP_ERROR` — daily free limit reached |
+| `deepseek/deepseek-v4.1-flash` (no prefix) | 402 `insufficient_credits` — this is a *paid* id |
+| `cline-pass/deepseek-v4.1-flash` | 403 `ENTITLEMENT_ERROR` — not subscribed to ClinePass |
+| `cline-cloud/glm-5.3` | 403 — not supported |
+| `deepseek/deepseek-v4-flash` (the catalog default) | 500 `empty response content` — passes auth, returns nothing |
+
+Two conclusions:
+
+1. **The `402` carve-out in `classify_exhaust` is correct.** Its comment says a
+   Cline negative-balance 402 "does not actually block free-model usage". That
+   holds: 402 is a *paid-model* gate, and the free models work regardless of
+   balance. An earlier note in this file claimed that carve-out was wrong; it is
+   not, and the claim is withdrawn.
+
+2. **The real Cline quota signal is `429 INFERENCE_CAP_ERROR`, and it is
+   per-model with a retry time.** "Daily free limit reached on model
+   deepseek/deepseek-v4.1-flash ... Try again in 20h 54m" names the model and
+   gives an exact reset. This is precisely the model-dependent quota that
+   `limit_scope: per-model` exists to express: bench the key for *that* model
+   and leave the other five free models usable.
+
+   The open question is whether Clawde currently classifies it that way.
+   `classify_exhaust` matches on `ProviderError::RateLimited`, so the outcome
+   depends on how the 429 is mapped in the provider adapter — that mapping is
+   the thing to check next, and it is the highest-value part of the auto-mode
+   work.
+
+Separately, the catalog default `deepseek/deepseek-v4-flash` is unhealthy: it
+returns `500 empty response content`, so it authenticates but produces nothing.
+
+### Two concrete bugs this exposes in Clawde's handling
+
+**Bug 1 — the reset time is discarded, so a daily cap retries every 60s.**
+
+Cline returns `429` with a precise reset in the body:
+
+```
+"Daily free limit reached on model deepseek/deepseek-v4.1-flash.
+ Try again in 20h 54m"
+```
+
+`time_extract::parse_time_after_keyword` *can* read that shape (`20h` → 72000s).
+But it never sees the body, for two independent reasons:
+
+- `error_handling.rs:154` maps `429 => ProviderError::RateLimited { provider,
+  retry_after: None }` — the body is not stored on the variant at all.
+- `key_rotating.rs:80` returns the literal string `"rate limited"` for that
+  variant, and the `body_from_error` binding is populated only for
+  `ProviderError::Other`.
+
+So `estimate_cooldown` receives `"rate limited"` with no body, finds nothing,
+and falls through to `default_cooldown_for_signal(RateLimit) = 60`. A cap that
+resets in 20h54m is treated as a 60-second limit. The chain will re-hit the same
+capped model roughly every minute for the next 21 hours.
+
+Fix: carry the body (or a parsed `retry_after`) on the `RateLimited` variant, and
+feed it to `estimate_cooldown` the way `Other` already is.
+
+**Bug 2 — Cline's free models are per-model caps but the profile is per-key.**
+
+Each of the six free models has its own daily counter, but `cline` has no
+`limit_scope`, so it defaults to `per-key`. One model exhausting its daily cap
+benches the key for *all six*, when five are still usable. Measured: all six are
+simultaneously capped here only because the account burned through them; the
+granularity is per model.
+
+This is the "model-dependent quota" case from the top of this section, and the
+`per-model` machinery already exists — `cline` simply is not opted into it.
+
+Neither bug is fixed here. Bug 1 is a small, well-scoped change to
+`parse_error_response` plus the cooldown path. Bug 2 is one JSON field, gated on
+the same verification as the other `limit_scope` entries.

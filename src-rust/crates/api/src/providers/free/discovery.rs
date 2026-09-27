@@ -682,8 +682,11 @@ const NVIDIA_NON_CHAT: &[&str] = &[
 /// pins for groq/cerebras; `nemotron-3.5-lightning` is NVIDIA's current free
 /// flagship. The rest of the list keeps catalog order (deduped).
 const NVIDIA_PREFERRED_FREE: &[&str] = &[
-    "openai/gpt-oss-120b",
+    // `openai/gpt-oss-120b` was removed 2026-09-03: NVIDIA answers HTTP 410
+    // "reached its end of life". It used to lead this list and the catalog
+    // default with it, so a live probe is what caught it.
     "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "openai/gpt-oss-20b",
 ];
 
 /// Fetch the current free chat model list directly from NVIDIA's own catalog
@@ -1748,13 +1751,13 @@ mod tests {
             "nvidia/riva-translate-4b-instruct-v2",
             "nvidia/nemotron-3.5-lightning-30b-a3b",
         ];
-        // gpt-oss-120b is NVIDIA_PREFERRED_FREE[0] → default pick; the rest
-        // sort alphabetically; the duplicate is deduped.
+        // nemotron-lightning is NVIDIA_PREFERRED_FREE[0] → default pick; the
+        // rest sort alphabetically; the duplicate is deduped.
         assert_eq!(
             select_nvidia_catalog_free_models(&entries, &wire_ids),
             vec![
-                "openai/gpt-oss-120b".to_string(),
                 "nvidia/nemotron-3.5-lightning-30b-a3b".to_string(),
+                "openai/gpt-oss-120b".to_string(),
             ]
         );
     }
@@ -1790,6 +1793,9 @@ mod tests {
             ("gpt-oss-120b".to_string(), false),
             ("step-3.7-flash".to_string(), false),
         ];
+        // gpt-oss-120b is no longer NVIDIA_PREFERRED_FREE[0] (retired upstream),
+        // so gpt-oss-20b is not in this fixture and the preference that does
+        // match here is none: everything sorts alphabetically.
         let wire_ids = vec![
             "nvidia/step-3.7-flash",
             "openai/gpt-oss-120b",
@@ -1798,9 +1804,9 @@ mod tests {
         assert_eq!(
             select_nvidia_catalog_free_models(&entries, &wire_ids),
             vec![
-                "openai/gpt-oss-120b".to_string(),
                 "meta/muse-glimmer-30b".to_string(),
                 "nvidia/step-3.7-flash".to_string(),
+                "openai/gpt-oss-120b".to_string(),
             ]
         );
     }

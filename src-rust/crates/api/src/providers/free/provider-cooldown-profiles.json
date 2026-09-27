@@ -8,28 +8,37 @@
       "max_cooldown_secs": 300,
       "respects_retry_after": true,
       "limit_scope": "per-model",
-      "notes": "RPM: 30-60, TPM: 6K-30K, per-model. Resets quickly. Returns x-ratelimit-reset-tokens header."
+      "notes": "RPM: 30-60, TPM: 6K-30K, per-model. Verified 2026-09-27: the free-plan limits table is keyed by MODEL ID with distinct RPM/RPD/TPM/TPD per row. IMPORTANT: 'Rate limits apply at the organization level, not individual users' — so a second Groq API key does NOT grant a second quota, it only avoids per-key auth/rate-limit bookkeeping. Headers: x-ratelimit-limit-requests (always RPD), x-ratelimit-limit-tokens (always TPM), -remaining- and -reset- variants, plus retry-after only on a 429."
     },
     "nvidia": {
       "rate_limit_cooldown_secs": 90,
       "server_error_cooldown_secs": 60,
       "max_cooldown_secs": 600,
       "respects_retry_after": false,
-      "notes": "RPM: ~40. Often missing Retry-After. Be conservative."
+      "notes": "RPM: ~40. Often missing Retry-After. Be conservative. UNVERIFIED limit_scope: NVIDIA's API reference carries no per-model limits table, so this stays per-key. Verify with scripts/probes/limit-scope-probe.py before changing."
     },
     "cerebras": {
       "rate_limit_cooldown_secs": 120,
       "server_error_cooldown_secs": 60,
       "max_cooldown_secs": 600,
       "respects_retry_after": true,
-      "notes": "RPM: 5 (very strict). TPM: 30K. Returns x-ratelimit-reset headers."
+      "limit_scope": "per-model",
+      "notes": "Verified 2026-09-27: 'Rate limits apply at the organization level, not the user level, and vary based on the model'. The Limits-by-Tier table is keyed by model id (gpt-oss-120b 5 RPM/30K uncached TPM, qwen-3.8-27b 1 RPM/5K uncached TPM), and both the uncached and total TPM buckets are per model — a 429 body says which bucket was exceeded. CAVEAT: there is NO permanently free tier any more. The 'Free Trial' is $5 of credits expiring in 30 days, and it requires a verified payment method. A 402 here means the trial expired, and auth/credit failures are always global cooldowns, so this upstream will eventually hard-fail rather than degrade."
+    },
+    "poolside": {
+      "rate_limit_cooldown_secs": 120,
+      "server_error_cooldown_secs": 60,
+      "max_cooldown_secs": 600,
+      "respects_retry_after": false,
+      "notes": "Free preview tier: 200 requests/hour (matches local_quota_for in catalog.rs). Poolside's rate-limit docs are access-gated, so limit_scope is UNVERIFIED and left at the per-key default — deliberate, because the damaging error is a wrongly-shared bucket. Verify with scripts/probes/limit-scope-probe.py before changing it."
     },
     "sambanova": {
       "rate_limit_cooldown_secs": 60,
       "server_error_cooldown_secs": 30,
       "max_cooldown_secs": 300,
       "respects_retry_after": true,
-      "notes": "Free tier: 20 RPM, 200K TPD. Returns rate limit headers."
+      "limit_scope": "per-model",
+      "notes": "Free tier is PER-MODEL: 20 RPM / 20 RPD / 200K TPD for each model individually (DeepSeek-V3.1, Meta-Llama-3.3-70B-Instruct, gpt-oss-120b each get their own 20 RPM). Docs page: 'SambaNova model rate limits'. Note the TPD is per-model on the free tier, while Developer tier is capped at 20M tokens/day ACROSS all models. Headers: x-ratelimit-limit-requests, -remaining-requests, -reset-requests, and -day variants."
     },
     "zai": {
       "rate_limit_cooldown_secs": 60,
@@ -43,7 +52,8 @@
       "server_error_cooldown_secs": 60,
       "max_cooldown_secs": 600,
       "respects_retry_after": true,
-      "notes": "Free tier very restricted. ~1 RPS. Returns Retry-After."
+      "limit_scope": "per-model",
+      "notes": "Docs: 'Completion rate limits are listed per model' — each model gets its own tokens-per-minute and requests-per-second limit, viewable at admin.mistral.ai/plateforme/limits. Free mode exists ('lets you create API keys and use included monthly usage'). NOTE: the same page says rate limits 'define how much traffic your Organization can send', so keys in one Organization share a quota — but that is a property of the USER'S key set (how many Organizations their keys span), not a per-provider constant, so nothing is encoded for it here. See docs/free-model-routing.md section 8."
     },
     "google": {
       "rate_limit_cooldown_secs": 60,
@@ -51,7 +61,7 @@
       "max_cooldown_secs": 300,
       "respects_retry_after": true,
       "limit_scope": "per-model",
-      "notes": "RPM: 5-15, TPM: 250K, quotas per model. Returns RESOURCE_EXHAUSTED."
+      "notes": "Verified 2026-09-27: 'Limits vary depending on the specific model being used' and 'Rate limits are applied per project, not per API key'. So model scoping is correct, but a second Gemini API key from the SAME project shares the quota — only a second project grants a second quota. RPM/TPM/RPD vary by model and tier; RPD resets midnight Pacific; RESOURCE_EXHAUSTED signals exhaustion."
     },
     "cohere": {
       "rate_limit_cooldown_secs": 60,
@@ -65,7 +75,7 @@
       "server_error_cooldown_secs": 15,
       "max_cooldown_secs": 180,
       "respects_retry_after": true,
-      "notes": "High RPM (150-720). 10K neurons/day. Returns error codes 3036/3040."
+      "notes": "MIXED scope, left per-key. RPM is per TASK TYPE (Text Generation 300 RPM, Summarization 1500, Embeddings 3000, ASR 720) with some per-model overrides such as @cf/baai/bge-large-en-v1.5 at 1500; paid-model limits 'apply per account, per model'. But the 10K neurons/day quota is cumulative per account, and a single limit_scope string cannot express both — so this stays per-key until learned per-model bucket state lands. Returns error codes 3036/3040."
     },
     "huggingface": {
       "rate_limit_cooldown_secs": 60,
@@ -79,14 +89,16 @@
       "server_error_cooldown_secs": 30,
       "max_cooldown_secs": 300,
       "respects_retry_after": true,
-      "notes": "Free tier: 50-1000 requests/day. Returns X-RateLimit headers."
+      "limit_scope": "per-model",
+      "notes": "MIXED scope, resolved as per-model. Per-model RPM ('different rate limits for different models, so you can share the load that way'), so a rate limit on one model leaves the others usable. The free-model DAILY quota is a different signal and is gated by all-time credits purchased, which is cumulative per account — but that surfaces as a 402/credit error, and 402 is deliberately NOT an exhaust signal (it is treated as a display-only negative balance, per key_rotating.rs), so it never becomes a wrongly-scoped cooldown here. ALSO GLOBAL ACROSS KEYS: 'Making additional accounts or API keys will not affect your rate limits, as we govern capacity globally' — a second OpenRouter key buys a second spending cap, not a second quota. Headers: X-RateLimit-Limit/Remaining/Reset."
     },
     "cline": {
       "rate_limit_cooldown_secs": 60,
       "server_error_cooldown_secs": 30,
       "max_cooldown_secs": 300,
       "respects_retry_after": false,
-      "notes": "Conservative estimate."
+      "limit_scope": "per-model",
+      "notes": "MEASURED 2026-09-27. Each of the 6 models in the recommended-models `free` array has its OWN daily counter; one model hitting its cap does not affect the others. A cap returns 429 INFERENCE_CAP_ERROR 'Daily free limit reached on model <id>. Try again in 20h 54m'. Requires the X-CLIENT-TYPE: cline-sdk header (already sent in production) or every free id 403s with 'only available via Cline product surfaces'. Works at zero credit balance - 402 insufficient_credits is a PAID-model gate and does not block the free ones. cline-pass/* needs a ClinePass subscription (403 ENTITLEMENT_ERROR) and cline-cloud/* is unsupported."
     },
     "opencode-zen": {
       "rate_limit_cooldown_secs": 60,

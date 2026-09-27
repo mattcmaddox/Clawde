@@ -426,7 +426,7 @@ impl FreeProvider {
         route: &Route,
         request: Option<&ProviderRequest>,
     ) -> Vec<(usize, String)> {
-        let mut plan = match self.routing.strategy {
+        let plan = match self.routing.strategy {
             // Auto is the smart default — it routes by task just like the
             // explicit TaskBased strategy (audit spec §8.4).
             RoutingStrategy::Auto | RoutingStrategy::TaskBased => {
@@ -451,11 +451,34 @@ impl FreeProvider {
         let has_tools = request.map(Self::request_has_tools).unwrap_or(false);
         let has_thinking = request.map(Self::request_has_thinking).unwrap_or(false);
         let estimate = request.map(Self::estimate_request_tokens).unwrap_or(0);
-        plan = plan
+        let plan: Vec<(usize, String)> = plan
             .into_iter()
             .filter(|(idx, _)| !self.is_disabled_upstream(*idx))
             .filter(|(idx, _)| {
                 self.entry_fits_request(*idx, has_images, has_tools, has_thinking, estimate)
+            })
+            .collect();
+
+        // Liveness gate: drop upstreams whose pinned model the background probe
+        // found retired or blocked. A 410 ("reached its end of life") is not a
+        // rate limit and must never be retried, so leaving it in the plan burns
+        // a request on every turn. `Unknown` and `Indeterminate` pass through —
+        // a cold or unreachable gate must not disable the whole chain.
+        let mut plan: Vec<(usize, String)> = plan
+            .into_iter()
+            .filter(|(idx, _)| {
+                let state = crate::providers::free::liveness_of(self.chain[*idx].upstream.id);
+                if state.is_usable() {
+                    return true;
+                }
+                tracing::debug!(
+                    "free chain: dropping {} ({}) — {} is {}",
+                    self.chain[*idx].upstream.id,
+                    self.chain[*idx].upstream.title,
+                    self.model_for_entry(*idx),
+                    state.label()
+                );
+                false
             })
             .collect();
 
@@ -1061,6 +1084,33 @@ impl FreeProvider {
 
     /// Record a failed request at `idx`. `task` is the request's classified
     /// [`TaskType`] — the dispatch is also credited to the per-task view.
+    /// Feed a real dispatch outcome into the liveness cache.
+    ///
+    /// Using the dispatch itself as the probe means the gate costs no extra
+    /// network request and is never wrong about the model that was actually
+    /// tried. A retired model is discovered the first time something selects
+    /// it, and from then on the plan drops it before any request is spent.
+    ///
+    /// `err` is `None` for success. Only decisive statuses are recorded;
+    /// anything else leaves the cache alone so a transient blip cannot mark a
+    /// healthy upstream as retired.
+    fn observe_liveness(&self, idx: usize, model: &str, err: Option<&ProviderError>) {
+        let state = match err {
+            None => Liveness::Dispatchable,
+            Some(err) => match err.recovery_class() {
+                crate::provider_error::RecoveryClass::ModelUnavailable => Liveness::Gone,
+                crate::provider_error::RecoveryClass::InvalidCredential => Liveness::Unauthorized,
+                crate::provider_error::RecoveryClass::RateLimited => Liveness::RateLimited {
+                    retry_after_secs: err.retry_after_secs(),
+                },
+                // Quota, 5xx, context overflow, and everything else are not
+                // evidence about whether the model exists.
+                _ => return,
+            },
+        };
+        crate::providers::free::record_liveness(self.chain[idx].upstream.id, model, state);
+    }
+
     fn record_failure(&self, idx: usize, task: TaskType) {
         // Always count the failure for the success-rate views — the circuit
         // breaker below is an optional extra layer.
@@ -2843,6 +2893,10 @@ impl LlmProvider for FreeProvider {
                     return Ok(resp);
                 }
                 Ok(Err(err)) if Self::should_fallback(&err) => {
+                    // Feed the liveness cache: a 410/404 here marks the pinned
+                    // model retired so the next plan drops this upstream before
+                    // spending another request on it.
+                    self.observe_liveness(idx, &upstream_model, Some(&err));
                     // Same-upstream retry for transient errors (5xx, rate
                     // limits) before advancing to the next plan entry.
                     // Mirrors sub2api's RetryableOnSameAccount pattern:
@@ -4700,10 +4754,13 @@ mod tests {
             },
             false,
         );
-        // Sequential Auto plan: nvidia's 120B primary, then its 20B fallback
-        // on the SAME index, then the other upstreams.
+        // Sequential Auto plan: nvidia's lightning primary, then its 20B
+        // fallback on the SAME index, then the other upstreams.
         let plan = provider.attempt_plan(&Route::Auto, None);
-        assert_eq!(plan[0], (0, "openai/gpt-oss-120b".to_string()));
+        assert_eq!(
+            plan[0],
+            (0, "nvidia/nemotron-3.5-lightning-30b-a3b".to_string())
+        );
         assert_eq!(plan[1], (0, "openai/gpt-oss-20b".to_string()));
         assert_eq!(plan[2], (1, "gpt-oss-120b".to_string()));
         assert_eq!(plan[3], (2, "openai/gpt-oss-120b".to_string()));
@@ -4883,19 +4940,26 @@ mod tests {
             entry("nvidia", true),
             entry("groq", true),
         ]);
+        // Route on nvidia's own family: its primary is nemotron-lightning
+        // (gpt-oss-120b was retired 2026-09-03), with gpt-oss-20b adjacent as
+        // the same-key fallback. nvidia is the only host in this chain, so its
+        // two rows lead and everything else follows in catalog order.
         let plan = provider.attempt_plan(
             &Route::Family {
-                model_family: "gpt-oss-120b",
+                model_family: "nemotron-lightning",
             },
             None,
         );
-        // Family hosts first in catalog order — cerebras (idx 1), nvidia
-        // (idx 2) with its 20B fallback on the same index, then groq (idx 3).
-        assert_eq!(plan[0], (1, "gpt-oss-120b".to_string()));
-        assert_eq!(plan[1], (2, "openai/gpt-oss-120b".to_string()));
-        assert_eq!(plan[2], (2, "openai/gpt-oss-20b".to_string()));
+        assert_eq!(
+            plan[0],
+            (2, "nvidia/nemotron-3.5-lightning-30b-a3b".to_string())
+        );
+        assert_eq!(plan[1], (2, "openai/gpt-oss-20b".to_string()));
+        // The rest follow, then take the capacity bias: sambanova has the
+        // tightest local quota (20 RPM / 200K TPD) so it sorts last, not in
+        // catalog order.
+        assert_eq!(plan[2], (1, "gpt-oss-120b".to_string()));
         assert_eq!(plan[3], (3, "openai/gpt-oss-120b".to_string()));
-        // Non-family upstreams follow in catalog order.
         assert_eq!(plan[4], (0, "Meta-Llama-3.3-70B-Instruct".to_string()));
     }
 
@@ -5031,6 +5095,100 @@ mod tests {
         let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
         assert_eq!(plan[0].0, 1, "faster upstream leads when trusted rates tie");
         assert_eq!(plan[1].0, 0);
+    }
+
+    /// The liveness cache is process-global, so tests that mutate it must not
+    /// run concurrently with any other test that builds a plan — otherwise a
+    /// `Gone` recorded for one upstream silently changes another's plan. This
+    /// mirrors the crate's ENV_LOCK convention for process-global test state.
+    static LIVENESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A liveness gate exists because a retired model is not a rate limit:
+    /// NVIDIA answers HTTP 410 for `openai/gpt-oss-120b` and Cline answers 403
+    /// for models the account may not use. Either way the upstream must leave
+    /// the plan rather than burn a request on every turn.
+    #[test]
+    fn retired_upstream_is_dropped_from_the_plan() {
+        let _guard = LIVENESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let provider = FreeProvider::with_routing(
+            vec![entry("groq", true), entry("sambanova", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        let req = dummy_request("free/auto");
+        // Unprobed: both lanes present. A cold gate must never disable anything.
+        let before = provider.attempt_plan(&Route::Auto, Some(&req));
+        assert!(
+            before
+                .iter()
+                .any(|(idx, _)| provider.chain[*idx].upstream.id == "groq"),
+            "an unprobed upstream must stay in the plan"
+        );
+
+        crate::providers::free::clear_liveness();
+        crate::providers::free::record_liveness("groq", "llama-3.3-70b", Liveness::Gone);
+        let after = provider.attempt_plan(&Route::Auto, Some(&req));
+        assert!(
+            !after
+                .iter()
+                .any(|(idx, _)| provider.chain[*idx].upstream.id == "groq"),
+            "a retired model must be dropped from the plan"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|(idx, _)| provider.chain[*idx].upstream.id == "sambanova"),
+            "the healthy lane must survive"
+        );
+
+        crate::providers::free::clear_liveness();
+    }
+
+    /// `RateLimited` is NOT a reason to drop the upstream: on a per-model
+    /// provider the other models may still work (Cline's six free models each
+    /// carry their own daily cap).
+    #[test]
+    fn rate_limited_upstream_stays_in_the_plan() {
+        let _guard = LIVENESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let provider = FreeProvider::with_routing(
+            vec![entry("cline", true), entry("groq", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        let req = dummy_request("free/auto");
+        crate::providers::free::clear_liveness();
+        crate::providers::free::record_liveness(
+            "cline",
+            "cline-free/deepseek-v4.1-flash",
+            Liveness::RateLimited {
+                retry_after_secs: Some(75_000),
+            },
+        );
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        assert!(
+            plan.iter()
+                .any(|(idx, _)| provider.chain[*idx].upstream.id == "cline"),
+            "a per-model cap must not remove the whole upstream"
+        );
+        crate::providers::free::clear_liveness();
+    }
+
+    /// A transport failure is not evidence a model is retired. Disabling on it
+    /// would take the whole chain down during a network blip.
+    #[test]
+    fn indeterminate_probe_does_not_disable_the_upstream() {
+        let _guard = LIVENESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let provider =
+            FreeProvider::with_routing(vec![entry("groq", true)], RoutingConfig::default(), false);
+        let req = dummy_request("free/auto");
+        crate::providers::free::clear_liveness();
+        crate::providers::free::record_liveness("groq", "whatever", Liveness::Indeterminate);
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        assert!(
+            !plan.is_empty(),
+            "an unreachable probe must not disable the chain"
+        );
+        crate::providers::free::clear_liveness();
     }
 
     #[test]
@@ -6803,8 +6961,11 @@ mod tests {
 
         let plan = provider.attempt_plan(&Route::Auto, None);
 
-        // nvidia (idx 1, fastest) first: 120B then its 20B fallback adjacent.
-        assert_eq!(plan[0], (1, "openai/gpt-oss-120b".to_string()));
+        // nvidia (idx 1, fastest) first: lightning then its 20B fallback adjacent.
+        assert_eq!(
+            plan[0],
+            (1, "nvidia/nemotron-3.5-lightning-30b-a3b".to_string())
+        );
         assert_eq!(plan[1], (1, "openai/gpt-oss-20b".to_string()));
         // google (300ms), cerebras (500ms), poolside (800ms).
         assert_eq!(plan[2], (3, "gemini-2.5-flash".to_string()));

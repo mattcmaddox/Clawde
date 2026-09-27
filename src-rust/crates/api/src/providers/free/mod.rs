@@ -822,6 +822,158 @@ pub fn force_refresh_discovery_caches() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Liveness
+// ---------------------------------------------------------------------------
+
+/// What a background probe last observed for one upstream's pinned model.
+///
+/// The distinction that matters is [`Self::Gone`] vs [`Self::Unauthorized`]:
+/// both mean "stop using this", but for different reasons, and the operator
+/// needs to see which. Everything is surfaced rather than silently dropped —
+/// a chain that quietly gets shorter is indistinguishable from a bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// No observation yet. Treat as usable: a cold gate must never disable the
+    /// whole chain.
+    Unknown,
+    /// The model answered.
+    Dispatchable,
+    /// The model is rate-limited or quota-capped *for this model*. Other models
+    /// on the same upstream may still work, so the upstream stays in the chain
+    /// and only this model is demoted.
+    RateLimited { retry_after_secs: Option<u64> },
+    /// The model no longer exists / reached end-of-life. NVIDIA answers HTTP 410
+    /// "reached its end of life" for a retired id, which is not a rate limit
+    /// and must never be retried.
+    Gone,
+    /// The credentials are rejected, or the model is gated on a plan the
+    /// account does not hold. Cline returns 403 for both.
+    Unauthorized,
+    /// Transport failure, or the probe could not be completed. Deliberately
+    /// distinct from `Gone`: an unreachable network is not evidence that a
+    /// model is retired and must never disable an upstream.
+    Indeterminate,
+}
+
+impl Liveness {
+    /// Whether the upstream may be used at all.
+    pub fn is_usable(&self) -> bool {
+        !matches!(self, Self::Gone | Self::Unauthorized)
+    }
+
+    /// Short label for the TUI / logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Unknown | Self::Indeterminate => "unprobed",
+            Self::Dispatchable => "ok",
+            Self::RateLimited { .. } => "rate-limited",
+            Self::Gone => "retired",
+            Self::Unauthorized => "blocked",
+        }
+    }
+
+    /// Map a probe outcome onto a state. `None` means "no HTTP response".
+    pub fn from_status(status: Option<u16>, retry_after_secs: Option<u64>) -> Self {
+        match status {
+            Some(200..=299) => Self::Dispatchable,
+            Some(401..=403) => Self::Unauthorized,
+            Some(404..=410) => Self::Gone,
+            Some(429) => Self::RateLimited { retry_after_secs },
+            // 5xx and everything else is not evidence about the model's
+            // existence, so it must not disable the upstream.
+            _ => Self::Indeterminate,
+        }
+    }
+}
+
+/// One upstream's cached observation.
+#[derive(Debug, Clone)]
+pub struct LivenessRecord {
+    pub upstream_id: String,
+    pub model: String,
+    pub state: Liveness,
+    /// Unix seconds when this record was written.
+    pub observed_at_unix: u64,
+}
+
+/// Process-wide liveness cache. Cheap to read on the plan path: a lock and a
+/// map lookup, never a network call.
+static LIVENESS: OnceLock<Mutex<Vec<LivenessRecord>>> = OnceLock::new();
+
+fn liveness_store() -> &'static Mutex<Vec<LivenessRecord>> {
+    LIVENESS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// How long a `Gone` / `Unauthorized` verdict is trusted before re-probing.
+/// Long by design: these do not flip back quickly, and re-probing a retired
+/// model on every plan build would be its own waste. `--refresh` clears it.
+const TERMINAL_TTL_SECS: u64 = 6 * 60 * 60;
+
+/// Record a probe result. Terminal states (`Gone`, `Unauthorized`) are sticky
+/// for [`TERMINAL_TTL_SECS`]; anything else is replaced immediately.
+pub fn record_liveness(upstream_id: &str, model: &str, state: Liveness) {
+    let mut store = match liveness_store().lock() {
+        Ok(store) => store,
+        // A poisoned lock must not take down routing.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = now_unix();
+    if let Some(existing) = store.iter_mut().find(|r| r.upstream_id == upstream_id) {
+        let still_valid = matches!(existing.state, Liveness::Gone | Liveness::Unauthorized)
+            && now.saturating_sub(existing.observed_at_unix) < TERMINAL_TTL_SECS
+            && !matches!(state, Liveness::Dispatchable);
+        if still_valid {
+            return;
+        }
+        existing.model = model.to_string();
+        existing.state = state;
+        existing.observed_at_unix = now;
+        return;
+    }
+    store.push(LivenessRecord {
+        upstream_id: upstream_id.to_string(),
+        model: model.to_string(),
+        state,
+        observed_at_unix: now,
+    });
+}
+
+/// The cached state for an upstream, or [`Liveness::Unknown`] when unprobed.
+pub fn liveness_of(upstream_id: &str) -> Liveness {
+    let store = match liveness_store().lock() {
+        Ok(store) => store,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    store
+        .iter()
+        .find(|r| r.upstream_id == upstream_id)
+        .map(|r| r.state)
+        .unwrap_or(Liveness::Unknown)
+}
+
+/// Every cached record, for the TUI.
+pub fn liveness_records() -> Vec<LivenessRecord> {
+    match liveness_store().lock() {
+        Ok(store) => store.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Drop all cached observations. Exposed for `clawde --refresh`.
+pub fn clear_liveness() {
+    if let Ok(mut store) = liveness_store().lock() {
+        store.clear();
+    }
+}
+
 /// Routing configuration for a [`FreeProvider`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingConfig {
@@ -2842,13 +2994,26 @@ pub struct ProviderCooldownProfile {
     pub respects_retry_after: bool,
     /// Scope of the provider's rate limits: `"per-key"` (default) means a
     /// rate limit benches the key for every model; `"per-model"` means the
-    /// provider enforces TPM/RPM buckets per model (Groq, Gemini), so a rate
-    /// limit only benches the key for the model it was hit on.
-    #[serde(default)]
+    /// provider enforces TPM/RPM buckets per model (Groq, Gemini, Cerebras), so
+    /// a rate limit only benches the key for the model it was hit on.
+    ///
+    /// The `default` here must be a named function, not bare `#[serde(default)]`
+    /// — that expands to `String::default()`, i.e. `""`, so every row that
+    /// omits the key would deserialize to the empty string rather than
+    /// `"per-key"`. That happens to behave correctly (only the literal
+    /// `"per-model"` arms model scoping) but leaves a silent gap between the
+    /// serialized default and the documented one.
+    #[serde(default = "default_limit_scope")]
     pub limit_scope: String,
     /// Optional notes about this provider's limits
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+/// Rate limits are cumulative per key/account unless a profile opts into
+/// `"per-model"`. See [`ProviderCooldownProfile::limit_scope`].
+fn default_limit_scope() -> String {
+    "per-key".to_string()
 }
 
 impl Default for ProviderCooldownProfile {
@@ -2858,7 +3023,7 @@ impl Default for ProviderCooldownProfile {
             server_error_cooldown_secs: 60,
             max_cooldown_secs: 600,
             respects_retry_after: false,
-            limit_scope: "per-key".to_string(),
+            limit_scope: default_limit_scope(),
             notes: None,
         }
     }
@@ -3081,4 +3246,203 @@ fn calculate_exponential_backoff(base_secs: u64, failure_count: u32, max_secs: u
     let jitter_range = capped as f64 * 0.2;
     let jitter = (rand::random::<f64>() * jitter_range * 2.0) - jitter_range;
     ((capped as f64 + jitter).max(1.0)) as u64
+}
+
+// ---------------------------------------------------------------------------
+// Cooldown-profile coverage audit
+// ---------------------------------------------------------------------------
+
+/// Guards the `provider-cooldown-profiles.json` table against the two failure
+/// modes that silently degrade routing:
+///
+/// 1. A catalog upstream with no profile row at all — it inherits `defaults`
+///    (`per-key`, 120s, no `Retry-After`), which is a guess, not a fact.
+/// 2. A row with a `limit_scope` typo — `limit_scope_is_per_model` is a bare
+///    string equality, so anything other than `"per-model"` reads as
+///    `per-key`. A misspelling therefore over-scopes every rate-limit cooldown
+///    to the whole key.
+///
+/// (2) is the expensive direction: over-scoping benches a healthy key for every
+/// model on the upstream over a one-model rate limit.
+#[cfg(test)]
+mod cooldown_profile_audit {
+    use super::{
+        clear_liveness, liveness_of, record_liveness, Liveness, ProviderProfiles, FREE_CATALOG,
+    };
+
+    /// The only `limit_scope` value that enables model-scoped cooldowns.
+    /// Every other string — including a typo — means `per-key`.
+    const PER_MODEL: &str = "per-model";
+
+    #[test]
+    fn every_catalog_upstream_has_a_cooldown_profile() {
+        let profiles = ProviderProfiles::load();
+        let missing: Vec<&str> = FREE_CATALOG
+            .iter()
+            .map(|upstream| upstream.id)
+            .filter(|id| !profiles.profiles.contains_key(*id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "FREE_CATALOG upstreams with no cooldown profile (they silently \
+             inherit `defaults`): {missing:?}. Add a row to \
+             provider-cooldown-profiles.json."
+        );
+    }
+
+    #[test]
+    fn every_limit_scope_is_a_recognised_value() {
+        let profiles = ProviderProfiles::load();
+        for (id, profile) in &profiles.profiles {
+            assert!(
+                matches!(profile.limit_scope.as_str(), "per-key" | "per-model"),
+                "upstream `{id}` has limit_scope={:?}; only \"per-key\" and \
+                 \"per-model\" are recognised. A typo reads as per-key and \
+                 over-scopes every rate-limit cooldown to the whole key.",
+                profile.limit_scope
+            );
+        }
+    }
+
+    /// `limit_scope_is_per_model` compares against the literal `"per-model"`,
+    /// so the default must not be that value. If it ever is, every unknown
+    /// upstream silently gets model-scoped cooldowns.
+    #[test]
+    fn the_default_profile_is_not_per_model() {
+        let profiles = ProviderProfiles::load();
+        assert_ne!(
+            profiles.defaults.limit_scope, PER_MODEL,
+            "the default profile must stay per-key — it is the fallback for \
+             every upstream without an explicit row"
+        );
+    }
+
+    /// Guards the regression this fix addressed: cerebras enforces per-model
+    /// limits (its docs' Limits-by-Tier table is keyed by model id) but was
+    /// previously unlabelled, so a one-model rate limit benched the key for
+    /// every cerebras model. Cerebras free-tier RPM is 1-5, making it the
+    /// most likely upstream in the chain to fire a rate limit at all.
+    /// The status->state mapping is the whole contract of the gate, and the
+    /// boundaries matter: a 410 is a retired model (never retry) while a 5xx is
+    /// not evidence the model exists (never disable).
+    #[test]
+    fn status_mapping_separates_retired_from_transient() {
+        assert_eq!(
+            Liveness::from_status(Some(200), None),
+            Liveness::Dispatchable
+        );
+        assert_eq!(
+            Liveness::from_status(Some(204), None),
+            Liveness::Dispatchable
+        );
+        // Retired / unknown model: NVIDIA's end-of-life answer.
+        assert_eq!(Liveness::from_status(Some(410), None), Liveness::Gone);
+        assert_eq!(Liveness::from_status(Some(404), None), Liveness::Gone);
+        // Blocked: bad key, no credits, or a plan the account does not hold.
+        for status in [401, 402, 403] {
+            assert_eq!(
+                Liveness::from_status(Some(status), None),
+                Liveness::Unauthorized,
+                "HTTP {status} must not be treated as a retired model"
+            );
+        }
+        // Per-model cap: usable upstream, just not this model.
+        assert_eq!(
+            Liveness::from_status(Some(429), Some(600)),
+            Liveness::RateLimited {
+                retry_after_secs: Some(600)
+            }
+        );
+        // Transport / server trouble must never disable anything.
+        for status in [Some(500), Some(503), Some(0), None] {
+            assert_eq!(
+                Liveness::from_status(status, None),
+                Liveness::Indeterminate,
+                "{status:?} is not evidence a model is retired"
+            );
+        }
+    }
+
+    #[test]
+    fn only_gone_and_blocked_are_unusable() {
+        assert!(
+            Liveness::Unknown.is_usable(),
+            "a cold gate disables nothing"
+        );
+        assert!(Liveness::Dispatchable.is_usable());
+        assert!(
+            Liveness::RateLimited {
+                retry_after_secs: None
+            }
+            .is_usable(),
+            "a per-model cap leaves the upstream usable"
+        );
+        assert!(!Liveness::Gone.is_usable());
+        assert!(!Liveness::Unauthorized.is_usable());
+        assert!(
+            Liveness::Indeterminate.is_usable(),
+            "an unreachable probe must not disable the chain"
+        );
+    }
+
+    /// Terminal verdicts are sticky so a retired model is not re-probed on
+    /// every plan build, but a later success must be able to clear them.
+    #[test]
+    fn terminal_verdicts_are_sticky_until_a_success() {
+        clear_liveness();
+        record_liveness("groq", "old-model", Liveness::Gone);
+        record_liveness("groq", "old-model", Liveness::Indeterminate);
+        assert_eq!(
+            liveness_of("groq"),
+            Liveness::Gone,
+            "a later Indeterminate must not silently resurrect a retired model"
+        );
+        record_liveness("groq", "new-model", Liveness::Dispatchable);
+        assert_eq!(
+            liveness_of("groq"),
+            Liveness::Dispatchable,
+            "an explicit success must clear a sticky verdict"
+        );
+        clear_liveness();
+        assert_eq!(liveness_of("groq"), Liveness::Unknown);
+    }
+
+    #[test]
+    fn cerebras_is_per_model() {
+        let profiles = ProviderProfiles::load();
+        assert_eq!(
+            profiles.profile_for("cerebras").limit_scope,
+            PER_MODEL,
+            "cerebras limits 'vary based on the model' per its docs"
+        );
+    }
+
+    /// Every upstream verified per-model against current vendor docs
+    /// (checked 2026-09-27). Each of these docs keys its limits table by model
+    /// id with distinct values per row, so a rate limit on one model leaves
+    /// the key usable for the others.
+    const VERIFIED_PER_MODEL: [&str; 6] = [
+        "cerebras",   // "vary based on the model"; limits table keyed by model id
+        "groq",       // free-plan table keyed by MODEL ID
+        "google",     // "Limits vary depending on the specific model being used"
+        "sambanova",  // 20 RPM / 20 RPD / 200K TPD granted per model
+        "mistral",    // "Completion rate limits are listed per model"
+        "openrouter", // "different rate limits for different models" (RPM only)
+    ];
+
+    /// Guards the regression that motivated this audit: cerebras, sambanova and
+    /// mistral were all unlabelled, so a one-model rate limit benched the key
+    /// for every model on those upstreams. cerebras runs 1-5 free-tier RPM and
+    /// sambanova 20, so both fire in normal use.
+    #[test]
+    fn verified_per_model_upstreams_are_labelled() {
+        let profiles = ProviderProfiles::load();
+        for id in VERIFIED_PER_MODEL {
+            assert_eq!(
+                profiles.profile_for(id).limit_scope,
+                PER_MODEL,
+                "{id} enforces per-model rate limits (verified 2026-09-27)"
+            );
+        }
+    }
 }
