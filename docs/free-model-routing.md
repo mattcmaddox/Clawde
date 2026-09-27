@@ -735,3 +735,71 @@ all, and what status it returns if it does. The docs and forum pages tried are
 stale or unrelated. `limit_scope` is left at the conservative `per-key`
 default rather than guessed, and the generic 429 / 403 handling already applies
 if the limit is ever hit.
+
+---
+
+## 12. NVIDIA does have a rate limit - the earlier probe could not find it
+
+`scripts/probes/rate-burst-probe.py` exists because the sequential probe was
+**methodologically incapable** of testing an RPM limit. It waits for each full
+round-trip before sending the next, so 200 sequential requests take ~200 seconds
+- about 6 requests per minute. It could never exceed a 40 RPM cap, so "no 429
+after 200 requests" proved nothing. That was my error, and it is the reason the
+profile earlier said "no rate limit found".
+
+Bursting instead, on the same key:
+
+| test | ok | 429 | achieved |
+| --- | --- | --- | --- |
+| A: 60x `openai/gpt-oss-20b` | 33 | 27 | 897 rpm |
+| B: 60x `nvidia/nemotron-3.5-lightning-30b-a3b`, same key, immediately | 11 | 43 | 59 rpm |
+
+**B also got rate-limited, so the limit is shared across models on one key.** A
+~60-second sliding window, sized at roughly 31-36 requests:
+
+| settle before burst | ok | 429 |
+| --- | --- | --- |
+| (cold) | 31 | 28 |
+| 30s | 13 | 44 |
+| 65s | 36 | 23 |
+
+Full recovery by 65s and partial at 30s places the window at ~60s, and the
+allowance of ~35/min matches the commonly cited 40 RPM.
+
+**So the number is right but the scope is wrong: ~40 RPM per KEY (or org), not
+per model.** The consequences:
+
+- Switching between NVIDIA models does **not** escape a rate limit. Per-model
+  scope is wrong here, so the profile keeps `limit_scope: per-key`.
+- Rotating to a second NVIDIA key only helps if that key is in a **different
+  organization**. Two keys in one org share the window, exactly as the OpenRouter
+  and Groq cases did. This is the thing to check before adding the brev token
+  as a second key - if it lands in the same org it adds nothing.
+- The returned 429 is a normal `RateLimited`, so the existing per-key cooldown
+  applies and no new error mapping is needed.
+
+## 13. Cloudflare: no free models, and a stale exclusion list
+
+The model listing Clawde needs is already implemented:
+`fetch_cloudflare_available_free_models` queries
+`/ai/models/search?per_page=100` and keeps models whose `source` is `"hosted"`
+(neuron-billed, inside the 10K/day allocation), dropping `"proxied"` ones which
+are billed separately and never free.
+
+Probing confirmed the semantics the user described - there is no free/free-tier
+model concept, only a unit budget:
+
+```
+@cf/qwen/qwen3-30b-a3b-fp8   200 OK
+@cf/zai-org/glm-5.2          403 not available on the Workers Free plan
+@cf/zai-org/glm-5.3          403 not available on the Workers Free plan
+@cf/zai-org/glm-5.3-flash    403 not available on the Workers Free plan
+```
+
+**Bug found:** `CLOUDFLARE_PAID_REQUIRED` listed `glm-5.2` but **omitted
+`glm-5.3` and `glm-5.3-flash`**, which the current pricing page names and which
+both 403. Discovery could therefore pick a model that fails on every dispatch.
+Fixed, with the live 403 recorded in the comment.
+
+It is a genuine trap: `glm-5-3` **is** free on NVIDIA, so the cross-provider
+name similarity makes it look safe. The list must be per-provider.

@@ -1141,6 +1141,13 @@ const CLOUDFLARE_PAID_REQUIRED: &[&str] = &[
     "@cf/moonshotai/kimi-k2.6",
     "@cf/moonshotai/kimi-k2.7-code",
     "@cf/zai-org/glm-5.2",
+    // Added 2026-09-27: the pricing page lists these alongside glm-5.2, and a
+    // live probe confirms all three 403 with "not available on the Workers
+    // Free plan". Leaving them in the candidate list would pick a model that
+    // then 403s on every dispatch. Notably `glm-5-3` IS free on NVIDIA, so the
+    // cross-provider name similarity is a trap.
+    "@cf/zai-org/glm-5.3",
+    "@cf/zai-org/glm-5.3-flash",
     "@cf/deepseek-ai/deepseek-v4-flash-0731",
     "@cf/deepseek-ai/deepseek-v4-pro-0813",
 ];
