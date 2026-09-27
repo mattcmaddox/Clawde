@@ -690,40 +690,48 @@ in free mode it yields a single "free" row rather than one per upstream.
 
 ---
 
-## 11. NVIDIA: the limit is a dollar cap, not a rate limit
+## 11. NVIDIA: two surfaces, and a correction
 
-The account reports **"your organization has a resource usage limit of $30.00
-per hour"** (org `mattcmaddox-0-zz1i`). That single fact resolves several open
-questions and invalidates one measurement.
+An earlier revision of this file concluded that NVIDIA's ceiling was a $30/hour
+organization spend cap. **That was an over-generalisation and has been
+reverted.** The $30.00/hour figure came from a **brev.nvidia.com** organization
+dashboard. Clawde talks to **build.nvidia.com** / `integrate.api.nvidia.com`,
+which is a different surface with different billing. Nothing established that
+the brev cap applies here, and the catalog hint and `terminal_ttl_secs` that were
+added on that assumption have both been removed.
 
-NVIDIA's hosted API returns **no rate-limit or spend headers**. A 200 response
-carries only `Nvcf-Reqid` and `Nvcf-Status: fulfilled`. So:
+What *is* established, measured 2026-09-27 against the endpoint Clawde uses:
 
-- There is no proactive signal to read. Clawde can only learn the state from an
-  error, which is why the liveness cache is dispatch-fed.
-- Draining 1200+ requests at `max_tokens=2` never tripped anything. That is
-  consistent with a *spend* cap, not a request-rate cap — the earlier "ceiling
-  above the probe cap" reading was the wrong inference from the same fact.
+**1. There is an authoritative free-endpoint API, and Clawde already uses it.**
+`api.ngc.nvidia.com/v2/search/catalog/resources` marks each endpoint with
+`PREVIEW == "true"` (the "Free Endpoint" badge) and `DEPRECATION` for retired
+ones. `fetch_nvidia_catalog_free_models` filters on exactly that. A live sweep
+returns **41 free endpoints, 0 deprecated**, all on page 0 — so
+`NVIDIA_CATALOG_MAX_PAGES = 8` is more than enough and there is no pagination
+bug. Free and live today includes:
 
-Routing consequences, all recorded in the profile:
+```
+nemotron-3.5-lightning-30b-a3b   (the catalog default — fix validated)
+gpt-oss-20b                      (the fallback)
+nemotron-3-ultra-550b-a55b   deepseek-v4.1-flash   kimi-k3   glm-5-3
+```
 
-| property | value | why |
-| --- | --- | --- |
-| `limit_scope` | `per-key` (unchanged) | the cap is organization-wide dollars, not a per-model bucket |
-| `no_credits_is_terminal` | `false` | the cap **resets hourly**, so it is a periodic quota, never terminal |
-| `terminal_ttl_secs` | `3600` | see below |
+This is the authoritative free-model signal. The `build.nvidia.com/models`
+HTML filter in the `nimType=anim_type_preview` query string is a view of the
+same data; the catalog API is better because it is structured, paginated, and
+carries the deprecation flag.
 
-### The 403 risk, and why the TTL is now per-provider
+**2. The chat API returns no limit headers at all.** A 200 carries only
+`Nvcf-Reqid` and `Nvcf-Status: fulfilled`. There is no proactive signal to
+read, which is why the liveness cache is dispatch-fed rather than probe-driven.
 
-Still unverified: the status NVIDIA returns on exhaustion. The docs and forum
-pages are stale or unrelated. If it is **403** rather than 429, the liveness
-gate classifies it `Unauthorized` — correct for a revoked key, but six times too
-long for an hourly reset against a flat 6-hour terminal TTL.
+**3. Draining 1200+ requests at `max_tokens=2` never tripped anything.** Given
+(2), the honest reading is that there may be no request-rate limit on this
+endpoint to find — not that a ceiling sits above the probe cap, which is what
+this file previously claimed.
 
-So `terminal_ttl_secs` is now a per-profile field. Erring short is safe: a
-still-broken upstream is simply re-marked on the next attempt. Erring long
-silently removes capacity for hours, which is the failure users notice.
-
-The next time the $30 cap is actually hit, the observed status is what pins the
-mapping. That is the one measurement still outstanding here, and it is not
-obtainable without spending the cap.
+**Still unverified:** whether `integrate.api.nvidia.com` has any rate limit at
+all, and what status it returns if it does. The docs and forum pages tried are
+stale or unrelated. `limit_scope` is left at the conservative `per-key`
+default rather than guessed, and the generic 429 / 403 handling already applies
+if the limit is ever hit.
