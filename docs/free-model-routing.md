@@ -763,11 +763,41 @@ Bursting instead, on the same key:
 | 30s | 13 | 44 |
 | 65s | 36 | 23 |
 
-Full recovery by 65s and partial at 30s places the window at ~60s, and the
-allowance of ~35/min matches the commonly cited 40 RPM.
+Full recovery by 65s and partial at 30s places the window at ~60s.
 
-**So the number is right but the scope is wrong: ~40 RPM per KEY (or org), not
-per model.** The consequences:
+### Cross-checked against documentation - the scope holds, the number does not
+
+| claim | source | verdict |
+| --- | --- | --- |
+| shared across models, per key/account | "hosted NIM endpoints have per-account / per-API-key rate limits" | **matches the measurement** |
+| 40 RPM | - | **not supported** - NVIDIA publishes no universal RPM |
+
+The documentation is explicit that the number does not exist as a constant:
+
+> "The free tier is rate-limit based, with **no universal published RPM**"
+>
+> "subject to **model- and account-specific rate limits that NVIDIA does not
+> publish as one universal quota**"
+>
+> "specific RPM/TPM numbers are **not consistently published**"
+
+So the ~35-per-window figure measured here is **this account's** allowance, not
+a global constant, and must not be hard-coded anywhere. The earlier phrasing
+"matches the commonly cited 40 RPM" was doing work the evidence did not support
+and has been removed.
+
+### A documented behaviour that matters for routing
+
+> "When free-trial credits on build.nvidia.com are exhausted, requests return an
+> **authorization error rather than a throttle**."
+
+Credit exhaustion on this surface can therefore surface as **401/403, not 429**.
+The liveness gate reads 403 as `Unauthorized` and suppresses for
+`terminal_ttl_secs` (default 6h) — which is too long for a budget that rotates.
+That is a real risk, recorded in the profile, and it needs the observed status
+before a per-provider TTL can be set honestly.
+
+**Scope verdict: ~per key/account, shared across models.** The consequences:
 
 - Switching between NVIDIA models does **not** escape a rate limit. Per-model
   scope is wrong here, so the profile keeps `limit_scope: per-key`.
