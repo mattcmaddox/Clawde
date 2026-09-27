@@ -767,24 +767,39 @@ Full recovery by 65s and partial at 30s places the window at ~60s.
 
 ### Cross-checked against documentation - the scope holds, the number does not
 
+A previous revision of this table over-corrected and declared 40 RPM
+"unsupported". That was wrong in the other direction, and both halves are
+retained here because they are not in conflict:
+
 | claim | source | verdict |
 | --- | --- | --- |
-| shared across models, per key/account | "hosted NIM endpoints have per-account / per-API-key rate limits" | **matches the measurement** |
-| 40 RPM | - | **not supported** - NVIDIA publishes no universal RPM |
+| ~40 RPM is the default | a whole cluster of forum threads titled *"Request for NVIDIA Build API Rate Limit Increase (40 RPM → 200 RPM)"*, plus the ~35/window measured here | **supported** as a default, never as a contract |
+| shared across models, per key/account | *"hosted NIM endpoints have per-account / per-API-key rate limits"* | **matches the measurement** |
+| it is a constant you can rely on | - | **refuted** |
 
-The documentation is explicit that the number does not exist as a constant:
+NVIDIA publishes no universal number:
 
 > "The free tier is rate-limit based, with **no universal published RPM**"
 >
-> "subject to **model- and account-specific rate limits that NVIDIA does not
-> publish as one universal quota**"
->
-> "specific RPM/TPM numbers are **not consistently published**"
+> "model- and account-specific rate limits that **NVIDIA does not publish as
+> one universal quota**"
 
-So the ~35-per-window figure measured here is **this account's** allowance, not
-a global constant, and must not be hard-coded anywhere. The earlier phrasing
-"matches the commonly cited 40 RPM" was doing work the evidence did not support
-and has been removed.
+And a moderator states the decisive part:
+
+> "this usually involves a rate limit that is **dependent on model, use-case and
+> the amount of current overall traffic using the same access**"
+
+**So: 40 RPM is a real observed default that our measurement is consistent with,
+and it is explicitly not a guarantee.** Two consequences:
+
+- Never hard-code it. The allowance moves with model, use-case and current
+  shared load.
+- The *"current overall traffic"* clause means the ceiling is partly about
+  **shared capacity, not a private per-account bucket**. Adding accounts
+  therefore does not multiply headroom the way a per-account quota would - which
+  is the strongest argument yet against building multi-account NVIDIA rotation.
+
+
 
 ### A documented behaviour that matters for routing
 
