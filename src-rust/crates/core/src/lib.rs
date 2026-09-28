@@ -3671,13 +3671,68 @@ pub mod config {
         /// `TestHome` guards), which still wins; only the implicit fallback to
         /// the real user directory is removed while testing.
         pub fn global_settings_path() -> PathBuf {
+            Self::test_scratch_home()
+                .map(|dir| dir.join("settings.json"))
+                .unwrap_or_else(|| Self::config_dir().join("settings.json"))
+        }
+
+        /// The per-process scratch home used while a cargo test harness runs
+        /// with no explicit `CLAWDE_HOME`, or `None` when the process should
+        /// use the real config dir.
+        ///
+        /// This is the single detection site behind every "tests must not touch
+        /// real user state" redirect, so they can never disagree. Detection
+        /// reads the executable path ([`Self::running_under_cargo_test`]) rather
+        /// than an env var on purpose: the `TestHome` guards work by setting
+        /// `CLAWDE_HOME`, which is process-global, so they only protect tests
+        /// that opt in and race the ones that don't on the parallel test runner.
+        pub(crate) fn test_scratch_home() -> Option<PathBuf> {
             if std::env::var_os("CLAWDE_HOME").is_none() && Self::running_under_cargo_test() {
                 let dir =
                     std::env::temp_dir().join(format!("clawde-test-home-{}", std::process::id()));
                 let _ = std::fs::create_dir_all(&dir);
-                return dir.join("settings.json");
+                Some(dir)
+            } else {
+                None
             }
-            Self::config_dir().join("settings.json")
+        }
+
+        /// Root for mutable runtime state the app both reads and writes:
+        /// `free-state/` (tool-dialect tally, discovery caches),
+        /// `empty-cooldown-state/`, `telemetry-state/`, `capacity-state/`, and
+        /// `key-ring-state/`.
+        ///
+        /// Identical to [`Self::config_dir`] in production. Under a cargo test
+        /// harness with no explicit `CLAWDE_HOME` it points at
+        /// [`Self::test_scratch_home`] instead, because these files are loaded
+        /// eagerly on construction and rewritten during dispatch — an unguarded
+        /// test would otherwise read the developer's live routing history into
+        /// its assertions and overwrite it on the way out. That is how
+        /// `free::impls::tests::tool_routing_gate_demotes_prose_prone_upstream`
+        /// came to fail: the real tally held 21 structured samples for groq, so
+        /// the 3 prose samples it recorded never crossed the 60% demotion gate.
+        ///
+        /// Tests that want a specific home still set `CLAWDE_HOME` (the
+        /// `TestHome` guards), which takes precedence here too.
+        pub fn state_dir() -> PathBuf {
+            Self::test_scratch_home().unwrap_or_else(Self::config_dir)
+        }
+
+        /// Clawde's home when it has been redirected away from the real user
+        /// directory, or `None` in a normal production process.
+        ///
+        /// This folds the two redirects into one place — an explicit
+        /// `CLAWDE_HOME` and the cargo-test scratch home — so every consumer
+        /// that must not read the developer's live data detects them
+        /// identically, rather than re-deriving the precedence. Returns
+        /// `None` when the real user home is the effective home.
+        pub(crate) fn redirected_home() -> Option<PathBuf> {
+            if let Some(explicit) = std::env::var_os("CLAWDE_HOME") {
+                if !explicit.is_empty() {
+                    return Some(PathBuf::from(explicit));
+                }
+            }
+            Self::test_scratch_home()
         }
 
         /// Load settings from disk, returning defaults when the file is missing.
@@ -4931,7 +4986,15 @@ pub mod config {
             const MIB: u64 = 1024 * 1024;
             // 2000 lines, well past the cap; the whole stream parses to 200_000
             // in the `used` column, so a truncated result proves the cap.
-            let (used_mib, total_mib) = run_ollama_vram_probe("yes 100,200 | head -n 2000")
+            //
+            // `; exit 0` is load-bearing. Hitting the cap closes the read end,
+            // which SIGPIPEs whichever pipeline member is still writing, so the
+            // shell's status must not be taken from that pipeline. Without it
+            // the test raced: normally `head` finished writing before the
+            // close, but under load it lost that race, the pipeline reported
+            // 141, and the probe correctly returned `None` — failing the
+            // assertion ~15% of the time at six-way CPU oversubscription.
+            let (used_mib, total_mib) = run_ollama_vram_probe("yes 100,200 | head -n 2000; exit 0")
                 .await
                 .expect("the capped prefix still parses");
             let line_bytes = "100,200\n".len() as u64;
@@ -4945,8 +5008,12 @@ pub mod config {
             // garbage rather than reporting it.
             let started = std::time::Instant::now();
             assert_eq!(run_ollama_vram_probe("yes 100,200").await, None);
+            // The bug this guards was an unconditional `read_to_end` that waited
+            // out the *full* timeout; half of it still leaves a >100x margin
+            // over the ~10 ms a healthy run needs, so a loaded machine cannot
+            // trip the assertion while a real regression still does.
             assert!(
-                started.elapsed() < VRAM_PROBE_TIMEOUT,
+                started.elapsed() < VRAM_PROBE_TIMEOUT / 2,
                 "a streaming probe must not hold the reader for the timeout. \
                  Elapsed: {:?}",
                 started.elapsed()
@@ -8976,6 +9043,33 @@ mod tests {
             !path.starts_with(dirs::home_dir().unwrap_or_default().join(".clawde")),
             "the developer's real ~/.clawde must never be in scope for a test: {}",
             path.display()
+        );
+    }
+
+    /// The mutable runtime-state root must never resolve into the developer's
+    /// real config dir while a test harness runs. Unlike settings.json, the
+    /// files under it (`free-state/tool-dialect.json`, `empty-cooldown-state/`,
+    /// `telemetry-state/`, `capacity-state/`) are loaded eagerly when a
+    /// `FreeProvider` is built and rewritten during dispatch, so one unguarded
+    /// test both reads live routing history into its assertions and overwrites
+    /// it — the shape of the `tool_routing_gate_demotes_prose_prone_upstream`
+    /// failure, where a real tally of 21 structured samples for groq kept a
+    /// demotion gate from ever firing.
+    #[test]
+    fn tests_resolve_runtime_state_to_a_scratch_directory() {
+        // A `TestHome` on another thread may point CLAWDE_HOME at its own temp
+        // dir; both that and the implicit scratch fallback are acceptable,
+        // the developer's home is not.
+        let dir = crate::config::Settings::state_dir();
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "a test build must resolve runtime state into a scratch directory, got {}",
+            dir.display()
+        );
+        assert!(
+            !dir.starts_with(dirs::home_dir().unwrap_or_default().join(".clawde")),
+            "the developer's real ~/.clawde must never hold test state: {}",
+            dir.display()
         );
     }
 

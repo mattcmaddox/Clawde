@@ -673,7 +673,7 @@ const DISCOVERY_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
 const MODELSDEV_DEFAULTS_TTL_SECS: u64 = 24 * 60 * 60;
 
 fn free_state_dir() -> std::path::PathBuf {
-    clawde_core::config::Settings::config_dir().join("free-state")
+    clawde_core::config::Settings::state_dir().join("free-state")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2074,7 +2074,7 @@ pub fn resolve_free_upstream_keys(
 /// the dispatching provider. Expired entries are ignored, and a missing or
 /// unparseable file simply means "nothing known to be cooling".
 pub fn cooling_free_upstreams() -> std::collections::HashSet<String> {
-    let path = clawde_core::config::Settings::config_dir()
+    let path = clawde_core::config::Settings::state_dir()
         .join("empty-cooldown-state")
         .join("free.json");
     let Ok(json) = std::fs::read_to_string(&path) else {
@@ -2783,7 +2783,7 @@ mod cache_tests {
     #[test]
     fn failure_reason_is_capped_before_persist() {
         let _home = TestHome::new();
-        let path = clawde_core::config::Settings::config_dir()
+        let path = clawde_core::config::Settings::state_dir()
             .join("telemetry-state")
             .join("free.json");
         let mut state =
@@ -2814,7 +2814,7 @@ mod cache_tests {
     #[test]
     fn cooling_free_upstreams_reads_persisted_snapshot() {
         let _home = TestHome::new();
-        let dir = clawde_core::config::Settings::config_dir().join("empty-cooldown-state");
+        let dir = clawde_core::config::Settings::state_dir().join("empty-cooldown-state");
         std::fs::create_dir_all(&dir).unwrap();
         // No file yet: nothing known to be cooling.
         assert!(cooling_free_upstreams().is_empty());
@@ -2890,7 +2890,7 @@ mod cache_tests {
     #[test]
     fn last_failure_reason_persists_and_restores() {
         let _home = TestHome::new();
-        let path = clawde_core::config::Settings::config_dir()
+        let path = clawde_core::config::Settings::state_dir()
             .join("telemetry-state")
             .join("free.json");
         let mut state =

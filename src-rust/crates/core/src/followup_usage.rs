@@ -93,8 +93,16 @@ impl FollowupUsage {
     }
 
     /// Save to `primary_dir` and, on success, remove the legacy global file.
+    ///
+    /// When `primary_dir` and `legacy_dir` are the same directory there is no
+    /// migration to perform — removing "the legacy" path would delete the file
+    /// that was just written. That happens whenever no project root resolves,
+    /// so the global directory is both the primary and the legacy location.
     pub fn save_migrating(&self, primary_dir: &Path, legacy_dir: &Path) -> anyhow::Result<()> {
         self.save(primary_dir)?;
+        if primary_dir == legacy_dir {
+            return Ok(());
+        }
         let legacy = legacy_dir.join(FILE_NAME);
         if legacy.exists() {
             let _ = std::fs::remove_file(legacy);
@@ -304,6 +312,18 @@ mod tests {
             .unwrap();
         assert!(primary.path().join(FILE_NAME).exists());
         assert!(!legacy.path().join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn save_migrating_keeps_the_file_when_primary_is_the_legacy_dir() {
+        // No project root: the global dir is both primary and legacy. The save
+        // must survive — the bug removed the file it had just written.
+        let dir = tempfile::tempdir().unwrap();
+        let mut usage = FollowupUsage::default();
+        usage.record("Run tests");
+        usage.save_migrating(dir.path(), dir.path()).unwrap();
+        assert!(dir.path().join(FILE_NAME).exists());
+        assert_eq!(FollowupUsage::load(dir.path()).len(), 1);
     }
 
     #[test]

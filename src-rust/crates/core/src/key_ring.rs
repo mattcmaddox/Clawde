@@ -643,8 +643,15 @@ impl KeyRing {
 
     /// Default path for this provider's persisted key ring state:
     /// `{clawde_home}/key-ring-state/{provider_id}.json`
+    ///
+    /// Resolves through [`crate::config::Settings::state_dir`], not
+    /// `config_dir()`, so the cargo-test scratch-home redirect applies. This
+    /// file is loaded eagerly when a `KeyRotatingProvider` is constructed and
+    /// rewritten after every key exhaustion, and each entry stores the raw key
+    /// string, so an unguarded test would both read the developer's live
+    /// cooldowns into its assertions and rewrite their keys.
     pub fn default_state_path(provider_id: &str) -> std::path::PathBuf {
-        crate::config::Settings::config_dir()
+        crate::config::Settings::state_dir()
             .join("key-ring-state")
             .join(format!("{provider_id}.json"))
     }
@@ -660,6 +667,28 @@ mod tests {
 
     fn make_ring(keys: &[&str]) -> KeyRing {
         KeyRing::new("groq", keys.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// The persisted key ring is mutable runtime state, so it must resolve
+    /// through the test-scratch root like its siblings. It was left on
+    /// `config_dir()` while `free-state/`, `empty-cooldown-state/`,
+    /// `telemetry-state/` and `capacity-state/` moved to `state_dir()`, which
+    /// meant an unguarded test would read and rewrite the developer's real
+    /// `~/.clawde/key-ring-state/<provider>.json` — a file that stores the raw
+    /// key strings. This also covers it in production, where the two roots are
+    /// identical by construction.
+    #[test]
+    fn default_state_path_resolves_below_the_state_dir() {
+        let path = KeyRing::default_state_path("nvidia");
+        assert!(
+            path.starts_with(crate::config::Settings::state_dir()),
+            "key-ring state must live under the state dir, got {}",
+            path.display()
+        );
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("nvidia.json")
+        );
     }
 
     #[test]

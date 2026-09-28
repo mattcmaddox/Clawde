@@ -40,8 +40,16 @@ impl FollowupHistory {
     }
 
     /// Save to `primary_dir` and, on success, remove the legacy global file.
+    ///
+    /// When `primary_dir` and `legacy_dir` are the same directory there is no
+    /// migration to perform — removing "the legacy" path would delete the file
+    /// that was just written. That happens whenever no project root resolves,
+    /// so the global directory is both the primary and the legacy location.
     pub fn save_migrating(&self, primary_dir: &Path, legacy_dir: &Path) -> anyhow::Result<()> {
         self.save(primary_dir)?;
+        if primary_dir == legacy_dir {
+            return Ok(());
+        }
         let legacy = legacy_dir.join(FILE_NAME);
         if legacy.exists() {
             let _ = std::fs::remove_file(legacy);
@@ -130,14 +138,26 @@ fn temporary_path(path: &Path) -> PathBuf {
     path.with_extension("json.tmp")
 }
 
+/// The global followup data directory: the legacy home of the followup files,
+/// and the fallback used when no project root is known.
+///
+/// Resolves through [`crate::config::Settings::state_dir`], so it is the real
+/// `~/.clawde` in production while a cargo test harness is redirected to a
+/// per-process scratch directory. Followups are read and rewritten eagerly by
+/// the TUI, so an unredirected test would otherwise overwrite the developer's
+/// live `followup_history.json` / `followup_usage.json` and `followups.md`.
+pub fn global_followup_dir() -> PathBuf {
+    crate::config::Settings::state_dir()
+}
+
 /// Directory holding project-scoped followup data: `<project_root>/.clawde/`,
-/// falling back to the global config dir when no project root is known. This
+/// falling back to [`global_followup_dir`] when no project root is known. This
 /// mirrors the per-project `.clawde/` convention already used for custom modes
 /// and memory dirs, so followup data never leaks across projects.
 pub fn followup_data_dir(project_root: Option<&Path>) -> PathBuf {
     match project_root {
         Some(root) => root.join(".clawde"),
-        None => crate::config::Settings::config_dir(),
+        None => global_followup_dir(),
     }
 }
 
@@ -223,15 +243,28 @@ mod tests {
     }
 
     #[test]
+    fn save_migrating_keeps_the_file_when_primary_is_the_legacy_dir() {
+        // No project root: the global dir is both primary and legacy. The save
+        // must survive — the bug removed the file it had just written.
+        let dir = tempdir().unwrap();
+        let mut history = FollowupHistory::default();
+        history.insert(&item("Run tests", FollowupRank::Recommended, ""));
+        history.save_migrating(dir.path(), dir.path()).unwrap();
+        assert!(dir.path().join(FILE_NAME).exists());
+        assert_eq!(FollowupHistory::load(dir.path()).items().len(), 1);
+    }
+
+    #[test]
     fn followup_data_dir_resolves_per_project_and_global_fallback() {
         let project = tempdir().unwrap();
         assert_eq!(
             followup_data_dir(Some(project.path())),
             project.path().join(".clawde")
         );
-        assert_eq!(
-            followup_data_dir(None),
-            crate::config::Settings::config_dir()
-        );
+        // The global fallback is test-redirected: it must resolve under the
+        // runtime state root (a scratch dir under a cargo test harness), never
+        // the real config dir.
+        assert_eq!(followup_data_dir(None), global_followup_dir());
+        assert_eq!(global_followup_dir(), crate::config::Settings::state_dir());
     }
 }

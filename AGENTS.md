@@ -94,9 +94,9 @@ tmux send-keys -t clawde-test C-o   # ctrl+o
 #      tmux send-keys -t s "PROBEMARK" C-m     # submitted
 #
 # 2. Sending text and the submit key in the SAME invocation fails even with
-#    `C-m`: the app enables bracketed paste (`crates/tui/src/lib.rs`), so tmux
-#    wraps the payload in paste markers and the CR inside it is delivered as
-#    pasted content — a literal newline:
+#    `C-m`: the app enables bracketed paste on Linux/macOS (`crates/tui/src/lib.rs`
+#    disables it on Windows by design), so tmux wraps the payload in paste
+#    markers and the CR inside it is delivered as pasted content — a newline:
 #
 #      tmux send-keys -t s "a long prompt" C-m   # NOT submitted (verified)
 #      tmux send-keys -t s "a long prompt"       # submitted
@@ -121,11 +121,17 @@ On Windows hosts, prefer `cargo run -- --print "..."` against the headless path.
 
 The TUI main loop must never repaint at full rate while idle. The decision
 lives in `App::needs_fast_repaint()` (`crates/tui/src/app.rs`) and the poll
-timeout in `crates/cli/src/main.rs` (16 ms while streaming / effort-picker
-animation / any modal is open, 250 ms otherwise). Any new per-frame animation
-must extend `needs_fast_repaint()`; never hardcode a 16 ms poll for all states.
-An idle session regressing to a constant 60fps repaint burns ~30% of a core
-forever. Check with:
+timeout in `crates/cli/src/main.rs` (16 ms while it returns true, 250 ms
+otherwise). The fast list is deliberately narrow: streaming / verifying /
+compacting, a paused stream's buffered-char counter, the effort-picker
+animation, the dialogs that carry an animated spinner (permission request,
+ask-user, MCP approval, elicitation), and a held chord-prefix key.
+`any_modal_open()` is **excluded on purpose** — static forms (onboarding,
+settings, connect, model picker) do not need 60fps, and including every modal
+made a first-run session burn ~15% of a core in the idle-CPU probe. Any new
+per-frame animation must extend `needs_fast_repaint()`; never hardcode a 16 ms
+poll for all states. An idle session regressing to a constant 60fps repaint
+burns ~30% of a core forever. Check with:
 
 ```bash
 python3 scripts/probes/idle-cpu-probe.py --binary src-rust/target/debug/clawde
@@ -143,9 +149,15 @@ cargo check -p clawde-tui --tests
 
 ### Pre-commit hook
 
-`.githooks/pre-commit` runs gitleaks + the async file-flush audit + rustfmt + the
-TUI test-target check + an idle-CPU smoke probe (skipped when the debug binary is
-missing/stale) before commits (see the script header). Enable once per clone:
+`.githooks/pre-commit` runs five checks before a commit lands (see the script
+header for the full contract): the gitleaks secret scan, the async file-flush
+audit, rustfmt drift, the TUI test-target compile, an idle-CPU smoke probe, and
+a **live eval gate** (`scripts/eval/run_eval.py --fixture
+scripts/eval/fixtures/catalog-order`) that runs the real free-provider chain and
+blocks the commit if it stops enumerating `FREE_CATALOG` order. The two slow
+checks self-skip when the debug binary is missing or older than the staged Rust
+sources, and the eval gate skips when no free keys are configured. Enable once
+per clone:
 
 ```bash
 git config core.hooksPath .githooks
@@ -153,6 +165,9 @@ git config core.hooksPath .githooks
 
 Opt out of a single commit: `SKIP_CLAWDE_HOOK=1 git commit ...`
 Skip the secret scan only: `CLAWDE_HOOK_SKIP_GITLEAKS=1 git commit ...`
+Skip the slower cargo check + probes: `CLAWDE_HOOK_SKIP_TESTS=1 git commit ...`
+Skip only the idle-CPU probe: `CLAWDE_HOOK_SKIP_IDLE_CPU=1 git commit ...`
+Skip only the live eval gate: `CLAWDE_HOOK_SKIP_EVAL=1 git commit ...`
 
 The secret scan (check 0) blocks any commit staging credentials in any file
 type, via `gitleaks protect --staged` with the repo baseline `gitleaks.toml`
@@ -170,9 +185,9 @@ directory) MUST serialize on a crate-level `ENV_LOCK` mutex before mutating
 guard will race under parallelism and flake CI. `scripts/audit-env-tests.py`
 scans for unguarded mutations — keep it green when adding tests.
 
-### Tests must never touch real user state (settings, keybindings)
+### Tests must never touch real user state (settings, keybindings, runtime state)
 
-`cargo test` must not read or write the developer's real config. Two guards
+`cargo test` must not read or write the developer's real config. Three guards
 exist; use them and do not route around them:
 
 - **keybindings** — a test build resolves through `crate::keybindings_dir()`
@@ -183,18 +198,50 @@ exist; use them and do not route around them:
   `cfg!(test)` is NOT sufficient because a dependent crate compiles this one
   without it). `crates/tui/src/app.rs::TestHome` still pins an explicit home
   where a test needs one.
+- **runtime state** — `Settings::state_dir()` is the root for the files the app
+  both reads and writes: `free-state/` (tool-dialect tally, discovery caches),
+  `empty-cooldown-state/`, `telemetry-state/`, `capacity-state/`,
+  `key-ring-state/`, and the global followup files (`followup_history.json`,
+  `followup_usage.json`, `followups.md`) reached through
+  `crates/core/src/followup_history.rs::global_followup_dir`. It falls back to
+  `test_scratch_home()` exactly like settings, because these files are loaded
+  eagerly when a `FreeProvider` or `KeyRotatingProvider` is built and rewritten
+  during dispatch (and, for followups, on every recorded selection/completion).
+  A state path that resolves through `config_dir()` instead bypasses the
+  redirect; that is how
+  `free::impls::tests::tool_routing_gate_demotes_prose_prone_upstream` came to
+  read the developer's live tally (21 structured groq samples) and fail, and
+  how the followup tests rewrote the real `~/.clawde/followups.md`.
+
+`test_scratch_home()` is a single per-process directory keyed on the pid, so it
+is scratch-space protection, not per-test isolation: two tests in one binary
+that write the same file still race. Give state that a test must control an
+explicit in-memory or `persist: false` path rather than relying on the redirect.
+The followup stores hit exactly this: every followup test that left
+`project_dir: None` wrote the same process-global followup dir. Each now builds
+its app from a per-test temp project dir
+(`tui::app::tests::make_app_with_project`), so its followup files are private.
+`save_migrating` also no longer deletes the file it just wrote when the primary
+and legacy dirs coincide (which is what happens with no project root).
 
 This is enforced, not advisory. `tui::settings_screen::tests::
 memory_toggle_flips_snapshot_and_config` called a persisting helper without a
 home guard and rewrote the real `~/.clawde/settings.json`, silently destroying
 unrelated preferences. Regression tests:
-`core::tests::tests_resolve_settings_to_a_scratch_directory` and
-`tui::app::tests::tests_resolve_keybindings_to_a_scratch_directory`.
+`core::tests::tests_resolve_settings_to_a_scratch_directory`,
+`core::tests::tests_resolve_runtime_state_to_a_scratch_directory`,
+`core::key_ring::tests::default_state_path_resolves_below_the_state_dir`,
+`core::followup_history::tests::save_migrating_keeps_the_file_when_primary_is_the_legacy_dir`,
+`core::followup_usage::tests::save_migrating_keeps_the_file_when_primary_is_the_legacy_dir`,
+and `tui::app::tests::tests_resolve_keybindings_to_a_scratch_directory`.
 
 When adding a test that calls any persisting path (`save_sync`,
-`apply_theme`, `toggle_or_cycle_current`, `maybe_record_bash_prefix`, …), either
-acquire the crate's `TestHome`/`MemoryTestHome` guard or confirm the path above
-keeps it in scratch space. Verify with a canary value in the real file:
+`apply_theme`, `toggle_or_cycle_current`, `maybe_record_bash_prefix`,
+`ToolDialectState::save`, `KeyRing::save_to_file`, `FollowupHistory::save`,
+`FollowupUsage::save`, the `CooldownState` /
+`LatencyState` / `CapacityState` persistence, …), either acquire the crate's
+`TestHome`/`MemoryTestHome` guard, build the owner with `persist: false`, or
+confirm the path above keeps it in scratch space. Verify with a canary value in the real file:
 
 ```bash
 python3 -c "import json,os;p=os.path.expanduser('~/.clawde/settings.json');d=json.load(open(p));d['config']['output_style']='__CANARY__';open(p,'w').write(json.dumps(d,indent=2))"
@@ -277,6 +324,8 @@ Add a well-known constant on `ProviderId`, e.g. `pub const FOO: &'static str = "
 
 Import the new provider and add it to the registry construction. The registry hands back `Arc<dyn LlmProvider>` by id.
 
+If the provider is also a `FREE_CATALOG` upstream, add its per-key arm to `build_multi_key_provider` in the same file — that is the factory a `KeyRotatingProvider` calls once per request, and `every_catalog_upstream_has_a_multi_key_factory` fails if an upstream lacks one.
+
 ### 4. Model registry (`crates/api/src/model_registry.rs`)
 
 Add the canonical model IDs and capability metadata (context window, supports thinking, supports vision, etc.).
@@ -293,8 +342,11 @@ If the provider uses an env var (e.g. `FOO_API_KEY`), wire it into the auth-stor
 
 ### 7. Documentation
 
-- `README.md`: add the provider to the "Supported Providers" list if it's user-visible.
-- `docs/providers.md`: setup instructions, env var, and `settings.json` shape.
+- `docs/providers.md`: add a `## Provider Reference` subsection — setup
+  instructions, env var, and `settings.json` shape. This is the repo's only
+  provider inventory; `README.md` has none (its provider-facing prose is the
+  "Smart multi-model routing (Phase 2)" section, which describes routing
+  behaviour, not a roster), so do not go looking for a list to append to.
 
 ## Releasing
 
@@ -339,7 +391,7 @@ are never force-moved.
 
 ## **CRITICAL** Git Rules for Parallel Agents
 
-This repo runs parallel agents in worktrees under `.claude/worktrees/`. Multiple agents may be modifying different files in the same checkout simultaneously. You MUST follow these rules:
+This repo runs parallel agents in worktrees under `.claude/worktrees/` (created on demand — a plain checkout has no such directory). Multiple agents may be modifying different files in the same checkout simultaneously. You MUST follow these rules:
 
 ### Committing
 
@@ -429,7 +481,7 @@ change this diagram in the same commit.
 | **AuthStore** | `crates/core/src/auth_store.rs` | JSON store at `~/.clawde/auth.json` — `credentials` (single-key) + `keys` (multi-key) maps |
 | **KeysCommand** | `crates/commands/src/keys.rs` | `/keys` command: set, add, remove, list, health |
 | **ProviderRegistry** | `crates/api/src/registry.rs` | Wires `KeyRotatingProvider` when 2+ keys detected |
-| **FreeProvider** | `crates/api/src/providers/free/` (mod.rs + catalog.rs + discovery.rs + modelsdev.rs + impls.rs) | Composite aggregator chaining upstreams with ordered fallback |
+| **FreeProvider** | `crates/api/src/providers/free/` (mod.rs, catalog.rs, impls.rs, discovery.rs, modelsdev.rs, capacity.rs, task_classifier.rs, tool_gate.rs, provider-cooldown-profiles.json) | Composite aggregator chaining upstreams with ordered fallback |
 | **time_extract** | `crates/api/src/time_extract.rs` | Cooldown extraction from Retry-After headers, error bodies, ISO 8601 timestamps |
 
 ### Key Resolution (single source of truth)
@@ -487,13 +539,73 @@ fetching a model list.
 
 Cooldown estimation priority: (1) error's `retry_after` field, (2) HTTP `Retry-After` header, (3) error body text parsing, (4) default per signal type.
 
+### Validating Rotation End-to-End
+
+Rotation is error-driven and provider-agnostic: `build_free_provider` wraps *any*
+`FREE_CATALOG` upstream holding 2+ keys in the same `KeyRotatingProvider`, so a 429
+on key A is retried on key B inside the same user request, on the identical model
+string. Two probes pin that against the real binary instead of a Rust mock:
+
+- `scripts/probes/free-upstream-rotation-mock.py` — a local OpenAI-compatible
+  upstream that answers 429 for exactly one credential and streams a marker on any
+  other, logging every request (key suffix, model, status) as JSONL.
+- `scripts/probes/rotation-tmux-validation.sh` — drives the TUI in tmux against
+  that mock with a scratch `CLAWDE_HOME`, then asserts the reply rendered, no
+  rate-limit wording reached the pane, the throttled key was tried once and
+  benched, and every attempt carried the same model. `UPSTREAM`/`WIRE_MODEL`
+  switch it to any other upstream; three are exercised and all pass:
+  `nvidia` (per-key bench, auth-lax probe), `groq` and `cerebras` (per-model
+  bench, auth-validating probe).
+
+The persisted bench's *scope* is asserted against
+`provider-cooldown-profiles.json`, the same file the runtime profile loader
+reads: `limit_scope = "per-model"` must leave `cooldown_model` equal to the wire
+model (the key stays usable for every other model), while an upstream absent from
+the profiles — i.e. the per-key default shape — must persist no model at all. A
+re-scoped profile therefore cannot silently leave the probe asserting the old
+shape.
+
+Both halves need `CLAWDE_FREE_BASE_URL_<UPSTREAM>`, which only takes effect in
+debug builds and only for a loopback host.
+
+### Health sweep (the startup key probe)
+
+`run_health_poller` (`crates/api/src/health_poller.rs`, spec §6.4) is spawned from
+both the interactive and the headless path in `crates/cli/src/main.rs`. It sweeps
+every configured free-upstream key once `STARTUP_SWEEP_DELAY` (2s) after startup,
+then every `routing.health_poll_interval_secs` (default 300; `0` = startup sweep
+only). Purpose: bench a *definitively dead* key (401/403 → `mark_key_exhausted`,
+300s) in the running ring before the user's first request pays for it. The
+`key_idx` it forwards is ring-aligned with `build_free_provider`
+(`poller_probe_list_aligns_with_registry_ring_keys` locks that alignment).
+
+- A rate limit (429) and any 5xx/connection failure classify as `Transient` and
+  must **never** bench a key: these endpoints are shared capacity, and busy is
+  not invalid. Verified — a 429-ing mock leaves every ring entry at
+  `cooldown_remaining_secs: 0`.
+- A definitive success calls `mark_key_healthy`, which **persists** the ring, so
+  every sweep rewrites `state_dir()/key-ring-state/<upstream>.json` with zero
+  cooldowns even when nothing was benched. The file existing is not evidence of
+  a bench.
+- Cost: for the auth-lax upstreams (nvidia, openrouter, sambanova, poolside)
+  `probe_upstream_key` **skips the models GET entirely** and takes the whole
+  verdict from a 1-token chat confirm — that is the only route which can prove
+  the key there, and every verdict the GET could have produced is one the
+  confirm produces too. So a key costs ONE request, sent at
+  `fallback_models.first()` (nvidia: `openai/gpt-oss-20b`), never the upstream's
+  default model. cloudflare is the same shape through its own account-scoped
+  chat probe; every other upstream costs one models GET.
+  `auth_lax_probe_shortcut_has_a_chat_confirm_for_every_id` pins the pairing —
+  an auth-lax upstream without a `chat_probe_for` entry would report a valid key
+  as `Transient("No chat probe")`.
+
 ### Thread Safety
 
 `KeyRing` behind `Arc<Mutex<>>` — lock scope never held across `.await`. Lock → get key → unlock → dispatch. Lock → mark exhausted → save → unlock.
 
 ### Discover Models (FreeProvider)
 
-Synthetic only — never calls upstream `discover_models()`. Produces one `free/auto` entry (200K context) plus one per configured upstream with `<id>/<default_model>` (128K context, 8192 max output tokens). All pinned to `provider_id: "free"`.
+Synthetic only — never calls upstream `discover_models()`. Produces one `free/auto` entry (200K context) plus one per configured upstream, id `<id>/<model_for_entry>` (the models.dev-overridden default when one exists, else `default_model`) at that upstream's own `context_window` — those are NOT uniform (128K on most, plus 65_536, 16_384 and 262_144). `max_output_tokens` is a flat 8192. Every entry is pinned to `provider_id: "free"`.
 
 ### TUI Status Display
 
@@ -506,7 +618,7 @@ Synthetic only — never calls upstream `discover_models()`. Produces one `free/
 ### Chain Assembly (`build_free_provider`)
 
 - `FREE_CATALOG` in `crates/api/src/providers/free/catalog.rs` defines the upstreams by priority (13 as of 2026-09-18)
-- Each `FreeUpstream` has: id, title, key_url, default_model, model_family, note, tool_calling, vision, thinking, max_tokens_cap
+- Each `FreeUpstream` has: id, title, key_url, default_model, fallback_models, model_family, note, specialty, usage, tool_calling, vision, thinking, context_window, max_tokens_cap
 - Cloudflare: OpenAI-compat endpoint embeds the account ID in the URL path,
   so its stored key is the composite `ACCOUNT_ID:API_TOKEN`; key validation
   uses the chat probe (the `/ai/v1/models` endpoint returns 405 for GET)

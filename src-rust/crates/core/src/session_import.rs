@@ -12,6 +12,12 @@
 // Each importer produces a list of Clawde `Message` objects plus metadata
 // (working directory, original source) suitable for creating a new
 // `ConversationSession`.
+//
+// The roots for these paths are resolved under the real user home only in a
+// normal production process. When Clawde's own home is redirected (an explicit
+// `CLAWDE_HOME`, or a cargo test harness), the external roots move with it —
+// see [`external_import_home`] — so a sandboxed or tested run can never absorb
+// the developer's live conversations.
 
 use crate::types::{ContentBlock, Message, MessageContent, Role, ToolResultContent};
 use serde::Deserialize;
@@ -495,9 +501,11 @@ pub struct KnownLocations {
     pub freebuff_projects: PathBuf,
 }
 
-impl Default for KnownLocations {
-    fn default() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+impl KnownLocations {
+    /// The known locations resolved under `home`. Kept explicit (rather than
+    /// only on [`Default`]) so a caller can point at a fixture tree without
+    /// mutating the process environment.
+    pub fn under(home: &Path) -> Self {
         KnownLocations {
             opencode_projects: home
                 .join(".local")
@@ -512,6 +520,30 @@ impl Default for KnownLocations {
             freebuff_projects: home.join(".config").join("manicode").join("projects"),
         }
     }
+}
+
+impl Default for KnownLocations {
+    fn default() -> Self {
+        Self::under(&external_import_home())
+    }
+}
+
+/// The home directory under which the external apps' session data is looked up.
+///
+/// Production reads the real user home — these roots belong to Opencode, Cline
+/// and Freebuff, not to Clawde. But when Clawde's own home is redirected
+/// ([`crate::config::Settings::redirected_home`]: an explicit `CLAWDE_HOME`, or
+/// the per-process scratch home a cargo test harness uses) the external roots
+/// are redirected with it, so a sandboxed or tested session cannot silently
+/// absorb the developer's live conversations into a throwaway home.
+///
+/// In a redirect those directories do not exist, so discovery finds nothing;
+/// that is the safe direction (a missed import, never a wrong one) and an
+/// explicit fixture is still reachable through [`KnownLocations::under`].
+fn external_import_home() -> PathBuf {
+    crate::config::Settings::redirected_home()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("~"))
 }
 
 /// A pluggable external-session source.
@@ -1196,5 +1228,57 @@ mod tests {
         // A typo must degrade to importing nothing, not error at startup.
         let allow = vec!["not-a-source".to_string()];
         assert!(discover_all_external_paths_for(Some(&allow)).is_empty());
+    }
+
+    #[test]
+    fn known_locations_under_builds_the_documented_layout() {
+        let home = PathBuf::from("/example/home");
+        let locs = KnownLocations::under(&home);
+        assert_eq!(
+            locs.opencode_projects,
+            home.join(".local/share/opencode/projects")
+        );
+        assert_eq!(
+            locs.cline_workspace,
+            home.join(".config/Code/User/workspaceStorage")
+        );
+        assert_eq!(
+            locs.freebuff_projects,
+            home.join(".config/manicode/projects")
+        );
+    }
+
+    #[test]
+    fn known_locations_default_follows_an_explicit_clawde_home() {
+        // The regression: a scratch-home session silently absorbed a live
+        // conversation because these roots stayed pinned to the real home. An
+        // explicit `CLAWDE_HOME` must carry them with it.
+        let _guard = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os("CLAWDE_HOME");
+        let sandbox = tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", sandbox.path());
+        let locs = KnownLocations::default();
+        let expected = KnownLocations::under(sandbox.path());
+        assert_eq!(locs.opencode_projects, expected.opencode_projects);
+        assert_eq!(locs.cline_workspace, expected.cline_workspace);
+        assert_eq!(locs.freebuff_projects, expected.freebuff_projects);
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+    }
+
+    #[test]
+    fn default_locations_are_not_the_real_home_roots_under_test() {
+        // Even with no `CLAWDE_HOME`, the cargo-test scratch redirect applies,
+        // so the default roots can never be the real-home ones.
+        let real_home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+        let real = KnownLocations::under(&real_home);
+        let locs = KnownLocations::default();
+        assert_ne!(locs.opencode_projects, real.opencode_projects);
+        assert_ne!(locs.cline_workspace, real.cline_workspace);
+        assert_ne!(locs.freebuff_projects, real.freebuff_projects);
     }
 }

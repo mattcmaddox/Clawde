@@ -12,7 +12,7 @@ pub(crate) fn gather_provider_status() -> String {
     let mut lines = vec!["Provider Status:\n".to_string()];
 
     // Load cooldown state from disk if available
-    let cooldown_path = clawde_core::config::Settings::config_dir()
+    let cooldown_path = clawde_core::config::Settings::state_dir()
         .join("empty-cooldown-state")
         .join("free.json");
 
@@ -56,7 +56,7 @@ pub(crate) fn gather_provider_status() -> String {
     }
 
     // Load telemetry state from disk if available
-    let telemetry_path = clawde_core::config::Settings::config_dir()
+    let telemetry_path = clawde_core::config::Settings::state_dir()
         .join("telemetry-state")
         .join("free.json");
 

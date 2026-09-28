@@ -34,6 +34,7 @@ use crate::{
 use clawde_core::config::{Config, Settings, Theme};
 use clawde_core::cost::CostTracker;
 use clawde_core::file_history::FileHistory;
+use clawde_core::followup_history::global_followup_dir;
 use clawde_core::keybindings::{
     KeyContext, KeybindingPreset, KeybindingResolver, KeybindingResult, ParsedKeystroke,
     UserKeybindings,
@@ -2535,12 +2536,12 @@ impl App {
             followup_dir: followup_dir.clone(),
             followup_history: clawde_core::FollowupHistory::load_preferring(
                 &followup_dir,
-                &Settings::config_dir(),
+                &global_followup_dir(),
             ),
             followup_history_mode: false,
             followup_usage: clawde_core::FollowupUsage::load_preferring(
                 &followup_dir,
-                &Settings::config_dir(),
+                &global_followup_dir(),
             ),
             pending_followup_text: None,
             scroll_accel: 3.0,
@@ -2805,7 +2806,7 @@ impl App {
     fn save_followup_usage(&self) {
         if let Err(error) = self
             .followup_usage
-            .save_migrating(&self.followup_dir, &Settings::config_dir())
+            .save_migrating(&self.followup_dir, &global_followup_dir())
         {
             debug!(%error, "failed to persist followup usage");
         }
@@ -2942,7 +2943,7 @@ impl App {
             self.followup_history_mode = false;
             if let Err(error) = self
                 .followup_history
-                .save_migrating(&self.followup_dir, &Settings::config_dir())
+                .save_migrating(&self.followup_dir, &global_followup_dir())
             {
                 debug!(%error, "failed to clear followup history");
             }
@@ -2951,7 +2952,7 @@ impl App {
             self.followup_usage = clawde_core::FollowupUsage::default();
             if let Err(error) = self
                 .followup_usage
-                .save_migrating(&self.followup_dir, &Settings::config_dir())
+                .save_migrating(&self.followup_dir, &global_followup_dir())
             {
                 debug!(%error, "failed to clear followup usage");
             }
@@ -2996,7 +2997,7 @@ impl App {
             }
             if let Err(error) = self
                 .followup_history
-                .save_migrating(&self.followup_dir, &Settings::config_dir())
+                .save_migrating(&self.followup_dir, &global_followup_dir())
             {
                 debug!(%error, "failed to persist followup history");
             }
@@ -13569,6 +13570,24 @@ mod tests {
         App::new(config, cost_tracker)
     }
 
+    /// Build an `App` whose followup state is scoped to a fresh temp project
+    /// dir. The temp dir is returned so it outlives the test body — the app
+    /// only stores the resolved path, so dropping it early would remove the
+    /// files mid-test.
+    ///
+    /// Without a project root the followup files resolve to the process-global
+    /// followup dir, which every parallel followup test would then share and
+    /// race on. Scoping each test to its own project keeps its writes private.
+    fn make_app_with_project() -> (App, tempfile::TempDir) {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let config = Config {
+            project_dir: Some(project.path().to_path_buf()),
+            ..Config::default()
+        };
+        let app = App::new(config, clawde_core::cost::CostTracker::new());
+        (app, project)
+    }
+
     #[test]
     fn shift_tab_clears_an_active_ceiling_before_cycling_the_mode() {
         use clawde_core::action_risk::RiskTier;
@@ -13693,7 +13712,7 @@ mod tests {
 
     #[test]
     fn followup_selection_tracks_submission_only_when_unchanged() {
-        let mut app = make_app();
+        let (mut app, _project) = make_app_with_project();
         app.current_followups = vec![RankedFollowup {
             text: "Run tests".into(),
             rank: clawde_core::FollowupRank::Recommended,
@@ -13741,7 +13760,7 @@ mod tests {
 
     #[test]
     fn followup_completion_survives_stream_flush() {
-        let mut app = make_app();
+        let (mut app, _project) = make_app_with_project();
         app.pending_followup_text = Some("Run tests".into());
         app.is_streaming = true;
         app.handle_query_event(QueryEvent::Stream(
@@ -13773,7 +13792,7 @@ mod tests {
 
     #[test]
     fn followup_completion_is_recorded_only_after_successful_turn() {
-        let mut app = make_app();
+        let (mut app, _project) = make_app_with_project();
         app.pending_followup_text = Some("Run tests".into());
         app.is_streaming = true;
         app.handle_query_event(clawde_query::QueryEvent::Error("failed".into()));
@@ -13807,7 +13826,7 @@ mod tests {
         // Restoring input from history search, global search, or the file
         // injection dialog is not a followup selection. It must not be counted
         // as a followup submission even when the text happens to match one.
-        let mut app = make_app();
+        let (mut app, _project) = make_app_with_project();
         app.set_prompt_text("Run tests".into());
         assert!(app.pending_followup_text.is_none());
         assert_eq!(app.take_input(), "Run tests");
@@ -13816,7 +13835,7 @@ mod tests {
 
     #[test]
     fn followup_mode_toggle_invalidates_cached_transcript_lines() {
-        let mut app = make_app();
+        let (mut app, _project) = make_app_with_project();
         app.persisted_followups.push_back(RankedFollowup {
             text: "Old suggestion".into(),
             rank: clawde_core::FollowupRank::Optional,
@@ -13911,7 +13930,7 @@ mod tests {
     #[test]
     fn followup_keyboard_navigation_selects_current_and_history() {
         // Current-mode keyboard: Down selects, Enter inserts.
-        let mut app = make_app();
+        let (mut app, _project) = make_app_with_project();
         app.current_followups = vec![RankedFollowup {
             text: "Current one".into(),
             rank: clawde_core::FollowupRank::Recommended,
@@ -13925,7 +13944,7 @@ mod tests {
         assert!(!app.followup_history_mode);
 
         // History-mode keyboard: same navigation reads the persisted list.
-        let mut app = make_app();
+        let (mut app, _project) = make_app_with_project();
         app.persisted_followups.push_back(RankedFollowup {
             text: "History one".into(),
             rank: clawde_core::FollowupRank::Optional,
@@ -13944,7 +13963,7 @@ mod tests {
     #[test]
     fn followup_mouse_click_resolves_current_vs_history_source() {
         // A click on a current-response row inserts that followup.
-        let mut app = make_app();
+        let (mut app, _project) = make_app_with_project();
         app.current_followups = vec![RankedFollowup {
             text: "Mouse current".into(),
             rank: clawde_core::FollowupRank::Recommended,
@@ -13967,7 +13986,7 @@ mod tests {
         assert!(!app.followup_history_mode);
 
         // A click on a history row (visible in history mode) inserts that item.
-        let mut app = make_app();
+        let (mut app, _project) = make_app_with_project();
         app.persisted_followups.push_back(RankedFollowup {
             text: "Mouse history".into(),
             rank: clawde_core::FollowupRank::Optional,
@@ -13993,7 +14012,7 @@ mod tests {
 
     #[test]
     fn followup_status_report_includes_counts_and_lifecycle() {
-        let mut app = make_app();
+        let (mut app, _project) = make_app_with_project();
         app.current_followups = vec![RankedFollowup {
             text: "Run tests".into(),
             rank: clawde_core::FollowupRank::Recommended,
@@ -14572,7 +14591,7 @@ mod tests {
     fn refresh_models_intercept_expires_discovery_caches() {
         let _home = TestHome::acquire(); // isolate CLAWDE_HOME
         let mut app = make_app();
-        let state_dir = clawde_core::config::Settings::config_dir().join("free-state");
+        let state_dir = clawde_core::config::Settings::state_dir().join("free-state");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::write(
             state_dir.join("live-discovery.json"),
@@ -15923,19 +15942,23 @@ mod tests {
     fn test_open_free_model_popup_is_model_first() {
         let _home = TestHome::acquire();
         let mut app = make_app();
-        // nvidia + groq both host gpt-oss-120b (same model family), so they
-        // must collapse into ONE family entry — the popup lists models, not
-        // providers.
+        // cerebras + groq share `model_family = "gpt-oss-120b"` in the catalog,
+        // so they must collapse into ONE family entry — the popup lists models,
+        // not providers. (The gpt-oss side of this fixture used to be nvidia,
+        // until nvidia's family became `nemotron-lightning` and stopped sharing
+        // a slug with groq.) Only the ids are read on this path — the family
+        // comes from the catalog entry, not from the model string — but the
+        // models are each upstream's real catalog default anyway.
         app.free_model_defaults = vec![
             (
-                "nvidia".to_string(),
-                "NVIDIA NIM".to_string(),
-                "openai/gpt-oss-120b".to_string(),
+                "cerebras".to_string(),
+                "Cerebras".to_string(),
+                "gpt-oss-120b".to_string(),
             ),
             (
                 "groq".to_string(),
                 "Groq".to_string(),
-                "gpt-oss-120b".to_string(),
+                "openai/gpt-oss-120b".to_string(),
             ),
             (
                 "sambanova".to_string(),
@@ -15943,6 +15966,21 @@ mod tests {
                 "Meta-Llama-3.3-70B-Instruct".to_string(),
             ),
         ];
+        // Guard the fixture's premise against the live catalog. This test is
+        // about two providers collapsing into ONE family entry, so if either is
+        // re-familied it must fail loudly here rather than keep passing while
+        // exercising no collapse at all.
+        for id in ["cerebras", "groq"] {
+            let family = clawde_api::providers::free::FREE_CATALOG
+                .iter()
+                .find(|u| u.id == id)
+                .map(|u| u.model_family)
+                .expect("fixture upstream must be in FREE_CATALOG");
+            assert_eq!(
+                family, "gpt-oss-120b",
+                "{id} no longer shares a family, so this fixture tests nothing"
+            );
+        }
         app.handle_keybinding_action("openFreeModelPopup");
         assert!(app.free_model_popup.visible);
         let ids: Vec<&str> = app
@@ -15952,7 +15990,7 @@ mod tests {
             .map(|i| i.id.as_str())
             .collect();
         // Auto first, then one entry per model family (model-first, not
-        // provider-first). gpt-oss-120b (nvidia, groq) collapses into one
+        // provider-first). gpt-oss-120b (cerebras, groq) collapses into one
         // entry; sambanova's llama-3.3-70b follows in catalog order.
         assert_eq!(
             ids,
