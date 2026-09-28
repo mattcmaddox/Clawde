@@ -372,7 +372,7 @@ fn catalog_entry_default(upstream: &str) -> Option<&'static str> {
 }
 
 /// Distinct `model_family` first, then distinct hosts of already-seen
-/// families (groq+nvidia both serving gpt-oss is still real diversity).
+/// families (cerebras+groq both serving gpt-oss is still real diversity).
 fn family_ranked(
     entries: Vec<&clawde_api::providers::free::FreeUpstream>,
 ) -> Vec<&clawde_api::providers::free::FreeUpstream> {
@@ -2680,8 +2680,8 @@ mod tests {
     fn ladder_pins_distinct_families_then_hosts() {
         // Auto-derivation (spec §6): keyed upstreams in catalog order,
         // distinct model_family first, then distinct hosts of the same
-        // family. nvidia/cerebras/groq all host gpt-oss-120b — groq must not
-        // take a rung until families are exhausted.
+        // family. cerebras/groq both host gpt-oss-120b — groq must not take a
+        // rung until every distinct family has one.
         let keyed: HashSet<String> = ["nvidia", "cerebras", "groq", "zai"]
             .into_iter()
             .map(str::to_string)
@@ -2701,11 +2701,26 @@ mod tests {
         let mut uniq = families.clone();
         uniq.sort_unstable();
         uniq.dedup();
-        // Primary rungs are distinct families; with only 2 families across 4
-        // keyed upstreams and N=3, the 3rd rung reuses a family on a distinct
-        // host (spec §6.2).
+        // Primary rungs are distinct families while distinct families remain:
+        // with N rungs and F distinct families in the keyed set, exactly
+        // `min(N, F)` rungs carry distinct families and any surplus rung reuses
+        // a family on a distinct host (spec §6.2). Derived from the catalog so
+        // adding an upstream family does not need an edit here.
+        let distinct_families: HashSet<&str> = keyed
+            .iter()
+            .filter_map(|id| {
+                clawde_api::providers::free::FREE_CATALOG
+                    .iter()
+                    .find(|e| e.id == id.as_str())
+                    .map(|e| e.model_family)
+            })
+            .collect();
         assert_eq!(families.len(), 3);
-        assert_eq!(uniq.len(), 2, "families: {families:?}");
+        assert_eq!(
+            uniq.len(),
+            3.min(distinct_families.len()),
+            "families: {families:?} (distinct in keyed set: {distinct_families:?})"
+        );
         let ups: Vec<&str> = pins.iter().map(|p| p.upstream.as_str()).collect();
         assert_eq!(
             ups.len(),

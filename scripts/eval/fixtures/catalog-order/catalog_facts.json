@@ -1,6 +1,6 @@
 {
   "source": "src-rust/crates/api/src/providers/free/catalog.rs",
-  "source_sha256": "2460819e81ae117325b5bc350d99930cd3919cce65d6429627a1f9b31d62412d",
+  "source_sha256": "113103ccc7ed41b9ffc57908eff972e9467ba5a1feea504b8469264cc655e5fd",
   "upstreams": [
     {
       "id": "github-copilot",
@@ -15,7 +15,7 @@
     {
       "id": "nvidia",
       "title": "NVIDIA NIM",
-      "default_model": "openai/gpt-oss-120b"
+      "default_model": "nvidia/nemotron-3.5-lightning-30b-a3b"
     },
     {
       "id": "cerebras",
@@ -45,7 +45,7 @@
     {
       "id": "cline",
       "title": "Cline",
-      "default_model": "deepseek/deepseek-v4-flash"
+      "default_model": "cline-free/deepseek-v4.1-flash"
     },
     {
       "id": "mistral",

@@ -2369,16 +2369,6 @@ fn classify_probe_status(upstream_id: &str, status: u16) -> Result<(), String> {
     Err(format!("HTTP {} — unexpected response", status))
 }
 
-/// Confirm a key with a minimal 1-token `chat/completions` request.
-///
-/// Used only for upstreams whose models endpoint doesn't check auth. Providers
-/// validate the key *before* model validation, so 401/403 unambiguously means
-/// an invalid key. 429, 5xx, connection failures, and empty completion bodies
-/// are transient: they do not prove the key is invalid or fully healthy.
-///
-/// The response body is consumed so empty/server-error content can be
-/// classified, while headers are retained for [`query_rate_limits`].
-///
 /// Sends a 1-token `chat/completions` probe to Cloudflare's account-scoped
 /// OpenAI-compatible endpoint.
 ///
@@ -2501,6 +2491,15 @@ struct ChatProbeResponse {
     body: String,
 }
 
+/// Confirm a key with a minimal 1-token `chat/completions` request.
+///
+/// Used only for upstreams whose models endpoint doesn't check auth. Providers
+/// validate the key *before* model validation, so 401/403 unambiguously means
+/// an invalid key. 429, 5xx, connection failures, and empty completion bodies
+/// are transient: they do not prove the key is invalid or fully healthy.
+///
+/// The response body is consumed so empty/server-error content can be
+/// classified, while headers are retained for [`query_rate_limits`].
 fn validate_key_via_chat(
     upstream_id: &str,
     key: &str,
@@ -2603,6 +2602,32 @@ pub fn probe_upstream_key(upstream_id: &str, key: &str) -> UpstreamKeyProbe {
         return classify_chat_probe(status, &body, "API token");
     }
 
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return UpstreamKeyProbe::Transient(format!("Failed to create HTTP client: {}", error))
+        }
+    };
+
+    // Auth-lax upstreams (`models_endpoint_validates_auth` false; cloudflare
+    // took its own branch above) answer 200 from /models even for a garbage
+    // key, so that response cannot prove anything on its own. Every verdict the
+    // models GET could produce for them — 401/403 => `Invalid`, 429/5xx/
+    // connection failure => `Transient` — is also produced by the chat confirm,
+    // so the GET is a round trip whose result is discarded. Skip it: the health
+    // sweep probes every configured key on every launch and every
+    // `routing.health_poll_interval_secs`, and these endpoints meter both
+    // routes.
+    if !models_endpoint_validates_auth(upstream_id) {
+        return match validate_key_via_chat(upstream_id, key, &client) {
+            Ok(response) => classify_chat_probe(response.status, &response.body, "API key"),
+            Err(error) => UpstreamKeyProbe::Transient(error),
+        };
+    }
+
     let native: &str = match upstream_id {
         "cerebras" => "https://api.cerebras.ai/v1/models",
         "nvidia" => "https://integrate.api.nvidia.com/v1/models",
@@ -2628,16 +2653,6 @@ pub fn probe_upstream_key(upstream_id: &str, key: &str) -> UpstreamKeyProbe {
         None => native.to_string(),
     };
 
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            return UpstreamKeyProbe::Transient(format!("Failed to create HTTP client: {}", error))
-        }
-    };
-
     let request = if upstream_id == "google" {
         client.get(base_url).query(&[("key", key)])
     } else {
@@ -2658,14 +2673,9 @@ pub fn probe_upstream_key(upstream_id: &str, key: &str) -> UpstreamKeyProbe {
             Err(error) => UpstreamKeyProbe::Transient(error),
         };
     }
-    if models_endpoint_validates_auth(upstream_id) {
-        return UpstreamKeyProbe::Valid;
-    }
-
-    match validate_key_via_chat(upstream_id, key, &client) {
-        Ok(response) => classify_chat_probe(response.status, &response.body, "API key"),
-        Err(error) => UpstreamKeyProbe::Transient(error),
-    }
+    // The auth-lax upstreams returned above, so a models 2xx here is the
+    // verdict: this endpoint enforces auth.
+    UpstreamKeyProbe::Valid
 }
 
 /// Validate an API key for existing callers that only need a pass/fail result.
@@ -2983,10 +2993,10 @@ mod cache_tests {
         assert_eq!(base, "https://inference.poolside.ai/v1");
         assert_eq!(model, "poolside/laguna-s-2.1");
 
-        // The probe URL builder must not hit the "no validation endpoint"
-        // fallback. Exercise the pure URL resolution via the same match used
-        // by probe_upstream_key by checking a too-short key short-circuits
-        // before any network I/O (proving poolside is not rejected early).
+        // A too-short key short-circuits before any network I/O, which proves
+        // poolside is not rejected by the "no validation endpoint" arm: it
+        // returns through the chat confirm, before the models-GET block that
+        // arm lives in.
         let short = probe_upstream_key("poolside", "short");
         assert_eq!(
             short,
@@ -2996,6 +3006,30 @@ mod cache_tests {
         // Removed upstreams no longer have probe endpoints.
         assert_eq!(chat_probe_for("huggingface"), None);
         assert_eq!(chat_probe_for("cohere"), None);
+    }
+
+    /// `probe_upstream_key` skips the models GET for every auth-lax upstream and
+    /// takes the whole verdict from the chat confirm, so each of those ids must
+    /// have a `chat_probe_for` entry. Without one, a *valid* key would be
+    /// reported as `Transient("No chat probe for '<id>'")` instead of being
+    /// validated — a silent downgrade to "unproven", not a loud failure.
+    ///
+    /// cloudflare is the exception and is not listed: it returns through its own
+    /// account-scoped chat probe before the models-GET block is reached.
+    #[test]
+    fn auth_lax_probe_shortcut_has_a_chat_confirm_for_every_id() {
+        for id in ["nvidia", "poolside", "openrouter", "sambanova"] {
+            assert!(
+                !models_endpoint_validates_auth(id),
+                "{id} is expected to be auth-lax"
+            );
+            assert!(
+                chat_probe_for(id).is_some(),
+                "{id} skips its models GET, so it needs a chat confirm"
+            );
+        }
+        // cloudflare is auth-lax too, but never reaches the skip.
+        assert!(!models_endpoint_validates_auth("cloudflare"));
     }
 }
 

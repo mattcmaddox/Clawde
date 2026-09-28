@@ -93,6 +93,47 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
     }
 }
 
+/// Construct the per-key provider for a free-catalog upstream.
+///
+/// This is the factory a [`KeyRotatingProvider`] calls once per request, so an
+/// upstream it returns `None` for cannot rotate. It also must cover every
+/// descendant of [`FREE_CATALOG`] — a ring resolves the factory lazily, per
+/// request, which turns a missing arm into a panic on first dispatch rather
+/// than a failure at build time. `every_catalog_upstream_has_a_multi_key_factory`
+/// asserts that across the whole catalog.
+fn build_multi_key_provider(upstream_id: &str, key: String) -> Option<Arc<dyn LlmProvider>> {
+    match upstream_id {
+        "google" => Some(Arc::new(GoogleProvider::new(key)) as Arc<dyn LlmProvider>),
+        "cloudflare" => {
+            let mut provider = crate::providers::openai_compat_providers::cloudflare_with_key(&key);
+            if let Some(base) =
+                crate::providers::free::free_upstream_base_url_override("cloudflare")
+            {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider) as Arc<dyn LlmProvider>)
+        }
+        "github-copilot" => Some(Arc::new(CopilotProvider::new(key)) as Arc<dyn LlmProvider>),
+        id => {
+            let provider = crate::providers::openai_compat_providers::provider_for_id(id)?;
+            let mut provider = provider.with_api_key(key);
+            if let Some(base) = crate::providers::free::free_upstream_base_url_override(id) {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider) as Arc<dyn LlmProvider>)
+        }
+    }
+}
+
+/// Whether an upstream can be wrapped in a [`KeyRotatingProvider`].
+///
+/// The probe key is a throwaway: every branch only stores it, none of them
+/// perform I/O at construction, and the point is to ask the arms above rather
+/// than to keep a second list in sync with them.
+fn multi_key_factory_available(upstream_id: &str) -> bool {
+    build_multi_key_provider(upstream_id, String::new()).is_some()
+}
+
 /// Build a [`FreeProvider`] by walking [`FREE_CATALOG`] and pulling any keys
 /// the user has stored in the auth store. Each catalog entry whose upstream
 /// has a key becomes one link in the fallback chain.
@@ -145,45 +186,33 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
                 .filter(|k| k.len() > 1);
 
         if let Some(keys) = multi_keys {
+            if !multi_key_factory_available(upstream.id) {
+                // Degrade instead of aborting: the single-key path below would
+                // skip this upstream for the same reason, so `continue` leaves
+                // the chain identical to what a one-key user sees. A startup
+                // panic here would take every other configured upstream down
+                // with it over one unusable entry.
+                tracing::warn!(
+                    "free chain: '{}' has {} stored keys but no per-key factory; \
+                     skipping the upstream",
+                    upstream.id,
+                    keys.len(),
+                );
+                continue;
+            }
             let upstream_id = upstream.id.to_string();
             let upstream_name = upstream.title.to_string();
             let mut rotating = KeyRotatingProvider::new_with_persistence(
                 upstream_id.clone(),
                 upstream_name,
                 keys,
-                move |key| {
-                    let key_owned = key.to_string();
-                    match upstream_id.as_str() {
-                        "google" => {
-                            Arc::new(GoogleProvider::new(key_owned)) as Arc<dyn LlmProvider>
-                        }
-                        "cloudflare" => {
-                            let mut p =
-                                crate::providers::openai_compat_providers::cloudflare_with_key(
-                                    &key_owned,
-                                );
-                            if let Some(base) =
-                                crate::providers::free::free_upstream_base_url_override(
-                                    "cloudflare",
-                                )
-                            {
-                                p = p.with_base_url(base);
-                            }
-                            Arc::new(p) as Arc<dyn LlmProvider>
-                        }
-                        id => {
-                            let p = crate::providers::openai_compat_providers::provider_for_id(id)
-                                .unwrap_or_else(|| {
-                                    panic!("KeyRotatingProvider: no upstream factory for '{}'", id)
-                                });
-                            let mut p = p.with_api_key(key_owned);
-                            if let Some(base) =
-                                crate::providers::free::free_upstream_base_url_override(id)
-                            {
-                                p = p.with_base_url(base);
-                            }
-                            Arc::new(p) as Arc<dyn LlmProvider>
-                        }
+                move |key| match build_multi_key_provider(&upstream_id, key.to_string()) {
+                    Some(provider) => provider,
+                    // Unreachable: the entry below is only recorded after
+                    // `multi_key_factory_available` succeeds for this id, and
+                    // both go through the same match arms.
+                    None => {
+                        unreachable!("multi-key factory vanished after the chain entry was built")
                     }
                 },
             );
@@ -1421,5 +1450,83 @@ mod tests {
             "request must go to the overridden base URL, error was: {}",
             msg
         );
+    }
+
+    /// A [`Config`] that disables every catalog upstream except `enabled`, so a
+    /// developer machine's real `*_API_KEY` env vars cannot build extra chain
+    /// entries (and fire real network calls) while a test runs.
+    fn config_with_only_upstream(enabled: &str) -> Config {
+        let disabled: Vec<&str> = FREE_CATALOG
+            .iter()
+            .map(|upstream| upstream.id)
+            .filter(|id| *id != enabled)
+            .collect();
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            "routing".to_string(),
+            serde_json::json!({ "disabled_upstreams": disabled }),
+        );
+        let mut provider_configs = std::collections::HashMap::new();
+        provider_configs.insert(
+            "free".to_string(),
+            ProviderConfig {
+                options,
+                ..Default::default()
+            },
+        );
+        Config {
+            provider_configs,
+            ..Default::default()
+        }
+    }
+
+    /// Two GitHub Copilot keys must rotate like any other upstream.
+    ///
+    /// Copilot leads `FREE_CATALOG` and has no `provider_for_id` entry — only
+    /// the single-key path special-cased it. A ring over two Copilot keys was
+    /// therefore built successfully and then panicked inside its own factory on
+    /// the first dispatch, which is worse than failing loudly at build time.
+    #[test]
+    fn two_github_copilot_keys_build_a_rotating_chain() {
+        let (mut store, _home) = crate::test_support::test_auth_store();
+        store.set_keys(
+            "github-copilot",
+            vec![
+                "ghu_fake00000000000000000000000000000001".to_string(),
+                "ghu_fake00000000000000000000000000000002".to_string(),
+            ],
+        );
+
+        let provider = build_free_provider(&config_with_only_upstream("github-copilot"))
+            .expect("two copilot keys must build a free chain");
+        assert!(
+            provider.key_ring_status().is_some(),
+            "two keys must be wrapped in a KeyRotatingProvider"
+        );
+        assert!(
+            multi_key_factory_available("github-copilot"),
+            "the ring's factory must resolve on every dispatch, not just build"
+        );
+    }
+
+    /// Every catalog upstream must have a per-key factory, because a ring
+    /// resolves one lazily — per request — and a missing arm only surfaces the
+    /// first time that upstream is actually routed to. Asserted over the whole
+    /// catalog so adding an upstream without its factory fails here instead of
+    /// panicking on a user's machine.
+    #[test]
+    fn every_catalog_upstream_has_a_multi_key_factory() {
+        for upstream in FREE_CATALOG {
+            assert!(
+                multi_key_factory_available(upstream.id),
+                "catalog upstream '{}' has no multi-key factory",
+                upstream.id
+            );
+            assert!(
+                build_multi_key_provider(upstream.id, "probe-key-123456".to_string()).is_some(),
+                "catalog upstream '{}' must construct a provider",
+                upstream.id
+            );
+        }
     }
 }

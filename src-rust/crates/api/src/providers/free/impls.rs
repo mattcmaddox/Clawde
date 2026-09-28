@@ -144,7 +144,7 @@ impl FreeProvider {
             capacity: Arc::new(Mutex::new(
                 CapacityState::new(n).with_persistence(upstream_ids, None),
             )),
-            tool_dialect: Arc::new(Mutex::new(ToolDialectState::load(n))),
+            tool_dialect: Arc::new(Mutex::new(ToolDialectState::new(n))),
             liveness: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -152,18 +152,28 @@ impl FreeProvider {
     /// Create a new `FreeProvider` with an explicit [`RoutingConfig`].
     ///
     /// When `persist` is `true` (production path — use
-    /// `ENABLE_EMPTY_COOLDOWN_PERSISTENCE`) both cooldown tracks (5xx /
-    /// circuit-breaker and empty-completion) are persisted to
-    /// `{clawde_home}/empty-cooldown-state/free.json`. The filename is
+    /// `ENABLE_EMPTY_COOLDOWN_PERSISTENCE`) all four routing tracks are
+    /// persisted under `{clawde_home}`: the two cooldown tracks (5xx /
+    /// circuit-breaker and empty-completion) to
+    /// `empty-cooldown-state/free.json`, latency samples to
+    /// `telemetry-state/free.json`, capacity observations to
+    /// `capacity-state/free.json`, and the tool-dialect tally to
+    /// `free-state/tool-dialect.json`. The `empty-cooldown-state` filename is
     /// retained for backward compatibility with files written before the
     /// 5xx track was added.
+    ///
+    /// When it is `false` no track reads or writes disk. Tests rely on that: a
+    /// chain built here at `persist: false` must not be able to read the
+    /// developer's live routing history, which is what made
+    /// `tool_routing_gate_demotes_prose_prone_upstream` depend on ambient
+    /// state.
     pub fn with_routing(chain: Vec<FreeEntry>, routing: RoutingConfig, persist: bool) -> Self {
         let n = chain.len();
         let cb_config = routing.circuit_breaker.clone().unwrap_or_default();
         let upstream_ids: Vec<String> = chain.iter().map(|e| e.upstream.id.to_string()).collect();
         let persist_path = if persist {
             Some(
-                clawde_core::config::Settings::config_dir()
+                clawde_core::config::Settings::state_dir()
                     .join("empty-cooldown-state")
                     .join("free.json"),
             )
@@ -175,7 +185,7 @@ impl FreeProvider {
         ));
         let telemetry_path = if persist {
             Some(
-                clawde_core::config::Settings::config_dir()
+                clawde_core::config::Settings::state_dir()
                     .join("telemetry-state")
                     .join("free.json"),
             )
@@ -190,14 +200,18 @@ impl FreeProvider {
         );
         let capacity_path = if persist {
             Some(
-                clawde_core::config::Settings::config_dir()
+                clawde_core::config::Settings::state_dir()
                     .join("capacity-state")
                     .join("free.json"),
             )
         } else {
             None
         };
-        let capacity = CapacityState::new(n).with_persistence(upstream_ids, capacity_path);
+        let capacity = CapacityState::new(n).with_persistence(upstream_ids.clone(), capacity_path);
+        // Same `persist` gate as the three tracks above. The tally used to load
+        // and save unconditionally, so a test building the chain with
+        // `persist: false` still read and rewrote `free-state/tool-dialect.json`.
+        let tool_dialect = ToolDialectState::new(n).with_persistence(upstream_ids, persist);
         Self {
             id: ProviderId::new(ProviderId::FREE),
             chain,
@@ -206,7 +220,7 @@ impl FreeProvider {
             profiles: Arc::new(ProviderProfiles::load()),
             latencies: Arc::new(Mutex::new(latencies)),
             capacity: Arc::new(Mutex::new(capacity)),
-            tool_dialect: Arc::new(Mutex::new(ToolDialectState::load(n))),
+            tool_dialect: Arc::new(Mutex::new(tool_dialect)),
             liveness: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -4455,6 +4469,99 @@ mod tests {
             },
             false,
         )
+    }
+
+    /// End-to-end proof of the seamless NVIDIA key hand-off through the real
+    /// free chain on a *pinned* route.
+    ///
+    /// When the first key 429s and a second key is still healthy, the free
+    /// chain must NOT see the failure: the [`KeyRotatingProvider`] absorbs it,
+    /// re-dispatches the identical model on the next key, and the request
+    /// succeeds without ever falling through to a different upstream (which
+    /// would silently switch the model).
+    ///
+    /// This is a continuity guarantee, not a throughput one. NVIDIA's ~40 RPM
+    /// ceiling is per account/key but shared across models, so rotating to a
+    /// key in the SAME organization buys nothing — the ceiling is partly shared
+    /// capacity (`provider-cooldown-profiles.json`). The hand-off only pays off
+    /// against a key from a different account, and it stops being possible once
+    /// every key in the ring is spent, at which point the chain legitimately
+    /// falls through.
+    #[tokio::test]
+    async fn pinned_nvidia_route_rotates_keys_without_switching_model() {
+        let nvidia_models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Per-key stub: key0 always rate-limits, key1 succeeds; both record the
+        // model they were actually dispatched with.
+        let mut rotating = crate::providers::KeyRotatingProvider::new(
+            "nvidia",
+            "NVIDIA",
+            vec!["key0".to_string(), "key1".to_string()],
+            {
+                let models = Arc::clone(&nvidia_models);
+                move |key: &str| {
+                    let ok = key != "key0";
+                    let models = Arc::clone(&models);
+                    Arc::new(StubProvider {
+                        id: ProviderId::new("nvidia"),
+                        ok,
+                        seen_max_tokens: None,
+                        seen_request: None,
+                        ring_status: None,
+                        exhaustion: None,
+                        attempt_log: Some(models),
+                        fail_msg: None,
+                        rate_limit: None,
+                    }) as Arc<dyn LlmProvider>
+                }
+            },
+        );
+        // Mirror production: nested in the free chain, no internal cooldown wait.
+        rotating.set_skip_recovery_loop(true);
+
+        // A second, healthy upstream so we can prove it is NOT reached.
+        let groq_attempted = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let provider = FreeProvider::new(vec![
+            FreeEntry {
+                upstream: *catalog_entry("nvidia").expect("nvidia catalog entry"),
+                provider: Arc::new(rotating),
+                effective_model: None,
+            },
+            FreeEntry {
+                upstream: *catalog_entry("groq").expect("groq catalog entry"),
+                provider: Arc::new(StubProvider {
+                    id: ProviderId::new("groq"),
+                    ok: true,
+                    seen_max_tokens: None,
+                    seen_request: None,
+                    ring_status: None,
+                    exhaustion: None,
+                    attempt_log: Some(Arc::clone(&groq_attempted)),
+                    fail_msg: None,
+                    rate_limit: None,
+                }),
+                effective_model: None,
+            },
+        ]);
+
+        let resp = provider
+            .create_message(dummy_request("free/nvidia/openai/gpt-oss-120b"))
+            .await
+            .expect("the second nvidia key must serve the pinned request");
+
+        // Served on the pinned wire model, by nvidia. Both keys saw the
+        // identical model string, proving rotation happened below the plan.
+        assert_eq!(resp.model, "openai/gpt-oss-120b");
+        assert_eq!(
+            *nvidia_models.lock().unwrap(),
+            vec!["openai/gpt-oss-120b", "openai/gpt-oss-120b"],
+            "key0 then key1, both on the identical pinned model"
+        );
+        // The hand-off was silent: groq was never consulted, so no model switch.
+        assert!(
+            groq_attempted.lock().unwrap().is_empty(),
+            "same-provider rotation must not fall through to another upstream"
+        );
     }
 
     #[test]

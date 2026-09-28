@@ -179,7 +179,7 @@ When `attempt_upstreams` is empty, derive N upstreams at spawn time:
    the registry already does).
 2. **Distinct `model_family`** first: the measured diversity is across
    families (glm vs gpt-oss vs gemini), not just hosts. Fill remaining slots
-   with distinct hosts of the same family if needed (groq+nvidia gpt-oss is
+   with distinct hosts of the same family if needed (cerebras+groq gpt-oss is
    still real diversity — serving stacks differ measurably).
 3. Dead upstreams (auth-failed / quota-402 / tier-403 classifications from
    the key-ring state) are skipped — the eval's cerebras/mistral findings.

@@ -521,13 +521,35 @@ impl KeyRotatingProvider {
                             ring.save_to_file(persist_path);
                         }
 
+                        // Rotation is a fallback, not extra throughput. The
+                        // ring re-dispatches on the next key so a rate-limited
+                        // credential stays invisible and the user does not get
+                        // switched to a different model — but on a provider
+                        // whose ceiling is partly shared capacity (NVIDIA's
+                        // limit is "dependent on model, use-case and the amount
+                        // of current overall traffic using the same access")
+                        // a second key only adds headroom when it belongs to a
+                        // different account/organization. Name the model and
+                        // the keys left so a silent hand-off is traceable.
+                        // Only promise a hand-off while one is actually
+                        // possible: with every key spent there is nothing left
+                        // in this provider to hand off to.
+                        let keys_left = ring.active_count();
+                        let handoff = if keys_left > 0 {
+                            "same model continues on the next key"
+                        } else {
+                            "no keys left on this provider"
+                        };
                         tracing::info!(
-                            "KeyRotatingProvider: key exhausted ({}s cooldown), \
-                             {}/{} active for {}",
-                            final_cooldown,
-                            ring.active_count(),
-                            ring.len(),
+                            "KeyRotatingProvider: {} key#{} exhausted for {} \
+                             ({}s cooldown); {} of {} keys still usable, {}",
                             self.provider_id,
+                            active_idx,
+                            model,
+                            final_cooldown,
+                            keys_left,
+                            ring.len(),
+                            handoff,
                         );
                     }
                 }
@@ -796,6 +818,14 @@ mod tests {
         call_count: Arc<AtomicUsize>,
         delay: Duration,
         rate_limit: Option<RateLimitObservation>,
+        /// When set, records the model of each dispatch so a test can assert
+        /// the model never changes across a key hand-off.
+        seen_models: Option<Arc<Mutex<Vec<String>>>>,
+        /// When set, emulates a per-key rate limit: the first `budget` calls
+        /// succeed and every later call answers 429, the way a key whose RPM
+        /// window is full does. Models the request's real failure mode so a
+        /// test can drive a whole busy session, not just one hand-off.
+        rpm_budget: Option<usize>,
     }
 
     #[async_trait]
@@ -811,7 +841,20 @@ mod tests {
             &self,
             request: ProviderRequest,
         ) -> Result<ProviderResponse, ProviderError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let calls = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(seen) = &self.seen_models {
+                seen.lock()
+                    .expect("model recording mutex")
+                    .push(request.model.clone());
+            }
+            if let Some(budget) = self.rpm_budget {
+                if calls > budget {
+                    return Err(ProviderError::RateLimited {
+                        provider: self.id.clone(),
+                        retry_after: Some(RPM_WINDOW_SECS),
+                    });
+                }
+            }
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
@@ -942,6 +985,79 @@ mod tests {
             call_count: counter,
             delay: Duration::ZERO,
             rate_limit,
+            seen_models: None,
+            rpm_budget: None,
+        })
+    }
+
+    /// How long a [`MockProvider`] with an `rpm_budget` asks the ring to bench
+    /// the key for, in seconds. Only the tests' own choice of number: NVIDIA
+    /// sends no rate-limit headers at all (`respects_retry_after: false`), so
+    /// nothing here models an observable upstream value. Kept below a minute so
+    /// an exhausted pool does not wait out a real window inside a test.
+    const RPM_WINDOW_SECS: u64 = 45;
+
+    /// Like [`build_mock_provider`] but also records the model of every
+    /// dispatch, so a test can assert the model never changes across a key
+    /// hand-off.
+    fn build_mock_provider_recording(
+        key: &str,
+        fail: Option<ProviderError>,
+        counters: &Arc<Vec<Arc<AtomicUsize>>>,
+        seen: Arc<Mutex<Vec<String>>>,
+    ) -> Arc<dyn LlmProvider> {
+        let idx: usize = key
+            .chars()
+            .last()
+            .and_then(|c| c.to_digit(10))
+            .map(|d| d as usize)
+            .unwrap_or(0);
+        let counter = counters
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+        Arc::new(MockProvider {
+            id: ProviderId::new("mock"),
+            name: format!("mock-{key}"),
+            fail_with: fail,
+            fail_on_model: None,
+            call_count: counter,
+            delay: Duration::ZERO,
+            rate_limit: None,
+            seen_models: Some(seen),
+            rpm_budget: None,
+        })
+    }
+
+    /// [`build_mock_provider_recording`] with a per-key request budget, so a
+    /// test can run a whole session against keys that dry up mid-way the way a
+    /// full RPM window does.
+    fn build_mock_provider_budgeted(
+        key: &str,
+        rpm_budget: Option<usize>,
+        counters: &Arc<Vec<Arc<AtomicUsize>>>,
+        seen: Arc<Mutex<Vec<String>>>,
+    ) -> Arc<dyn LlmProvider> {
+        let idx: usize = key
+            .chars()
+            .last()
+            .and_then(|c| c.to_digit(10))
+            .map(|d| d as usize)
+            .unwrap_or(0);
+        let counter = counters
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+        Arc::new(MockProvider {
+            id: ProviderId::new("mock"),
+            name: format!("mock-{key}"),
+            fail_with: None,
+            fail_on_model: None,
+            call_count: counter,
+            delay: Duration::ZERO,
+            rate_limit: None,
+            seen_models: Some(seen),
+            rpm_budget,
         })
     }
 
@@ -1488,6 +1604,8 @@ mod tests {
             call_count: counter,
             delay,
             rate_limit: None,
+            seen_models: None,
+            rpm_budget: None,
         })
     }
 
@@ -1873,6 +1991,246 @@ mod tests {
         );
     }
 
+    /// The same-model hand-off, at the size that matters in practice.
+    ///
+    /// NVIDIA's ~40 RPM ceiling is per account/key but *shared across models*,
+    /// so switching models escapes nothing. That makes account rotation the
+    /// only lever that keeps the user on ONE model instead of being silently
+    /// switched — and only when the second key belongs to a different account
+    /// or organization, because the ceiling is partly shared capacity rather
+    /// than a private per-account bucket (see `provider-cooldown-profiles.json`).
+    /// This does NOT claim a throughput multiplier; it pins that every attempt
+    /// uses the identical model string and keys are consumed strictly in order.
+    #[tokio::test]
+    async fn three_keys_string_together_on_the_same_model() {
+        const MODEL: &str = "nvidia/nemotron-3.5-lightning-30b-a3b";
+        // Two keys exhausted before the request arrives (stale cooldowns).
+        // The third must serve, on the same model, with no plan involvement.
+        let models_seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let call_order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let counters = Arc::new(vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ]);
+
+        let build = {
+            let c = counters.clone();
+            let models = Arc::clone(&models_seen);
+            let order = Arc::clone(&call_order);
+            move |key: &str| {
+                order.lock().unwrap().push(key.to_string());
+                build_mock_provider_recording(key, None, &c, Arc::clone(&models))
+            }
+        };
+
+        let provider = KeyRotatingProvider::new(
+            "nvidia",
+            "NVIDIA",
+            vec!["key0".into(), "key1".into(), "key2".into()],
+            build,
+        );
+        {
+            let mut ring = provider.ring().lock().unwrap();
+            ring.mark_exhausted(0, 60, Some("429 on the previous window".into()));
+            ring.mark_exhausted(1, 60, Some("429 on the previous window".into()));
+        }
+
+        let mut req = dummy_request();
+        req.model = MODEL.into();
+        let result = provider.create_message(req).await;
+        assert!(result.is_ok(), "the third key must serve the request");
+
+        // Only the third key was used, and the model never changed.
+        assert_eq!(
+            *call_order.lock().unwrap(),
+            vec!["key2".to_string()],
+            "exhausted keys must not be retried"
+        );
+        assert_eq!(
+            *models_seen.lock().unwrap(),
+            vec![MODEL.to_string()],
+            "the model must be identical across the whole hand-off"
+        );
+        assert_eq!(counters[2].load(Ordering::SeqCst), 1);
+        assert_eq!(counters[0].load(Ordering::SeqCst), 0);
+        assert_eq!(counters[1].load(Ordering::SeqCst), 0);
+    }
+
+    /// The same stringing-together on a *live* 429 rather than a stale
+    /// cooldown: a request is dispatched, gets 429, and must be re-dispatched
+    /// on the next key without ever leaving the model.
+    #[tokio::test]
+    async fn a_live_429_hands_off_to_the_next_key_on_the_same_model() {
+        const MODEL: &str = "openai/gpt-oss-20b";
+        let models_seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let keys_used: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let counters = Arc::new(vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ]);
+
+        let build = {
+            let c = counters.clone();
+            let models = Arc::clone(&models_seen);
+            let keys = Arc::clone(&keys_used);
+            move |key: &str| {
+                keys.lock().unwrap().push(key.to_string());
+                let fail = if key == "key0" {
+                    Some(ProviderError::RateLimited {
+                        provider: ProviderId::new("nvidia"),
+                        retry_after: Some(60),
+                    })
+                } else {
+                    None
+                };
+                build_mock_provider_recording(key, fail, &c, Arc::clone(&models))
+            }
+        };
+
+        let mut provider = KeyRotatingProvider::new(
+            "nvidia",
+            "NVIDIA",
+            vec!["key0".into(), "key1".into()],
+            build,
+        );
+        // Mirror production: nested in the free chain, fail over fast.
+        provider.set_skip_recovery_loop(true);
+
+        let mut req = dummy_request();
+        req.model = MODEL.into();
+        let result = provider.create_message(req).await;
+        assert!(result.is_ok(), "must recover on the second key");
+
+        assert_eq!(
+            *keys_used.lock().unwrap(),
+            vec!["key0".to_string(), "key1".to_string()],
+            "key0 then key1, in ring order"
+        );
+        assert_eq!(
+            *models_seen.lock().unwrap(),
+            vec![MODEL.to_string(), MODEL.to_string()],
+            "both dispatches must use the identical model"
+        );
+    }
+
+    /// The contract for a per-key RPM lane over a *whole session*, not one
+    /// hand-off.
+    ///
+    /// A busy conversation runs a key dry and the next request answers "too
+    /// many requests". None of that may reach the user: the request is
+    /// re-dispatched on another key of the same provider, on the same model,
+    /// and the pool keeps serving until every key is spent. The combined
+    /// budget is what the pool can serve before the caller sees a limit — it is
+    /// NOT a throughput multiplier over one key, because NVIDIA's ceiling is
+    /// partly shared capacity (`provider-cooldown-profiles.json`: "adding
+    /// accounts does not multiply headroom the way a per-account quota would").
+    #[tokio::test]
+    async fn sustained_load_cycles_through_every_key_without_a_failure() {
+        const MODEL: &str = "nvidia/nemotron-3.5-lightning-30b-a3b";
+        // Unequal on purpose: key0 dries first, then key1, then key2. Six
+        // requests is exactly the pool's combined budget.
+        const BUDGETS: [usize; 3] = [1, 2, 3];
+        let counters = Arc::new(vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ]);
+        let models_seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let build = {
+            let c = Arc::clone(&counters);
+            let models = Arc::clone(&models_seen);
+            move |key: &str| {
+                let idx = key
+                    .chars()
+                    .last()
+                    .and_then(|c| c.to_digit(10))
+                    .map(|d| d as usize)
+                    .unwrap_or(0);
+                build_mock_provider_budgeted(key, Some(BUDGETS[idx]), &c, Arc::clone(&models))
+            }
+        };
+
+        let mut provider = KeyRotatingProvider::new(
+            "nvidia",
+            "NVIDIA",
+            vec!["key0".into(), "key1".into(), "key2".into()],
+            build,
+        );
+        // Mirror production: nested in the free chain, which fails over instead
+        // of sleeping out a cooldown here.
+        provider.set_skip_recovery_loop(true);
+
+        for turn in 1..=BUDGETS.iter().sum::<usize>() {
+            let mut req = dummy_request();
+            req.model = MODEL.into();
+            let result = provider.create_message(req).await;
+            assert!(
+                result.is_ok(),
+                "turn {turn} must be served by the pool; keys drying out is not the user's problem"
+            );
+        }
+
+        // The model never changed across any of the internal hand-offs.
+        let seen = models_seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|m| m == MODEL),
+            "every dispatch stays on the pinned model: {seen:?}"
+        );
+        assert!(
+            counters.iter().all(|c| c.load(Ordering::SeqCst) > 0),
+            "the load must spread across the pool, got {:?}",
+            counters
+                .iter()
+                .map(|c| c.load(Ordering::SeqCst))
+                .collect::<Vec<_>>()
+        );
+
+        // A benched key stays benched for its window: the next request must not
+        // re-try it (that would re-pay the 429 on every turn).
+        let benched: Vec<usize> = provider
+            .key_statuses()
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.active)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !benched.is_empty(),
+            "the session must have dried at least one key"
+        );
+        let before: Vec<usize> = benched
+            .iter()
+            .map(|i| counters[*i].load(Ordering::SeqCst))
+            .collect();
+
+        // The pool is now exhausted, so the caller finally sees a rate limit —
+        // with a retry hint, and without the ring sleeping out the window.
+        let mut req = dummy_request();
+        req.model = MODEL.into();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), provider.create_message(req))
+            .await
+            .expect("must not block waiting for a cooldown inside the chain");
+        match outcome {
+            Err(ProviderError::RateLimited { retry_after, .. }) => {
+                assert!(
+                    retry_after.is_some(),
+                    "an exhausted pool carries the earliest retry hint"
+                );
+            }
+            other => panic!("exhausted pool must surface a rate limit, got {other:?}"),
+        }
+        let after: Vec<usize> = benched
+            .iter()
+            .map(|i| counters[*i].load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(
+            before, after,
+            "benched keys must not be retried while cooling"
+        );
+    }
+
     #[tokio::test]
     async fn per_key_rate_limit_keeps_global_cooldown() {
         // The "nvidia" profile is limit_scope=per-key (default): the same
@@ -2001,6 +2359,8 @@ mod tests {
                     call_count: counter,
                     delay: Duration::ZERO,
                     rate_limit: None,
+                    seen_models: None,
+                    rpm_budget: None,
                 }) as Arc<dyn LlmProvider>
             }
         };
