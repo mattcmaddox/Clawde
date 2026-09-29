@@ -32,6 +32,14 @@ use super::*;
 /// request budget — fall through instead of stalling the stream.
 const MAX_RETRY_AFTER_WAIT_SECS: u64 = 120;
 
+/// Cadence of [`StreamEvent::UpstreamRetryProgress`] while a same-upstream
+/// retry waits. Also caps the gap between events leaving this stream, so a
+/// long `Retry-After` wait (up to [`MAX_RETRY_AFTER_WAIT_SECS`]) can never
+/// trip the consumer's stream-stall watchdog — 45s for `free` in
+/// `clawde-query`, which only resets when an event actually leaves the stream
+/// — and silently truncate the wait into a spurious retry.
+const RETRY_PROGRESS_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Upper bound for how long the refusal-buffer may hide an in-progress
 /// attempt (seconds). Must stay well under the query loop's stream-stall
 /// watchdog for `free` (45s), which only resets when an event actually leaves
@@ -92,6 +100,17 @@ impl SameRetryDelay {
         }
     }
 
+    /// Short cause label for the user-facing wait indicator
+    /// ([`StreamEvent::UpstreamRetryProgress`]). Distinct from [`Self::label`],
+    /// which is a log-line suffix.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::RateLimited { hint_secs: Some(_) } => "rate limited (server asked for a pause)",
+            Self::RateLimited { hint_secs: None } => "rate limited",
+            Self::Transient => "transient failure",
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             Self::RateLimited { hint_secs: Some(_) } => " (honoring Retry-After)",
@@ -99,6 +118,20 @@ impl SameRetryDelay {
             Self::Transient => "",
         }
     }
+}
+
+/// Display state for a scheduled same-upstream retry, surfaced to consumers as
+/// [`StreamEvent::UpstreamRetryProgress`]. Without it a rate-limit backoff is a
+/// silent spinner for the length of the wait (20-120s), which reads as a hang.
+struct RetryNotice {
+    upstream_id: String,
+    model: String,
+    reason: &'static str,
+    total_secs: u64,
+    /// Whether the wait has been announced yet. The first `poll_next` after
+    /// scheduling reports the wait immediately so the indicator appears at
+    /// t=0 rather than one tick late.
+    emitted: bool,
 }
 
 impl FreeProvider {
@@ -1441,6 +1474,20 @@ fn is_tool_refusal(text: &str) -> bool {
     false
 }
 
+/// The error to record when a dispatch's walk budget has run out, or `None`
+/// while the walk may still start another attempt. A `None` deadline is an
+/// unbounded walk (`turn_walk_budget_secs == 0`).
+///
+/// Every walk loop consults this before starting an attempt, so a throttled
+/// chain reports the budget as its reason instead of trying upstreams for
+/// minutes with nothing on screen. The note is pushed LAST into the error
+/// list, which is the one element [`join_capped_upstream_errors`] always
+/// keeps.
+fn walk_budget_note(deadline: Option<Instant>, budget_secs: u64) -> Option<String> {
+    (deadline.is_some_and(|deadline| Instant::now() >= deadline))
+        .then(|| format!("walk budget of {budget_secs}s exhausted — stopped trying upstreams"))
+}
+
 fn join_capped_upstream_errors(errors: &[String]) -> String {
     const MAX_LISTED: usize = 5;
     let mut deduped: Vec<&str> = errors.iter().map(String::as_str).collect();
@@ -1545,6 +1592,16 @@ struct RetryingFreeStream {
     retry_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     /// The upstream to retry after the delay fires: (chain_idx, model).
     retry_target: Option<(usize, String)>,
+    /// Wall-clock deadline of the scheduled same-upstream retry. `retry_sleep`
+    /// re-arms for at most [`RETRY_PROGRESS_TICK`] so the wait can report
+    /// progress; this is the point at which the retry actually fires.
+    retry_deadline: Option<Instant>,
+    /// Indicator state for the scheduled retry (see [`RetryNotice`]).
+    retry_notice: Option<RetryNotice>,
+    /// Deadline for this dispatch's whole upstream walk (every attempt plus
+    /// their same-upstream retries). `None` = unbounded. Bounds the worst-case
+    /// silence a user can be handed before the turn reports exhaustion.
+    walk_deadline: Option<Instant>,
     /// Shared structured-vs-prose tool-call tally used by the routing gate to
     /// demote prose-prone upstreams on future tool-bearing requests.
     tool_dialect: Arc<Mutex<ToolDialectState>>,
@@ -1578,7 +1635,7 @@ impl RetryingFreeStream {
         routing: RoutingConfig,
         profiles: Arc<ProviderProfiles>,
         request: ProviderRequest,
-        stream: BoxedProviderStream,
+        current: Option<BoxedProviderStream>,
         idx: usize,
         upstream_model: String,
         remaining_plan: VecDeque<(usize, String)>,
@@ -1589,6 +1646,7 @@ impl RetryingFreeStream {
         // Compute before the struct literal below moves `request`/`remaining_plan`.
         let initial_waiting_refusal =
             FreeProvider::request_has_tools(&request) && !remaining_plan.is_empty();
+        let walk_deadline = routing.turn_walk_budget();
         Self {
             chain,
             cooldown,
@@ -1599,7 +1657,7 @@ impl RetryingFreeStream {
             request,
             task,
             remaining_plan,
-            current: Some(stream),
+            current,
             current_idx: idx,
             current_model: upstream_model,
             pending_attribution: true,
@@ -1632,8 +1690,64 @@ impl RetryingFreeStream {
             same_upstream_retries: HashMap::new(),
             retry_sleep: None,
             retry_target: None,
+            retry_deadline: None,
+            retry_notice: None,
+            walk_deadline,
             tool_dialect,
         }
+    }
+
+    /// Build a stream that opens by waiting out a same-upstream retry for a
+    /// *pre-stream* dispatch failure — the first attempt of a turn failing
+    /// before any stream exists.
+    ///
+    /// `FreeProvider::create_message_stream` used to sleep out that wait
+    /// itself, which made a 20-120s rate-limit backoff a silent stall: the walk
+    /// loop has no event channel, so nothing about the wait could reach the
+    /// consumer until the (retried) attempt finally produced a stream. Handing
+    /// the retry to the stream instead routes the wait through the same
+    /// [`StreamEvent::UpstreamRetryProgress`] reporting the in-stream retries
+    /// use. No attempt is in flight yet: the first `poll_next` announces the
+    /// wait, and the dispatch happens when `retry_deadline` passes.
+    #[allow(clippy::too_many_arguments)]
+    fn new_retry_pending(
+        chain: Vec<FreeEntry>,
+        cooldown: Arc<Mutex<CooldownState>>,
+        latencies: Arc<Mutex<LatencyState>>,
+        capacity: Arc<Mutex<CapacityState>>,
+        tool_dialect: Arc<Mutex<ToolDialectState>>,
+        routing: RoutingConfig,
+        profiles: Arc<ProviderProfiles>,
+        request: ProviderRequest,
+        idx: usize,
+        upstream_model: String,
+        remaining_plan: VecDeque<(usize, String)>,
+        is_auto_route: bool,
+        upstream_errors: Vec<String>,
+        delay: SameRetryDelay,
+    ) -> Self {
+        let mut state = Self::new(
+            chain,
+            cooldown,
+            latencies,
+            capacity,
+            tool_dialect,
+            routing,
+            profiles,
+            request,
+            None,
+            idx,
+            upstream_model.clone(),
+            remaining_plan,
+            is_auto_route,
+            upstream_errors,
+        );
+        // The caller hands off on the first pre-stream failure for `idx`, so
+        // the stream's per-upstream count starts empty and
+        // `schedule_same_upstream_retry` resolves the same delay the pre-stream
+        // sleep would have used.
+        state.schedule_same_upstream_retry(idx, upstream_model, delay);
+        state
     }
 
     /// Start a hedge request to a backup provider.
@@ -1805,10 +1919,19 @@ impl RetryingFreeStream {
             .unwrap_or(samples[0])
     }
 
-    /// Whether the upstream at `idx` has retries remaining.
+    /// Whether the upstream at `idx` has retries remaining within this
+    /// dispatch's walk budget.
     fn can_retry_same_upstream(&self, idx: usize) -> bool {
         let count = self.same_upstream_retries.get(&idx).copied().unwrap_or(0);
-        self.routing.fallback_retries > 0 && count < self.routing.fallback_retries
+        self.routing.fallback_retries > 0
+            && count < self.routing.fallback_retries
+            && !self.walk_budget_exhausted()
+    }
+
+    /// Whether this dispatch's walk budget (`routing.turn_walk_budget_secs`)
+    /// has run out. A zero budget disables the bound.
+    fn walk_budget_exhausted(&self) -> bool {
+        walk_budget_note(self.walk_deadline, self.routing.turn_walk_budget_secs).is_some()
     }
 
     /// Schedule a same-upstream retry after an exponential backoff delay.
@@ -1835,10 +1958,70 @@ impl RetryingFreeStream {
             delay_ms,
             delay.label(),
         );
+        self.retry_deadline = Some(Instant::now() + std::time::Duration::from_millis(delay_ms));
+        self.retry_notice = Some(RetryNotice {
+            upstream_id: uid.to_string(),
+            model: model.clone(),
+            reason: delay.reason(),
+            total_secs: delay_ms.div_ceil(1000),
+            emitted: false,
+        });
+        // Re-arm for at most one tick; `poll_next` re-arms until the deadline,
+        // so the wait is visible (and the consumer's stall watchdog is fed) for
+        // its whole length instead of going silent for up to
+        // MAX_RETRY_AFTER_WAIT_SECS. Never wait past the deadline itself.
         self.retry_sleep = Some(Box::pin(tokio::time::sleep(
-            std::time::Duration::from_millis(delay_ms),
+            std::time::Duration::from_millis(delay_ms).min(RETRY_PROGRESS_TICK),
         )));
         self.retry_target = Some((idx, model));
+    }
+
+    /// Time left before the scheduled retry fires. Zero when no retry is
+    /// scheduled or the deadline has passed.
+    fn retry_remaining(&self) -> std::time::Duration {
+        match self.retry_deadline {
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            None => std::time::Duration::ZERO,
+        }
+    }
+
+    /// Build the wait indicator for the scheduled retry. Returns `None` when no
+    /// notice is pending; `remaining_secs` is `0` once the retry has gone out,
+    /// which tells the consumer to clear its indicator.
+    fn retry_progress_event(&self, remaining_secs: u64) -> Option<StreamEvent> {
+        let notice = self.retry_notice.as_ref()?;
+        Some(StreamEvent::UpstreamRetryProgress {
+            upstream_id: notice.upstream_id.clone(),
+            model: notice.model.clone(),
+            reason: notice.reason.to_string(),
+            remaining_secs,
+            total_secs: notice.total_secs,
+        })
+    }
+
+    /// Take the wait indicator for a retry that is going out now, so the
+    /// consumer clears it. Leaves `retry_target` alone — the launch path needs
+    /// it.
+    fn take_retry_notice_event(&mut self) -> Option<StreamEvent> {
+        let notice = self.retry_notice.take()?;
+        notice
+            .emitted
+            .then_some(StreamEvent::UpstreamRetryProgress {
+                upstream_id: notice.upstream_id,
+                model: notice.model,
+                reason: notice.reason.to_string(),
+                remaining_secs: 0,
+                total_secs: notice.total_secs,
+            })
+    }
+
+    /// Abandon the scheduled same-upstream retry — a hedge superseded it. Clears
+    /// the timer, the target, and the wait indicator.
+    fn cancel_retry_wait(&mut self) -> Option<StreamEvent> {
+        self.retry_sleep = None;
+        self.retry_target = None;
+        self.retry_deadline = None;
+        self.take_retry_notice_event()
     }
 
     /// Launch the retry after the backoff timer fires. Consumes
@@ -2083,6 +2266,15 @@ impl RetryingFreeStream {
     /// `true` when a new attempt was launched, `false` when the plan is
     /// exhausted.
     fn start_next_plan_entry(&mut self) -> bool {
+        if let Some(note) = walk_budget_note(self.walk_deadline, self.routing.turn_walk_budget_secs)
+        {
+            // The walk budget bounds how long a turn may keep trying upstreams.
+            // Report it as the LAST error so every exhaustion message (all of
+            // which end with the joined error list) names the real reason.
+            self.remaining_plan.clear();
+            self.upstream_errors.push(note);
+            return false;
+        }
         while let Some((idx, model)) = self.remaining_plan.pop_front() {
             let mut cd = self.cooldown.lock().unwrap();
             cd.prune_expired();
@@ -2193,25 +2385,60 @@ impl Stream for RetryingFreeStream {
                     // Cancel any in-flight hedge
                     self.cancel_hedge();
                     // Cancel pending same-upstream retry — the hedge
-                    // provides a better upstream immediately.
-                    self.retry_sleep = None;
-                    self.retry_target = None;
+                    // provides a better upstream immediately. Report the
+                    // cancellation so the wait indicator clears at once
+                    // instead of standing until the turn ends.
+                    if let Some(evt) = self.cancel_retry_wait() {
+                        return Poll::Ready(Some(Ok(evt)));
+                    }
                     continue;
                 }
             }
 
-            // Same-upstream retry backoff: when a retry is scheduled, poll
-            // the sleep timer. While pending, yield control back to the
-            // executor. When the timer fires, launch the retry.
-            if let Some(ref mut sleep) = self.retry_sleep {
-                match Pin::new(sleep).poll(cx) {
-                    Poll::Ready(()) => {
-                        self.retry_sleep = None;
-                        self.start_retry();
-                        continue;
+            // Same-upstream retry wait. `retry_sleep` re-arms for at most
+            // RETRY_PROGRESS_TICK, so each second of the wait reports its
+            // countdown (see StreamEvent::UpstreamRetryProgress) and refreshes
+            // any consumer-side stall watchdog; the retry launches once
+            // `retry_deadline` passes.
+            if self.retry_sleep.is_some() {
+                let fired = match self.retry_sleep.as_mut() {
+                    Some(sleep) => Pin::new(sleep).poll(cx).is_ready(),
+                    None => false,
+                };
+                let remaining = self.retry_remaining();
+                if fired && remaining.is_zero() {
+                    let launched = self.take_retry_notice_event();
+                    self.retry_deadline = None;
+                    self.retry_sleep = None;
+                    self.start_retry();
+                    if let Some(evt) = launched {
+                        return Poll::Ready(Some(Ok(evt)));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    continue;
                 }
+                // Announce the wait the first time through so the indicator is
+                // on screen from t=0, and refresh it once per tick.
+                let announce = self
+                    .retry_notice
+                    .as_ref()
+                    .is_some_and(|notice| !notice.emitted || fired);
+                if announce {
+                    if let Some(notice) = self.retry_notice.as_mut() {
+                        notice.emitted = true;
+                    }
+                }
+                if fired {
+                    self.retry_sleep = Some(Box::pin(tokio::time::sleep(
+                        remaining.min(RETRY_PROGRESS_TICK),
+                    )));
+                }
+                if announce {
+                    let secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+                    if let Some(evt) = self.retry_progress_event(secs) {
+                        return Poll::Ready(Some(Ok(evt)));
+                    }
+                }
+                return Poll::Pending;
             }
 
             // Start hedge if conditions are met
@@ -2955,8 +3182,14 @@ impl LlmProvider for FreeProvider {
         let mut same_upstream_retries: HashMap<usize, u32> = HashMap::new();
         let mut plan_deque: std::collections::VecDeque<(usize, String)> =
             plan.into_iter().collect();
+        let walk_deadline = self.routing.turn_walk_budget();
 
         while let Some((idx, upstream_model)) = plan_deque.pop_front() {
+            if let Some(note) = walk_budget_note(walk_deadline, self.routing.turn_walk_budget_secs)
+            {
+                upstream_errors.push(note);
+                break;
+            }
             // Circuit breaker: skip upstreams in cooldown.
             if self.is_in_cooldown(idx) {
                 tracing::debug!("FreeProvider: skipping upstream {} (in cooldown)", idx,);
@@ -3167,15 +3400,21 @@ impl LlmProvider for FreeProvider {
         // The request's task tags every dispatch's success/failure counters
         // (spec §8.6 per-task success-rate view).
         let task = classify_request(&request);
-        // Per-upstream same-upstream retry counts for transient pre-stream
-        // failures. Mirrors the non-streaming path's retry logic.
+        // How many same-upstream retries one upstream is allowed. The first
+        // pre-stream failure hands the retry — and its wait — to the returned
+        // stream; every later attempt comes from the stream's own plan.
         let max_same_retries = self.routing.fallback_retries;
-        let mut same_upstream_retries: HashMap<usize, u32> = HashMap::new();
         let mut plan_deque: std::collections::VecDeque<(usize, String)> =
             plan_vec.into_iter().collect();
         let mut pos = 0usize;
+        let walk_deadline = self.routing.turn_walk_budget();
 
         while let Some((idx, upstream_model)) = plan_deque.pop_front() {
+            if let Some(note) = walk_budget_note(walk_deadline, self.routing.turn_walk_budget_secs)
+            {
+                upstream_errors.push(note);
+                break;
+            }
             // Circuit breaker: skip upstreams in cooldown.
             if self.is_in_cooldown(idx) {
                 tracing::debug!("FreeProvider: skipping upstream {} (in cooldown)", idx,);
@@ -3224,7 +3463,7 @@ impl LlmProvider for FreeProvider {
                         self.routing.clone(),
                         self.profiles.clone(),
                         request,
-                        stream,
+                        Some(stream),
                         idx,
                         upstream_model,
                         remaining,
@@ -3235,12 +3474,12 @@ impl LlmProvider for FreeProvider {
                 Ok(Err(err)) if Self::should_fallback(&err) => {
                     // Same-upstream retry for transient errors before
                     // advancing, matching the non-streaming path.
-                    let retry_count = same_upstream_retries.get(&idx).copied().unwrap_or(0);
-                    let can_retry_same = max_same_retries > 0
-                        && retry_count < max_same_retries
-                        && err.recovery_class().may_retry_same_provider();
+                    // This loop can hand off at most once per upstream: the
+                    // returned stream owns every remaining retry, so the count
+                    // it used to keep here is always the first one.
+                    let can_retry_same =
+                        max_same_retries > 0 && err.recovery_class().may_retry_same_provider();
                     if can_retry_same {
-                        same_upstream_retries.insert(idx, retry_count + 1);
                         let delay = if matches!(err, ProviderError::RateLimited { .. }) {
                             SameRetryDelay::RateLimited {
                                 hint_secs: err.retry_after_secs(),
@@ -3248,13 +3487,12 @@ impl LlmProvider for FreeProvider {
                         } else {
                             SameRetryDelay::Transient
                         };
-                        let delay_ms = delay.resolve(retry_count);
                         tracing::warn!(
                             "FreeProvider: {} stream failed ({}s): {} — retrying same upstream ({}/{}){}",
                             entry.upstream.id,
                             self.routing.upstream_timeout_secs,
                             err,
-                            retry_count + 1,
+                            1,
                             max_same_retries,
                             delay.label(),
                         );
@@ -3262,9 +3500,34 @@ impl LlmProvider for FreeProvider {
                             idx,
                             format_upstream_error(entry.upstream.id, &err),
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        plan_deque.push_front((idx, upstream_model));
-                        continue;
+                        // Hand the wait to the stream, which reports its
+                        // countdown as `StreamEvent::UpstreamRetryProgress`.
+                        // Sleeping here (the previous behaviour) made the
+                        // backoff a silent stall: this loop has no event
+                        // channel, and the consumer only sees events from the
+                        // stream it is handed.
+                        let remaining: VecDeque<_> = self
+                            .attempt_plan(&route, Some(&request))
+                            .into_iter()
+                            .skip(pos + 1)
+                            .collect();
+                        let is_auto = matches!(route, Route::Auto);
+                        return Ok(Box::pin(RetryingFreeStream::new_retry_pending(
+                            self.chain.clone(),
+                            self.cooldown.clone(),
+                            self.latencies.clone(),
+                            self.capacity.clone(),
+                            self.tool_dialect.clone(),
+                            self.routing.clone(),
+                            self.profiles.clone(),
+                            request,
+                            idx,
+                            upstream_model,
+                            remaining,
+                            is_auto,
+                            upstream_errors,
+                            delay,
+                        )));
                     }
                     tracing::warn!(
                         "FreeProvider: {} stream failed ({}s): {} — trying next upstream",
@@ -3284,16 +3547,12 @@ impl LlmProvider for FreeProvider {
                     return Err(err);
                 }
                 Err(_elapsed) => {
-                    let retry_count = same_upstream_retries.get(&idx).copied().unwrap_or(0);
-                    let can_retry_same = max_same_retries > 0 && retry_count < max_same_retries;
-                    if can_retry_same {
-                        same_upstream_retries.insert(idx, retry_count + 1);
-                        let delay_ms = same_upstream_retry_delay_ms(retry_count);
+                    if max_same_retries > 0 {
                         tracing::warn!(
                             "FreeProvider: upstream {} stream timed out after {}s — retrying same upstream ({}/{})",
                             entry.upstream.id,
                             self.routing.upstream_timeout_secs,
-                            retry_count + 1,
+                            1,
                             max_same_retries,
                         );
                         let reason = format!(
@@ -3301,9 +3560,30 @@ impl LlmProvider for FreeProvider {
                             entry.upstream.id, self.routing.upstream_timeout_secs
                         );
                         self.record_failure_reason(idx, reason);
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        plan_deque.push_front((idx, upstream_model));
-                        continue;
+                        // See the failure branch above: the wait belongs to the
+                        // stream so it can be reported instead of slept out.
+                        let remaining: VecDeque<_> = self
+                            .attempt_plan(&route, Some(&request))
+                            .into_iter()
+                            .skip(pos + 1)
+                            .collect();
+                        let is_auto = matches!(route, Route::Auto);
+                        return Ok(Box::pin(RetryingFreeStream::new_retry_pending(
+                            self.chain.clone(),
+                            self.cooldown.clone(),
+                            self.latencies.clone(),
+                            self.capacity.clone(),
+                            self.tool_dialect.clone(),
+                            self.routing.clone(),
+                            self.profiles.clone(),
+                            request,
+                            idx,
+                            upstream_model,
+                            remaining,
+                            is_auto,
+                            upstream_errors,
+                            SameRetryDelay::Transient,
+                        )));
                     }
                     tracing::warn!(
                         "FreeProvider: upstream {} stream timed out after {}s — trying next upstream",
@@ -5668,7 +5948,7 @@ mod tests {
         let json = serde_json::to_string(&rng).unwrap();
         assert_eq!(
             json,
-            r#"{"strategy":"random_failover","upstream_timeout_secs":30,"upstream_5xx_cooldown_secs":45,"fallback_retries":1}"#
+            r#"{"strategy":"random_failover","upstream_timeout_secs":30,"upstream_5xx_cooldown_secs":45,"fallback_retries":1,"turn_walk_budget_secs":240}"#
         );
         let deserialized: RoutingConfig = serde_json::from_str(&json).unwrap();
         assert!(matches!(
@@ -5930,8 +6210,12 @@ mod tests {
 
     #[tokio::test]
     async fn exhaustion_error_surfaces_all_upstream_failures_stream() {
-        // Streaming path: the first upstream fails before producing a stream,
-        // the second fails after. The final exhausted error must include both.
+        use futures::StreamExt;
+
+        // Streaming path: the first upstream fails before producing a stream
+        // (a retryable failure is handed to the stream so the retry wait can be
+        // reported), the second fails after. The final exhausted error must
+        // still include both.
         let provider = FreeProvider::with_routing(
             vec![
                 failing_entry("poolside", "quota exceeded"),
@@ -5944,14 +6228,19 @@ mod tests {
             false,
         );
 
-        let err = match provider
+        let mut stream = provider
             .create_message_stream(dummy_request("free/auto"))
             .await
-        {
-            Err(e) => e,
-            Ok(_) => panic!("expected exhaustion error, got Ok"),
-        };
-        let text = err.to_string();
+            .expect("a retryable first failure hands off to the stream");
+
+        let mut text = None;
+        while let Some(item) = stream.next().await {
+            if let Err(err) = item {
+                text = Some(err.to_string());
+                break;
+            }
+        }
+        let text = text.expect("the walk must end in an exhaustion error");
         assert!(
             text.contains("free-mode upstreams exhausted"),
             "got: {text}"
@@ -6058,6 +6347,220 @@ mod tests {
             ids,
             vec!["poolside", "poolside", "cerebras"],
             "empty attempt retried once on the same upstream, then advanced"
+        );
+    }
+
+    /// A `RetryingFreeStream` over `chain` with `remaining_plan` for the
+    /// upstreams after the first — lets walk-level decisions (the walk budget)
+    /// be exercised without a live round trip.
+    fn retrying_stream(
+        chain: Vec<FreeEntry>,
+        routing: RoutingConfig,
+        remaining_plan: Vec<(usize, String)>,
+    ) -> RetryingFreeStream {
+        let n = chain.len();
+        RetryingFreeStream::new(
+            chain,
+            Arc::new(Mutex::new(CooldownState::new(
+                n,
+                CircuitBreakerConfig::default(),
+            ))),
+            Arc::new(Mutex::new(LatencyState::new(n))),
+            Arc::new(Mutex::new(CapacityState::new(n))),
+            Arc::new(Mutex::new(ToolDialectState::new(n))),
+            routing,
+            Arc::new(ProviderProfiles::default()),
+            dummy_request("free/auto"),
+            Some(Box::pin(futures::stream::empty())),
+            0,
+            "model".to_string(),
+            remaining_plan.into_iter().collect(),
+            true,
+            Vec::new(),
+        )
+    }
+
+    /// The pre-stream hand-off (`RetryingFreeStream::new_retry_pending`) must
+    /// announce its wait on the first poll. That is the whole reason the retry
+    /// is handed to the stream instead of slept out inside
+    /// `create_message_stream`: the walk loop has no event channel, so a sleep
+    /// there was invisible (a bare spinner for the whole 20-120s backoff).
+    #[tokio::test]
+    async fn a_pre_stream_retry_hand_off_reports_its_wait() {
+        use futures::StreamExt;
+
+        let chain = vec![
+            stream_entry("poolside", true, Some("hi")),
+            stream_entry("cerebras", true, Some("bye")),
+        ];
+        let n = chain.len();
+        let mut stream = RetryingFreeStream::new_retry_pending(
+            chain,
+            Arc::new(Mutex::new(CooldownState::new(
+                n,
+                CircuitBreakerConfig::default(),
+            ))),
+            Arc::new(Mutex::new(LatencyState::new(n))),
+            Arc::new(Mutex::new(CapacityState::new(n))),
+            Arc::new(Mutex::new(ToolDialectState::new(n))),
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            Arc::new(ProviderProfiles::default()),
+            dummy_request("free/auto"),
+            0,
+            "model".to_string(),
+            std::collections::VecDeque::from(vec![(1, "model".to_string())]),
+            true,
+            Vec::new(),
+            SameRetryDelay::RateLimited { hint_secs: Some(1) },
+        );
+
+        let first = stream
+            .next()
+            .await
+            .expect("the hand-off stream must yield something")
+            .expect("the wait report is not an error");
+        match first {
+            StreamEvent::UpstreamRetryProgress {
+                upstream_id,
+                reason,
+                remaining_secs,
+                total_secs,
+                ..
+            } => {
+                assert_eq!(upstream_id, "poolside");
+                assert_eq!(remaining_secs, 1, "the wait is announced immediately");
+                assert_eq!(total_secs, 1);
+                assert!(reason.contains("rate limited"), "got: {reason}");
+            }
+            other => panic!("expected a retry-progress report, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn same_upstream_retry_reports_its_wait_then_clears_it() {
+        use futures::StreamExt;
+
+        // An empty completion on the first attempt triggers one same-upstream
+        // retry (the default). That wait used to be a silent spinner with no
+        // reason and no countdown; it must now be announced with the remaining
+        // seconds and then cleared when the retry goes out.
+        let provider = FreeProvider::with_routing(
+            vec![
+                stream_entry("poolside", true, None),
+                stream_entry("cerebras", true, Some("fallback answer")),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+
+        let mut progress: Vec<(String, String, u64, u64)> = Vec::new();
+        let mut attributions: Vec<String> = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("no stream error expected") {
+                StreamEvent::UpstreamRetryProgress {
+                    upstream_id,
+                    reason,
+                    remaining_secs,
+                    total_secs,
+                    ..
+                } => progress.push((upstream_id, reason, remaining_secs, total_secs)),
+                StreamEvent::ProviderAttribution { upstream_id, .. } => {
+                    attributions.push(upstream_id)
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            attributions,
+            vec!["poolside", "poolside", "cerebras"],
+            "the empty attempt still retried on the same upstream"
+        );
+        assert_eq!(
+            progress.len(),
+            2,
+            "one report for the wait and one for the launch: {progress:?}"
+        );
+        assert_eq!(progress[0].0, "poolside");
+        assert!(
+            progress[0].1.to_lowercase().contains("transient")
+                || progress[0].1.to_lowercase().contains("rate limited"),
+            "the wait names its cause, got: {}",
+            progress[0].1
+        );
+        assert_eq!(
+            progress[0].2, 1,
+            "the wait is announced with its full length"
+        );
+        assert_eq!(progress[0].3, 1, "the total wait is reported too");
+        assert_eq!(progress[1].2, 0, "the launch report clears the indicator");
+    }
+
+    #[tokio::test]
+    async fn walk_budget_bounds_the_plan_and_same_upstream_retries() {
+        let chain = vec![entry("groq", true), entry("cerebras", true)];
+        let routing = RoutingConfig {
+            strategy: RoutingStrategy::Sequential,
+            fallback_retries: 1,
+            turn_walk_budget_secs: 90,
+            ..Default::default()
+        };
+
+        // A live budget lets the walk continue and a retry is allowed.
+        let mut stream = retrying_stream(
+            chain.clone(),
+            routing.clone(),
+            vec![(1, "model".to_string())],
+        );
+        assert!(stream.can_retry_same_upstream(0));
+        assert!(
+            stream.start_next_plan_entry(),
+            "a live walk budget must not block the next upstream"
+        );
+
+        // An expired budget stops both a new attempt and a same-upstream retry,
+        // and names itself as the reason.
+        let mut expired = retrying_stream(chain, routing.clone(), vec![(1, "model".to_string())]);
+        expired.walk_deadline = Some(Instant::now() - std::time::Duration::from_secs(1));
+        assert!(!expired.can_retry_same_upstream(0));
+        assert!(
+            !expired.start_next_plan_entry(),
+            "an expired walk budget must stop the walk"
+        );
+        let joined = join_capped_upstream_errors(&expired.upstream_errors);
+        assert!(
+            joined.contains("walk budget of 90s exhausted"),
+            "the exhaustion reason must name the budget, got: {joined}"
+        );
+        // The walk stays stopped: the plan was dropped, not just skipped.
+        assert!(expired.remaining_plan.is_empty());
+    }
+
+    #[test]
+    fn turn_walk_budget_is_bounded_by_default_and_optional_when_zero() {
+        // The registry reads this from settings.json; an absent key must still
+        // bound the walk (a zero would silently restore unbounded waiting).
+        let parsed: RoutingConfig =
+            serde_json::from_str("{\"strategy\":\"auto\"}").expect("routing config parses");
+        assert_eq!(parsed.turn_walk_budget_secs, 240);
+        assert!(parsed.turn_walk_budget().is_some());
+        assert!(RoutingConfig::default().turn_walk_budget().is_some());
+
+        let unbounded: RoutingConfig =
+            serde_json::from_str("{\"turn_walk_budget_secs\":0}").expect("parses");
+        assert!(
+            unbounded.turn_walk_budget().is_none(),
+            "0 must disable the bound"
         );
     }
 

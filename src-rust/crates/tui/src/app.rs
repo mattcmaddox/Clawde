@@ -745,6 +745,10 @@ pub enum SystemMessageStyle {
     /// Execute-and-verify round indicator (audit spec Phase 1 §15.1) — a
     /// boxed block with per-check PASS/FAIL/SKIP lines.
     Verify,
+    /// A turn that produced nothing (e.g. every free upstream was throttled).
+    /// Drawn as a wrapped red block so the failure stays in the transcript
+    /// instead of only ever appearing in a toast that expires.
+    Error,
 }
 
 /// A synthetic system annotation inserted between conversation messages.
@@ -1373,6 +1377,12 @@ pub struct App {
     /// followup completion attribution.
     pub assistant_output_received: bool,
     pub status_message: Option<String>,
+    /// Live free-mode retry indicator: set while the composite provider waits
+    /// before re-dispatching to the same upstream (rate-limit backoff), cleared
+    /// when the retry goes out. Kept separate from `status_message` because a
+    /// status line is kept for the rest of the turn, while this one must not
+    /// outlive the wait it describes.
+    pub upstream_retry_notice: Option<String>,
     /// Whether the terminal window currently has input focus, as reported by
     /// DECSET 1004 focus events (crossterm `Event::FocusGained`/`FocusLost`).
     /// Starts `true` (focused) so a terminal that never sends focus events —
@@ -2269,6 +2279,7 @@ impl App {
             paused_thinking_buffer: String::new(),
             assistant_output_received: false,
             status_message: None,
+            upstream_retry_notice: None,
             spinner_verb: None,
             should_exit: false,
             show_help: false,
@@ -5879,7 +5890,6 @@ impl App {
         self.notifications.push(kind, msg, duration_secs);
     }
 
-    #[allow(dead_code)]
     pub fn push_system_message(&mut self, text: String, style: SystemMessageStyle) {
         self.system_annotations.push(SystemAnnotation {
             after_index: self.messages.len(),
@@ -12480,6 +12490,9 @@ impl App {
                         self.is_streaming = false;
                         self.spinner_verb = None;
                         self.stall_start = None;
+                        // The turn is over — a retry indicator describes a wait
+                        // that is no longer happening.
+                        self.upstream_retry_notice = None;
                         // The model finished while paused — fold the buffered
                         // tail in so the full response is flushed to the transcript.
                         let text = std::mem::take(&mut self.paused_text_buffer);
@@ -12666,6 +12679,32 @@ impl App {
                 // Verify event was produced). Clear the in-flight spinner so a
                 // failed round can never leave `verifying…` stuck on screen.
                 self.is_verifying = false;
+            }
+
+            QueryEvent::UpstreamRetryProgress {
+                upstream_id,
+                model,
+                reason,
+                remaining_secs,
+                total_secs,
+            } => {
+                // `remaining_secs == 0` is the provider saying the retry went
+                // out — drop the indicator rather than leaving it on screen for
+                // the rest of the turn.
+                // The model is part of the event (and the log below) but is
+                // left out of the indicator: the label shares one row with the
+                // spinner and the key-health summary, and the countdown is the
+                // part that matters there.
+                self.upstream_retry_notice = (remaining_secs > 0)
+                    .then(|| format!("{upstream_id} {reason} — retrying in {remaining_secs}s"));
+                tracing::debug!(
+                    upstream = %upstream_id,
+                    model = %model,
+                    reason = %reason,
+                    remaining_secs,
+                    total_secs,
+                    "free-mode retry wait"
+                );
             }
 
             QueryEvent::ModelInfo {
@@ -13586,6 +13625,52 @@ mod tests {
         };
         let app = App::new(config, clawde_core::cost::CostTracker::new());
         (app, project)
+    }
+
+    #[test]
+    fn upstream_retry_progress_drives_the_status_indicator() {
+        let mut app = make_app();
+        assert!(app.upstream_retry_notice.is_none());
+
+        app.handle_query_event(QueryEvent::UpstreamRetryProgress {
+            upstream_id: "nvidia".to_string(),
+            model: "openai/gpt-oss-120b".to_string(),
+            reason: "rate limited".to_string(),
+            remaining_secs: 18,
+            total_secs: 20,
+        });
+        assert_eq!(
+            app.upstream_retry_notice.as_deref(),
+            Some("nvidia rate limited — retrying in 18s")
+        );
+
+        // The provider reports the launch with 0 — the wait is over, so the
+        // indicator must not linger for the rest of the turn.
+        app.handle_query_event(QueryEvent::UpstreamRetryProgress {
+            upstream_id: "nvidia".to_string(),
+            model: "openai/gpt-oss-120b".to_string(),
+            reason: "rate limited".to_string(),
+            remaining_secs: 0,
+            total_secs: 20,
+        });
+        assert!(app.upstream_retry_notice.is_none());
+
+        // A wait interrupted by a mid-turn turn end also clears.
+        app.handle_query_event(QueryEvent::UpstreamRetryProgress {
+            upstream_id: "groq".to_string(),
+            model: "openai/gpt-oss-120b".to_string(),
+            reason: "transient failure".to_string(),
+            remaining_secs: 1,
+            total_secs: 1,
+        });
+        assert!(app.upstream_retry_notice.is_some());
+        app.handle_query_event(QueryEvent::Stream(
+            clawde_api::AnthropicStreamEvent::MessageStop,
+        ));
+        assert!(
+            app.upstream_retry_notice.is_none(),
+            "a finished turn must not keep a live retry indicator"
+        );
     }
 
     #[test]

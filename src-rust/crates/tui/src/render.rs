@@ -2818,6 +2818,24 @@ fn render_system_annotation_lines(
         return;
     }
 
+    // A turn that produced nothing: keep the failure in the transcript, wrapped
+    // to the pane width so a long chain-exhaustion message stays readable in
+    // place (the toast that carries it also expires).
+    if ann.style == SystemMessageStyle::Error {
+        let wrap_width = width.saturating_sub(6).max(20);
+        for chunk in crate::dialogs::word_wrap(&ann.text, wrap_width) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", figures::BLOCKQUOTE_BAR),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(chunk, Style::default().fg(Color::Red)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        return;
+    }
+
     // Execute-and-verify round indicator (audit spec Phase 1 §15.1): a boxed
     // block with one line per check plus a summary headline.
     if ann.style == SystemMessageStyle::Verify {
@@ -2833,6 +2851,9 @@ fn render_system_annotation_lines(
         SystemMessageStyle::Info => (Color::DarkGray, Color::DarkGray),
         SystemMessageStyle::Warning => (Color::Yellow, Color::Yellow),
         SystemMessageStyle::Compact => unreachable!(),
+        // Only reached if the wrapped Error branch above were bypassed; a red
+        // centred rule beats panicking on an unexpected annotation.
+        SystemMessageStyle::Error => (Color::Red, Color::Red),
         // Defensive: a Verify annotation without structured data degrades to
         // the plain centered rule (push_verify_annotation always sets it).
         SystemMessageStyle::Verify => (Color::DarkGray, Color::DarkGray),
@@ -3595,6 +3616,10 @@ fn should_render_status_row(app: &App) -> bool {
         || (app.is_streaming && interesting_stream_status)
         || has_exhausted_keys
         || has_empty_cooldowns
+        // A free-mode retry wait is the one moment the user most needs to know
+        // what is happening (rate-limit backoff, 20-120s), so it keeps the row
+        // alive even with no other status text.
+        || app.upstream_retry_notice.is_some()
         || app.fast_mode
         || app.active_goal_badge.is_some()
 }
@@ -3698,6 +3723,21 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Vec::new()
     };
+
+    // Free-mode retry wait: named cause plus a live countdown, so a
+    // rate-limit backoff (20-120s) never reads as a hang. Appended to whatever
+    // the row already shows — during the wait that is the spinner.
+    if let Some(notice) = app.upstream_retry_notice.as_deref() {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            format!("{} {notice}", figures::REFRESH_ARROW),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // Append key-ring status when any keys are exhausted. Only shown
     // when the active provider is "free" — standalone providers surface
@@ -5507,6 +5547,72 @@ mod tool_block_tests {
         terminal
             .draw(|frame| render_legacy_history_search(frame, &hs, &app, frame.area()))
             .unwrap();
+    }
+}
+
+/// Tests for the two auto-mode UX surfaces added after the routing audit: the
+/// live retry-wait indicator in the status row, and the transcript row that
+/// keeps a turn which produced nothing on screen.
+#[cfg(test)]
+mod free_mode_progress_tests {
+    use super::*;
+    use crate::app::{App, SystemAnnotation, SystemMessageStyle};
+    use clawde_core::config::Config;
+    use clawde_core::cost::CostTracker;
+
+    #[test]
+    fn a_retry_wait_keeps_the_status_row_visible() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.fast_mode = false;
+        app.status_message = None;
+        assert!(
+            !should_render_status_row(&app),
+            "an idle app with nothing to say draws no status row"
+        );
+
+        app.upstream_retry_notice = Some("nvidia rate limited — retrying in 18s".to_string());
+        assert!(
+            should_render_status_row(&app),
+            "a free-mode retry wait must be on screen with no other status text"
+        );
+    }
+
+    #[test]
+    fn a_long_turn_error_wraps_instead_of_running_off_the_pane() {
+        let text = "free-mode upstreams exhausted: nvidia [rate_limited], poolside \
+                    [rate_limited], groq [rate_limited], cerebras [rate_limited], \
+                    ... and 4 more, sambanova [rate_limited]"
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ann = SystemAnnotation {
+            after_index: 0,
+            text: text.clone(),
+            style: SystemMessageStyle::Error,
+            verify: None,
+        };
+
+        let mut lines = Vec::new();
+        render_system_annotation_lines(&mut lines, &ann, 40);
+        let rendered: Vec<String> = lines.iter().map(flatten_line_text).collect();
+
+        assert!(
+            rendered.len() > 3,
+            "a 200-char error in a 40-column pane must wrap, got {} line(s)",
+            rendered.len()
+        );
+        assert!(rendered[0].contains("free-mode upstreams exhausted"));
+        assert!(
+            rendered[0].contains(figures::BLOCKQUOTE_BAR),
+            "the row is marked as an error block, got: {}",
+            rendered[0]
+        );
+        // Nothing is dropped at the far end of the message.
+        let joined = rendered.join(" ");
+        assert!(
+            joined.contains("sambanova [rate_limited]"),
+            "the tail of the message must survive wrapping, got: {joined}"
+        );
     }
 }
 

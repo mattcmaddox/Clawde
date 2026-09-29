@@ -1789,7 +1789,7 @@ impl SlashCommand for StatusCommand {
             mcp = mcp_status,
             hooks = hook_count,
             summary = ctx.cost_tracker.summary(),
-            health = crate::status::gather_provider_status(),
+            health = crate::status::gather_provider_status(&ctx.config),
         ))
     }
 }

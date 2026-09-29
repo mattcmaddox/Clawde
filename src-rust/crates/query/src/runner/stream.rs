@@ -83,7 +83,11 @@ pub(crate) fn map_to_anthropic_event(
                 usage: usage.clone(),
             })
         }
-        StreamEvent::ProviderAttribution { .. } | StreamEvent::RateLimitHeaders { .. } => None,
+        StreamEvent::ProviderAttribution { .. }
+        | StreamEvent::RateLimitHeaders { .. }
+        // Routing progress is metadata, not content: it travels to the client as
+        // its own `QueryEvent`, never as an Anthropic-shaped delta.
+        | StreamEvent::UpstreamRetryProgress { .. } => None,
         StreamEvent::MessageStop => Some(AnthropicStreamEvent::MessageStop),
         StreamEvent::Error {
             error_type,

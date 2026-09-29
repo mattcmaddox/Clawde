@@ -86,6 +86,10 @@ A parallel first-byte watchdog (§6.5) fires at `first_byte_timeout_secs` on
 auto routes: it launches a *second concurrent* request on the next non-cooled
 plan entry (`impls.rs:1164-1256`) and switches to whichever returns first.
 
+Every walk is bounded by `turn_walk_budget_secs` (default 240s, `0` disables)
+and every same-upstream retry wait reports its countdown as
+`StreamEvent::UpstreamRetryProgress` — see §14.
+
 ### 2.3 Key rotation
 
 `KeyRotatingProvider` rotates within an upstream when a key is exhausted
@@ -848,3 +852,90 @@ Fixed, with the live 403 recorded in the comment.
 
 It is a genuine trap: `glm-5-3` **is** free on NVIDIA, so the cross-provider
 name similarity makes it look safe. The list must be per-provider.
+
+---
+
+## 14. Auto mode's failure UX: the silent wait, and the turn that vanished
+
+An audit of `RoutingStrategy::Auto` in a real TUI (100x30 tmux, scratch
+`CLAWDE_HOME`, one key, a mock that 429s every chat request) measured the user
+visible path end to end. Two defects were structural rather than cosmetic.
+
+### The retry wait was invisible
+
+A pinned/single-entry chain that gets a 429 waits on the same upstream
+(`schedule_same_upstream_retry` → `SameRetryDelay`, 20s doubling to 60s, or the
+server's `Retry-After` capped at `MAX_RETRY_AFTER_WAIT_SECS` = 120s). Across a
+20.5s wait the pane showed 70 distinct states and every one of them was spinner
+animation only: the system knew the cause, the retry budget and the exact
+window it was waiting on, and none of it reached the screen.
+
+Two consequences, one of them a correctness bug rather than a UX one:
+
+1. A `Retry-After` wait longer than the consumer's stream-stall watchdog (45s
+   for `free` in `clawde-query`) produced **no events at all**, so the watchdog
+   fired first and the stream was aborted and re-issued mid-wait. The same
+   silent-window problem the refusal buffer already guards against
+   (`BUFFER_CAP_SECS`), in a path nothing watched.
+2. A user could not tell a rate-limit backoff from a hang.
+
+`StreamEvent::UpstreamRetryProgress` is the fix: the provider re-arms its wait
+timer in `RETRY_PROGRESS_TICK` (1s) slices, reports the cause and the countdown
+each time, and reports `remaining_secs = 0` when the retry goes out so an
+indicator clears. `clawde-query` forwards it as
+`QueryEvent::UpstreamRetryProgress`; the TUI renders
+`nvidia rate limited — retrying in 18s` in the status row (which the notice
+alone keeps alive, `should_render_status_row`), and headless runs print the two
+edges of a wait rather than a line per tick.
+
+The *pre-stream* retry had the same gap, and it was the common case: when the
+first dispatch of a turn fails with a retryable error, `create_message_stream`
+slept the backoff out inside its own walk loop, before any stream existed. A
+single-key upstream answering 429 — exactly the shape of the audit repro —
+therefore waited 20s with a bare spinner and no event able to leave the loop.
+That wait is now handed to the stream instead
+(`RetryingFreeStream::new_retry_pending`): the returned stream owns the retry,
+announces it on its first poll, and dispatches when the deadline passes. The
+remaining silent wait is the non-streaming `create_message` walk, which returns
+a `ProviderResponse` rather than a stream and so has no event surface to report
+on; nothing interactive uses it.
+
+### The exhausted chain left nothing behind
+
+When every upstream fails, the terminal error is a `ServerError` with the joined
+upstream failures. `outcome_notification_class` classified
+`free-mode upstreams exhausted` as transient because a routine throttle should
+not be a persistent red alarm — but this error only arrives after the chain has
+spent every retry, so the turn produced nothing and the 5s toast was the only
+trace of it. It is now a persistent `Error`, and the CLI pushes the same text
+into the transcript as a `SystemMessageStyle::Error` annotation (a
+*display-only* row: an annotation never enters `messages`, so an error block can
+never be serialized into the next request).
+
+### `turn_walk_budget_secs` bounds the walk
+
+Bounds one dispatch's upstream walk — every attempt plus their same-upstream
+retries across the whole chain. Default 240s, `0` disables. When it passes, the
+walk stops and the exhaustion message names the budget
+(`walk budget of 240s exhausted — stopped trying upstreams`), which
+`join_capped_upstream_errors` always keeps because it preserves the last entry.
+Enforced at every walk step: `walk_budget_note` gates `start_next_plan_entry`
+(the stream and both dispatch loops) and `can_retry_same_upstream`.
+
+The default is deliberately generous — a healthy first attempt never pays it,
+and a single honored `Retry-After` is up to 120s — so it bounds the pathological
+all-throttled walk (worst case previously ~4.3 minutes of silent spinner)
+without cutting a recoverable one short.
+
+### `/status` reports the running configuration
+
+The configuration block printed `Routing strategy: Auto (task-based)` and
+`Parallel attempts: 2 (enabled for prompts <50K tokens)` as fixed strings. The
+second claim described a gate that does not exist anywhere in the code, and
+hedging ships **disabled** (`provider-cooldown-profiles.json` →
+`parallel.hedging.enabled: false`), so both lines described a configuration that
+was not running. It now reads the same
+`providers.free.options.routing` object `build_free_provider` reads and reports
+the strategy, the same-upstream retry count, disabled upstreams, the real
+hedging state and the walk budget. `resolve_routing_strategy_name` is shared
+with `/routing` so the two surfaces cannot disagree.

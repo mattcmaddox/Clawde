@@ -232,6 +232,29 @@ pub enum StreamEvent {
         /// Exact rotating-key slot that produced the headers, when known.
         key_idx: Option<usize>,
     },
+
+    /// Progress report for a same-upstream retry the composite (`free`)
+    /// provider is holding internally — a rate-limit backoff, or the short
+    /// exponential backoff after a transient failure.
+    ///
+    /// Emitted while the wait runs (roughly once a second, which also keeps a
+    /// consumer's stream-stall watchdog fed through waits longer than its
+    /// timeout) and once more when the retry goes out. Carries no generated
+    /// content — consumers must render it as a live indicator, never as
+    /// output, and `committed_output_text()` stays `None` for it.
+    UpstreamRetryProgress {
+        /// Catalog id of the upstream being retried (e.g. "nvidia").
+        upstream_id: String,
+        /// Model the retry will use.
+        model: String,
+        /// Why the retry is happening, for display (e.g. "rate limited").
+        reason: String,
+        /// Seconds left before the re-dispatch; `0` means the retry just went
+        /// out, so an indicator keyed on this event must be cleared.
+        remaining_secs: u64,
+        /// Total wait planned for this retry, for a progress hint.
+        total_secs: u64,
+    },
 }
 
 impl StreamEvent {

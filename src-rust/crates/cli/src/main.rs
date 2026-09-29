@@ -90,32 +90,39 @@ use tracing_subscriber::EnvFilter;
 
 /// Decide how a terminal query error should surface as a TUI toast.
 ///
-/// Recoverable, transient conditions — provider rate limits, free-mode
-/// upstream exhaustion (e.g. "free-mode upstreams exhausted: groq
-/// [rate_limited]"), timeouts, and 5xx server errors — surface as a temporary
-/// warning that auto-expires, so a routine throttle isn't a persistent red
-/// alarm. Hard failures (auth, config, tool, malformed requests) stay a
-/// persistent red `Error` that demands an explicit dismiss.
+/// Recoverable, transient conditions — a provider rate limit, a timeout, a 5xx
+/// — surface as a temporary warning that auto-expires, so a routine throttle
+/// isn't a persistent red alarm.
+///
+/// Two classes must NOT expire early:
+/// * hard failures (auth, config, tool, malformed requests), and
+/// * a fully exhausted free chain. The chain already absorbed every upstream
+///   retry before reporting this, so the turn produced nothing and the user
+///   has to decide what to do (wait, add keys, pick another model). A five
+///   second toast for that left the turn looking like it had simply vanished —
+///   there was no other trace of it on screen.
 ///
 /// The free-chain exhaustion error arrives wrapped as `Api(String)` with
-/// `is_retryable:false`, so its message text is consulted as a fallback for
-/// the transient set.
+/// `is_retryable:false`, so its message text is consulted as a fallback for the
+/// class that must persist.
 fn outcome_notification_class(
     err: &clawde_core::error::ClaudeError,
 ) -> (clawde_tui::notifications::NotificationKind, Option<u64>) {
     use clawde_tui::notifications::NotificationKind;
     let msg = err.to_string().to_ascii_lowercase();
-    let transient = err.is_retryable()
-        || matches!(
-            err,
-            clawde_core::error::ClaudeError::ApiStatus { status, .. }
-                if (500..600).contains(status)
-        )
-        || msg.contains("free-mode upstreams exhausted")
-        || msg.contains("rate limit")
-        || msg.contains("429")
-        || msg.contains("503")
-        || msg.contains("timed out");
+    let chain_exhausted = msg.contains("free-mode upstreams exhausted")
+        || msg.contains("all free-mode upstreams exhausted");
+    let transient = !chain_exhausted
+        && (err.is_retryable()
+            || matches!(
+                err,
+                clawde_core::error::ClaudeError::ApiStatus { status, .. }
+                    if (500..600).contains(status)
+            )
+            || msg.contains("rate limit")
+            || msg.contains("429")
+            || msg.contains("503")
+            || msg.contains("timed out"));
     if transient {
         (NotificationKind::Warning, Some(5))
     } else {
@@ -156,6 +163,57 @@ mod notify_gate_tests {
             .map(|s| s.notifications)
             .unwrap_or(true);
         assert_eq!(notify_on_unfocused_turn_end(&app), setting_allows);
+    }
+}
+
+#[cfg(test)]
+mod outcome_notification_tests {
+    use super::*;
+    use clawde_core::error::ClaudeError;
+    use clawde_tui::notifications::NotificationKind;
+
+    #[test]
+    fn an_exhausted_free_chain_does_not_expire() {
+        // The chain already spent every upstream retry before reporting this, so
+        // the turn produced nothing. A five-second warning let the whole failure
+        // vanish off the screen.
+        for msg in [
+            "free-mode upstreams exhausted: groq [rate_limited]",
+            "free-mode upstreams exhausted on empty completions: nvidia [empty]",
+            "all free-mode upstreams exhausted",
+        ] {
+            let (kind, duration) = outcome_notification_class(&ClaudeError::Api(msg.to_string()));
+            assert_eq!(kind, NotificationKind::Error, "for {msg}");
+            assert_eq!(
+                duration, None,
+                "an exhausted chain must stay on screen: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn routine_throttles_still_expire() {
+        for err in [
+            ClaudeError::RateLimit,
+            ClaudeError::Api("upstream said: rate limit reached".to_string()),
+            ClaudeError::ApiStatus {
+                status: 503,
+                message: "upstream unavailable".to_string(),
+            },
+            ClaudeError::Api("request timed out".to_string()),
+        ] {
+            let (kind, duration) = outcome_notification_class(&err);
+            assert_eq!(kind, NotificationKind::Warning, "for {err}");
+            assert_eq!(duration, Some(5), "for {err}");
+        }
+    }
+
+    #[test]
+    fn hard_failures_stay_persistent_errors() {
+        let (kind, duration) =
+            outcome_notification_class(&ClaudeError::Auth("invalid key".to_string()));
+        assert_eq!(kind, NotificationKind::Error);
+        assert_eq!(duration, None);
     }
 }
 
@@ -3243,6 +3301,39 @@ async fn run_headless(
                     eprintln!("{}", ev);
                 } else {
                     eprintln!("\n[status] {}", msg);
+                }
+            }
+            QueryEvent::UpstreamRetryProgress {
+                upstream_id,
+                reason,
+                remaining_secs,
+                total_secs,
+                ..
+            } => {
+                // The event ticks about once a second to drive a live indicator;
+                // headless runs report only the two edges of a wait — the moment
+                // it starts and the moment the retry goes out — so a paused turn
+                // explains itself without flooding stderr.
+                let line = if *remaining_secs == 0 {
+                    Some(format!("{upstream_id}: retrying now"))
+                } else if remaining_secs == total_secs {
+                    Some(format!(
+                        "{upstream_id} {reason} — retrying in {remaining_secs}s"
+                    ))
+                } else {
+                    None
+                };
+                if let Some(msg) = line {
+                    status_messages.push(msg.clone());
+                    if is_stream_json {
+                        let ev = serde_json::json!({ "type": "status", "status": msg });
+                        println!("{}", ev);
+                    } else if is_json_output {
+                        let ev = serde_json::json!({ "type": "status", "status": msg });
+                        eprintln!("{}", ev);
+                    } else {
+                        eprintln!("\n[status] {}", msg);
+                    }
                 }
             }
             QueryEvent::Error(msg) => {
@@ -7916,6 +8007,15 @@ async fn run_interactive(
                     }
                     let (kind, duration) = outcome_notification_class(err);
                     app.notifications.push(kind, err.to_string(), duration);
+                    // Everything that reaches here produced no reply, so leave the
+                    // reason in the transcript where that reply would have been.
+                    // The toast above expires (deliberately, for routine
+                    // throttles); without this row the failed turn simply
+                    // disappeared from the screen.
+                    app.push_system_message(
+                        err.to_string(),
+                        clawde_tui::app::SystemMessageStyle::Error,
+                    );
                 }
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();

@@ -254,7 +254,8 @@ async fn set_routing_strategy(ctx: &mut CommandContext, strategy: &str) -> Comma
 
 /// Read the current routing strategy name from the config, defaulting to
 /// "auto" when the config key is absent (the smart default, spec §8.4).
-fn resolve_routing_strategy_name(config: &Config) -> String {
+/// Shared with `/status` so both surfaces report the same strategy.
+pub(crate) fn resolve_routing_strategy_name(config: &Config) -> String {
     config
         .provider_configs
         .get("free")

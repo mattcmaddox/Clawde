@@ -573,6 +573,23 @@ pub enum QueryEvent {
     /// The consumer re-checks dialog visibility and the model match before
     /// applying (spec §Model/server behavior: never silently mismatched).
     OllamaServerInfoPolled(Box<OllamaPolledServerInfo>),
+    /// The composite (`free`) provider is waiting before re-dispatching to the
+    /// same upstream — a rate-limit backoff or a transient-failure backoff.
+    /// Emitted about once a second while the wait runs, so an interactive
+    /// client can show why the turn is sitting still instead of a bare
+    /// spinner, and once with `remaining_secs == 0` when the retry goes out.
+    /// Carries no generated content.
+    UpstreamRetryProgress {
+        upstream_id: String,
+        model: String,
+        /// Why the retry is happening, for display (e.g. "rate limited").
+        reason: String,
+        /// Seconds left; `0` means the retry just went out (clear the
+        /// indicator).
+        remaining_secs: u64,
+        /// Total wait planned for this retry, for a progress hint.
+        total_secs: u64,
+    },
 }
 
 /// One cycle of the continuous server-info poll. `model` is the model the
@@ -4462,6 +4479,23 @@ async fn run_query_loop_inner(
                                                         provider_id: provider_id.clone(),
                                                         tokens_pct_used: *tokens_pct_used,
                                                         requests_pct_used: *requests_pct_used,
+                                                    });
+                                                }
+                                            }
+                                            clawde_api::StreamEvent::UpstreamRetryProgress {
+                                                upstream_id,
+                                                model,
+                                                reason,
+                                                remaining_secs,
+                                                total_secs,
+                                            } => {
+                                                if let Some(ref tx) = event_tx {
+                                                    let _ = tx.send(QueryEvent::UpstreamRetryProgress {
+                                                        upstream_id: upstream_id.clone(),
+                                                        model: model.clone(),
+                                                        reason: reason.clone(),
+                                                        remaining_secs: *remaining_secs,
+                                                        total_secs: *total_secs,
                                                     });
                                                 }
                                             }

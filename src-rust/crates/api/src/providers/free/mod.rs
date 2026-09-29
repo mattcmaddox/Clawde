@@ -1026,10 +1026,38 @@ pub struct RoutingConfig {
         skip_serializing_if = "is_zero_u32"
     )]
     pub fallback_retries: u32,
+    /// Bound on one dispatch's upstream walk: every attempt plus their
+    /// same-upstream retries, across the whole fallback chain. Once it passes,
+    /// the walk stops and the turn reports exhaustion naming the budget
+    /// instead of continuing silently. `0` disables the bound.
+    ///
+    /// The default is deliberately generous — a healthy first attempt never
+    /// pays it, and a single honored `Retry-After` wait is up to 120s — so it
+    /// only cuts off a pathological walk (all upstreams rate-limited) that
+    /// would otherwise run for several minutes with nothing on screen.
+    #[serde(default = "default_turn_walk_budget_secs")]
+    pub turn_walk_budget_secs: u64,
+}
+
+impl RoutingConfig {
+    /// Deadline for a walk that starts now, or `None` when unbounded (a zero
+    /// budget). Retrying internally instead of walking the whole chain is the
+    /// point of the budget: after it, an exhausted turn is reported.
+    pub fn turn_walk_budget(&self) -> Option<Instant> {
+        (self.turn_walk_budget_secs > 0)
+            .then(|| Instant::now() + std::time::Duration::from_secs(self.turn_walk_budget_secs))
+    }
 }
 
 const fn default_upstream_timeout() -> u64 {
     30
+}
+
+/// Four minutes — above the worst case a *healthy* chain reaches (one retry per
+/// upstream with a short backoff), so it never truncates a recoverable walk,
+/// and below the multi-minute silence an all-throttled chain used to produce.
+const fn default_turn_walk_budget_secs() -> u64 {
+    240
 }
 
 const fn default_first_byte_timeout() -> u64 {
@@ -1071,6 +1099,7 @@ impl Default for RoutingConfig {
             upstream_5xx_cooldown_secs: default_upstream_5xx_cooldown(),
             health_poll_interval_secs: default_poll_interval(),
             fallback_retries: default_fallback_retries(),
+            turn_walk_budget_secs: default_turn_walk_budget_secs(),
         }
     }
 }
