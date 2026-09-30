@@ -42,7 +42,6 @@ pub const SPINNER_VERBS: &[&str] = &[
     "Beboppin'",
     "Booping",
     "Burrowing",
-    "Dilly-dallying",
     "Doodling",
     "Ebbing",
     "Flambéing",
@@ -133,12 +132,25 @@ pub const TURN_COMPLETION_VERBS: &[&str] = &[
     "Loafed",
 ];
 
+/// Mix a seed so the modulo spreads across the whole list.
+///
+/// Callers pass small, sequential seeds (frame counts, string lengths,
+/// XORs of lengths); a raw `seed % len` clusters on the first few
+/// entries, so the spinner only ever shows a couple of verbs. Multiply
+/// by the 64-bit golden-ratio constant and take the high bits to
+/// distribute across the full list.
+#[inline]
+fn mix_seed(seed: usize) -> usize {
+    const GOLDEN: usize = 0x9E37_79B9_7F4A_7C15;
+    (seed.wrapping_mul(GOLDEN) >> 32) as usize
+}
+
 /// Select a random spinner verb.
 pub fn sample_spinner_verb(seed: usize) -> &'static str {
-    SPINNER_VERBS[seed % SPINNER_VERBS.len()]
+    SPINNER_VERBS[mix_seed(seed) % SPINNER_VERBS.len()]
 }
 
 /// Select a random completion verb.
 pub fn sample_completion_verb(seed: usize) -> &'static str {
-    TURN_COMPLETION_VERBS[seed % TURN_COMPLETION_VERBS.len()]
+    TURN_COMPLETION_VERBS[mix_seed(seed) % TURN_COMPLETION_VERBS.len()]
 }

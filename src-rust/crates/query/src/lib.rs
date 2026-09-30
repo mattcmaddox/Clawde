@@ -3947,9 +3947,16 @@ async fn run_query_loop_inner(
                     // Notify TUI that we're calling the provider using a random
                     // spinner verb. The TUI prepends its own spinner glyph —
                     // embedding one here produces a doubled "⠸ ✳ Basking…".
+                    // Seed from elapsed time so it varies across dispatches
+                    // (a constant seed = same verb on every provider call).
                     if let Some(ref tx) = event_tx {
                         use clawde_core::sample_spinner_verb;
-                        let seed = provider_id_str.len() ^ model_id_str.len();
+                        let seed = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.subsec_nanos() as usize)
+                            .unwrap_or(0)
+                            ^ (provider_id_str.len() * 31)
+                            ^ (model_id_str.len() * 17);
                         let verb = sample_spinner_verb(seed);
                         let _ = tx.send(QueryEvent::Status(format!("{}…", verb)));
                     }
