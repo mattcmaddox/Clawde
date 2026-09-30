@@ -155,6 +155,8 @@ pub mod invalid_config_dialog;
 pub mod katban_controls;
 /// Masked text input overlay for entering API keys.
 pub mod key_input_dialog;
+/// `/keys` popup — j/k-navigable key manager with CRUD.
+pub mod keys_dialog;
 /// Inline image rendering via the Kitty graphics protocol (with text fallback).
 pub mod kitty_image;
 /// MCP server management UI.
@@ -268,6 +270,7 @@ pub use katban_controls::{
     build_control_items, render_katban_controls, KatbanControlItem, KatbanControlsState,
 };
 pub use key_input_dialog::{render_key_input_dialog, KeyInputDialogState};
+pub use keys_dialog::{render_keys_dialog, KeysDialogState};
 pub use mcp_view::{render_mcp_view, McpServerView, McpToolView, McpViewState, McpViewStatus};
 pub use memory_file_selector::{MemoryFile, MemoryFileSelectorState, MemoryFileType};
 pub use memory_update_notification::{

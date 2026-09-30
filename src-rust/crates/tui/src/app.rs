@@ -1639,6 +1639,8 @@ pub struct App {
     pub session_id: String,
     /// API key input dialog (opened from /connect for key-based providers).
     pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
+    /// `/keys` popup — j/k-navigable CRUD over stored API keys.
+    pub keys_dialog: crate::keys_dialog::KeysDialogState,
     /// Custom provider dialog for URL + API key input.
     pub custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState,
     /// Ollama config dialog for host URL + model picker.
@@ -1867,6 +1869,10 @@ pub struct App {
     /// Drained each frame so validation status updates as soon as the HTTP
     /// request completes.
     pub validation_rx: Option<std::sync::mpsc::Receiver<crate::free_mode_dialog::ValidationPing>>,
+    /// Receiver for `/keys` dialog validation results. Same shape as
+    /// `validation_rx` (free dialog); drained each frame so the `/keys` key
+    /// dots flip green/red as soon as each probe completes.
+    pub keys_dialog_rx: Option<std::sync::mpsc::Receiver<crate::keys_dialog::ValidationPing>>,
     /// Receiver for health-poller re-probe results (Ctrl+R in the free mode
     /// dialog — runs the same probe as `/health <upstream>`). Drained each
     /// frame so the re-probed provider's dots update in place. Each message
@@ -2392,6 +2398,7 @@ impl App {
             routing_dialog: crate::routing_dialog::RoutingDialogState::new(),
             spec_review: crate::spec_review::SpecReviewState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
+            keys_dialog: crate::keys_dialog::KeysDialogState::new(),
             custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState::new(),
             ollama_config_dialog: crate::ollama_config_dialog::OllamaConfigDialogState::new(),
             ollama_ping_pending: false,
@@ -2500,6 +2507,7 @@ impl App {
             model_fetch_rx: None,
             user_question_rx: None,
             validation_rx: None,
+            keys_dialog_rx: None,
             free_reprobe_rx: None,
             image_rx: None,
             ask_user_dialog: crate::ask_user_dialog::AskUserDialogState::new(),
@@ -3075,6 +3083,23 @@ impl App {
         }
     }
 
+    /// Poll the `/keys` dialog validation channel (called from main loop).
+    /// Drains completed validation results and updates the key dots.
+    pub fn poll_keys_dialog_validation(&mut self) {
+        if let Some(ref rx) = self.keys_dialog_rx {
+            match rx.try_recv() {
+                Ok((field_idx, key_idx, result)) => {
+                    self.keys_dialog
+                        .set_validation_result(field_idx, key_idx, result);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.keys_dialog_rx = None;
+                }
+            }
+        }
+    }
+
     /// Poll the free dialog re-probe channel (called from main loop).
     /// Applies a completed health-poller outcome to the active provider's
     /// health dots — same probe as `/health <upstream>`.
@@ -3113,6 +3138,51 @@ impl App {
         // bar and /ctx-viz reflect them now.
         self.refresh_free_provider();
         self.activate_provider("free".to_string(), "Free Mode".to_string(), "Connected to");
+    }
+
+    /// Open the interactive `/keys` management popup: one row per free-catalog
+    /// upstream with stored keys shown as health dots, j/k navigation, and
+    /// add / reveal / delete controls. Seeds each row from the auth store and
+    /// marks env-var-provided keys read-only (mirrors the Connect Free
+    /// dialog's collection, but for pure key management).
+    pub fn open_keys_dialog(&mut self) {
+        // Collect existing keys from auth_store *and* env vars so users see
+        // all configured keys — one dot per key.
+        let existing: Vec<(&'static str, Vec<String>)> = clawde_api::FREE_CATALOG
+            .iter()
+            .map(|upstream| {
+                let mut keys = free_upstream_stored_keys(&self.auth_store, upstream.id);
+                // Fall back to env var when nothing is stored.
+                if keys.is_empty() {
+                    if let Some(k) = detect_env_var_key(upstream.id) {
+                        keys.push(k);
+                    }
+                }
+                keys.retain(|k| !k.trim().is_empty());
+                (upstream.id, keys)
+            })
+            .collect();
+
+        // Collect env-var-only keys: only mark upstreams as "from env" when
+        // auth_store has NO key for them (stored keys take priority).
+        let env_var_keys: Vec<(&'static str, String)> = clawde_api::FREE_CATALOG
+            .iter()
+            .filter_map(|upstream| {
+                let already_in_store =
+                    !free_upstream_stored_keys(&self.auth_store, upstream.id).is_empty();
+                if already_in_store {
+                    return None;
+                }
+                let env_name = env_var_name_for_upstream(upstream.id)?;
+                std::env::var(env_name)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| (upstream.id, v))
+            })
+            .collect();
+
+        self.keys_dialog.open(&existing);
+        self.keys_dialog.set_env_var_keys(&env_var_keys);
     }
 
     /// Drain the non-blocking clipboard image receiver. Called every frame
@@ -4459,6 +4529,7 @@ impl App {
         self.import_config_dialog = ImportConfigDialogState::new();
         self.model_picker = ModelPickerState::new();
         self.key_input_dialog = crate::key_input_dialog::KeyInputDialogState::new();
+        self.keys_dialog = crate::keys_dialog::KeysDialogState::new();
         self.custom_provider_dialog =
             crate::custom_provider_dialog::CustomProviderDialogState::new();
         self.ollama_config_dialog = crate::ollama_config_dialog::OllamaConfigDialogState::new();
@@ -4952,6 +5023,15 @@ impl App {
             return true;
         }
 
+        // `/keys` opens the interactive key manager popup (j/k-nav CRUD over
+        // stored API keys). Subcommands like `/keys list`, `/keys add` and
+        // `/keys remove` stay at the commands layer so they still run.
+        if cmd == "keys" && args.trim().is_empty() {
+            self.close_secondary_views();
+            self.open_keys_dialog();
+            return true;
+        }
+
         self.intercept_slash_command(cmd)
     }
 
@@ -5382,6 +5462,7 @@ impl App {
         self.key_input_dialog.close();
         self.custom_provider_dialog.close();
         self.ollama_config_dialog.close();
+        self.keys_dialog.close();
         self.free_mode_dialog.close();
         self.device_auth_dialog.close();
         self.effort_picker.close();
@@ -5433,6 +5514,7 @@ impl App {
             || self.key_input_dialog.visible
             || self.custom_provider_dialog.visible
             || self.ollama_config_dialog.visible
+            || self.keys_dialog.visible
             || self.free_mode_dialog.visible
             || self.device_auth_dialog.visible
             || self.command_palette.visible
@@ -7357,6 +7439,134 @@ impl App {
                     }
                     let c = self.shift_normalize(c, key.modifiers);
                     self.free_mode_dialog.insert_char(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // `/keys` management dialog — j/k-navigable CRUD over stored keys.
+        if self.keys_dialog.visible {
+            // Delete-confirmation popup captures all keys while open.
+            if self.keys_dialog.delete_confirm.is_some() {
+                match key.code {
+                    KeyCode::Enter => {
+                        self.keys_dialog.confirm_delete();
+                    }
+                    KeyCode::Esc => {
+                        self.keys_dialog.cancel_delete();
+                    }
+                    KeyCode::Char(c) => match c.to_ascii_lowercase() {
+                        'y' => self.keys_dialog.confirm_delete(),
+                        'n' => self.keys_dialog.cancel_delete(),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                return false;
+            }
+            // Vim-modal text entry: the dialog opens in insert (typing keys
+            // works immediately); Esc exits insert before the unreveal →
+            // clear → close cascade runs.
+            match self
+                .keys_dialog
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
+                    self.keys_dialog.insert_char(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.keys_dialog.backspace();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
+            let active_pending_empty = self.keys_dialog.pending_is_empty();
+            match key.code {
+                KeyCode::Esc => {
+                    // Esc cascade: hide a revealed key → drop typed text → close.
+                    if !self.keys_dialog.unreveal_active() && !self.keys_dialog.clear_pending() {
+                        self.keys_dialog.close();
+                    }
+                }
+                KeyCode::Down => {
+                    self.keys_dialog.move_next();
+                }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled && active_pending_empty => {
+                    self.keys_dialog.move_next();
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.keys_dialog.move_prev();
+                }
+                KeyCode::Char('k') if self.prompt_input.vim_enabled && active_pending_empty => {
+                    self.keys_dialog.move_prev();
+                }
+                KeyCode::Enter => {
+                    // Auto-save + validate: Enter appends a typed key (or
+                    // reveals/toggles a dot), and when a key was actually
+                    // added we persist every row to the auth store and fire a
+                    // background validity check over the saved keys.
+                    let added = self.keys_dialog.enter_active();
+                    if added {
+                        let updates = self.keys_dialog.store_updates();
+                        let total: usize = updates.iter().map(|(_, ks)| ks.len()).sum();
+                        for (id, keys) in &updates {
+                            self.auth_store.set_keys(id, keys.clone());
+                        }
+                        self.auth_store.save();
+                        self.status_message =
+                            Some(format!("\u{2713} Saved {} key(s), validating…", total));
+                        // Rebuild the free chain so the saved keys take effect.
+                        self.refresh_free_provider();
+                        if let Some(rx) = self.keys_dialog.start_validate() {
+                            self.keys_dialog_rx = Some(rx);
+                        }
+                    }
+                }
+                KeyCode::Backspace | KeyCode::Delete if !self.prompt_input.vim_enabled => {
+                    // Delete on a revealed key asks for confirmation; otherwise
+                    // it edits the typed new-key text.
+                    if !self.keys_dialog.try_open_delete_confirm() {
+                        self.keys_dialog.backspace();
+                    }
+                }
+                KeyCode::Delete if self.prompt_input.vim_enabled => {
+                    self.keys_dialog.try_open_delete_confirm();
+                }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl+V: paste clipboard text into the active row's
+                    // new-key buffer (newlines trimmed to a single token).
+                    let paste = crate::image_paste::read_primary_text()
+                        .or_else(crate::image_paste::read_clipboard_text);
+                    if let Some(text) = paste {
+                        self.keys_dialog.paste_key(&text);
+                    }
+                }
+                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
+                    // Legacy (vim off): j/k navigate only while the new-key
+                    // buffer is empty — once a key is being typed those
+                    // letters belong to the key, not the cursor. Arrow keys
+                    // always navigate.
+                    let lower = c.to_ascii_lowercase();
+                    if active_pending_empty {
+                        match lower {
+                            'j' => {
+                                self.keys_dialog.move_next();
+                                return false;
+                            }
+                            'k' => {
+                                self.keys_dialog.move_prev();
+                                return false;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let c = self.shift_normalize(c, key.modifiers);
+                    self.keys_dialog.insert_char(c);
                 }
                 _ => {}
             }
@@ -11380,6 +11590,10 @@ impl App {
             if r.area() > 0 {
                 return Some(r);
             }
+            let r = self.keys_dialog.last_rect.get();
+            if r.area() > 0 {
+                return Some(r);
+            }
         } else if self.elicitation.visible {
             let r = self.elicitation.last_rect.get();
             if r.area() > 0 {
@@ -11984,6 +12198,7 @@ impl App {
             || self.key_input_dialog.visible
             || self.custom_provider_dialog.visible
             || self.ollama_config_dialog.visible
+            || self.keys_dialog.visible
             || self.free_mode_dialog.visible
             || self.device_auth_dialog.visible
             || self.command_palette.visible

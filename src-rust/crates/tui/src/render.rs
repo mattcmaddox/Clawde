@@ -1144,6 +1144,16 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         );
     }
 
+    // `/keys` management dialog (j/k-navigable key CRUD).
+    if app.keys_dialog.visible {
+        crate::keys_dialog::render_keys_dialog(
+            frame,
+            &app.keys_dialog,
+            app.prompt_input.vim_enabled,
+            size,
+        );
+    }
+
     // Smart-router comparison dialog (/compare).
     if app.compare_dialog.visible {
         crate::compare_dialog::render_compare_dialog(frame, &app.compare_dialog, size);

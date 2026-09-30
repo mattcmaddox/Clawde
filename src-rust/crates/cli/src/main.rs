@@ -7536,6 +7536,7 @@ async fn run_interactive(
         // Drain free dialog key validation results (non-blocking).
         app.poll_free_dialog_validation();
         app.poll_free_dialog_reprobe();
+        app.poll_keys_dialog_validation();
         app.poll_image_results();
 
         // Drain ask-user question events (non-blocking).
