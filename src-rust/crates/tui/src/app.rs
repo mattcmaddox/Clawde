@@ -3185,6 +3185,24 @@ impl App {
         self.keys_dialog.set_env_var_keys(&env_var_keys);
     }
 
+    /// Persist the `/keys` dialog's edited key map to the auth store, rebuild
+    /// the free chain, and fire a background validity sweep. Shared by the
+    /// Enter (new key) and Delete (removed key) paths so both reach disk.
+    fn persist_keys_dialog(&mut self) {
+        let updates = self.keys_dialog.store_updates();
+        let total: usize = updates.iter().map(|(_, ks)| ks.len()).sum();
+        for (id, keys) in &updates {
+            self.auth_store.set_keys(id, keys.clone());
+        }
+        self.auth_store.save();
+        self.status_message = Some(format!("\u{2713} Saved {} key(s), validating…", total));
+        // Rebuild the free chain so the saved keys take effect.
+        self.refresh_free_provider();
+        if let Some(rx) = self.keys_dialog.start_validate() {
+            self.keys_dialog_rx = Some(rx);
+        }
+    }
+
     /// Drain the non-blocking clipboard image receiver. Called every frame
     /// from the main event loop so images attach as soon as the background
     /// thread (xclip/wl-paste) finishes.
@@ -7451,13 +7469,19 @@ impl App {
             if self.keys_dialog.delete_confirm.is_some() {
                 match key.code {
                     KeyCode::Enter => {
-                        self.keys_dialog.confirm_delete();
+                        if self.keys_dialog.confirm_delete() {
+                            self.persist_keys_dialog();
+                        }
                     }
                     KeyCode::Esc => {
                         self.keys_dialog.cancel_delete();
                     }
                     KeyCode::Char(c) => match c.to_ascii_lowercase() {
-                        'y' => self.keys_dialog.confirm_delete(),
+                        'y' => {
+                            if self.keys_dialog.confirm_delete() {
+                                self.persist_keys_dialog();
+                            }
+                        }
                         'n' => self.keys_dialog.cancel_delete(),
                         _ => {}
                     },
@@ -7486,9 +7510,10 @@ impl App {
                 VimSearchKey::Passthrough => {}
             }
             let active_pending_empty = self.keys_dialog.pending_is_empty();
+            let active_revealed = self.keys_dialog.active_is_revealed();
             match key.code {
                 KeyCode::Esc => {
-                    // Esc cascade: hide a revealed key → drop typed text → close.
+                    // Esc cascade: hide the expanded key list → drop typed text → close.
                     if !self.keys_dialog.unreveal_active() && !self.keys_dialog.clear_pending() {
                         self.keys_dialog.close();
                     }
@@ -7505,30 +7530,30 @@ impl App {
                 KeyCode::Char('k') if self.prompt_input.vim_enabled && active_pending_empty => {
                     self.keys_dialog.move_prev();
                 }
+                // Key-cursor movement within the expanded row. Arrows always
+                // work; h/l mirror them in vim normal mode (in insert mode
+                // the vim state machine consumes h/l as text).
+                KeyCode::Left | KeyCode::Char('h') if active_revealed => {
+                    self.keys_dialog.select_prev_key();
+                }
+                KeyCode::Right | KeyCode::Char('l') if active_revealed => {
+                    self.keys_dialog.select_next_key();
+                }
                 KeyCode::Enter => {
-                    // Auto-save + validate: Enter appends a typed key (or
-                    // reveals/toggles a dot), and when a key was actually
-                    // added we persist every row to the auth store and fire a
-                    // background validity check over the saved keys.
-                    let added = self.keys_dialog.enter_active();
-                    if added {
-                        let updates = self.keys_dialog.store_updates();
-                        let total: usize = updates.iter().map(|(_, ks)| ks.len()).sum();
-                        for (id, keys) in &updates {
-                            self.auth_store.set_keys(id, keys.clone());
-                        }
-                        self.auth_store.save();
-                        self.status_message =
-                            Some(format!("\u{2713} Saved {} key(s), validating…", total));
-                        // Rebuild the free chain so the saved keys take effect.
-                        self.refresh_free_provider();
-                        if let Some(rx) = self.keys_dialog.start_validate() {
-                            self.keys_dialog_rx = Some(rx);
-                        }
+                    // Enter appends a typed new key (auto-save + validate), or
+                    // expands/collapses the row's key list. A pure expand is
+                    // view-only and never writes to the store.
+                    if self.keys_dialog.enter_active() {
+                        self.persist_keys_dialog();
                     }
                 }
-                KeyCode::Backspace | KeyCode::Delete if !self.prompt_input.vim_enabled => {
-                    // Delete on a revealed key asks for confirmation; otherwise
+                KeyCode::Backspace if !self.prompt_input.vim_enabled => {
+                    // Text editing only; `backspace()` is a no-op while the row
+                    // is expanded, so it can never touch a stored key.
+                    self.keys_dialog.backspace();
+                }
+                KeyCode::Delete if !self.prompt_input.vim_enabled => {
+                    // Delete on an expanded key asks for confirmation; otherwise
                     // it edits the typed new-key text.
                     if !self.keys_dialog.try_open_delete_confirm() {
                         self.keys_dialog.backspace();
@@ -11590,6 +11615,7 @@ impl App {
             if r.area() > 0 {
                 return Some(r);
             }
+        } else if self.keys_dialog.visible {
             let r = self.keys_dialog.last_rect.get();
             if r.area() > 0 {
                 return Some(r);

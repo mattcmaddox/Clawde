@@ -2,14 +2,18 @@
 //
 // The popup shows one row per free-tier upstream (in FREE_CATALOG order,
 // matching fallback priority). Each row lists that upstream's stored
-// rotation keys masked as health dots; Enter reveals a key inline, typing
-// into the pending line appends a new key, and Delete on a revealed key
-// asks for confirmation before removing it. `store_updates()` returns the
-// edited key map; the App persists it to the AuthStore via `apply_values`.
+// rotation keys masked as health dots. Enter expands the active row to show
+// every one of its keys inline with a selection cursor on one of them;
+// Left/Right (or h/l in vim normal mode) move that cursor, typing into the
+// pending line appends a new key, and Delete on the selected key asks for
+// confirmation before removing it. `store_updates()` returns the edited key
+// map; the App persists it to the AuthStore.
 //
-// Stored keys are NEVER shown by default — a key is only visible while its
-// index is `revealed` (cleared on nav, Esc, and every mutation). The state
-// is deliberately decoupled from `AuthStore` so the App owns persistence,
+// Stored keys are NEVER shown by default — a row's key list is only visible
+// while `revealed` is `Some` (the value is the selection cursor). Expanding
+// is view-only: typing/pasting is blocked until the row is collapsed again,
+// so an accidental keystroke can never corrupt a stored key. The state is
+// deliberately decoupled from `AuthStore` so the App owns persistence,
 // mirroring `FreeModeDialogState` in `free_mode_dialog.rs`.
 
 use ratatui::layout::Rect;
@@ -40,7 +44,9 @@ pub struct KeysField {
     pub key_status: Vec<Option<Result<(), String>>>,
     /// New-key input buffer — the blank line that accepts new keys.
     pub pending: String,
-    /// Index of the key currently revealed inline (view-only). `None` = masked.
+    /// `Some(i)` = the row is expanded: every stored key is shown inline and
+    /// key `i` is the highlighted selection cursor. `None` = masked (health
+    /// dots only). The row is view-only while expanded.
     pub revealed: Option<usize>,
     /// When `true`, the keys came from environment variables and are
     /// read-only in this dialog (cannot be edited, appended to, or deleted).
@@ -243,9 +249,11 @@ impl KeysDialogState {
             .unwrap_or(true)
     }
 
-    /// Enter on the active row: appends a typed new key (create) or toggles
-    /// the first masked key (read). Returns `true` when a new key was
-    /// appended — the caller then persists and fires a validity check.
+    /// Enter on the active row: append a typed new key (create), else toggle
+    /// the row's key list. Expanding shows every stored key inline with the
+    /// selection cursor on the first one; a second Enter collapses the row.
+    /// Returns `true` when a new key was appended — the caller then persists
+    /// and fires a validity check.
     pub fn enter_active(&mut self) -> bool {
         if self.append_pending() {
             return true;
@@ -259,6 +267,55 @@ impl KeysDialogState {
             field.revealed = Some(0);
         }
         false
+    }
+
+    /// Whether the active row is currently expanded (its key list is shown).
+    pub fn active_is_revealed(&self) -> bool {
+        self.fields
+            .get(self.active_idx)
+            .map(|f| f.revealed.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Number of stored keys on the active row (0 for an unknown row).
+    pub fn active_key_count(&self) -> usize {
+        self.fields
+            .get(self.active_idx)
+            .map(|f| f.keys.len())
+            .unwrap_or(0)
+    }
+
+    /// Move the selection cursor to the next key on the expanded active row.
+    /// No-op unless the row is expanded; wraps at the end.
+    pub fn select_next_key(&mut self) {
+        let Some(field) = self.fields.get_mut(self.active_idx) else {
+            return;
+        };
+        let Some(i) = field.revealed else {
+            return;
+        };
+        if field.keys.is_empty() {
+            field.revealed = None;
+            return;
+        }
+        field.revealed = Some((i + 1) % field.keys.len());
+    }
+
+    /// Move the selection cursor to the previous key on the expanded active
+    /// row. No-op unless the row is expanded; wraps at the start.
+    pub fn select_prev_key(&mut self) {
+        let Some(field) = self.fields.get_mut(self.active_idx) else {
+            return;
+        };
+        let Some(i) = field.revealed else {
+            return;
+        };
+        if field.keys.is_empty() {
+            field.revealed = None;
+            return;
+        }
+        let len = field.keys.len();
+        field.revealed = Some((i + len - 1) % len);
     }
 
     /// Commit the typed new-key buffer as an additional stored key (a new
@@ -311,10 +368,11 @@ impl KeysDialogState {
         false
     }
 
-    /// Insert a character into the active row's new-key buffer.
+    /// Insert a character into the active row's new-key buffer. Ignored while
+    /// the row is expanded (view-only) so a keystroke cannot corrupt a key.
     pub fn insert_char(&mut self, c: char) {
         if let Some(field) = self.fields.get_mut(self.active_idx) {
-            if !field.from_env {
+            if !field.from_env && field.revealed.is_none() {
                 field.pending.push(c);
             }
         }
@@ -325,7 +383,7 @@ impl KeysDialogState {
     /// carries a trailing line feed lands as a single token.
     pub fn paste_key(&mut self, text: &str) {
         if let Some(field) = self.fields.get_mut(self.active_idx) {
-            if field.from_env {
+            if field.from_env || field.revealed.is_some() {
                 return;
             }
             let cleaned = text.trim();
@@ -336,15 +394,18 @@ impl KeysDialogState {
         }
     }
 
-    /// Backspace the active row's new-key buffer.
+    /// Backspace the active row's new-key buffer. Ignored while the row is
+    /// expanded (view-only).
     pub fn backspace(&mut self) {
         if let Some(field) = self.fields.get_mut(self.active_idx) {
-            field.pending.pop();
+            if field.revealed.is_none() {
+                field.pending.pop();
+            }
         }
     }
 
-    /// Offer the delete-confirmation popup when the active row's key is
-    /// revealed. Returns `true` when the popup opened.
+    /// Offer the delete-confirmation popup for the active row's selected key.
+    /// Returns `true` when the popup opened.
     pub fn try_open_delete_confirm(&mut self) -> bool {
         let Some(field) = self.fields.get(self.active_idx) else {
             return false;
@@ -364,19 +425,30 @@ impl KeysDialogState {
         false
     }
 
-    /// Confirm the pending delete: remove the key (and its dot) locally.
-    /// Changes are applied to the auth store on commit (Ctrl+Enter / Ctrl+S).
-    pub fn confirm_delete(&mut self) {
+    /// Confirm the pending delete: remove the selected key (and its dot)
+    /// locally and keep the row expanded with the cursor clamped onto a
+    /// surviving key. Returns `true` when a key was actually removed — the
+    /// caller then persists the edited map to the auth store.
+    pub fn confirm_delete(&mut self) -> bool {
         let Some(dc) = self.delete_confirm.take() else {
-            return;
+            return false;
         };
-        if let Some(field) = self.fields.get_mut(dc.field_idx) {
-            if dc.key_idx < field.keys.len() {
-                field.keys.remove(dc.key_idx);
-                field.key_status.remove(dc.key_idx);
-                field.revealed = None;
-            }
+        let Some(field) = self.fields.get_mut(dc.field_idx) else {
+            return false;
+        };
+        if dc.key_idx >= field.keys.len() {
+            return false;
         }
+        field.keys.remove(dc.key_idx);
+        field.key_status.remove(dc.key_idx);
+        if field.keys.is_empty() {
+            field.revealed = None;
+        } else {
+            // Keep the row expanded; land the cursor on the next surviving
+            // key (or the last one when the removed key was the tail).
+            field.revealed = Some(dc.key_idx.min(field.keys.len() - 1));
+        }
+        true
     }
 
     /// Cancel the delete popup (key is kept).
@@ -515,7 +587,7 @@ pub fn render_keys_dialog(
         Style::default().fg(pink).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::styled(
-        "  j/k nav · enter reveal/add+saves · ctrl+v paste · del delete · esc close",
+        "  j/k nav · enter reveal/add · ←/→ select key · del delete · ctrl+v paste · esc close",
         Style::default().fg(dim),
     ));
     lines.push(Line::styled("", Style::default()));
@@ -560,31 +632,53 @@ pub fn render_keys_dialog(
             ),
         ]));
 
-        // Key dots / revealed key line.
+        // Key line — health dots when masked, every key inline (with the
+        // selection cursor highlighted) when the row is expanded.
         if field.keys.is_empty() {
             lines.push(Line::styled("      (no keys)", Style::default().fg(dim)));
-        } else {
+        } else if let Some(sel) = field.revealed {
             let mut spans: Vec<Span<'static>> = vec![Span::styled("      ", Style::default())];
-            for (ki, status) in field.key_status.iter().enumerate() {
-                if field.revealed == Some(ki) {
-                    if let Some(key) = field.keys.get(ki) {
-                        let all: Vec<char> = key.chars().collect();
-                        let body: String = if all.len() > 30 {
-                            format!("{}…", all.iter().take(30).collect::<String>())
-                        } else {
-                            key.clone()
-                        };
-                        spans.push(Span::styled(
-                            format!("[{}] ", body),
-                            Style::default().fg(Color::Rgb(210, 210, 210)),
-                        ));
-                    }
+            for (ki, key) in field.keys.iter().enumerate() {
+                let all: Vec<char> = key.chars().collect();
+                let body: String = if all.len() > 24 {
+                    format!("{}…", all.iter().take(24).collect::<String>())
                 } else {
+                    key.clone()
+                };
+                let selected = ki == sel;
+                if selected {
                     spans.push(Span::styled(
-                        "\u{25cf} ",
-                        Style::default().fg(dot_color(status)),
+                        "\u{25b8} ",
+                        Style::default().fg(pink).add_modifier(Modifier::BOLD),
                     ));
                 }
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(pink)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(muted)
+                };
+                spans.push(Span::styled(format!("[{}]", body), style));
+                spans.push(Span::styled("  ", Style::default()));
+            }
+            lines.push(Line::from(spans));
+            lines.push(Line::styled(
+                format!(
+                    "      key {}/{} · \u{2190}/\u{2192} select · del delete · esc hide",
+                    sel + 1,
+                    field.keys.len()
+                ),
+                Style::default().fg(dim),
+            ));
+        } else {
+            let mut spans: Vec<Span<'static>> = vec![Span::styled("      ", Style::default())];
+            for status in field.key_status.iter() {
+                spans.push(Span::styled(
+                    "\u{25cf} ",
+                    Style::default().fg(dot_color(status)),
+                ));
             }
             lines.push(Line::from(spans));
         }
@@ -637,9 +731,9 @@ pub fn render_keys_dialog(
 
     // Static keybind footer (vim vs arrows).
     let footer = if vim_enabled {
-        "  j/k move · enter reveal → auto-save+validate · type+enter add · ctrl+v paste · del confirm delete · esc close"
+        "  j/k move · h/l select key · enter reveal/add → auto-save+validate · del confirm delete · esc close"
     } else {
-        "  ↑/↓ move · enter reveal → auto-save+validate · type+enter add · ctrl+v paste · del confirm delete · esc close"
+        "  ↑/↓ move · ←/→ select key · enter reveal/add → auto-save+validate · del confirm delete · esc close"
     };
     let footer_widget =
         Paragraph::new(Line::styled(footer, Style::default().fg(dim))).bg(dialog_bg);
@@ -702,12 +796,86 @@ mod tests {
     }
 
     #[test]
-    fn enter_reveals_first_key_then_hides() {
+    fn enter_expands_all_keys_then_collapses() {
         let mut s = seeded();
         s.enter_active();
-        assert_eq!(s.fields[0].revealed, Some(0));
+        assert_eq!(
+            s.fields[0].revealed,
+            Some(0),
+            "cursor lands on the first key"
+        );
+        assert!(s.active_is_revealed());
+        assert_eq!(s.active_key_count(), 2, "every stored key is shown");
         s.enter_active();
-        assert_eq!(s.fields[0].revealed, None, "enter toggles reveal");
+        assert_eq!(s.fields[0].revealed, None, "enter toggles expansion");
+        assert!(!s.active_is_revealed());
+    }
+
+    #[test]
+    fn selection_cursor_moves_and_wraps_within_the_expanded_row() {
+        let mut s = seeded();
+        s.select_next_key();
+        assert_eq!(s.fields[0].revealed, None, "no-op while masked");
+        s.enter_active();
+        s.select_next_key();
+        assert_eq!(s.fields[0].revealed, Some(1));
+        s.select_next_key();
+        assert_eq!(s.fields[0].revealed, Some(0), "wraps past the last key");
+        s.select_prev_key();
+        assert_eq!(s.fields[0].revealed, Some(1), "wraps before the first key");
+    }
+
+    #[test]
+    fn delete_removes_the_selected_key_not_always_the_first() {
+        let mut s = seeded();
+        s.enter_active();
+        s.select_next_key();
+        assert_eq!(s.fields[0].revealed, Some(1));
+        assert!(s.try_open_delete_confirm());
+        assert!(s.confirm_delete());
+        assert_eq!(s.fields[0].keys, vec!["k1"], "the selected second key went");
+        assert_eq!(
+            s.fields[0].revealed,
+            Some(0),
+            "cursor clamps onto the survivor"
+        );
+    }
+
+    #[test]
+    fn delete_collapses_a_row_that_loses_its_last_key() {
+        let mut s = seeded();
+        s.enter_active();
+        s.select_next_key();
+        s.try_open_delete_confirm();
+        assert!(s.confirm_delete());
+        // Now delete the remaining key.
+        s.try_open_delete_confirm();
+        assert!(s.confirm_delete());
+        assert!(s.fields[0].keys.is_empty());
+        assert_eq!(s.fields[0].revealed, None, "empty row re-masks");
+    }
+
+    #[test]
+    fn expanded_row_is_view_only() {
+        let mut s = seeded();
+        s.enter_active();
+        s.insert_char('x');
+        s.paste_key("y");
+        s.backspace();
+        assert_eq!(s.fields[0].pending, "", "typing is blocked while expanded");
+        s.enter_active(); // collapse
+        s.insert_char('x');
+        assert_eq!(s.fields[0].pending, "x", "typing resumes once collapsed");
+    }
+
+    #[test]
+    fn row_nav_collapses_the_expanded_row() {
+        let mut s = seeded();
+        s.enter_active();
+        assert!(s.active_is_revealed());
+        s.move_next();
+        assert_eq!(s.fields[0].revealed, None, "leaving the row re-masks it");
+        assert_eq!(s.active_idx, 1);
     }
 
     #[test]
@@ -761,18 +929,18 @@ mod tests {
     }
 
     #[test]
-    fn delete_requires_revealed_key_then_confirms() {
+    fn delete_requires_an_expanded_key_then_confirms() {
         let mut s = seeded();
-        // Not revealed — no confirm popup.
+        // Not expanded — no confirm popup.
         assert!(!s.try_open_delete_confirm());
         s.enter_active();
         assert!(s.try_open_delete_confirm());
         assert!(s.delete_confirm.is_some());
-        s.confirm_delete();
+        assert!(s.confirm_delete());
         assert!(s.delete_confirm.is_none());
-        assert_eq!(s.fields[0].keys, vec!["k2"], "revealed key removed");
+        assert_eq!(s.fields[0].keys, vec!["k2"], "selected key removed");
         assert_eq!(s.fields[0].key_status.len(), 1);
-        assert_eq!(s.fields[0].revealed, None);
+        assert_eq!(s.fields[0].revealed, Some(0), "row stays expanded");
     }
 
     #[test]
@@ -782,6 +950,13 @@ mod tests {
         s.try_open_delete_confirm();
         s.cancel_delete();
         assert!(s.delete_confirm.is_none());
+        assert_eq!(s.fields[0].keys.len(), 2);
+    }
+
+    #[test]
+    fn confirm_delete_without_a_pending_confirmation_is_a_no_op() {
+        let mut s = seeded();
+        assert!(!s.confirm_delete());
         assert_eq!(s.fields[0].keys.len(), 2);
     }
 
