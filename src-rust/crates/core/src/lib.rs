@@ -3594,6 +3594,38 @@ pub mod config {
         }
     }
 
+    /// Scratch directories this process created through
+    /// [`Settings::test_scratch_dir`], removed when the process exits so a
+    /// `cargo test` run leaves nothing behind. Only ever holds paths built
+    /// directly inside [`std::env::temp_dir`].
+    static TEST_SCRATCH_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    /// Whether [`remove_test_scratch_dirs`] has been handed to `libc::atexit`.
+    static TEST_SCRATCH_CLEANUP_REGISTERED: std::sync::Once = std::sync::Once::new();
+
+    /// Delete every registered test scratch directory.
+    ///
+    /// Called from `libc::atexit`, the one exit hook that also fires for the
+    /// `std::process::exit` that both `libtest` and ordinary code leave through.
+    /// An abort or fatal signal skips it, which is why
+    /// [`Settings::test_scratch_dir`] *also* sweeps dead-pid directories at
+    /// creation: together a normal run leaves nothing and a crashed run is
+    /// reclaimed by the next one.
+    ///
+    /// Must not unwind, so the lock is recovered rather than `unwrap`ped and
+    /// every removal error is ignored. On platforms without `/proc` the
+    /// creation-time sweep is disabled, but this still runs, so they get zero
+    /// residue too.
+    extern "C" fn remove_test_scratch_dirs() {
+        let dirs = match TEST_SCRATCH_DIRS.lock() {
+            Ok(dirs) => dirs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for dir in dirs.iter() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     impl Settings {
         /// The canonical per-user clawde home directory — the single source of
         /// truth for where clawde keeps everything (settings, sessions,
@@ -3676,6 +3708,130 @@ pub mod config {
                 .unwrap_or_else(|| Self::config_dir().join("settings.json"))
         }
 
+        /// Create and return the per-process scratch directory `prefix-<pid>`
+        /// for a cargo test harness, reaping scratch directories left behind by
+        /// earlier runs with the same prefix.
+        ///
+        /// A test harness cannot reliably clean up after itself: a binary that
+        /// aborts or exits without unwinding skips every `Drop` guard, and no
+        /// guard in one test binary can see the directory a sibling binary
+        /// created. Unreaped, every `cargo test` run leaves one directory per
+        /// scratch prefix behind, so `$TMPDIR` slowly fills with thousands of
+        /// `clawde-test-home-*` / `clawde-tui-test-keybindings-*` entries.
+        ///
+        /// Reclaiming an abandoned directory therefore happens on creation
+        /// rather than at exit: sweep `$TMPDIR` for siblings named
+        /// `<prefix>-<pid>` and delete the ones whose pid is no longer alive. That is idempotent and safe under the
+        /// parallel runner — a live sibling's pid still exists, so it is
+        /// skipped, and pid reuse can only make a directory read as alive and be
+        /// left in place, never the reverse. Where there is no `/proc` nothing
+        /// is reaped, which leaks a directory rather than ever deleting a live
+        /// one.
+        ///
+        /// The sweep runs at most once per prefix per process, so callers that
+        /// resolve this path repeatedly (`global_settings_path`, `state_dir`) do
+        /// not rescan `$TMPDIR` on every call.
+        ///
+        /// The directory is also registered for removal at process exit (see
+        /// [`Self::register_exit_cleanup`]), which is what removes the *last*
+        /// directory of a run — the one whose owner is still alive when the run
+        /// ends, and which no creation-time sweep can ever see as dead.
+        pub fn test_scratch_dir(prefix: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            Self::reap_stale_scratch_dirs(prefix);
+            Self::register_exit_cleanup(dir.clone());
+            dir
+        }
+
+        /// Register `dir` for removal when the process exits.
+        ///
+        /// Paired with the creation-time sweep in [`Self::test_scratch_dir`]:
+        /// that reclaims what a crashed run abandoned, this removes what the
+        /// still-running process leaves when it exits normally.
+        fn register_exit_cleanup(dir: PathBuf) {
+            // Only ever delete something created directly inside the temp dir: a
+            // pathological prefix must not turn exit cleanup into a recursive
+            // delete somewhere else.
+            let temp = std::env::temp_dir();
+            if dir.parent() != Some(temp.as_path()) {
+                return;
+            }
+
+            {
+                let mut dirs = match TEST_SCRATCH_DIRS.lock() {
+                    Ok(dirs) => dirs,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if dirs.contains(&dir) {
+                    return;
+                }
+                dirs.push(dir);
+            }
+
+            TEST_SCRATCH_CLEANUP_REGISTERED.call_once(|| {
+                // SAFETY: `atexit` only stores the function pointer and calls it
+                // later, with no arguments, from libc's exit path.
+                // `remove_test_scratch_dirs` is a plain `extern "C" fn()` that
+                // captures nothing and touches only the `TEST_SCRATCH_DIRS`
+                // static, so there is no lifetime or aliasing invariant to
+                // uphold; the `Once` prevents duplicate registration.
+                let _ = unsafe { libc::atexit(remove_test_scratch_dirs) };
+            });
+        }
+
+        /// Delete `<prefix>-<pid>` scratch directories in `$TMPDIR` whose pid is
+        /// dead. See [`Self::test_scratch_dir`] for why this runs at creation
+        /// and why it is safe under the parallel test runner.
+        fn reap_stale_scratch_dirs(prefix: &str) {
+            static REAPED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            {
+                // Best-effort cleanup: a poisoned lock means another thread
+                // panicked mid-sweep, in which case skip rather than re-panic.
+                let Ok(mut reaped) = REAPED.lock() else {
+                    return;
+                };
+                if reaped.iter().any(|seen| seen.as_str() == prefix) {
+                    return;
+                }
+                reaped.push(prefix.to_string());
+            }
+
+            // Without /proc there is no portable liveness probe, so leave the
+            // directories alone: a leak is recoverable, a wrong delete is not.
+            // (This is the same /proc idiom as `named_commands.rs` and
+            // `attachments.rs`.)
+            if !std::path::Path::new("/proc").is_dir() {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+                return;
+            };
+            let needle = format!("{prefix}-");
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(pid) = name
+                    .strip_prefix(needle.as_str())
+                    .and_then(|rest| rest.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                // A zombie keeps its `/proc/<pid>`, which is what we want: the
+                // directory may still be in use.
+                if pid == std::process::id()
+                    || std::path::Path::new(&format!("/proc/{pid}")).exists()
+                {
+                    continue;
+                }
+                // `file_type` does not follow symlinks, so an entry that merely
+                // looks like a scratch dir is never traversed out of $TMPDIR.
+                if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+
         /// The per-process scratch home used while a cargo test harness runs
         /// with no explicit `CLAWDE_HOME`, or `None` when the process should
         /// use the real config dir.
@@ -3688,10 +3844,7 @@ pub mod config {
         /// that opt in and race the ones that don't on the parallel test runner.
         pub(crate) fn test_scratch_home() -> Option<PathBuf> {
             if std::env::var_os("CLAWDE_HOME").is_none() && Self::running_under_cargo_test() {
-                let dir =
-                    std::env::temp_dir().join(format!("clawde-test-home-{}", std::process::id()));
-                let _ = std::fs::create_dir_all(&dir);
-                Some(dir)
+                Some(Self::test_scratch_dir("clawde-test-home"))
             } else {
                 None
             }
@@ -9070,6 +9223,101 @@ mod tests {
             !dir.starts_with(dirs::home_dir().unwrap_or_default().join(".clawde")),
             "the developer's real ~/.clawde must never hold test state: {}",
             dir.display()
+        );
+    }
+
+    /// A test run must not leak one scratch directory per process forever.
+    /// `Settings::test_scratch_dir` reaps siblings whose pid is dead while
+    /// leaving a live sibling untouched. A dedicated prefix is used so the
+    /// one-shot per-process sweep guard has not already fired for this prefix.
+    #[test]
+    fn scratch_dirs_reap_dead_pids_and_keep_live_ones() {
+        if !std::path::Path::new("/proc").is_dir() {
+            // The reaper is deliberately a no-op without /proc, so asserting a
+            // reap here would be asserting Linux behaviour on a platform that
+            // chooses a leak over a possibly-wrong delete.
+            return;
+        }
+        let prefix = "clawde-test-scratch-reap-probe";
+        let root = std::env::temp_dir();
+
+        let live = root.join(format!("{prefix}-{}", std::process::id()));
+        std::fs::create_dir_all(&live).unwrap();
+        let live_marker = live.join("keep");
+        std::fs::write(&live_marker, b"keep").unwrap();
+
+        // `u32::MAX` cannot belong to a running process, so this directory is
+        // unambiguously garbage left by an earlier run.
+        let dead = root.join(format!("{prefix}-{}", u32::MAX));
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("stale"), b"stale").unwrap();
+
+        let _ = crate::config::Settings::test_scratch_dir(prefix);
+
+        assert!(
+            !dead.exists(),
+            "a dead-pid scratch dir must be reaped: {}",
+            dead.display()
+        );
+        assert!(
+            live_marker.exists(),
+            "a live-pid scratch dir must be left alone: {}",
+            live.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&live);
+    }
+
+    /// The exit hook is the only thing that removes the *last* scratch
+    /// directory of a run: the creation-time sweep can only reclaim a directory
+    /// whose owner has already died, and the final test binary is still alive
+    /// when the run ends. Verified end to end by re-executing this test binary
+    /// as a child, because `libc::atexit` only fires when a process actually
+    /// exits.
+    #[test]
+    fn exit_cleanup_removes_the_scratch_dir_when_the_process_exits() {
+        const PROBE_ENV: &str = "CLAWDE_TEST_SCRATCH_EXIT_PROBE";
+        const TEST_NAME: &str =
+            "tests::exit_cleanup_removes_the_scratch_dir_when_the_process_exits";
+        let prefix = "clawde-test-scratch-exit-probe";
+
+        if std::env::var_os(PROBE_ENV).is_some() {
+            // Child: create and register the directory, then let the harness
+            // exit normally so the atexit hook runs. Assert it exists first, so
+            // the parent's "it is gone" cannot pass because it was never made.
+            let dir = crate::config::Settings::test_scratch_dir(prefix);
+            assert!(
+                dir.is_dir(),
+                "scratch dir was not created: {}",
+                dir.display()
+            );
+            std::fs::write(dir.join("marker"), b"marker").unwrap();
+            println!("{PROBE_ENV}_DIR={}", dir.display());
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().expect("current exe"))
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg(TEST_NAME)
+            .env(PROBE_ENV, "1")
+            .output()
+            .expect("spawn the child test binary");
+        assert!(
+            output.status.success(),
+            "child test run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let marker = format!("{PROBE_ENV}_DIR=");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let dir = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(marker.as_str()))
+            .expect("the child must report the scratch dir it created");
+        assert!(
+            !std::path::Path::new(dir).exists(),
+            "the exit hook must remove the last scratch dir, still present: {dir}"
         );
     }
 

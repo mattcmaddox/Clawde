@@ -213,6 +213,19 @@ exist; use them and do not route around them:
   read the developer's live tally (21 structured groq samples) and fail, and
   how the followup tests rewrote the real `~/.clawde/followups.md`.
 
+Both scratch directories are self-cleaning: `Settings::test_scratch_dir()`
+(`crates/core/src/lib.rs`) creates the `prefix-<pid>` directory, registers it
+for removal at process exit through `libc::atexit`, and reaps siblings in
+`$TMPDIR` whose pid is no longer alive. Together those mean a normal
+`cargo test` run leaves nothing behind, and a run that aborted is reclaimed by
+the next one. The `atexit` hook is the only thing that can remove the *last*
+directory of a run, whose owner is still alive when the run ends; the
+creation-time sweep exists because `atexit` never runs for an abort or a fatal
+signal, and no `Drop` guard can see a sibling binary's directory. `/proc`
+supplies the liveness check, so on platforms without `/proc` nothing is reaped
+(a leak, never a wrong delete) — the exit hook still applies there.
+`crates/tui/src/lib.rs::keybindings_dir()` shares the same helper.
+
 `test_scratch_home()` is a single per-process directory keyed on the pid, so it
 is scratch-space protection, not per-test isolation: two tests in one binary
 that write the same file still race. Give state that a test must control an

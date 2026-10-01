@@ -35,16 +35,14 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// developer's real `~/.clawde/keybindings.json` as soon as the defaults change.
 /// It also keeps tests hermetic: a locally customized keymap must not change
 /// what a test observes. Keyed by process id so a stale file from an earlier run
-/// can never influence a later one.
+/// can never influence a later one. Creation goes through
+/// `Settings::test_scratch_dir`, which also reaps scratch directories left by
+/// pids that are no longer alive — otherwise every `cargo test` run would leak
+/// one of these directories forever.
 pub(crate) fn keybindings_dir() -> std::path::PathBuf {
     #[cfg(test)]
     {
-        let dir = std::env::temp_dir().join(format!(
-            "clawde-tui-test-keybindings-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        dir
+        clawde_core::config::Settings::test_scratch_dir("clawde-tui-test-keybindings")
     }
     #[cfg(not(test))]
     {

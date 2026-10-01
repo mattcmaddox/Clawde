@@ -953,6 +953,7 @@ dependencies = [
  "glob",
  "hex",
  "indexmap 2.14.2",
+ "libc",
  "once_cell",
  "parking_lot",
  "regex",

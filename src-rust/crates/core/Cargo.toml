@@ -104,6 +104,9 @@ futures = { workspace = true }
 rusqlite = { workspace = true }
 # Optional: real audio capture for voice input (gated behind the `voice` feature)
 cpal = { version = "0.15", optional = true }
+# `libc::atexit` removes the per-process test scratch directory when a test
+# harness exits, so a `cargo test` run leaves nothing behind.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
