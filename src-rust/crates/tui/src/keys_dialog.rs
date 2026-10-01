@@ -632,26 +632,28 @@ pub fn render_keys_dialog(
             ),
         ]));
 
-        // Key line — health dots when masked, every key inline (with the
+        // Key line — health dots when masked, one key per line (with the
         // selection cursor highlighted) when the row is expanded.
         if field.keys.is_empty() {
             lines.push(Line::styled("      (no keys)", Style::default().fg(dim)));
         } else if let Some(sel) = field.revealed {
-            let mut spans: Vec<Span<'static>> = vec![Span::styled("      ", Style::default())];
+            // Vertical list: one key per line so long keys stay readable.
             for (ki, key) in field.keys.iter().enumerate() {
                 let all: Vec<char> = key.chars().collect();
-                let body: String = if all.len() > 24 {
-                    format!("{}…", all.iter().take(24).collect::<String>())
+                let body: String = if all.len() > 64 {
+                    format!("{}…", all.iter().take(64).collect::<String>())
                 } else {
                     key.clone()
                 };
                 let selected = ki == sel;
-                if selected {
-                    spans.push(Span::styled(
+                let marker = if selected {
+                    Span::styled(
                         "\u{25b8} ",
                         Style::default().fg(pink).add_modifier(Modifier::BOLD),
-                    ));
-                }
+                    )
+                } else {
+                    Span::styled("  ", Style::default().fg(dim))
+                };
                 let style = if selected {
                     Style::default()
                         .fg(Color::Black)
@@ -660,10 +662,12 @@ pub fn render_keys_dialog(
                 } else {
                     Style::default().fg(muted)
                 };
-                spans.push(Span::styled(format!("[{}]", body), style));
-                spans.push(Span::styled("  ", Style::default()));
+                lines.push(Line::from(vec![
+                    Span::styled("      ", Style::default()),
+                    marker,
+                    Span::styled(format!("[{}]", body), style),
+                ]));
             }
-            lines.push(Line::from(spans));
             lines.push(Line::styled(
                 format!(
                     "      key {}/{} · \u{2190}/\u{2192} select · del delete · esc hide",

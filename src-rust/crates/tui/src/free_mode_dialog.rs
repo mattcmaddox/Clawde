@@ -1234,23 +1234,26 @@ pub fn render_free_mode_dialog(
         }
         lines.push(Line::from(name_spans));
 
-        // Second line — expanded key list > typed new key > node hints > blank.
-        let mut input_line: Vec<Span<'static>> = vec![Span::styled("     ", Style::default())];
+        // Second line — an expanded key list (one key per line) > typed new
+        // key > node hints > blank.
         if let Some(sel) = field.revealed {
+            // Vertical list: one key per line so long keys stay readable.
             for (ki, key) in field.keys.iter().enumerate() {
                 let all: Vec<char> = key.chars().collect();
-                let body: String = if all.len() > 20 {
-                    format!("{}\u{2026}", all.iter().take(20).collect::<String>())
+                let body: String = if all.len() > 60 {
+                    format!("{}\u{2026}", all.iter().take(60).collect::<String>())
                 } else {
                     key.clone()
                 };
                 let selected = ki == sel;
-                if selected {
-                    input_line.push(Span::styled(
+                let marker = if selected {
+                    Span::styled(
                         "\u{25b8} ",
                         Style::default().fg(pink).add_modifier(Modifier::BOLD),
-                    ));
-                }
+                    )
+                } else {
+                    Span::styled("  ", Style::default().fg(dim))
+                };
                 let style = if selected {
                     Style::default()
                         .fg(Color::Black)
@@ -1259,56 +1262,70 @@ pub fn render_free_mode_dialog(
                 } else {
                     Style::default().fg(muted)
                 };
-                input_line.push(Span::styled(format!("[{}]", body), style));
-                input_line.push(Span::styled("  ", Style::default()));
+                lines.push(Line::from(vec![
+                    Span::styled("     ", Style::default()),
+                    marker,
+                    Span::styled(format!("[{}]", body), style),
+                ]));
             }
-            input_line.push(Span::styled(
+            lines.push(Line::styled(
                 format!(
-                    "key {}/{} \u{2014} \u{2190}/\u{2192} select, del deletes, esc hides",
+                    "     key {}/{} \u{2014} \u{2190}/\u{2192} select, del deletes, esc hides",
                     sel + 1,
                     field.keys.len()
                 ),
                 Style::default().fg(dim),
             ));
-        } else if !field.pending.is_empty() {
-            let masked = mask_key(&field.pending);
-            let input_style = if active {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            input_line.push(Span::styled(masked, input_style));
-            input_line.push(Span::styled("_", Style::default().fg(pink)));
-        } else if active && state.active_node == NodePos::NewKey {
-            let input_style = if field.from_env {
-                Style::default()
-                    .fg(Color::Rgb(180, 160, 80))
-                    .add_modifier(Modifier::ITALIC)
-            } else {
-                Style::default().fg(dim)
-            };
-            input_line.push(Span::styled(new_key_placeholder(field), input_style));
-            if !field.from_env {
-                input_line.push(Span::styled("_", Style::default().fg(pink)));
+            if active && field.from_env {
+                lines.push(Line::styled(
+                    "     [env \u{2014} edit in shell profile]",
+                    Style::default()
+                        .fg(Color::Rgb(160, 140, 60))
+                        .add_modifier(Modifier::DIM),
+                ));
             }
-        } else if active {
-            // A dot is selected but not expanded — invite reveal.
-            input_line.push(Span::styled(
-                "enter to reveal all keys",
-                Style::default().fg(dim),
-            ));
+        } else {
+            let mut input_line: Vec<Span<'static>> = vec![Span::styled("     ", Style::default())];
+            if !field.pending.is_empty() {
+                let masked = mask_key(&field.pending);
+                let input_style = if active {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                input_line.push(Span::styled(masked, input_style));
+                input_line.push(Span::styled("_", Style::default().fg(pink)));
+            } else if active && state.active_node == NodePos::NewKey {
+                let input_style = if field.from_env {
+                    Style::default()
+                        .fg(Color::Rgb(180, 160, 80))
+                        .add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default().fg(dim)
+                };
+                input_line.push(Span::styled(new_key_placeholder(field), input_style));
+                if !field.from_env {
+                    input_line.push(Span::styled("_", Style::default().fg(pink)));
+                }
+            } else if active {
+                // A dot is selected but not expanded — invite reveal.
+                input_line.push(Span::styled(
+                    "enter to reveal all keys",
+                    Style::default().fg(dim),
+                ));
+            }
+            if active && field.from_env {
+                input_line.push(Span::styled(
+                    "  [env \u{2014} edit in shell profile]",
+                    Style::default()
+                        .fg(Color::Rgb(160, 140, 60))
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
+            lines.push(Line::from(input_line));
         }
-        if active && field.from_env {
-            input_line.push(Span::styled(
-                "  [env \u{2014} edit in shell profile]",
-                Style::default()
-                    .fg(Color::Rgb(160, 140, 60))
-                    .add_modifier(Modifier::DIM),
-            ));
-        }
-        lines.push(Line::from(input_line));
 
         // Active row's catalog note — per-upstream limits and key-format
         // hints (e.g. Cloudflare's ACCOUNT_ID:API_TOKEN composite) shown
