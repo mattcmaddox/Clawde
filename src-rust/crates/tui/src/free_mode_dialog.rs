@@ -23,18 +23,19 @@
 //   │     enter to reveal key                                   │
 //   │    …8 more — tab/↑↓ to scroll                             │
 //   │                                                            │
-//   │  ↑/↓ j/k provider  ←/→ h/l key  enter reveal/append  del  │
+//   │  ↑/↓ j/k provider  ←/→ h/l key  enter reveal-all/append  │
 //   │  tab show all  ctrl+d on/off  ctrl+enter connect (3 keys) │
 //   └────────────────────────────────────────────────────────────┘
 //
 // Stored keys are NEVER shown by default — each usable key is a health
 // dot next to the provider name (● green = valid, ● red = invalid,
 // dim = untested). Dots are selectable nodes (←/→ or h/l); Enter on a
-// dot reveals that key inline; the blank line under each provider
-// accepts a new key which Enter appends as an additional dot. Delete
-// while a key is revealed asks for confirmation, showing that key's
-// health dot. Ctrl+Enter commits everything and connects Free mode;
-// Esc closes without applying changes.
+// dot expands the row to show every key inline with the selection
+// cursor on the chosen dot, and ←/→ then move that cursor between keys.
+// The blank line under each provider accepts a new key which Enter
+// appends as an additional dot. Delete while a row is expanded asks for
+// confirmation for the selected key, showing its health dot. Ctrl+Enter
+// commits everything and connects Free mode; Esc closes without applying.
 
 use ratatui::layout::Rect;
 use ratatui::prelude::Stylize;
@@ -89,8 +90,9 @@ pub struct FreeModeField {
     /// was captured on the first Enter and the row now awaits the account ID.
     /// The second Enter joins them into the stored `ACCOUNT_ID:API_TOKEN`.
     pub pending_token: Option<String>,
-    /// Index of the key currently revealed inline (view-only). `None` =
-    /// masked.
+    /// `Some(i)` = the row is expanded: every stored key is shown inline and
+    /// key `i` is the highlighted selection cursor. `None` = masked (health
+    /// dots only). The row is view-only while expanded.
     pub revealed: Option<usize>,
     /// When `true`, this upstream is hidden behind the "show all" toggle.
     pub collapsed: bool,
@@ -454,20 +456,78 @@ impl FreeModeDialogState {
         }
     }
 
-    /// Enter on the active node: appends a typed new key as a dot, reveals
-    /// a selected dot, or advances to the next node when neither applies.
+    /// Enter on the active node: append a typed new key as a dot, else toggle
+    /// the row's key list. Expanding shows every key inline with the selection
+    /// cursor on the chosen dot; a second Enter collapses. When the new-key
+    /// line is active and nothing is typed, Enter advances to the next node.
     pub fn enter_active(&mut self) {
         if self.append_pending() {
             return;
         }
-        if let Some(field) = self.fields.get_mut(self.active_idx) {
-            match self.active_node {
-                NodePos::Key(i) if i < field.keys.len() => {
+        let reveal = match self.fields.get(self.active_idx) {
+            Some(field) => match self.active_node {
+                NodePos::Key(i) if i < field.keys.len() => Some(i),
+                _ => None,
+            },
+            None => None,
+        };
+        match reveal {
+            Some(i) => {
+                let field = &mut self.fields[self.active_idx];
+                if field.revealed.is_some() {
+                    field.revealed = None;
+                } else {
                     field.revealed = Some(i);
                 }
-                _ => self.move_node_next(),
             }
+            None => self.move_node_next(),
         }
+    }
+
+    /// Whether the active row is currently expanded (its key list is shown).
+    pub fn active_is_revealed(&self) -> bool {
+        self.fields
+            .get(self.active_idx)
+            .map(|f| f.revealed.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Number of stored keys on the active row.
+    pub fn active_key_count(&self) -> usize {
+        self.fields
+            .get(self.active_idx)
+            .map(|f| f.keys.len())
+            .unwrap_or(0)
+    }
+
+    /// Move the selection cursor to the next key on the expanded active row.
+    /// No-op unless the row is expanded; wraps at the end. Keeps the node
+    /// cursor in sync so the bracketed health dot follows the selection.
+    pub fn select_next_key(&mut self) {
+        self.select_key_by(1);
+    }
+
+    /// Move the selection cursor to the previous key on the expanded active
+    /// row. No-op unless the row is expanded; wraps at the start.
+    pub fn select_prev_key(&mut self) {
+        self.select_key_by(-1);
+    }
+
+    fn select_key_by(&mut self, delta: isize) {
+        let Some(field) = self.fields.get_mut(self.active_idx) else {
+            return;
+        };
+        let Some(i) = field.revealed else {
+            return;
+        };
+        let len = field.keys.len();
+        if len == 0 {
+            field.revealed = None;
+            return;
+        }
+        let next = ((i as isize + delta).rem_euclid(len as isize)) as usize;
+        field.revealed = Some(next);
+        self.active_node = NodePos::Key(next);
     }
 
     /// Re-mask the revealed key of the active row. Returns `true` if a key
@@ -577,10 +637,9 @@ impl FreeModeDialogState {
         }
     }
 
-    /// Open the delete-confirmation popup for the currently revealed key.
-    /// Only possible when the active node is a key dot AND that key is
-    /// revealed inline. Returns `false` (and lets the caller backspace) when
-    /// no key is revealed or the field is read-only.
+    /// Open the delete-confirmation popup for the active row's selected key.
+    /// Returns `false` (and lets the caller backspace) when no key is
+    /// expanded or the field is read-only.
     pub fn try_open_delete_confirm(&mut self) -> bool {
         let Some(field) = self.fields.get(self.active_idx) else {
             return false;
@@ -588,8 +647,8 @@ impl FreeModeDialogState {
         if field.from_env {
             return false;
         }
-        if let NodePos::Key(i) = self.active_node {
-            if field.revealed == Some(i) && i < field.keys.len() {
+        if let Some(i) = field.revealed {
+            if i < field.keys.len() {
                 self.delete_confirm = Some(DeleteConfirm {
                     field_idx: self.active_idx,
                     key_idx: i,
@@ -610,10 +669,17 @@ impl FreeModeDialogState {
             if dc.key_idx < field.keys.len() {
                 field.keys.remove(dc.key_idx);
                 field.key_status.remove(dc.key_idx);
-                field.revealed = None;
+                if field.keys.is_empty() {
+                    field.revealed = None;
+                } else {
+                    // Keep the row expanded; land the cursor on the next
+                    // surviving key (or the last one when the tail was cut).
+                    field.revealed = Some(dc.key_idx.min(field.keys.len() - 1));
+                }
             }
         }
-        // Re-clamp the node cursor to the (possibly shorter) dot list.
+        // Re-clamp the node cursor to the (possibly shorter) dot list, then
+        // keep it in sync with the reveal cursor when the row is expanded.
         let node_count = self
             .fields
             .get(self.active_idx)
@@ -623,6 +689,9 @@ impl FreeModeDialogState {
             if i + 1 >= node_count {
                 self.active_node = node_at(node_count.saturating_sub(1));
             }
+        }
+        if let Some(i) = self.fields.get(self.active_idx).and_then(|f| f.revealed) {
+            self.active_node = NodePos::Key(i);
         }
     }
 
@@ -1165,16 +1234,42 @@ pub fn render_free_mode_dialog(
         }
         lines.push(Line::from(name_spans));
 
-        // Second line — revealed key > typed new key > node hints > blank.
+        // Second line — expanded key list > typed new key > node hints > blank.
         let mut input_line: Vec<Span<'static>> = vec![Span::styled("     ", Style::default())];
-        if let Some(ri) = field.revealed {
-            if let Some(key) = field.keys.get(ri) {
-                input_line.push(Span::styled(key.clone(), Style::default().fg(Color::Cyan)));
-                input_line.push(Span::styled(
-                    "  (revealed \u{2014} del deletes, esc hides)",
-                    Style::default().fg(dim),
-                ));
+        if let Some(sel) = field.revealed {
+            for (ki, key) in field.keys.iter().enumerate() {
+                let all: Vec<char> = key.chars().collect();
+                let body: String = if all.len() > 20 {
+                    format!("{}\u{2026}", all.iter().take(20).collect::<String>())
+                } else {
+                    key.clone()
+                };
+                let selected = ki == sel;
+                if selected {
+                    input_line.push(Span::styled(
+                        "\u{25b8} ",
+                        Style::default().fg(pink).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(pink)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(muted)
+                };
+                input_line.push(Span::styled(format!("[{}]", body), style));
+                input_line.push(Span::styled("  ", Style::default()));
             }
+            input_line.push(Span::styled(
+                format!(
+                    "key {}/{} \u{2014} \u{2190}/\u{2192} select, del deletes, esc hides",
+                    sel + 1,
+                    field.keys.len()
+                ),
+                Style::default().fg(dim),
+            ));
         } else if !field.pending.is_empty() {
             let masked = mask_key(&field.pending);
             let input_style = if active {
@@ -1199,9 +1294,9 @@ pub fn render_free_mode_dialog(
                 input_line.push(Span::styled("_", Style::default().fg(pink)));
             }
         } else if active {
-            // A dot is selected but not revealed — invite reveal.
+            // A dot is selected but not expanded — invite reveal.
             input_line.push(Span::styled(
-                "enter to reveal key",
+                "enter to reveal all keys",
                 Style::default().fg(dim),
             ));
         }
@@ -1259,7 +1354,7 @@ pub fn render_free_mode_dialog(
         Span::styled("\u{2190}/\u{2192} h/l", Style::default().fg(dim)),
         Span::styled(" key   ", Style::default().fg(dim)),
         Span::styled("enter", Style::default().fg(Color::Rgb(140, 140, 160))),
-        Span::styled(" reveal/append   ", Style::default().fg(dim)),
+        Span::styled(" reveal-all/append   ", Style::default().fg(dim)),
         Span::styled("del", Style::default().fg(Color::Rgb(140, 140, 160))),
         Span::styled(" delete key", Style::default().fg(dim)),
     ];
@@ -1561,6 +1656,69 @@ mod tests {
         );
         assert!(s.unreveal_active());
         assert_eq!(s.fields[0].revealed, None);
+    }
+
+    #[test]
+    fn enter_expands_all_keys_then_collapses() {
+        let mut s = FreeModeDialogState::new();
+        s.open(&[(
+            FREE_CATALOG[0].id,
+            vec!["k1".into(), "k2".into(), "k3".into()],
+        )]);
+        s.move_node_next(); // → Key(0)
+        s.enter_active();
+        assert_eq!(s.fields[0].revealed, Some(0));
+        assert!(s.active_is_revealed());
+        assert_eq!(s.active_key_count(), 3, "every stored key is shown");
+        s.enter_active();
+        assert_eq!(s.fields[0].revealed, None, "enter toggles expansion");
+        assert!(!s.active_is_revealed());
+    }
+
+    #[test]
+    fn selection_cursor_moves_and_wraps_within_expanded_row() {
+        let mut s = FreeModeDialogState::new();
+        s.open(&[(FREE_CATALOG[0].id, vec!["k1".into(), "k2".into()])]);
+        s.select_next_key();
+        assert_eq!(s.fields[0].revealed, None, "no-op while masked");
+        s.move_node_next(); // → Key(0)
+        s.enter_active(); // expand
+        s.select_next_key();
+        assert_eq!(s.fields[0].revealed, Some(1));
+        assert_eq!(s.active_node, NodePos::Key(1), "node cursor follows");
+        s.select_next_key();
+        assert_eq!(s.fields[0].revealed, Some(0), "wraps past the last key");
+        s.select_prev_key();
+        assert_eq!(s.fields[0].revealed, Some(1), "wraps before the first key");
+    }
+
+    #[test]
+    fn delete_removes_the_selected_key_and_keeps_row_expanded() {
+        let mut s = FreeModeDialogState::new();
+        s.open(&[(FREE_CATALOG[0].id, vec!["k1".into(), "k2".into()])]);
+        s.move_node_next(); // → Key(0)
+        s.enter_active(); // expand
+        s.select_next_key(); // select k2
+        assert!(s.try_open_delete_confirm());
+        s.confirm_delete();
+        assert_eq!(s.fields[0].keys, vec!["k1"], "selected key removed");
+        assert_eq!(s.fields[0].revealed, Some(0), "row stays expanded");
+        assert_eq!(s.active_node, NodePos::Key(0));
+    }
+
+    #[test]
+    fn row_nav_collapses_expanded_row() {
+        let mut s = FreeModeDialogState::new();
+        s.open(&[
+            (FREE_CATALOG[0].id, vec!["k1".into()]),
+            (FREE_CATALOG[2].id, vec!["k3".into()]),
+        ]);
+        s.active_idx = 0;
+        s.move_node_next();
+        s.enter_active();
+        assert!(s.active_is_revealed());
+        s.move_next();
+        assert_eq!(s.fields[0].revealed, None, "leaving the row re-masks it");
     }
 
     #[test]

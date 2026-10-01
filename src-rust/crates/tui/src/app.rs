@@ -7306,6 +7306,7 @@ impl App {
                 .fields
                 .get(self.free_mode_dialog.active_idx)
                 .is_none_or(|f| f.pending.is_empty());
+            let active_revealed = self.free_mode_dialog.active_is_revealed();
             match key.code {
                 KeyCode::Esc => {
                     // Esc cascade: hide a revealed key → drop typed text → close.
@@ -7331,14 +7332,29 @@ impl App {
                 KeyCode::Char('k') if self.prompt_input.vim_enabled && active_pending_empty => {
                     self.free_mode_dialog.move_prev();
                 }
+                // An expanded row: ←/→ (h/l in vim normal mode) move the
+                // key-selection cursor. Otherwise they move the node cursor
+                // across the new-key line and the key dots.
+                KeyCode::Right if active_revealed => {
+                    self.free_mode_dialog.select_next_key();
+                }
                 KeyCode::Right => {
                     self.free_mode_dialog.move_node_next();
+                }
+                KeyCode::Char('l') if active_pending_empty && active_revealed => {
+                    self.free_mode_dialog.select_next_key();
                 }
                 KeyCode::Char('l') if self.prompt_input.vim_enabled && active_pending_empty => {
                     self.free_mode_dialog.move_node_next();
                 }
+                KeyCode::Left if active_revealed => {
+                    self.free_mode_dialog.select_prev_key();
+                }
                 KeyCode::Left => {
                     self.free_mode_dialog.move_node_prev();
+                }
+                KeyCode::Char('h') if active_pending_empty && active_revealed => {
+                    self.free_mode_dialog.select_prev_key();
                 }
                 KeyCode::Char('h') if self.prompt_input.vim_enabled && active_pending_empty => {
                     self.free_mode_dialog.move_node_prev();
