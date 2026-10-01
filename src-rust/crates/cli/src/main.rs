@@ -6499,6 +6499,13 @@ async fn run_interactive(
                             for ch in data.chars() {
                                 app.custom_provider_dialog.insert_char(ch);
                             }
+                        } else if app.keys_dialog.visible {
+                            // Paste into the /keys popup's active row new-key
+                            // buffer, trimmed to a single token. The
+                            // delete-confirm popup accepts no text.
+                            if app.keys_dialog.delete_confirm.is_none() {
+                                app.keys_dialog.paste_key(&data);
+                            }
                         } else {
                             // Paste into the main prompt through the shared path
                             // so file-path/image pastes and the large-paste

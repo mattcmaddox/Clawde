@@ -11807,6 +11807,7 @@ impl App {
             && !self.key_input_dialog.visible
             && !self.custom_provider_dialog.visible
             && !self.ollama_config_dialog.visible
+            && !self.keys_dialog.visible
             && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
     }
 
@@ -13665,6 +13666,13 @@ impl App {
                         } else if self.ollama_config_dialog.visible {
                             for ch in data.chars() {
                                 self.ollama_config_dialog.insert_char(ch);
+                            }
+                        } else if self.keys_dialog.visible {
+                            // A paste into `/keys` fills the active row's
+                            // new-key buffer, trimmed to a single token.
+                            // The delete-confirm popup accepts no text.
+                            if self.keys_dialog.delete_confirm.is_none() {
+                                self.keys_dialog.paste_key(&data);
                             }
                         } else {
                             self.handle_paste_data(data);

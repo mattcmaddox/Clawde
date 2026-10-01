@@ -732,6 +732,27 @@ mod tests {
     }
 
     #[test]
+    fn paste_key_trims_to_a_single_token() {
+        let mut s = seeded();
+        // A clipboard key often carries a trailing newline and padding.
+        s.paste_key("  sk-abc123\n");
+        assert_eq!(s.fields[0].pending, "sk-abc123");
+        // Pasting again appends rather than replacing.
+        s.paste_key("tail");
+        assert_eq!(s.fields[0].pending, "sk-abc123tail");
+    }
+
+    #[test]
+    fn paste_key_ignores_blank_and_env_rows() {
+        let mut s = seeded();
+        s.paste_key("   \n  ");
+        assert_eq!(s.fields[0].pending, "", "whitespace-only paste is dropped");
+        s.set_env_var_keys(&[(FREE_CATALOG[0].id, "env-key".into())]);
+        s.paste_key("should-not-land");
+        assert_eq!(s.fields[0].pending, "", "env rows reject pasted text");
+    }
+
+    #[test]
     fn append_pending_ignores_blank() {
         let mut s = seeded();
         s.fields[0].pending = "   ".into();
