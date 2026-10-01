@@ -20,9 +20,11 @@
 #   4. Idle-CPU smoke probe (`scripts/probes/idle-cpu-probe.py`) — fails if an
 #      idle TUI session repaints at full rate, i.e. the
 #      `App::needs_fast_repaint()` / poll-timeout throttle regressed. Runs with
-#      a shortened window (5s warmup / 6s idle) to stay quick; Linux-only, and
+#      a shortened window (25s warmup / 6s idle) to stay quick; Linux-only, and
 #      skipped when the debug binary is missing or older than the staged Rust
-#      sources (a stale binary would silently test the previous code).
+#      sources (a stale binary would silently test the previous code). A warmup
+#      that never settled is retried once (slow-network startup sweep); a
+#      window that burned too much CPU is not, since it fails deterministically.
 #   5. Live eval gate (`scripts/eval/run_eval.py`, catalog-order fixture) —
 #      runs the real free-provider chain and blocks the commit if the model
 #      stops enumerating the FREE_CATALOG order (answer-quality regression).
@@ -153,15 +155,30 @@ if [ "${newest_staged_rs:-0}" -gt "$binary_mtime" ]; then
     exit 0
 fi
 
-python3 "$ROOT/scripts/probes/idle-cpu-probe.py" \
-    --binary "$BINARY" --warmup-secs 25 --idle-secs 6 --max-cpu-secs 1.2 \
-    >/dev/null 2>&1
+# Capture the probe's own output: its failure text separates a repaint
+# regression ("Ns window ... -> FAIL") from a warmup that never settled
+# ("never settled"), and only the latter is retryable.
+run_idle_cpu_probe() {
+    python3 "$ROOT/scripts/probes/idle-cpu-probe.py" \
+        --binary "$BINARY" --warmup-secs 25 --idle-secs 6 --max-cpu-secs 1.2 2>&1
+}
+
+probe_out="$(run_idle_cpu_probe)"
 status=$?
 if [ "$status" -eq 2 ]; then
     exit 0  # probe self-skipped (non-Linux)
 fi
-if [ "$status" -ne 0 ]; then
+# A warmup that never settled is a one-time startup sweep (health-key probe /
+# model discovery) stretched past the budget on a slow network, not a repaint
+# regression — a real regression fails the idle window deterministically, so a
+# retry cannot mask one. Retry that mode once; never retry a CPU-burn failure.
+if [ "$status" -ne 0 ] && printf '%s' "$probe_out" | grep -q 'never settled'; then
+    probe_out="$(run_idle_cpu_probe)"
+    status=$?
+fi
+if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then
     echo "pre-commit: idle-CPU probe FAILED."
+    printf '%s\n' "$probe_out" | sed 's/^/  /'
     echo "  Either the TUI repaints at full rate while idle (check"
     echo "  App::needs_fast_repaint() in crates/tui/src/app.rs and the poll"
     echo "  timeout in crates/cli/src/main.rs), or the process never went idle"
