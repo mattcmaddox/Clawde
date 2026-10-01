@@ -142,7 +142,7 @@ pub const TURN_COMPLETION_VERBS: &[&str] = &[
 #[inline]
 fn mix_seed(seed: usize) -> usize {
     const GOLDEN: usize = 0x9E37_79B9_7F4A_7C15;
-    (seed.wrapping_mul(GOLDEN) >> 32) as usize
+    seed.wrapping_mul(GOLDEN) >> 32
 }
 
 /// Select a random spinner verb.
