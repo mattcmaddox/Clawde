@@ -290,12 +290,11 @@ const THINKING_OPTION_KEYS: &[&str] = &[
     "chat_template_kwargs",
 ];
 
-/// Shape an explicit effort override onto the upstream's native thinking
-/// parameters.
+/// Re-shape the upstream's native thinking parameters for THIS chain entry.
 ///
 /// The query layer cannot know which upstream will serve a `free` request
 /// (the plan depends on cooldown / latency / task routing), so the chain
-/// re-assembles per-entry request parameters at dispatch time — mirroring the
+/// re-derives per-entry request parameters at dispatch time — mirroring the
 /// `build_provider_options` the query layer performs for direct providers.
 /// The per-upstream mapping is the shared [`shape_provider_thinking`] in
 /// `effort_shaping`, the same single source of truth the query layer uses;
@@ -303,14 +302,19 @@ const THINKING_OPTION_KEYS: &[&str] = &[
 /// `RetryingFreeStream` re-dispatch, and the hedge path).
 ///
 /// The query layer shapes `provider_options` against the *requested* provider
-/// and model. For a `free` request that provider is the composite id, and a
-/// model-gated arm can still fire — a pinned `cline/deepseek/...` trips the
-/// deepseek arm and writes `thinking`. Every attempt here re-dispatches the
+/// and model. For a `free` request that provider is the composite id, so the
+/// shaping it applies is not necessarily right for any given upstream: a
+/// model-gated arm still fires (a pinned `cline/deepseek/...` trips the
+/// deepseek arm and writes `thinking`), and an arm gated on a real provider
+/// id (`google`) never fires at all. Every attempt here re-dispatches the
 /// cloned request to a different upstream, so an uncleared parameter rides
 /// into a fallback whose API rejects it (Groq: "property 'thinking' is
-/// unsupported"). The stale keys are therefore removed first and the target
-/// upstream re-shaped from scratch; a fallback can never inherit the previous
-/// provider's thinking parameters.
+/// unsupported"). The stale keys are therefore removed first, then the target
+/// upstream is shaped from scratch with the *same* inputs the query layer had
+/// — including `effort_level == None`, because a model-gated arm (deepseek)
+/// and the google arm both shape on `None`. A fallback can never inherit the
+/// previous provider's thinking parameters, and the first, intended upstream
+/// keeps the shaping the query layer intended for it.
 fn shape_thinking_for_upstream(req: &mut ProviderRequest, entry: &FreeEntry) {
     use crate::providers::effort_shaping::shape_provider_thinking;
 
@@ -320,20 +324,19 @@ fn shape_thinking_for_upstream(req: &mut ProviderRequest, entry: &FreeEntry) {
         }
     }
 
-    // Only re-shape when the request carries an explicit effort override;
-    // otherwise the upstream's own default stands. The clear above still runs:
-    // a stale key can be present with no override, because the query layer's
-    // deepseek arm enables thinking for `effort_level == None` too.
-    let Some(effort_level) = req.effort_level else {
-        return;
-    };
-    // Requests assembled without provider options (test-constructed requests)
-    // must not silently drop the override — fuse into an object first.
-    if !req.provider_options.is_object() {
-        req.provider_options = serde_json::json!({});
-    }
-    let Some(options) = req.provider_options.as_object_mut() else {
-        return;
+    // Shape into the existing options object when there is one; otherwise into
+    // a scratch map and only fuse it in when the shaping actually writes
+    // something. This keeps a request that carries no options and gains no
+    // parameters (e.g. a non-reasoning model with no override) untouched rather
+    // than promoting `null` to an empty object.
+    let mut scratch = serde_json::Map::new();
+    let uses_scratch = !req.provider_options.is_object();
+    let options = if uses_scratch {
+        &mut scratch
+    } else {
+        req.provider_options
+            .as_object_mut()
+            .expect("checked is_object above")
     };
     // max_tokens is already clamped to the entry's cap by every dispatch
     // site before this runs, so Google's thinkingBudget clamp sees the
@@ -342,10 +345,13 @@ fn shape_thinking_for_upstream(req: &mut ProviderRequest, entry: &FreeEntry) {
         options,
         entry.upstream.id,
         &req.model.to_ascii_lowercase(),
-        Some(effort_level),
+        req.effort_level,
         None,
         Some(req.max_tokens),
     );
+    if uses_scratch && !scratch.is_empty() {
+        req.provider_options = serde_json::Value::Object(scratch);
+    }
 }
 
 /// Serialize provider-state writes in this process. The per-file lock below

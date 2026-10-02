@@ -8094,6 +8094,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shape_thinking_no_override_reshapes_for_the_matching_upstream() {
+        // Clearing must not be the whole story: with no effort override the
+        // query layer's deepseek arm still enables thinking, and the intended
+        // upstream (cline) must receive it. Only the stale keys shaped for a
+        // *different* provider are dropped.
+        let mut req = dummy_request("deepseek/deepseek-v4-flash");
+        assert!(req.effort_level.is_none(), "no override for this case");
+        // What `build_provider_options("free", <pinned model>, None, …)` would
+        // have baked before the chain chose an upstream.
+        req.provider_options = serde_json::json!({
+            "thinkingConfig": { "includeThoughts": true, "thinkingLevel": "high" },
+            "thinking": { "type": "enabled" },
+            "reasoningEffort": "high",
+        });
+        shape_thinking_for_upstream(&mut req, &entry("cline", true));
+        let opts = req.provider_options.as_object().expect("options");
+        assert!(
+            opts.get("thinkingConfig").is_none(),
+            "a stale key from another provider's shaping is cleared"
+        );
+        assert_eq!(opts["thinking"]["type"], serde_json::json!("enabled"));
+        assert_eq!(opts["reasoningEffort"], serde_json::json!("high"));
+    }
+
+    #[test]
+    fn shape_thinking_no_override_non_reasoning_model_leaves_options_null() {
+        // A request with no options that gains no parameters must stay `null`,
+        // not be promoted to an empty object by the scratch-map fusion.
+        let mut req = dummy_request("meta-llama/llama-3.3-70b-instruct");
+        assert!(req.provider_options.is_null());
+        shape_thinking_for_upstream(&mut req, &entry("sambanova", true));
+        assert!(
+            req.provider_options.is_null(),
+            "nothing shaped, so nothing to fuse: {:?}",
+            req.provider_options
+        );
+    }
+
     // -------------------------------------------------------------------
     // End-to-end: effort override → FreeProvider dispatch → upstream request
     // -------------------------------------------------------------------
@@ -8227,7 +8266,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_override_leaves_free_upstream_request_unshaped() {
+    async fn no_override_google_25_leaves_request_unshaped() {
+        // A google 2.5 model with no effort override has no thinking knob to
+        // write (the arm is a no-op for `None`), so the dispatched request must
+        // carry no options. Providers whose arm *does* shape on `None` (the
+        // model-gated deepseek arm) are covered above.
         let recorder = Arc::new(Mutex::new(None));
         let chain = vec![entry_with_request_recorder("google", recorder.clone())];
         let provider = FreeProvider::with_routing(
