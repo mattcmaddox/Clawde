@@ -226,10 +226,9 @@ impl PluginListState {
 /// When `state.show_detail` is true and a plugin is selected, a detail
 /// panel is rendered below the list.
 /// Returns the height consumed.
-#[allow(dead_code)]
 pub fn render_plugin_list(
     frame: &mut Frame,
-    state: &mut PluginListState,
+    state: &PluginListState,
     area: Rect,
     title: Option<&str>,
 ) -> u16 {
@@ -467,5 +466,64 @@ mod tests {
         s.move_up();
         s.move_down();
         assert_eq!(s.selected, 0);
+    }
+
+    /// Flatten a rendered terminal buffer into one string for content asserts.
+    fn rendered_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn plugin_list_renders_rows_and_enabled_count() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut items = make_items(2);
+        items[0].enabled = true;
+        items[1].enabled = false;
+        let state = PluginListState::new(items);
+        terminal
+            .draw(|frame| {
+                render_plugin_list(frame, &state, frame.area(), None);
+            })
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("Plugins (1/2 enabled)"), "{text}");
+        assert!(text.contains("plugin-0"), "{text}");
+        assert!(text.contains("plugin-1"), "{text}");
+    }
+
+    #[test]
+    fn plugin_list_renders_detail_panel_when_toggled() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut state = PluginListState::new(make_items(2));
+        state.show_detail = true;
+        terminal
+            .draw(|frame| {
+                render_plugin_list(frame, &state, frame.area(), None);
+            })
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("Plugin Detail"), "{text}");
+        assert!(text.contains("plugin-0"), "{text}");
+    }
+
+    #[test]
+    fn plugin_list_tiny_area_renders_nothing() {
+        // area.height < 3 bails out before any allocation, consuming no space.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 2)).unwrap();
+        let state = PluginListState::new(make_items(2));
+        terminal
+            .draw(|frame| {
+                assert_eq!(render_plugin_list(frame, &state, frame.area(), None), 0);
+            })
+            .unwrap();
     }
 }

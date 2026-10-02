@@ -2242,9 +2242,14 @@ impl PromptInputState {
         self.pending_images.push(img);
     }
 
-    /// Drain and return all pending image attachments (called at send time).
+    /// Drain and return the pending image attachments that are still selected
+    /// (called at send time). Images deselected in the attachments overlay
+    /// (`excluded`) are dropped without being sent.
     pub fn clear_images(&mut self) -> Vec<crate::image_paste::PastedImage> {
-        std::mem::take(&mut self.pending_images)
+        self.pending_images
+            .drain(..)
+            .filter(|img| !img.excluded)
+            .collect()
     }
 
     /// Insert a character at cursor position.
@@ -3926,10 +3931,14 @@ pub fn render_prompt_input(
             } else {
                 format!(" \u{f03e} {} ", img.label)
             };
-            pills.push(Span::styled(
-                label,
-                Style::default().fg(Color::Black).bg(Color::Cyan),
-            ));
+            // Deselected-in-the-overlay images are dimmed rather than hidden,
+            // so the user can see they exist but will not be sent.
+            let style = if img.excluded {
+                Style::default().fg(Color::DarkGray).bg(Color::Black)
+            } else {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            };
+            pills.push(Span::styled(label, style));
             pills.push(Span::raw(" "));
         }
         if !pills.is_empty() {

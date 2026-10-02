@@ -15,7 +15,9 @@ pub mod registry;
 
 // Re-export the most commonly used items at the crate root.
 pub use hooks::{register_plugin_hooks, HookOutcome, HookRegistry, RegisteredHook};
-pub use loader::{default_user_plugins_dir, discover_plugins, project_plugins_dir};
+pub use loader::{
+    default_user_plugins_dir, discover_plugins, discover_plugins_blocking, project_plugins_dir,
+};
 pub use manifest::{
     HookEventKind, PluginAuthor, PluginHookEntry, PluginHookMatcher, PluginHooksConfig,
     PluginLspServer, PluginManifest, PluginMcpServer, UserConfigValueType,
@@ -196,42 +198,41 @@ pub fn run_global_post_tool_hook(
 /// Returns a fully populated `PluginRegistry`.  Errors encountered during
 /// loading are stored in `registry.errors` rather than propagated, so the
 /// caller always gets a usable registry even when individual plugins fail.
+///
+/// Async wrapper over [`load_plugins_blocking`]; discovery performs no async
+/// work, so callers outside a runtime (the TUI event loop) use the blocking
+/// form directly.
 pub async fn load_plugins(
     project_dir: &Path,
     extra_paths: &[std::path::PathBuf],
 ) -> PluginRegistry {
+    load_plugins_blocking(project_dir, extra_paths)
+}
+
+/// Synchronous counterpart to [`load_plugins`].
+pub fn load_plugins_blocking(
+    project_dir: &Path,
+    extra_paths: &[std::path::PathBuf],
+) -> PluginRegistry {
     let mut registry = PluginRegistry::new();
-    let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
-
-    // 1. User-global plugins directory.
-    if let Some(user_dir) = default_user_plugins_dir() {
-        search_dirs.push(user_dir);
-    }
-
-    // 2. Project-local plugins directory.
-    search_dirs.push(project_plugins_dir(project_dir));
-
-    // 3. Extra paths (from --plugin-dir or settings).
-    search_dirs.extend_from_slice(extra_paths);
 
     // User plugins.
     if let Some(user_dir) = default_user_plugins_dir() {
-        let (plugins, errors) = discover_plugins(&[user_dir], PluginSource::User).await;
+        let (plugins, errors) = discover_plugins_blocking(&[user_dir], PluginSource::User);
         registry.extend(plugins, errors);
     }
 
     // Project plugins.
     let proj_dir = project_plugins_dir(project_dir);
-    let (plugins, errors) = discover_plugins(&[proj_dir], PluginSource::Project).await;
+    let (plugins, errors) = discover_plugins_blocking(&[proj_dir], PluginSource::Project);
     registry.extend(plugins, errors);
 
-    // Extra paths.
+    // Extra paths (from --plugin-dir or settings).
     for path in extra_paths {
-        let (plugins, errors) = discover_plugins(
+        let (plugins, errors) = discover_plugins_blocking(
             std::slice::from_ref(path),
             PluginSource::Extra(path.to_string_lossy().into_owned()),
-        )
-        .await;
+        );
         registry.extend(plugins, errors);
     }
 

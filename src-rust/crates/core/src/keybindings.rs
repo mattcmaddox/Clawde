@@ -71,7 +71,13 @@ pub enum KeyContext {
     DiffDialog,
     ModelPicker,
     Select,
+    /// The MCP server/tool view. A standalone context (rather than reusing
+    /// `Select`) so its `h`/`l` pane cycling never collides with `Select`'s
+    /// vim-preset `h`/`l` prev/next.
+    McpView,
     Plugin,
+    KeysDialog,
+    FreeModeDialog,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +316,9 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // and attaches any image found, without requiring Ctrl+V (which
         // Windows Terminal via SSH intercepts).
         ("alt+i", "pasteImage", KeyContext::Chat),
+        // Open the attachments overlay over the prompt's pending images
+        // (toggle inclusion, add, remove). Alt+Shift+I pairs with Alt+I.
+        ("alt+shift+i", "openAttachments", KeyContext::Chat),
         // Scrolling
         ("pageup", "scrollUp", KeyContext::Chat),
         ("pagedown", "scrollDown", KeyContext::Chat),
@@ -400,6 +409,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("j", "nextTask", KeyContext::Task),
         ("enter", "selectTask", KeyContext::Task),
         ("escape", "closeTask", KeyContext::Task),
+        ("q", "closeTask", KeyContext::Task),
         ("x", "toggleDone", KeyContext::Task),
         // ========== DIFF DIALOG ==========
         ("up", "prevDiff", KeyContext::DiffDialog),
@@ -425,21 +435,111 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("pagedown", "pageDown", KeyContext::Select),
         ("shift+k", "verticalPrev", KeyContext::Settings),
         ("shift+j", "verticalNext", KeyContext::Settings),
+        // ========== MODEL PICKER ==========
+        // Navigation/selection for the interactive model picker. Printable
+        // letters also type into the filter, so the handler applies a letter's
+        // action only in vim normal mode or while the filter is empty (see
+        // `handle_model_picker_navigation`). Tab/Shift+Tab (task sort), Enter
+        // (confirm), Ctrl+R (refresh), Backspace and digits stay with the
+        // picker's own handler.
+        ("escape", "cancel", KeyContext::ModelPicker),
+        ("home", "first", KeyContext::ModelPicker),
+        ("end", "last", KeyContext::ModelPicker),
+        ("up", "prev", KeyContext::ModelPicker),
         ("shift+k", "verticalPrev", KeyContext::ModelPicker),
+        ("k", "prev", KeyContext::ModelPicker),
+        ("ctrl+p", "prev", KeyContext::ModelPicker),
+        ("down", "next", KeyContext::ModelPicker),
         ("shift+j", "verticalNext", KeyContext::ModelPicker),
+        ("j", "next", KeyContext::ModelPicker),
+        ("ctrl+n", "next", KeyContext::ModelPicker),
+        ("left", "effortPrev", KeyContext::ModelPicker),
+        ("h", "effortPrev", KeyContext::ModelPicker),
+        ("right", "effortNext", KeyContext::ModelPicker),
+        ("l", "effortNext", KeyContext::ModelPicker),
         ("enter", "select", KeyContext::Select),
         ("escape", "cancel", KeyContext::Select),
         ("/", "search", KeyContext::Select),
+        // ========== MCP VIEW ==========
+        // Its own context (not `Select`) so `h`/`l` cycle panes without
+        // colliding with `Select`'s vim-preset `h`/`l` prev/next. `j`/`k` are
+        // deliberately absent: in this view they are conditional (they type
+        // into the tool filter once it has text), so the view's own handler
+        // applies them behind that guard.
+        ("escape", "cancel", KeyContext::McpView),
+        ("up", "prev", KeyContext::McpView),
+        ("down", "next", KeyContext::McpView),
+        ("tab", "cyclePane", KeyContext::McpView),
+        ("left", "cyclePane", KeyContext::McpView),
+        ("right", "cyclePane", KeyContext::McpView),
+        ("h", "cyclePane", KeyContext::McpView),
+        ("l", "cyclePane", KeyContext::McpView),
+        ("e", "toggleError", KeyContext::McpView),
+        ("a", "startAuth", KeyContext::McpView),
+        ("r", "reconnect", KeyContext::McpView),
         // ========== PLUGIN & ATTACHMENTS ==========
         ("up", "prev", KeyContext::Plugin),
         ("down", "next", KeyContext::Plugin),
         ("shift+k", "verticalPrev", KeyContext::Plugin),
         ("shift+j", "verticalNext", KeyContext::Plugin),
+        ("k", "prev", KeyContext::Plugin),
+        ("j", "next", KeyContext::Plugin),
         ("enter", "select", KeyContext::Plugin),
         ("escape", "cancel", KeyContext::Plugin),
+        ("up", "prev", KeyContext::Attachments),
+        ("down", "next", KeyContext::Attachments),
+        ("shift+k", "verticalPrev", KeyContext::Attachments),
+        ("shift+j", "verticalNext", KeyContext::Attachments),
+        ("k", "prev", KeyContext::Attachments),
+        ("j", "next", KeyContext::Attachments),
+        ("escape", "cancel", KeyContext::Attachments),
+        ("q", "cancel", KeyContext::Attachments),
         ("space", "toggle", KeyContext::Attachments),
         ("a", "addAttachment", KeyContext::Attachments),
         ("r", "removeAttachment", KeyContext::Attachments),
+        // ========== /keys MANAGEMENT DIALOG ==========
+        // Navigation/selection for the `/keys` dialog. Printable letters also
+        // type key text, so the handler only applies a letter's action while
+        // the condition that keeps it out of text entry holds (see
+        // `handle_keys_dialog_navigation`). h/l walk the expanded key list.
+        ("escape", "cancel", KeyContext::KeysDialog),
+        ("up", "prev", KeyContext::KeysDialog),
+        ("shift+tab", "prev", KeyContext::KeysDialog),
+        ("shift+k", "verticalPrev", KeyContext::KeysDialog),
+        ("k", "prev", KeyContext::KeysDialog),
+        ("down", "next", KeyContext::KeysDialog),
+        ("shift+j", "verticalNext", KeyContext::KeysDialog),
+        ("j", "next", KeyContext::KeysDialog),
+        ("left", "prevKey", KeyContext::KeysDialog),
+        ("h", "prevKey", KeyContext::KeysDialog),
+        ("right", "nextKey", KeyContext::KeysDialog),
+        ("l", "nextKey", KeyContext::KeysDialog),
+        ("enter", "select", KeyContext::KeysDialog),
+        ("ctrl+enter", "select", KeyContext::KeysDialog),
+        ("backspace", "backspace", KeyContext::KeysDialog),
+        ("delete", "delete", KeyContext::KeysDialog),
+        // ========== CONNECT-FREE DIALOG ==========
+        // Navigation/selection for the Connect-Free upstream dialog. h/l move
+        // the horizontal node cursor (new-key line ↔ key dots), j/k move
+        // between upstream rows; these are the modes the legacy vim-off paths
+        // used, so they stay in the base table rather than the Vim preset.
+        ("escape", "cancel", KeyContext::FreeModeDialog),
+        ("up", "prev", KeyContext::FreeModeDialog),
+        ("shift+tab", "prev", KeyContext::FreeModeDialog),
+        ("shift+k", "verticalPrev", KeyContext::FreeModeDialog),
+        ("k", "prev", KeyContext::FreeModeDialog),
+        ("down", "next", KeyContext::FreeModeDialog),
+        ("shift+j", "verticalNext", KeyContext::FreeModeDialog),
+        ("j", "next", KeyContext::FreeModeDialog),
+        ("left", "prevKey", KeyContext::FreeModeDialog),
+        ("right", "nextKey", KeyContext::FreeModeDialog),
+        ("h", "prevKey", KeyContext::FreeModeDialog),
+        ("shift+h", "prevKey", KeyContext::FreeModeDialog),
+        ("l", "nextKey", KeyContext::FreeModeDialog),
+        ("shift+l", "nextKey", KeyContext::FreeModeDialog),
+        ("enter", "select", KeyContext::FreeModeDialog),
+        ("backspace", "backspace", KeyContext::FreeModeDialog),
+        ("delete", "delete", KeyContext::FreeModeDialog),
     ];
 
     defaults
@@ -1234,6 +1334,9 @@ mod tests {
             KeyContext::DiffDialog,
             KeyContext::Select,
             KeyContext::Settings,
+            KeyContext::KeysDialog,
+            KeyContext::FreeModeDialog,
+            KeyContext::ModelPicker,
         ] {
             assert!(bindings.iter().any(|binding| {
                 binding.context == context
@@ -1246,6 +1349,74 @@ mod tests {
                     && binding.action.as_deref() == Some("verticalNext")
             }));
         }
+    }
+
+    #[test]
+    fn test_dialog_navigation_contexts_are_registered() {
+        let resolver = KeybindingResolver::new(&UserKeybindings::default());
+        let cases = [
+            (KeyContext::KeysDialog, "j", "next"),
+            (KeyContext::KeysDialog, "k", "prev"),
+            (KeyContext::KeysDialog, "h", "prevKey"),
+            (KeyContext::KeysDialog, "l", "nextKey"),
+            (KeyContext::KeysDialog, "up", "prev"),
+            (KeyContext::KeysDialog, "shift+tab", "prev"),
+            (KeyContext::KeysDialog, "enter", "select"),
+            (KeyContext::KeysDialog, "escape", "cancel"),
+            (KeyContext::KeysDialog, "delete", "delete"),
+            (KeyContext::FreeModeDialog, "h", "prevKey"),
+            (KeyContext::FreeModeDialog, "l", "nextKey"),
+            (KeyContext::FreeModeDialog, "down", "next"),
+            (KeyContext::FreeModeDialog, "escape", "cancel"),
+            (KeyContext::McpView, "h", "cyclePane"),
+            (KeyContext::McpView, "l", "cyclePane"),
+            (KeyContext::McpView, "tab", "cyclePane"),
+            (KeyContext::McpView, "up", "prev"),
+            (KeyContext::McpView, "down", "next"),
+            (KeyContext::McpView, "escape", "cancel"),
+            (KeyContext::McpView, "e", "toggleError"),
+            (KeyContext::McpView, "a", "startAuth"),
+            (KeyContext::McpView, "r", "reconnect"),
+        ];
+        for (context, chord, action) in cases {
+            let ks = parse_keystroke(chord).unwrap();
+            assert!(
+                matches!(
+                    resolver.resolve_single(&ks, &context),
+                    Some(KeybindingResult::Action(ref a)) if a.as_str() == action
+                ),
+                "{chord} in {context:?} should resolve to {action}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_view_keeps_h_l_pane_cycling_under_the_vim_preset() {
+        // The whole point of `McpView`: Select's vim-preset h/l prev/next must
+        // not leak in, while Select itself still gets them.
+        let user = UserKeybindings {
+            preset: KeybindingPreset::Vim,
+            ..UserKeybindings::default()
+        };
+        let resolver = KeybindingResolver::new(&user);
+        for chord in ["h", "l"] {
+            let ks = parse_keystroke(chord).unwrap();
+            assert!(
+                matches!(
+                    resolver.resolve_single(&ks, &KeyContext::McpView),
+                    Some(KeybindingResult::Action(ref a)) if a == "cyclePane"
+                ),
+                "{chord} in McpView should cycle panes under the vim preset"
+            );
+        }
+        let h = parse_keystroke("h").unwrap();
+        assert!(
+            matches!(
+                resolver.resolve_single(&h, &KeyContext::Select),
+                Some(KeybindingResult::Action(ref a)) if a == "prev"
+            ),
+            "Select should still get vim h/l prev/next"
+        );
     }
 
     #[test]

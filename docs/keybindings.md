@@ -36,10 +36,15 @@ These bindings are active in all contexts.
 | `Ctrl+C` | interrupt | Interrupt the current operation (non-rebindable) |
 | `Ctrl+D` | exit | Exit Clawde (non-rebindable) |
 | `Ctrl+L` | redraw | Redraw the terminal screen |
+| `Ctrl+/` | showKeybindings | Open the keybinding cheat-sheet overlay |
 | `Alt+R` | historySearch | Open interactive history search |
 | `Alt+B` | createBranch | Create a new git branch |
+| `Alt+C` | compact | Compact the conversation |
 | `Alt+G` | openKatbanControls | Open the Katban controls menu (links, boards, IPs) |
+| `Alt+S` | showSources | Toggle the sources display |
 | `Alt+/` | openHelp | Open the help panel |
+| `Alt+Shift+H` | clearFollowupHistory | Clear the followup history |
+| `Alt+Shift+U` | clearFollowupUsage | Clear the followup usage counters |
 
 ### Chat Context
 
@@ -48,38 +53,43 @@ These bindings are active when focus is in the chat input field.
 | Key | Action | Description |
 |-----|--------|-------------|
 | `Enter` | submit | Submit the current message to the model |
-| `Shift+Enter` | newline | Insert a literal newline without submitting |
-| `Ctrl+J` | newline | Newline (fallback for terminals without CSI-u protocol) |
-| `Up` | historyPrev | Navigate to the previous message in input history |
-| `Down` / `Ctrl+I` | historyNext | Navigate to the next message in input history |
-| `Ctrl+O` | toggleThinkingExpand | Expand or collapse all thinking blocks |
-| `Tab` | cycleAgentMode | Complete the open suggestion, otherwise cycle the agent mode (build → plan → image). Text already in the input is kept |
-| `Shift+Tab` | cyclePermissionMode | Cycle the permission mode (Default → Accept edits → Bypass → Default) |
-| `Page Up` | scrollUp | Scroll the conversation view up one page |
-| `Page Down` | scrollDown | Scroll the conversation view down one page |
+| `Shift+Enter` / `Ctrl+J` / `Alt+Enter` | newline | Insert a literal newline without submitting (`Ctrl+J` is the fallback for terminals without the CSI-u/kitty protocol) |
 | `Home` / `Cmd+Left` / `Ctrl+A` | goLineStart | Move cursor to beginning of line |
 | `End` / `Cmd+Right` / `Ctrl+E` | goLineEnd | Move cursor to end of line |
 | `Ctrl+Left` / `Alt+B` | moveWordBackward | Move one word left |
 | `Ctrl+Right` / `Alt+F` | moveWordForward | Move one word right |
-| `Alt+Left` | previousMessage | Jump to previous user/assistant message |
-| `Alt+Right` | nextMessage | Jump to next user/assistant message |
-| `Alt+M` | openModelPicker | Open the interactive model picker |
-| `Ctrl+K` | openCommandPalette | Open the slash command palette |
-| `Alt+R` | historySearch | Search command history |
-| `Alt+.` | jumpToPreviousError | Jump to previous error / issue |
-| `Alt+N` | jumpToNextError | Jump to next error / issue |
-| `Ctrl+U` | killToStart | Delete from cursor to beginning of line |
 | `Ctrl+W` / `Alt+Backspace` | killWord | Delete the word before the cursor |
 | `Alt+D` | deleteWord | Delete the word after the cursor |
-| `Ctrl+H` | deleteCharBefore | Delete character before cursor |
-| `Ctrl+L` | clearLine | Clear current input line |
+| `Ctrl+H` | deleteCharBefore | Delete the character before the cursor |
+| `Ctrl+U` | killToStart | Delete from the cursor to the beginning of the line |
+| `Ctrl+Shift+L` | clearLine | Clear the current input line |
+| `Up` | historyPrev | Navigate to the previous entry in input history |
+| `Down` / `Ctrl+I` | historyNext | Navigate to the next entry in input history |
+| `Shift+K` / `Shift+J` | verticalPrev / verticalNext | Move the selection up / down in list widgets (resolved to the arrow keys) |
+| `Ctrl+O` | toggleThinkingExpand | Expand or collapse all thinking blocks |
+| `Alt+Left` | previousMessage | Jump to the previous user/assistant message |
+| `Alt+Right` | nextMessage | Jump to the next user/assistant message |
+| `Alt+N` | jumpToNextError | Jump to the next error / issue |
+| `Alt+.` | jumpToPreviousError | Jump to the previous error / issue |
+| `Tab` | cycleAgentMode | Complete the open suggestion, otherwise cycle the agent mode (build → plan → image). Text already in the input is kept |
+| `Shift+Tab` | cyclePermissionMode | Cycle the permission mode (Default → Accept edits → Bypass → Default) |
+| `Alt+P` | expandPaste | Expand a `[Pasted text #N]` placeholder |
+| `Alt+I` | pasteImage | Attach an image from the clipboard |
+| `Alt+Shift+I` | openAttachments | Open the attachments overlay (toggle / add / remove pending images) |
+| `Page Up` / `Page Down` | scrollUp / scrollDown | Scroll the conversation view up / down one page |
+| `Alt+M` | openModelPicker | Open the interactive model picker |
+| `Alt+Shift+M` | openModePicker | Open the mode picker |
+| `Ctrl+,` | openSettings | Open the settings screen |
+| `Ctrl+K` | openCommandPalette | Open the slash command palette |
 | `Alt+J` / `Alt+K` | openFreeModelPopup | Open the free-model dropdown (auto + every configured free upstream); Enter pins the selection |
-| `Alt+U` | cycleFreeUpstream | Cycle to next free-mode upstream (forward alias) |
+| `Alt+U` | cycleFreeUpstream | Cycle to the next free-mode upstream (forward alias) |
+| `Alt+T` | cycleFreeTask | Cycle the free-model task filter |
+| `Alt+O` | openOllamaConfig | Open the Ollama configuration screen |
 | `Alt+H` / `Alt+L` | effortDecrease / effortIncrease | Step reasoning down / up along the model's supported ladder (clamped, no wrap) |
 | `Alt+E` | openEffort | Open the effort/reasoning picker |
-| `Alt+P` | expandPaste | Expand paste placeholder |
+| `Tab H` / `Tab L` | effortDecrease / effortIncrease | Chord aliases for `Alt+H` / `Alt+L` |
 
-> **Modifier theme:** `Ctrl` = text editing, `Alt` = navigation + config. No `Ctrl+Shift` or `Alt+Shift` combos remain. Old `keybindings.json` files are auto-migrated.
+> **Modifier theme:** `Ctrl` drives text editing and app shortcuts; `Alt` drives navigation and configuration. A few shifted chords remain where they avoid a collision — `Ctrl+Shift+L` (clear line), `Alt+Shift+M` (mode picker), `Alt+Shift+I` (attachments overlay), and `Alt+Shift+H` / `Alt+Shift+U` (followup history / usage). Older `keybindings.json` files are auto-migrated.
 
 ### Confirmation Context
 
@@ -93,23 +103,93 @@ These bindings are active when Clawde is displaying a yes/no confirmation prompt
 | `Enter` | defaultAction | Accept the highlighted default option |
 | `Escape` | cancel | Cancel the prompt and deny the action |
 
+### Plugin Context
+
+Active while the plugin-list overlay (bare `/plugin`) is open.
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Up` / `k` | prev | Move the highlight up |
+| `Down` / `j` | next | Move the highlight down |
+| `Shift+K` / `Shift+J` | verticalPrev / verticalNext | Move the highlight up / down (resolved to the arrow keys) |
+| `Enter` | select | Show/hide the detail panel for the highlighted plugin |
+| `Escape` | cancel | Close the overlay |
+
+### Attachments Context
+
+Active while the attachments overlay (`Alt+Shift+I`) is open over the prompt's pending images.
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Up` / `k` | prev | Move the highlight up |
+| `Down` / `j` | next | Move the highlight down |
+| `Shift+K` / `Shift+J` | verticalPrev / verticalNext | Move the highlight up / down (resolved to the arrow keys) |
+| `Space` | toggle | Include / exclude the highlighted image from the next send |
+| `a` | addAttachment | Attach another image from the clipboard |
+| `r` | removeAttachment | Remove the highlighted image |
+| `Escape` / `q` | cancel | Close the overlay |
+
+### MCP View Context
+
+Active while the MCP server/tool view is open. It has its own context (rather
+than reusing `Select`) so `h`/`l` can cycle panes without colliding with
+`Select`'s vim-preset `h`/`l` prev/next.
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Up` | prev | Move the highlight up |
+| `Down` | next | Move the highlight down |
+| `Tab` / `Left` / `Right` / `h` / `l` | cyclePane | Cycle server list → tool list → tool detail |
+| `Escape` | cancel | Close the view |
+
+`j`/`k` are not bound here on purpose: in this view they are conditional (they
+type into the tool filter once it has text), so the view's own handler decides
+when they navigate versus type.
+
 ---
 
 ## Keybinding Contexts
 
-Clawde uses a context system so that the same key can have different effects depending on where focus is. A binding in a more specific context takes precedence over a binding in a broader context.
+Clawde uses a context system so that the same key can have different effects depending on where focus is. A key is resolved against the active context together with `Global`; where the same chord is bound in both, the context-specific binding wins.
+
+Context strings are the exact `KeyContext` variant names (PascalCase) from `crates/core/src/keybindings.rs` — the same values the `/keybindings` editor writes into `keybindings.json`.
+
+### Active contexts
+
+These are the contexts the TUI produces while handling keys today.
 
 | Context | Description |
 |---------|-------------|
-| `global` | Always active regardless of focus |
-| `chat` | Active when the chat input field has focus |
-| `confirmation` | Active when a permission confirmation dialog is open |
-| `modelPicker` | Active inside the model selection overlay |
-| `commandPalette` | Active inside the slash command palette overlay |
-| `search` | Active while the inline search bar is open |
-| `vim.normal` | Active in vim normal mode (when vim mode is enabled) |
-| `vim.insert` | Active in vim insert mode (when vim mode is enabled) |
-| `vim.visual` | Active in vim visual mode (when vim mode is enabled) |
+| `Global` | Available as a fallback from every context |
+| `Chat` | The chat input / prompt, and the fallback when no overlay is focused |
+| `Confirmation` | Permission requests, step 2 of the `/rewind` flow, and the import-config dialog |
+| `Help` | The help overlay |
+| `HistorySearch` | The history-search overlay |
+| `ThemePicker` | The theme picker and theme creator screens |
+| `Settings` | The settings screen |
+| `DiffDialog` | The diff viewer |
+| `Select` | Generic modal selects: agents menu, stats dialog |
+| `McpView` | The MCP server/tool view |
+| `KeysDialog` | The `/keys` key-management dialog |
+| `FreeModeDialog` | The Connect-Free upstream dialog |
+| `MessageSelector` | Step 1 of the `/rewind` flow (browse messages) |
+| `ModelPicker` | The model picker overlay (open with `Alt+M`, `/model` or `/models`) |
+| `Task` | The task-list overlay (`Ctrl+T`) |
+| `Plugin` | The plugin-list overlay (bare `/plugin`) |
+| `Attachments` | The attachments overlay (`Alt+Shift+I`) over the prompt's pending images |
+
+### Declared contexts
+
+These contexts exist in `KeyContext` and can be named in `keybindings.json`, but no UI currently produces them while handling keys, so a binding in one has no effect yet.
+
+| Context | Intended for |
+|---------|-------------|
+| `Autocomplete` | The prompt's suggestion / autocomplete list |
+| `Transcript` | The transcript pane |
+| `Tabs` | The tab bar |
+| `Footer` | The status footer |
+
+> **Vim mode is not a context.** It is the `vim` preset plus a per-dialog insert/normal state machine, so vim normal-mode `hjkl` come from the preset rather than a `vim.*` context.
 
 ---
 
@@ -131,7 +211,7 @@ For batch edits or scripted configuration, edit `~/.clawde/keybindings.json` dir
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "bindings": [
     {
       "context": "Chat",
@@ -157,7 +237,7 @@ Each binding object has:
 
 ### Schema Versioning and Smart Merge
 
-`keybindings.json` carries a top-level `schema_version` field (currently `2`). When Clawde's defaults change in a release, the file is auto-migrated on next launch:
+`keybindings.json` carries a top-level `schema_version` field (currently `3`). When Clawde's defaults change in a release, the file is auto-migrated on next launch:
 
 1. Clawde reads the file and compares `schema_version` against the bundled `KEYBINDINGS_SCHEMA_VERSION`.
 2. If the file is older, Clawde runs a **smart merge**:
@@ -189,7 +269,7 @@ Clawde supports chord bindings — multi-key sequences where you press a leader 
 
 ```json
 {
-  "context": "chat",
+  "context": "Chat",
   "action": "openModelPicker",
   "chord": ["ctrl+x", "ctrl+m"]
 }
@@ -203,7 +283,7 @@ Example — map `Ctrl+X Ctrl+C` to exit:
 
 ```json
 {
-  "context": "global",
+  "context": "Global",
   "action": "exit",
   "chord": ["ctrl+x", "ctrl+c"]
 }
@@ -303,6 +383,7 @@ A few dialogs have extra guards:
 
 - **Free-mode dialog:** `j`/`k`/`h`/`l` only navigate when the active field has no pending typed text, so you can't lose a partially typed key by moving rows.
 - **Ask-user dialog:** `j`/`k` navigate only when not typing a custom answer.
+- **Diff viewer:** it has no filter bar, so the `DiffDialog` context binds `j`/`k` to prev/next unconditionally — they navigate the file list or scroll the detail pane in either vim mode. (`h`/`l` are prev/next only under the vim preset.)
 
 ---
 
@@ -412,7 +493,7 @@ If you want a binding that fires only when the `A` character is actually produce
 
 ```json
 {
-  "context": "chat",
+  "context": "Chat",
   "action": "myAction",
   "key": "ctrl+char:a"
 }

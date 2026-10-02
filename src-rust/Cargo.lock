@@ -1165,6 +1165,7 @@ dependencies = [
  "clawde-core",
  "clawde-katban",
  "clawde-mcp",
+ "clawde-plugins",
  "clawde-query",
  "clawde-tools",
  "cpal",

@@ -26,6 +26,9 @@ pub struct PastedImage {
     pub label: String,
     /// Original dimensions, if known.
     pub dimensions: Option<(u32, u32)>,
+    /// Whether the user has deselected this attachment in the attachments
+    /// overlay. Excluded images are dropped at send time (`clear_images`).
+    pub excluded: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +196,7 @@ close access fp"#,
             label: "clipboard.png".to_string(),
             path: tmp,
             dimensions: dims,
+            excluded: false,
         })
     } else {
         let _ = std::fs::remove_file(&tmp);
@@ -266,6 +270,7 @@ fn save_clipboard_bytes(data: Vec<u8>) -> Option<PastedImage> {
         label: format!("clipboard.{}", ext),
         path: tmp,
         dimensions: dims,
+        excluded: false,
     })
 }
 
@@ -308,6 +313,7 @@ fn read_image_windows() -> Option<PastedImage> {
             label: "clipboard.png".to_string(),
             path: tmp,
             dimensions: dims,
+            excluded: false,
         })
     } else {
         let _ = std::fs::remove_file(&tmp);
@@ -643,6 +649,7 @@ mod tests {
             path: PathBuf::from("/tmp/test.png"),
             label: "test.png".to_string(),
             dimensions: Some((800, 600)),
+            excluded: false,
         };
         let cloned = img.clone();
         assert_eq!(cloned.label, "test.png");

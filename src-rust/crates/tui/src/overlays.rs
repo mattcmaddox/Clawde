@@ -2207,6 +2207,7 @@ fn context_label(ctx: &clawde_core::keybindings::KeyContext) -> &'static str {
         KeyContext::Task => "Tasks",
         KeyContext::DiffDialog => "Diff Viewer",
         KeyContext::Select => "Select Dialogs",
+        KeyContext::McpView => "MCP View",
         KeyContext::Plugin => "Plugin",
         KeyContext::HistorySearch => "History Search",
         KeyContext::Settings => "Settings",
@@ -2215,6 +2216,8 @@ fn context_label(ctx: &clawde_core::keybindings::KeyContext) -> &'static str {
         KeyContext::Tabs => "Tabs",
         KeyContext::Attachments => "Attachments",
         KeyContext::Footer => "Footer",
+        KeyContext::KeysDialog => "/keys Dialog",
+        KeyContext::FreeModeDialog => "Connect Free",
     }
 }
 
@@ -2500,6 +2503,76 @@ pub fn render_keybindings_overlay(
         ))),
         layout.footer_area,
     );
+}
+
+// ============================================================================
+// Attachments overlay
+// ============================================================================
+
+/// Render the prompt's pending image attachments as a navigable list.
+///
+/// The `[x]` / `[ ]` marker shows whether each image is included in the next
+/// send (`space` toggles it); the highlighted row is the one `r` removes and
+/// `a` adds another clipboard image.
+pub fn render_attachments_overlay(
+    frame: &mut Frame,
+    images: &[crate::image_paste::PastedImage],
+    selected: usize,
+    area: Rect,
+) {
+    let dialog_width = 76u16.min(area.width.saturating_sub(2)).max(20);
+    let dialog_height = (images.len() as u16 + 5).min(area.height.saturating_sub(2));
+    let dialog = centered_rect(dialog_width, dialog_height, area);
+
+    frame.render_widget(Clear, dialog);
+
+    let included = images.iter().filter(|i| !i.excluded).count();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " Attachments ({}/{} included) ",
+            included,
+            images.len()
+        ))
+        .border_style(Style::default().fg(CLAWDE_ACCENT));
+    let inner = block.inner(dialog);
+    frame.render_widget(block, dialog);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, img) in images.iter().enumerate() {
+        let is_selected = i == selected;
+        let marker = if img.excluded { "[ ]" } else { "[x]" };
+        let dims = img
+            .dimensions
+            .map(|(w, h)| format!(" {}x{}", w, h))
+            .unwrap_or_default();
+        let style = if img.excluded {
+            Style::default().fg(CLAWDE_MUTED)
+        } else {
+            Style::default().fg(CLAWDE_TEXT)
+        };
+        let mut line = Line::from(vec![
+            Span::styled(format!(" {} ", marker), style),
+            Span::styled(format!("{}{}", img.label, dims), style),
+        ]);
+        if is_selected {
+            line = line.style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+        lines.push(line);
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " [space] toggle   [a] add   [r] remove   [j/k] move   [esc] close",
+        Style::default()
+            .fg(CLAWDE_MUTED)
+            .add_modifier(Modifier::ITALIC),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ============================================================================
@@ -2905,6 +2978,48 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(23, 20)).unwrap();
         terminal
             .draw(|frame| render_message_selector(frame, &overlay, frame.area()))
+            .unwrap(); // no panic == pass
+    }
+
+    // --- Attachments overlay -------------------------------------------
+
+    fn pasted_image(label: &str, excluded: bool) -> crate::image_paste::PastedImage {
+        crate::image_paste::PastedImage {
+            path: std::path::PathBuf::from(format!("/tmp/{label}")),
+            label: label.to_string(),
+            dimensions: Some((640, 480)),
+            excluded,
+        }
+    }
+
+    #[test]
+    fn attachments_overlay_renders_markers_and_included_count() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let images = vec![pasted_image("a.png", false), pasted_image("b.png", true)];
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| render_attachments_overlay(frame, &images, 1, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(text.contains("Attachments (1/2 included)"), "{text}");
+        assert!(text.contains("[x]"), "{text}");
+        assert!(text.contains("[ ]"), "{text}");
+        assert!(text.contains("a.png"), "{text}");
+        assert!(text.contains("b.png"), "{text}");
+    }
+
+    #[test]
+    fn attachments_overlay_empty_renders_without_panic() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| render_attachments_overlay(frame, &[], 0, frame.area()))
             .unwrap(); // no panic == pass
     }
 }

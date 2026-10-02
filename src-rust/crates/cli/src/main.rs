@@ -5948,6 +5948,7 @@ async fn run_interactive(
                                     path,
                                     label,
                                     dimensions,
+                                    excluded: false,
                                 });
                             }
                         }

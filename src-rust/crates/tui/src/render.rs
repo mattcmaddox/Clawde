@@ -44,7 +44,7 @@ use crate::overlays::{
     render_global_search, render_help_overlay, render_history_search_overlay,
     render_keybindings_overlay, render_rewind_flow, CLAWDE_ACCENT,
 };
-use crate::plugin_views::render_plugin_hints;
+use crate::plugin_views::{render_plugin_hints, render_plugin_list};
 use crate::prompt_input::{input_height, render_prompt_input, InputMode, TypeaheadSource, VimMode};
 use crate::rustail::rustail_lines;
 use crate::rustail_editor::render_rustail_editor;
@@ -913,6 +913,24 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // Tasks overlay (Ctrl+T)
     if app.tasks_overlay.visible {
         render_tasks_overlay(frame, &app.tasks_overlay, size);
+    }
+
+    // Plugin list overlay (bare `/plugin`)
+    if let Some(state) = app.plugin_list_overlay.as_ref() {
+        let dialog_width = 100u16.min(size.width.saturating_sub(4)).max(20);
+        let dialog_height = 28u16.min(size.height.saturating_sub(2)).max(3);
+        let area = crate::overlays::centered_rect(dialog_width, dialog_height, size);
+        render_plugin_list(frame, state, area, None);
+    }
+
+    // Attachments overlay (Alt+Shift+I)
+    if app.attachments_overlay_visible {
+        crate::overlays::render_attachments_overlay(
+            frame,
+            &app.prompt_input.pending_images,
+            app.attachments_selected,
+            size,
+        );
     }
 
     // Keybinding cheat-sheet overlay (Ctrl+/)

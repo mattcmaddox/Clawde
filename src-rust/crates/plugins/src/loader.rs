@@ -34,7 +34,19 @@ pub fn project_plugins_dir(project_dir: &Path) -> PathBuf {
 ///
 /// Each directory in `search_dirs` is scanned at depth 1: every immediate
 /// subdirectory (or manifest file) is treated as a candidate plugin.
+///
+/// Async wrapper over [`discover_plugins_blocking`]. Discovery performs no
+/// async work, so callers outside a runtime (the TUI event loop) use the
+/// blocking form directly.
 pub async fn discover_plugins(
+    search_dirs: &[PathBuf],
+    source: PluginSource,
+) -> (Vec<LoadedPlugin>, Vec<PluginError>) {
+    discover_plugins_blocking(search_dirs, source)
+}
+
+/// Synchronous counterpart to [`discover_plugins`].
+pub fn discover_plugins_blocking(
     search_dirs: &[PathBuf],
     source: PluginSource,
 ) -> (Vec<LoadedPlugin>, Vec<PluginError>) {

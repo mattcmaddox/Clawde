@@ -16,7 +16,7 @@ use crate::overlays::{
     GlobalSearchState, HelpEntry, HelpOverlay, HistorySearchOverlay, KeybindingsOverlayState,
     RewindFlowOverlay, SelectorMessage,
 };
-use crate::plugin_views::PluginHintBanner;
+use crate::plugin_views::{PluginHintBanner, PluginListItem, PluginListState};
 use crate::prompt_input::{InputMode, PromptInputState, VimMode};
 use crate::render;
 use crate::rustail_editor::{RustailEditAction, RustailEditor};
@@ -1158,6 +1158,47 @@ fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
     })
 }
 
+/// Map a loaded plugin registry to the display records the plugin-list overlay
+/// renders. Kept here (rather than in `plugin_views`) so the widget module stays
+/// free of a `clawde-plugins` dependency.
+fn plugin_items_from_registry(registry: &clawde_plugins::PluginRegistry) -> Vec<PluginListItem> {
+    /// Count `.md` files directly inside a directory (one command per file).
+    fn count_command_files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| {
+                        e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "md")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    registry
+        .all()
+        .iter()
+        .map(|p| PluginListItem {
+            name: p.name.clone(),
+            version: p.manifest.version.clone().unwrap_or_default(),
+            description: p.manifest.description.clone().unwrap_or_default(),
+            enabled: p.enabled,
+            source: p.source_id.clone(),
+            command_count: p
+                .commands_path
+                .as_deref()
+                .map(count_command_files)
+                .unwrap_or(0),
+            hook_count: p
+                .hooks_config
+                .as_ref()
+                .map(|h| h.events.values().map(|m| m.len()).sum())
+                .unwrap_or(0),
+        })
+        .collect()
+}
+
 /// Convert configured semantic vertical-navigation aliases into ordinary arrow
 /// events before legacy dialog handlers run. This keeps Shift+J/K configurable:
 /// an explicit user unbinding or remap prevents the conversion.
@@ -1586,6 +1627,14 @@ pub struct App {
     pub session_branching: crate::session_branching::SessionBranchingState,
     /// Task progress overlay (Ctrl+T) — shows task status with toggle capability.
     pub tasks_overlay: TasksOverlay,
+    /// Plugin list overlay (bare `/plugin`) — navigable list of loaded
+    /// plugins. `None` while hidden; keys route through `KeyContext::Plugin`.
+    pub plugin_list_overlay: Option<PluginListState>,
+    /// Attachments overlay (Alt+Shift+I) — navigable list of the prompt's
+    /// pending image attachments. Keys route through `KeyContext::Attachments`.
+    pub attachments_overlay_visible: bool,
+    /// Highlighted row in the attachments overlay.
+    pub attachments_selected: usize,
     /// Export format picker dialog (/export).
     pub export_dialog: ExportDialogState,
     /// Context window / rate limit visualization overlay (/context).
@@ -2378,6 +2427,9 @@ impl App {
             session_browser: SessionBrowserState::new(),
             session_branching: crate::session_branching::SessionBranchingState::new(),
             tasks_overlay: TasksOverlay::new(),
+            plugin_list_overlay: None,
+            attachments_overlay_visible: false,
+            attachments_selected: 0,
             export_dialog: ExportDialogState::new(),
             context_viz: ContextVizState::new(),
             compare_dialog: CompareDialogState::new(),
@@ -3183,6 +3235,42 @@ impl App {
 
         self.keys_dialog.open(&existing);
         self.keys_dialog.set_env_var_keys(&env_var_keys);
+    }
+
+    /// Open the navigable plugin list overlay (bare `/plugin`).
+    ///
+    /// Loads the registry synchronously — plugin discovery performs no async
+    /// work (`clawde_plugins::load_plugins_blocking`). The list's navigation
+    /// keys route through `KeyContext::Plugin`.
+    pub fn open_plugin_list(&mut self) {
+        let project_dir = self
+            .current_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let registry = clawde_plugins::load_plugins_blocking(project_dir, &[]);
+        let items = plugin_items_from_registry(&registry);
+        self.plugin_list_overlay = Some(PluginListState::new(items));
+    }
+
+    /// Open the attachments overlay (Alt+Shift+I) over the prompt's pending
+    /// image attachments. Clamps the selection into range and is a no-op with
+    /// an empty list so the overlay cannot open onto nothing.
+    pub fn open_attachments_overlay(&mut self) {
+        if self.prompt_input.pending_images.is_empty() {
+            self.status_message = Some("No image attachments. Use Alt+I to paste one.".to_string());
+            return;
+        }
+        self.attachments_selected = self
+            .attachments_selected
+            .min(self.prompt_input.pending_images.len() - 1);
+        self.attachments_overlay_visible = true;
+    }
+
+    /// Close the attachments overlay and reset its cursor.
+    fn close_attachments_overlay(&mut self) {
+        self.attachments_overlay_visible = false;
+        self.attachments_selected = 0;
     }
 
     /// Persist the `/keys` dialog's edited key map to the auth store, rebuild
@@ -4607,6 +4695,12 @@ impl App {
         if cmd == "chat" && !args.trim().is_empty() {
             return false;
         }
+        // Bare `/plugin` opens the navigable plugin-list overlay; subcommands
+        // (`/plugin list|info|enable|disable|install|reload`) stay at the
+        // commands layer so they still run and print.
+        if cmd == "plugin" && !args.trim().is_empty() {
+            return false;
+        }
         // `/ollama status` is an async command because it queries the native
         // Ollama endpoint; leave it for the commands/CLI layer instead of
         // treating it as the mode toggle.
@@ -5156,6 +5250,12 @@ impl App {
                 self.hooks_config_menu.open();
                 true
             }
+            "plugin" => {
+                // Bare `/plugin` (no args) opens the navigable overlay; the
+                // text listing lives behind `/plugin list`.
+                self.open_plugin_list();
+                true
+            }
             "import-config" => {
                 self.open_import_config_picker();
                 true
@@ -5468,6 +5568,8 @@ impl App {
         self.session_browser.close();
         self.session_branching.close();
         self.tasks_overlay.close();
+        self.plugin_list_overlay = None;
+        self.close_attachments_overlay();
         self.export_dialog.dismiss();
         self.context_viz.close();
         self.compare_dialog.close();
@@ -5499,6 +5601,8 @@ impl App {
         self.permission_request.is_some()
             || self.rewind_flow.visible
             || self.tasks_overlay.visible
+            || self.plugin_list_overlay.is_some()
+            || self.attachments_overlay_visible
             || self.keybindings_overlay.visible
             || self.help_overlay.visible
             || self.show_help
@@ -7307,57 +7411,17 @@ impl App {
                 .get(self.free_mode_dialog.active_idx)
                 .is_none_or(|f| f.pending.is_empty());
             let active_revealed = self.free_mode_dialog.active_is_revealed();
+            // Navigation/selection flows through the configurable keybindings
+            // (`FreeModeDialog` context). Text entry and the controls left
+            // hardcoded fall through to the match below.
+            if self.handle_free_mode_dialog_navigation(&key, active_pending_empty, active_revealed)
+            {
+                return false;
+            }
             match key.code {
-                KeyCode::Esc => {
-                    // Esc cascade: hide a revealed key → drop typed text → close.
-                    if !self.free_mode_dialog.unreveal_active()
-                        && !self.free_mode_dialog.clear_pending()
-                    {
-                        self.free_mode_dialog.close();
-                    }
-                }
                 KeyCode::Tab => {
                     // Tab toggles between show-all and show-configured-only view
                     self.free_mode_dialog.toggle_show_all();
-                }
-                KeyCode::Down => {
-                    self.free_mode_dialog.move_next();
-                }
-                KeyCode::Char('j') if self.prompt_input.vim_enabled && active_pending_empty => {
-                    self.free_mode_dialog.move_next();
-                }
-                KeyCode::Up | KeyCode::BackTab => {
-                    self.free_mode_dialog.move_prev();
-                }
-                KeyCode::Char('k') if self.prompt_input.vim_enabled && active_pending_empty => {
-                    self.free_mode_dialog.move_prev();
-                }
-                // An expanded row: ←/→ (h/l in vim normal mode) move the
-                // key-selection cursor. Otherwise they move the node cursor
-                // across the new-key line and the key dots.
-                KeyCode::Right if active_revealed => {
-                    self.free_mode_dialog.select_next_key();
-                }
-                KeyCode::Right => {
-                    self.free_mode_dialog.move_node_next();
-                }
-                KeyCode::Char('l') if active_pending_empty && active_revealed => {
-                    self.free_mode_dialog.select_next_key();
-                }
-                KeyCode::Char('l') if self.prompt_input.vim_enabled && active_pending_empty => {
-                    self.free_mode_dialog.move_node_next();
-                }
-                KeyCode::Left if active_revealed => {
-                    self.free_mode_dialog.select_prev_key();
-                }
-                KeyCode::Left => {
-                    self.free_mode_dialog.move_node_prev();
-                }
-                KeyCode::Char('h') if active_pending_empty && active_revealed => {
-                    self.free_mode_dialog.select_prev_key();
-                }
-                KeyCode::Char('h') if self.prompt_input.vim_enabled && active_pending_empty => {
-                    self.free_mode_dialog.move_node_prev();
                 }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // Ctrl+Enter — commit everything and connect Free mode.
@@ -7368,22 +7432,6 @@ impl App {
                 {
                     // Some terminals report Ctrl+Enter as a control character.
                     self.connect_free_mode();
-                }
-                KeyCode::Enter => {
-                    self.free_mode_dialog.enter_active();
-                }
-                KeyCode::Backspace | KeyCode::Delete if !self.prompt_input.vim_enabled => {
-                    // Delete on a revealed key asks for confirmation; otherwise
-                    // it edits the typed new-key text.
-                    if !self.free_mode_dialog.try_open_delete_confirm() {
-                        self.free_mode_dialog.backspace();
-                    }
-                }
-                KeyCode::Delete if self.prompt_input.vim_enabled => {
-                    // With vim active, Backspace edits only in insert mode (the
-                    // guard above); Delete stays an action — offer the
-                    // delete-confirm without falling back to text editing.
-                    self.free_mode_dialog.try_open_delete_confirm();
                 }
                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 's' => {
                     // Ctrl+S: Apply/save keys without closing the dialog
@@ -7414,63 +7462,11 @@ impl App {
                     // Toggle enabled/disabled for the active upstream
                     self.free_mode_dialog.toggle_enabled();
                 }
-                KeyCode::Char(c)
-                    if self.prompt_input.vim_enabled
-                        && self.free_mode_dialog.pending_is_empty()
-                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
-                {
-                    // Vim normal mode: hjkl navigate, letters do NOT type
-                    // (typing happens in insert mode via the guard above).
-                    // Navigation is only offered while the new-key buffer is
-                    // empty — moving rows discards typed text, so hjkl must
-                    // never silently throw away a partially-typed key.
-                    match c.to_ascii_lowercase() {
-                        'j' => {
-                            self.free_mode_dialog.move_next();
-                            return false;
-                        }
-                        'k' => {
-                            self.free_mode_dialog.move_prev();
-                            return false;
-                        }
-                        'h' => {
-                            self.free_mode_dialog.move_node_prev();
-                            return false;
-                        }
-                        'l' => {
-                            self.free_mode_dialog.move_node_next();
-                            return false;
-                        }
-                        _ => {}
-                    }
-                }
                 KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
-                    // Legacy (vim off): h/j/k/l navigate only while the new-key
-                    // buffer is empty — once a key is being typed those letters
-                    // belong to the key, not the cursor. Arrow keys always
-                    // navigate.
-                    let lower = c.to_ascii_lowercase();
-                    if self.free_mode_dialog.pending_is_empty() {
-                        match lower {
-                            'j' => {
-                                self.free_mode_dialog.move_next();
-                                return false;
-                            }
-                            'k' => {
-                                self.free_mode_dialog.move_prev();
-                                return false;
-                            }
-                            'h' => {
-                                self.free_mode_dialog.move_node_prev();
-                                return false;
-                            }
-                            'l' => {
-                                self.free_mode_dialog.move_node_next();
-                                return false;
-                            }
-                            _ => {}
-                        }
-                    }
+                    // Text entry (vim off). With vim on, text reaches this arm
+                    // only in insert mode, which the vim search state machine
+                    // consumed above; normal-mode letters were handled as
+                    // navigation by `handle_free_mode_dialog_navigation`.
                     let c = self.shift_normalize(c, key.modifiers);
                     self.free_mode_dialog.insert_char(c);
                 }
@@ -7527,57 +7523,12 @@ impl App {
             }
             let active_pending_empty = self.keys_dialog.pending_is_empty();
             let active_revealed = self.keys_dialog.active_is_revealed();
+            // Navigation/selection flows through the configurable keybindings
+            // (`KeysDialog` context); Ctrl+V paste and text entry fall through.
+            if self.handle_keys_dialog_navigation(&key, active_pending_empty, active_revealed) {
+                return false;
+            }
             match key.code {
-                KeyCode::Esc => {
-                    // Esc cascade: hide the expanded key list → drop typed text → close.
-                    if !self.keys_dialog.unreveal_active() && !self.keys_dialog.clear_pending() {
-                        self.keys_dialog.close();
-                    }
-                }
-                KeyCode::Down => {
-                    self.keys_dialog.move_next();
-                }
-                KeyCode::Char('j') if self.prompt_input.vim_enabled && active_pending_empty => {
-                    self.keys_dialog.move_next();
-                }
-                KeyCode::Up | KeyCode::BackTab => {
-                    self.keys_dialog.move_prev();
-                }
-                KeyCode::Char('k') if self.prompt_input.vim_enabled && active_pending_empty => {
-                    self.keys_dialog.move_prev();
-                }
-                // Key-cursor movement within the expanded row. Arrows always
-                // work; h/l mirror them in vim normal mode (in insert mode
-                // the vim state machine consumes h/l as text).
-                KeyCode::Left | KeyCode::Char('h') if active_revealed => {
-                    self.keys_dialog.select_prev_key();
-                }
-                KeyCode::Right | KeyCode::Char('l') if active_revealed => {
-                    self.keys_dialog.select_next_key();
-                }
-                KeyCode::Enter => {
-                    // Enter appends a typed new key (auto-save + validate), or
-                    // expands/collapses the row's key list. A pure expand is
-                    // view-only and never writes to the store.
-                    if self.keys_dialog.enter_active() {
-                        self.persist_keys_dialog();
-                    }
-                }
-                KeyCode::Backspace if !self.prompt_input.vim_enabled => {
-                    // Text editing only; `backspace()` is a no-op while the row
-                    // is expanded, so it can never touch a stored key.
-                    self.keys_dialog.backspace();
-                }
-                KeyCode::Delete if !self.prompt_input.vim_enabled => {
-                    // Delete on an expanded key asks for confirmation; otherwise
-                    // it edits the typed new-key text.
-                    if !self.keys_dialog.try_open_delete_confirm() {
-                        self.keys_dialog.backspace();
-                    }
-                }
-                KeyCode::Delete if self.prompt_input.vim_enabled => {
-                    self.keys_dialog.try_open_delete_confirm();
-                }
                 KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // Ctrl+V: paste clipboard text into the active row's
                     // new-key buffer (newlines trimmed to a single token).
@@ -7588,24 +7539,10 @@ impl App {
                     }
                 }
                 KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
-                    // Legacy (vim off): j/k navigate only while the new-key
-                    // buffer is empty — once a key is being typed those
-                    // letters belong to the key, not the cursor. Arrow keys
-                    // always navigate.
-                    let lower = c.to_ascii_lowercase();
-                    if active_pending_empty {
-                        match lower {
-                            'j' => {
-                                self.keys_dialog.move_next();
-                                return false;
-                            }
-                            'k' => {
-                                self.keys_dialog.move_prev();
-                                return false;
-                            }
-                            _ => {}
-                        }
-                    }
+                    // Text entry (vim off). With vim on, text reaches this arm
+                    // only in insert mode, which the vim search state machine
+                    // consumed above; normal-mode letters were handled as
+                    // navigation by `handle_keys_dialog_navigation`.
                     let c = self.shift_normalize(c, key.modifiers);
                     self.keys_dialog.insert_char(c);
                 }
@@ -8509,40 +8446,13 @@ impl App {
                 }
                 VimSearchKey::Passthrough => {}
             }
+            // Navigation/selection flows through the configurable keybindings
+            // (`ModelPicker` context); Tab/Shift+Tab, Enter, Ctrl+R, Backspace
+            // and digits stay with the picker's own handler below.
+            if self.handle_model_picker_navigation(&key) {
+                return false;
+            }
             match key.code {
-                KeyCode::Esc => self.model_picker.close(),
-                KeyCode::Home => self.model_picker.select_first(),
-                KeyCode::End => self.model_picker.select_last(),
-                KeyCode::Up => self.model_picker.select_prev(),
-                // Always-on j/k/h/l (the Ollama dialog pattern): navigate when
-                // vim normal mode is active, or while the filter is empty
-                // (nothing to type into yet). Once the filter has text, these
-                // letters type into it. Uppercase J/K/H/L stay reserved for
-                // typing — filter matching is case-insensitive, so they
-                // filter identically.
-                KeyCode::Char('k')
-                    if self.prompt_input.vim_enabled || self.model_picker.filter.is_empty() =>
-                {
-                    self.model_picker.select_prev()
-                }
-                KeyCode::Down => self.model_picker.select_next(),
-                KeyCode::Char('j')
-                    if self.prompt_input.vim_enabled || self.model_picker.filter.is_empty() =>
-                {
-                    self.model_picker.select_next()
-                }
-                KeyCode::Left => self.model_picker.effort_prev(),
-                KeyCode::Char('h')
-                    if self.prompt_input.vim_enabled || self.model_picker.filter.is_empty() =>
-                {
-                    self.model_picker.effort_prev()
-                }
-                KeyCode::Right => self.model_picker.effort_next(),
-                KeyCode::Char('l')
-                    if self.prompt_input.vim_enabled || self.model_picker.filter.is_empty() =>
-                {
-                    self.model_picker.effort_next()
-                }
                 KeyCode::Tab => {
                     self.model_picker.task_next();
                     self.persist_free_task_sort();
@@ -8563,12 +8473,6 @@ impl App {
                     self.model_picker
                         .task_jump(c.to_digit(10).unwrap() as usize);
                     self.persist_free_task_sort();
-                }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.model_picker.select_prev()
-                }
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.model_picker.select_next()
                 }
                 KeyCode::Enter => {
                     if let Some((model_id, effort)) = self.model_picker.confirm() {
@@ -8878,26 +8782,27 @@ impl App {
             return false;
         }
 
-        // Tasks overlay intercepts navigation and Esc
+        // Tasks overlay intercepts navigation and Esc. Its keys resolve
+        // through the configurable `Task` context; unbound keys are swallowed
+        // so nothing leaks into the prompt behind the modal.
         if self.tasks_overlay.visible {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.tasks_overlay.close(),
-                KeyCode::Up => self.tasks_overlay.select_prev(),
-                // Always-on j/k (the Ollama dialog pattern): the overlay has
-                // no text-entry state, so plain letters cannot collide with
-                // typing.
-                KeyCode::Char('k') => self.tasks_overlay.select_prev(),
-                KeyCode::Down => self.tasks_overlay.select_next(),
-                KeyCode::Char('j') => self.tasks_overlay.select_next(),
-                KeyCode::Enter => {
-                    if let Some((task_id, new_status)) =
-                        self.tasks_overlay.cycle_and_persist_status()
-                    {
-                        self.status_message = Some(format!("Task {} → {}", task_id, new_status));
-                    }
-                }
-                _ => {}
-            }
+            self.handle_tasks_overlay_navigation(&key);
+            return false;
+        }
+
+        // Plugin list overlay (bare `/plugin`) intercepts navigation and Esc.
+        // Its keys resolve through the configurable `Plugin` context; unbound
+        // keys are swallowed so nothing leaks into the prompt behind the modal.
+        if self.plugin_list_overlay.is_some() {
+            self.handle_plugin_list_navigation(&key);
+            return false;
+        }
+
+        // Attachments overlay (Alt+Shift+I) intercepts navigation and Esc.
+        // Its keys resolve through the configurable `Attachments` context;
+        // unbound keys are swallowed so nothing leaks into the prompt.
+        if self.attachments_overlay_visible {
+            self.handle_attachments_overlay_navigation(&key);
             return false;
         }
 
@@ -10012,10 +9917,27 @@ impl App {
     }
 
     fn current_key_context(&self) -> KeyContext {
-        if self.diff_viewer.visible {
+        // These modal overlays are handled before the resolver (see
+        // `handle_key_event`), but their navigation keys resolve through their
+        // own contexts so they stay rebindable.
+        if self.keys_dialog.visible {
+            KeyContext::KeysDialog
+        } else if self.free_mode_dialog.visible {
+            KeyContext::FreeModeDialog
+        } else if self.model_picker.visible {
+            KeyContext::ModelPicker
+        } else if self.tasks_overlay.visible {
+            KeyContext::Task
+        } else if self.plugin_list_overlay.is_some() {
+            KeyContext::Plugin
+        } else if self.attachments_overlay_visible {
+            KeyContext::Attachments
+        } else if self.diff_viewer.visible {
             KeyContext::DiffDialog
-        } else if self.agents_menu.visible || self.mcp_view.visible || self.stats_dialog.visible {
+        } else if self.agents_menu.visible || self.stats_dialog.visible {
             KeyContext::Select
+        } else if self.mcp_view.visible {
+            KeyContext::McpView
         } else if self.import_config_dialog.visible {
             KeyContext::Confirmation
         } else if self.settings_screen.visible {
@@ -10023,7 +9945,16 @@ impl App {
         } else if self.theme_screen.visible || self.theme_creator.visible {
             KeyContext::ThemePicker
         } else if self.rewind_flow.visible {
-            KeyContext::Confirmation
+            // Step 1 browses messages; step 2 confirms. They use different
+            // contexts so each step's keys stay independently rebindable.
+            if matches!(
+                self.rewind_flow.step,
+                crate::overlays::RewindStep::Selecting
+            ) {
+                KeyContext::MessageSelector
+            } else {
+                KeyContext::Confirmation
+            }
         } else if self.help_overlay.visible {
             KeyContext::Help
         } else if self.history_search_overlay.visible || self.history_search.is_some() {
@@ -10037,25 +9968,443 @@ impl App {
         }
     }
 
+    /// Resolve the configured action for a key in a dialog-specific key
+    /// context. Returns `None` when the resolver has no binding — or the user
+    /// explicitly unbound the chord — for that context.
+    fn resolve_dialog_action(&self, key: &KeyEvent, context: &KeyContext) -> Option<String> {
+        let keystroke = key_event_to_keystroke(key)?;
+        match self.keybindings.resolve_single(&keystroke, context) {
+            Some(KeybindingResult::Action(action)) => Some(action),
+            _ => None,
+        }
+    }
+
+    /// Dispatch a key against the configured bindings for the `/keys` dialog.
+    /// Returns `true` when a bound action handled it; `false` lets the caller
+    /// fall through to text entry.
+    ///
+    /// j/k (and the arrows) navigate only while the new-key buffer is empty so
+    /// a partially typed key is never discarded; h/l walk the expanded key
+    /// list whenever a row is revealed. Both gates are key text-entry
+    /// conditions, not keybinding choices.
+    fn handle_keys_dialog_navigation(
+        &mut self,
+        key: &KeyEvent,
+        pending_empty: bool,
+        revealed: bool,
+    ) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::KeysDialog) else {
+            return false;
+        };
+        let is_char = matches!(key.code, KeyCode::Char(_));
+        match action.as_str() {
+            "cancel" => {
+                // Esc cascade: hide the expanded key list → drop typed text → close.
+                if !self.keys_dialog.unreveal_active() && !self.keys_dialog.clear_pending() {
+                    self.keys_dialog.close();
+                }
+                true
+            }
+            "prev" if !is_char || pending_empty => {
+                self.keys_dialog.move_prev();
+                true
+            }
+            "next" if !is_char || pending_empty => {
+                self.keys_dialog.move_next();
+                true
+            }
+            "prevKey" if !is_char || revealed => {
+                self.keys_dialog.select_prev_key();
+                true
+            }
+            "nextKey" if !is_char || revealed => {
+                self.keys_dialog.select_next_key();
+                true
+            }
+            "select" => {
+                // Enter appends a typed new key (auto-save + validate), or
+                // expands/collapses the row's key list. A pure expand is
+                // view-only and never writes to the store.
+                if self.keys_dialog.enter_active() {
+                    self.persist_keys_dialog();
+                }
+                true
+            }
+            "backspace" if !self.prompt_input.vim_enabled => {
+                // Text editing only; `backspace()` is a no-op while the row is
+                // expanded, so it can never touch a stored key.
+                self.keys_dialog.backspace();
+                true
+            }
+            "delete" => {
+                // Delete on an expanded key asks for confirmation; otherwise it
+                // edits the typed new-key text.
+                if !self.keys_dialog.try_open_delete_confirm() && !self.prompt_input.vim_enabled {
+                    self.keys_dialog.backspace();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Dispatch a key against the configured bindings for the Connect-Free
+    /// dialog. Returns `true` when a bound action handled it; `false` lets the
+    /// caller fall through to text entry and the remaining hardcoded controls
+    /// (Tab show-all, Ctrl+S/V/R/D, Ctrl+Enter).
+    fn handle_free_mode_dialog_navigation(
+        &mut self,
+        key: &KeyEvent,
+        pending_empty: bool,
+        revealed: bool,
+    ) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::FreeModeDialog) else {
+            return false;
+        };
+        let is_char = matches!(key.code, KeyCode::Char(_));
+        match action.as_str() {
+            "cancel" => {
+                // Esc cascade: hide a revealed key → drop typed text → close.
+                if !self.free_mode_dialog.unreveal_active()
+                    && !self.free_mode_dialog.clear_pending()
+                {
+                    self.free_mode_dialog.close();
+                }
+                true
+            }
+            "prev" if !is_char || pending_empty => {
+                self.free_mode_dialog.move_prev();
+                true
+            }
+            "next" if !is_char || pending_empty => {
+                self.free_mode_dialog.move_next();
+                true
+            }
+            // An expanded row: h/l (and the arrows) move the key-selection
+            // cursor. Otherwise they move the node cursor across the new-key
+            // line and the key dots. Letters only do either while the new-key
+            // buffer is empty, so a partially typed key is never discarded.
+            "prevKey" if !is_char || pending_empty => {
+                if revealed {
+                    self.free_mode_dialog.select_prev_key();
+                } else {
+                    self.free_mode_dialog.move_node_prev();
+                }
+                true
+            }
+            "nextKey" if !is_char || pending_empty => {
+                if revealed {
+                    self.free_mode_dialog.select_next_key();
+                } else {
+                    self.free_mode_dialog.move_node_next();
+                }
+                true
+            }
+            "select" => {
+                self.free_mode_dialog.enter_active();
+                true
+            }
+            "backspace" if !self.prompt_input.vim_enabled => {
+                if !self.free_mode_dialog.try_open_delete_confirm() {
+                    self.free_mode_dialog.backspace();
+                }
+                true
+            }
+            "delete" => {
+                if !self.free_mode_dialog.try_open_delete_confirm()
+                    && !self.prompt_input.vim_enabled
+                {
+                    self.free_mode_dialog.backspace();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Dispatch a key against the configured bindings for the task-list
+    /// overlay (`Ctrl+T`). Returns `true` when a bound action handled it.
+    fn handle_tasks_overlay_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::Task) else {
+            return false;
+        };
+        match action.as_str() {
+            "closeTask" => {
+                self.tasks_overlay.close();
+                true
+            }
+            "prevTask" => {
+                self.tasks_overlay.select_prev();
+                true
+            }
+            "nextTask" => {
+                self.tasks_overlay.select_next();
+                true
+            }
+            "selectTask" => {
+                if let Some((task_id, new_status)) = self.tasks_overlay.cycle_and_persist_status() {
+                    self.status_message = Some(format!("Task {} → {}", task_id, new_status));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Dispatch a key against the configured bindings for the plugin-list
+    /// overlay (bare `/plugin`). Returns `true` when a bound action handled
+    /// it; `false` lets the handler fall through.
+    fn handle_plugin_list_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::Plugin) else {
+            return false;
+        };
+        let Some(state) = self.plugin_list_overlay.as_mut() else {
+            return false;
+        };
+        match action.as_str() {
+            "cancel" => {
+                self.plugin_list_overlay = None;
+                true
+            }
+            "prev" => {
+                state.move_up();
+                true
+            }
+            "next" => {
+                state.move_down();
+                true
+            }
+            "select" => {
+                state.toggle_detail();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Dispatch a key against the configured bindings for the attachments
+    /// overlay (Alt+Shift+I). Returns `true` when a bound action handled it.
+    fn handle_attachments_overlay_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::Attachments) else {
+            return false;
+        };
+        let len = self.prompt_input.pending_images.len();
+        if len == 0 {
+            self.close_attachments_overlay();
+            return true;
+        }
+        match action.as_str() {
+            "cancel" => {
+                self.close_attachments_overlay();
+                true
+            }
+            "prev" => {
+                self.attachments_selected = if self.attachments_selected == 0 {
+                    len - 1
+                } else {
+                    self.attachments_selected - 1
+                };
+                true
+            }
+            "next" => {
+                self.attachments_selected = (self.attachments_selected + 1) % len;
+                true
+            }
+            "toggle" => {
+                if let Some(img) = self
+                    .prompt_input
+                    .pending_images
+                    .get_mut(self.attachments_selected)
+                {
+                    img.excluded = !img.excluded;
+                }
+                true
+            }
+            "addAttachment" => {
+                self.spawn_image_read();
+                true
+            }
+            "removeAttachment" => {
+                self.prompt_input
+                    .pending_images
+                    .remove(self.attachments_selected);
+                let remaining = self.prompt_input.pending_images.len();
+                if remaining == 0 {
+                    self.close_attachments_overlay();
+                } else if self.attachments_selected >= remaining {
+                    self.attachments_selected = remaining - 1;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Dispatch a key against the configured bindings for the model picker.
+    /// Returns `true` when a bound action handled it; `false` lets the picker's
+    /// own handler deal with Tab/Shift+Tab, Enter, Ctrl+R, Backspace, digits
+    /// and filter text.
+    ///
+    /// Plain letters navigate only when vim normal mode is active or the filter
+    /// is empty — otherwise they belong to the filter. Uppercase letters always
+    /// type (the pre-existing convention). This is a text-entry condition, not
+    /// a keybinding choice.
+    fn handle_model_picker_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::ModelPicker) else {
+            return false;
+        };
+        let plain_letter = matches!(
+            key.code,
+            KeyCode::Char(c)
+                if !c.is_ascii_uppercase()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+        );
+        if plain_letter && !self.prompt_input.vim_enabled && !self.model_picker.filter.is_empty() {
+            return false;
+        }
+        match action.as_str() {
+            "cancel" => {
+                self.model_picker.close();
+                true
+            }
+            "first" => {
+                self.model_picker.select_first();
+                true
+            }
+            "last" => {
+                self.model_picker.select_last();
+                true
+            }
+            "prev" => {
+                self.model_picker.select_prev();
+                true
+            }
+            "next" => {
+                self.model_picker.select_next();
+                true
+            }
+            "effortPrev" => {
+                self.model_picker.effort_prev();
+                true
+            }
+            "effortNext" => {
+                self.model_picker.effort_next();
+                true
+            }
+            _ => false,
+        }
+    }
+
     // -------------------------------------------------------------------
     // New overlay key handlers
     // -------------------------------------------------------------------
 
+    /// Dispatch a key against the configured `Select` bindings for the stats
+    /// dialog. Returns `true` when a bound action handled it; `false` lets the
+    /// caller fall through to the dialog's own controls (tab switching, range
+    /// cycling, `q` close).
+    fn handle_stats_dialog_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::Select) else {
+            return false;
+        };
+        match action.as_str() {
+            "cancel" => {
+                self.stats_dialog.close();
+                true
+            }
+            "prev" => {
+                self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_sub(1);
+                true
+            }
+            "next" => {
+                self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_add(1);
+                true
+            }
+            "pageUp" => {
+                self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_sub(10);
+                true
+            }
+            "pageDown" => {
+                self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_add(10);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_stats_dialog_key(&mut self, key: KeyEvent) {
+        if self.handle_stats_dialog_navigation(&key) {
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.stats_dialog.close(),
             KeyCode::Tab | KeyCode::Right => self.stats_dialog.next_tab(),
             KeyCode::BackTab | KeyCode::Left => self.stats_dialog.prev_tab(),
             KeyCode::Char('r') => self.stats_dialog.cycle_range(),
-            KeyCode::Up => self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_sub(1),
-            KeyCode::Char('k') => {
-                self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_sub(1)
-            }
-            KeyCode::Down => self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_add(1),
-            KeyCode::Char('j') => {
-                self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_add(1)
-            }
             _ => {}
+        }
+    }
+
+    /// Dispatch a key against the configured `McpView` bindings. Returns
+    /// `true` when a bound action handled it; `false` lets the caller fall
+    /// through to the view's own controls.
+    ///
+    /// The MCP view has its own context (not `Select`) so `h`/`l` pane
+    /// cycling never collides with `Select`'s vim-preset `h`/`l` prev/next.
+    /// Every key is resolved here — rebinding any of these actions should
+    /// work — but unbound letters resolve to `None` and fall through, so they
+    /// still reach the tool filter. `j`/`k` have no `McpView` default
+    /// precisely so the view keeps deciding when they navigate versus type.
+    fn handle_mcp_view_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::McpView) else {
+            return false;
+        };
+        match action.as_str() {
+            "cancel" => {
+                self.mcp_view.close();
+                true
+            }
+            "prev" => {
+                self.mcp_view.select_prev();
+                true
+            }
+            "next" => {
+                self.mcp_view.select_next();
+                true
+            }
+            "cyclePane" => {
+                self.mcp_view.switch_pane();
+                true
+            }
+            "toggleError" => {
+                self.mcp_view.toggle_error_detail();
+                true
+            }
+            "startAuth" => {
+                // `a` is a search character in the tool panes; only the server
+                // list starts auth, and the other panes fall through to typing.
+                if self.mcp_view.active_pane != crate::mcp_view::McpViewPane::ServerList {
+                    return false;
+                }
+                let selected_server = self
+                    .mcp_view
+                    .servers
+                    .get(self.mcp_view.selected_server)
+                    .map(|server| server.name.clone());
+                if let Some(server_name) = selected_server {
+                    self.pending_mcp_panel_auth = Some(server_name);
+                    self.mcp_view.close();
+                    self.status_message = Some("Starting MCP auth...".to_string());
+                }
+                true
+            }
+            "reconnect" => {
+                self.pending_mcp_reconnect = true;
+                self.status_message = Some("Reconnecting MCP runtime...".to_string());
+                true
+            }
+            _ => false,
         }
     }
 
@@ -10080,13 +10429,15 @@ impl App {
                 VimSearchKey::Passthrough => {}
             }
         }
+        if self.handle_mcp_view_navigation(&key) {
+            return false;
+        }
+        // Actions with a `McpView` default (escape/up/down/tab/left/right/h/l/
+        // e/a/r and the pane cycle) are owned by the resolver above; the arms
+        // below cover only what stays view-local: `q` close, the conditional
+        // `j`/`k`, backspace, and typing into the tool filter.
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mcp_view.close(),
-            KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.mcp_view.switch_pane(),
-            // Always-on h/l pane switching: pane switching is not text entry.
-            KeyCode::Char('h') => self.mcp_view.switch_pane(),
-            KeyCode::Char('l') => self.mcp_view.switch_pane(),
-            KeyCode::Up => self.mcp_view.select_prev(),
+            KeyCode::Char('q') => self.mcp_view.close(),
             // Always-on j/k in vim normal mode, or while the tool search is
             // empty (the connect-dialog pattern); letters type into it once it
             // has text.
@@ -10095,32 +10446,12 @@ impl App {
             {
                 self.mcp_view.select_prev()
             }
-            KeyCode::Down => self.mcp_view.select_next(),
             KeyCode::Char('j')
                 if self.prompt_input.vim_enabled || self.mcp_view.tool_search.is_empty() =>
             {
                 self.mcp_view.select_next()
             }
             KeyCode::Backspace if !self.prompt_input.vim_enabled => self.mcp_view.pop_search_char(),
-            KeyCode::Char('e') => self.mcp_view.toggle_error_detail(),
-            KeyCode::Char('a')
-                if self.mcp_view.active_pane == crate::mcp_view::McpViewPane::ServerList =>
-            {
-                let selected_server = self
-                    .mcp_view
-                    .servers
-                    .get(self.mcp_view.selected_server)
-                    .map(|server| server.name.clone());
-                if let Some(server_name) = selected_server {
-                    self.pending_mcp_panel_auth = Some(server_name);
-                    self.mcp_view.close();
-                    self.status_message = Some("Starting MCP auth...".to_string());
-                }
-            }
-            KeyCode::Char('r') => {
-                self.pending_mcp_reconnect = true;
-                self.status_message = Some("Reconnecting MCP runtime...".to_string());
-            }
             KeyCode::Char(c)
                 if !self.prompt_input.vim_enabled
                     && key.modifiers.is_empty()
@@ -10131,6 +10462,35 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Dispatch a key against the configured `Select` bindings for the agents
+    /// menu list. Returns `true` when a bound action handled it; `false` lets
+    /// the caller fall through to the menu's own controls (Left back, Right
+    /// confirm, q/Backspace close).
+    fn handle_agents_menu_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::Select) else {
+            return false;
+        };
+        match action.as_str() {
+            "cancel" => {
+                self.agents_menu.go_back();
+                true
+            }
+            "prev" => {
+                self.agents_menu.select_prev();
+                true
+            }
+            "next" => {
+                self.agents_menu.select_next();
+                true
+            }
+            "select" => {
+                self.agents_menu.confirm_selection();
+                true
+            }
+            _ => false,
+        }
     }
 
     fn handle_agents_menu_key(&mut self, key: KeyEvent) {
@@ -10160,21 +10520,64 @@ impl App {
             return;
         }
 
+        if self.handle_agents_menu_navigation(&key) {
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.agents_menu.go_back(),
-            KeyCode::Up => self.agents_menu.select_prev(),
-            // Always-on j/k on the menu list (the Ollama dialog pattern); the
-            // Editor route above is a text form and keeps its own arms.
-            KeyCode::Char('k') => self.agents_menu.select_prev(),
-            KeyCode::Down => self.agents_menu.select_next(),
-            KeyCode::Char('j') => self.agents_menu.select_next(),
             KeyCode::Enter | KeyCode::Right => self.agents_menu.confirm_selection(),
             KeyCode::Left => self.agents_menu.go_back(),
             _ => {}
         }
     }
 
+    /// Dispatch a key against the configured `DiffDialog` bindings for the
+    /// diff viewer. Returns `true` when a bound action handled it; `false`
+    /// lets the caller fall through to the viewer's own controls (pane
+    /// switching, diff-type toggle, file collapse, `q` close).
+    fn handle_diff_viewer_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::DiffDialog) else {
+            return false;
+        };
+        match action.as_str() {
+            // `escape` and `r` are both bound to `rejectDiff`; dismissing the
+            // viewer is the only reject-like action it has.
+            "cancel" | "rejectDiff" => {
+                self.diff_viewer.close();
+                true
+            }
+            "prevDiff" => {
+                if self.diff_viewer.active_pane == DiffPane::FileList {
+                    self.diff_viewer.select_prev();
+                } else {
+                    self.diff_viewer.scroll_detail_up();
+                }
+                true
+            }
+            "nextDiff" => {
+                if self.diff_viewer.active_pane == DiffPane::FileList {
+                    self.diff_viewer.select_next();
+                } else {
+                    self.diff_viewer.scroll_detail_down();
+                }
+                true
+            }
+            "pageUp" => {
+                self.diff_viewer.scroll_detail_up();
+                true
+            }
+            "pageDown" => {
+                self.diff_viewer.scroll_detail_down();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_diff_viewer_key(&mut self, key: KeyEvent) {
+        if self.handle_diff_viewer_navigation(&key) {
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.diff_viewer.close(),
             KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.diff_viewer.switch_pane(),
@@ -10417,25 +10820,22 @@ impl App {
     fn handle_rewind_flow_key(&mut self, key: KeyEvent) -> bool {
         use crate::overlays::RewindStep;
         match &self.rewind_flow.step {
-            RewindStep::Selecting => match key.code {
-                KeyCode::Esc => {
+            // Step 1 (browse messages) resolves through the configurable
+            // `MessageSelector` context; step 2 confirms under `Confirmation`.
+            RewindStep::Selecting => match self
+                .resolve_dialog_action(&key, &KeyContext::MessageSelector)
+                .as_deref()
+            {
+                Some("cancel") => {
                     self.rewind_flow.close();
                 }
-                KeyCode::Enter => {
+                Some("select") => {
                     self.rewind_flow.confirm_selection();
                 }
-                KeyCode::Up => {
+                Some("prevMessage") => {
                     self.rewind_flow.selector.select_prev();
                 }
-                // Always-on j/k (the Ollama dialog pattern): the selector has
-                // no text-entry state.
-                KeyCode::Char('k') => {
-                    self.rewind_flow.selector.select_prev();
-                }
-                KeyCode::Down => {
-                    self.rewind_flow.selector.select_next();
-                }
-                KeyCode::Char('j') => {
+                Some("nextMessage") => {
                     self.rewind_flow.selector.select_next();
                 }
                 _ => {}
@@ -11149,6 +11549,10 @@ impl App {
                 }
                 false
             }
+            "openAttachments" => {
+                self.open_attachments_overlay();
+                false
+            }
             "compact" => {
                 if !self.is_streaming {
                     self.intercept_slash_command("compact");
@@ -11815,6 +12219,7 @@ impl App {
                     path,
                     label: label.clone(),
                     dimensions: None,
+                    excluded: false,
                 };
                 self.prompt_input.add_image(img);
                 self.push_notification(
@@ -18832,6 +19237,380 @@ mod tests {
             normalize_configured_vertical_navigation(key, &app.keybindings, &KeyContext::Chat);
         assert_eq!(out.code, KeyCode::Char('j'));
         assert_eq!(out.modifiers, KeyModifiers::SHIFT);
+    }
+
+    #[test]
+    fn free_mode_dialog_navigation_flows_through_keybindings() {
+        // A user chord bound to a semantic action in the FreeModeDialog
+        // context must drive the dialog — proof its navigation is resolved
+        // through the configurable keybindings rather than matched inline.
+        let mut app = make_app();
+        let id0 = clawde_api::FREE_CATALOG[0].id;
+        let id1 = clawde_api::FREE_CATALOG[1].id;
+        app.free_mode_dialog
+            .open(&[(id0, vec!["k1".to_string()]), (id1, vec!["k2".to_string()])]);
+        let user = clawde_core::keybindings::UserKeybindings {
+            bindings: vec![clawde_core::keybindings::UserBinding {
+                chord: "ctrl+n".to_string(),
+                action: Some("next".to_string()),
+                context: Some("FreeModeDialog".to_string()),
+            }],
+            ..clawde_core::keybindings::UserKeybindings::default()
+        };
+        app.keybindings = KeybindingResolver::new(&user);
+        assert_eq!(app.free_mode_dialog.active_idx, 0);
+        app.handle_key_event(press_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.free_mode_dialog.active_idx, 1);
+    }
+
+    #[test]
+    fn free_mode_dialog_shift_tab_moves_previous() {
+        // BackTab is reported as Shift+Tab; it must reach the dialog's `prev`
+        // action like the arrow keys do.
+        let mut app = make_app();
+        let id0 = clawde_api::FREE_CATALOG[0].id;
+        let id1 = clawde_api::FREE_CATALOG[1].id;
+        app.free_mode_dialog
+            .open(&[(id0, vec!["k1".to_string()]), (id1, vec!["k2".to_string()])]);
+        assert_eq!(app.free_mode_dialog.active_idx, 0);
+        app.handle_key_event(press_key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.free_mode_dialog.active_idx, 1);
+    }
+
+    #[test]
+    fn keys_dialog_navigation_flows_through_keybindings() {
+        let mut app = make_app();
+        app.keys_dialog
+            .open(&[("anthropic", vec![]), ("openai", vec![])]);
+        let user = clawde_core::keybindings::UserKeybindings {
+            bindings: vec![clawde_core::keybindings::UserBinding {
+                chord: "ctrl+n".to_string(),
+                action: Some("next".to_string()),
+                context: Some("KeysDialog".to_string()),
+            }],
+            ..clawde_core::keybindings::UserKeybindings::default()
+        };
+        app.keybindings = KeybindingResolver::new(&user);
+        assert_eq!(app.keys_dialog.active_idx, 0);
+        app.handle_key_event(press_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.keys_dialog.active_idx, 1);
+    }
+
+    #[test]
+    fn keys_dialog_unbound_navigation_letter_types_instead() {
+        // Unbinding a dialog navigation letter in the KeysDialog context must
+        // restore text entry — the letter no longer moves the selection.
+        let mut app = make_app();
+        app.keys_dialog.open(&[("anthropic", vec![])]);
+        let user = clawde_core::keybindings::UserKeybindings {
+            bindings: vec![clawde_core::keybindings::UserBinding {
+                chord: "j".to_string(),
+                action: None,
+                context: Some("KeysDialog".to_string()),
+            }],
+            ..clawde_core::keybindings::UserKeybindings::default()
+        };
+        app.keybindings = KeybindingResolver::new(&user);
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.keys_dialog.fields[0].pending, "j");
+    }
+
+    #[test]
+    fn task_overlay_navigation_flows_through_keybindings() {
+        let mut app = make_app();
+        app.tasks_overlay.toggle();
+        app.tasks_overlay.tasks = vec![
+            crate::tasks_overlay::TaskDisplay {
+                id: "t1".to_string(),
+                subject: "First".to_string(),
+                status: clawde_tools::TaskStatus::Pending,
+            },
+            crate::tasks_overlay::TaskDisplay {
+                id: "t2".to_string(),
+                subject: "Second".to_string(),
+                status: clawde_tools::TaskStatus::Pending,
+            },
+        ];
+        assert_eq!(app.current_key_context(), KeyContext::Task);
+        let user = clawde_core::keybindings::UserKeybindings {
+            bindings: vec![clawde_core::keybindings::UserBinding {
+                chord: "ctrl+n".to_string(),
+                action: Some("nextTask".to_string()),
+                context: Some("Task".to_string()),
+            }],
+            ..clawde_core::keybindings::UserKeybindings::default()
+        };
+        app.keybindings = KeybindingResolver::new(&user);
+        assert_eq!(app.tasks_overlay.selected_idx, 0);
+        app.handle_key_event(press_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.tasks_overlay.selected_idx, 1);
+    }
+
+    #[test]
+    fn plugin_list_overlay_navigation_flows_through_keybindings() {
+        use crate::plugin_views::{PluginListItem, PluginListState};
+        fn item(name: &str) -> PluginListItem {
+            PluginListItem {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                enabled: true,
+                source: "user".to_string(),
+                command_count: 0,
+                hook_count: 0,
+            }
+        }
+        let mut app = make_app();
+        app.plugin_list_overlay = Some(PluginListState::new(vec![item("p1"), item("p2")]));
+        assert_eq!(app.current_key_context(), KeyContext::Plugin);
+        let user = clawde_core::keybindings::UserKeybindings {
+            bindings: vec![clawde_core::keybindings::UserBinding {
+                chord: "ctrl+n".to_string(),
+                action: Some("next".to_string()),
+                context: Some("Plugin".to_string()),
+            }],
+            ..clawde_core::keybindings::UserKeybindings::default()
+        };
+        app.keybindings = KeybindingResolver::new(&user);
+        assert_eq!(app.plugin_list_overlay.as_ref().unwrap().selected, 0);
+        app.handle_key_event(press_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.plugin_list_overlay.as_ref().unwrap().selected, 1);
+        // Enter toggles the detail panel via the `select` action.
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.plugin_list_overlay.as_ref().unwrap().show_detail);
+        // Escape closes the overlay via the `cancel` action.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.plugin_list_overlay.is_none());
+    }
+
+    #[test]
+    fn attachments_overlay_navigation_flows_through_keybindings() {
+        use crate::image_paste::PastedImage;
+        use std::path::PathBuf;
+        fn image(label: &str) -> PastedImage {
+            PastedImage {
+                path: PathBuf::from(format!("/tmp/{label}")),
+                label: label.to_string(),
+                dimensions: Some((16, 16)),
+                excluded: false,
+            }
+        }
+        let mut app = make_app();
+        app.prompt_input.pending_images = vec![image("a.png"), image("b.png")];
+        app.open_attachments_overlay();
+        assert!(app.attachments_overlay_visible);
+        assert_eq!(app.current_key_context(), KeyContext::Attachments);
+        let user = clawde_core::keybindings::UserKeybindings {
+            bindings: vec![clawde_core::keybindings::UserBinding {
+                chord: "ctrl+n".to_string(),
+                action: Some("next".to_string()),
+                context: Some("Attachments".to_string()),
+            }],
+            ..clawde_core::keybindings::UserKeybindings::default()
+        };
+        app.keybindings = KeybindingResolver::new(&user);
+        assert_eq!(app.attachments_selected, 0);
+        app.handle_key_event(press_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.attachments_selected, 1);
+        // `space` toggles inclusion of the selected image.
+        app.handle_key_event(press_key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(app.prompt_input.pending_images[1].excluded);
+        // `r` removes the selected image.
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.prompt_input.pending_images.len(), 1);
+        assert!(!app.prompt_input.pending_images[0].excluded);
+        // `clear_images` drops excluded images at send time.
+        app.prompt_input.pending_images[0].excluded = true;
+        assert!(app.prompt_input.clear_images().is_empty());
+    }
+
+    #[test]
+    fn mcp_view_pane_switching_flows_through_keybindings() {
+        use crate::mcp_view::{McpServerView, McpViewPane, McpViewStatus};
+        fn server(name: &str) -> McpServerView {
+            McpServerView {
+                name: name.to_string(),
+                transport: "stdio".to_string(),
+                status: McpViewStatus::Connected,
+                tool_count: 0,
+                resource_count: 0,
+                prompt_count: 0,
+                resources: Vec::new(),
+                prompts: Vec::new(),
+                error_message: None,
+                tools: Vec::new(),
+            }
+        }
+        let mut app = make_app();
+        app.mcp_view.open(vec![server("s1"), server("s2")]);
+        assert_eq!(app.current_key_context(), KeyContext::McpView);
+
+        // h/l cycle panes through the `cyclePane` action rather than a
+        // hardcoded key, so Select's vim-preset h/l prev/next no longer apply.
+        assert_eq!(app.mcp_view.active_pane, McpViewPane::ServerList);
+        app.handle_key_event(press_key(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.mcp_view.active_pane, McpViewPane::ToolList);
+        app.handle_key_event(press_key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.mcp_view.active_pane, McpViewPane::ToolDetail);
+        app.handle_key_event(press_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.mcp_view.active_pane, McpViewPane::ServerList);
+
+        // `e` toggles the error detail and `r` requests a reconnect, both via
+        // McpView actions rather than the view's hardcoded match.
+        assert!(!app.mcp_view.error_expanded);
+        app.handle_key_event(press_key(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.mcp_view.error_expanded);
+        assert!(!app.pending_mcp_reconnect);
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.pending_mcp_reconnect);
+
+        // `cyclePane` is rebindable.
+        let user = clawde_core::keybindings::UserKeybindings {
+            bindings: vec![clawde_core::keybindings::UserBinding {
+                chord: "ctrl+n".to_string(),
+                action: Some("cyclePane".to_string()),
+                context: Some("McpView".to_string()),
+            }],
+            ..clawde_core::keybindings::UserKeybindings::default()
+        };
+        app.keybindings = KeybindingResolver::new(&user);
+        app.handle_key_event(press_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.mcp_view.active_pane, McpViewPane::ToolList);
+
+        // `a` types into the tool filter while a tool pane is focused, but
+        // starts auth and closes the view from the server list.
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.pending_mcp_panel_auth.is_none());
+        assert_eq!(app.mcp_view.tool_search, "a");
+
+        // Escape closes via the `cancel` action.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.mcp_view.visible);
+
+        app.mcp_view.open(vec![server("s1"), server("s2")]);
+        app.keybindings =
+            KeybindingResolver::new(&clawde_core::keybindings::UserKeybindings::default());
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.pending_mcp_panel_auth.as_deref(), Some("s1"));
+        assert!(!app.mcp_view.visible);
+    }
+
+    #[test]
+    fn select_vim_h_l_still_navigates_agents_menu_and_stats_dialog() {
+        // Guard for the McpView split: `Select` (agents menu + stats dialog)
+        // must keep the vim-preset h/l prev/next.
+        use crate::agents_view::AgentDefinition;
+        use clawde_core::keybindings::KeybindingPreset;
+
+        let mut app = make_app();
+        app.keybindings = KeybindingResolver::new(&clawde_core::keybindings::UserKeybindings {
+            preset: KeybindingPreset::Vim,
+            ..clawde_core::keybindings::UserKeybindings::default()
+        });
+
+        app.agents_menu.visible = true;
+        app.agents_menu.definitions = vec![AgentDefinition {
+            file_path: std::path::PathBuf::from("/tmp/a.md"),
+            name: "a".to_string(),
+            source: "user".to_string(),
+            model: None,
+            memory_scope: None,
+            description: String::new(),
+            tools: Vec::new(),
+            shadowed_by: None,
+            instructions: String::new(),
+        }];
+        assert_eq!(app.current_key_context(), KeyContext::Select);
+        assert_eq!(app.agents_menu.selected_row, 0);
+        app.handle_key_event(press_key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.agents_menu.selected_row, 1);
+        app.handle_key_event(press_key(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.agents_menu.selected_row, 0);
+
+        // Stats dialog shares `Select`; vim h/l scroll it.
+        app.agents_menu.visible = false;
+        app.stats_dialog.visible = true;
+        assert_eq!(app.current_key_context(), KeyContext::Select);
+        app.stats_dialog.scroll = 5;
+        app.handle_key_event(press_key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.stats_dialog.scroll, 6);
+        app.handle_key_event(press_key(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.stats_dialog.scroll, 5);
+    }
+
+    #[test]
+    fn model_picker_navigation_flows_through_keybindings() {
+        let mut app = make_app();
+        app.model_picker.visible = true;
+        app.model_picker.models_loaded = true;
+        app.model_picker.models = vec![
+            crate::model_picker::ModelEntry {
+                id: "m-a".to_string(),
+                display_name: "A".to_string(),
+                description: String::new(),
+                is_current: true,
+                reasoning: false,
+                capabilities: vec![],
+                specialty: None,
+                usage: String::new(),
+            },
+            crate::model_picker::ModelEntry {
+                id: "m-b".to_string(),
+                display_name: "B".to_string(),
+                description: String::new(),
+                is_current: false,
+                reasoning: true,
+                capabilities: vec![],
+                specialty: None,
+                usage: String::new(),
+            },
+        ];
+        assert_eq!(app.current_key_context(), KeyContext::ModelPicker);
+        let user = clawde_core::keybindings::UserKeybindings {
+            bindings: vec![clawde_core::keybindings::UserBinding {
+                chord: "ctrl+n".to_string(),
+                action: Some("next".to_string()),
+                context: Some("ModelPicker".to_string()),
+            }],
+            ..clawde_core::keybindings::UserKeybindings::default()
+        };
+        app.keybindings = KeybindingResolver::new(&user);
+        assert_eq!(app.model_picker.selected_idx, 0);
+        app.handle_key_event(press_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.model_picker.selected_idx, 1);
+    }
+
+    #[test]
+    fn rewind_flow_selection_flows_through_keybindings() {
+        use crate::overlays::SelectorMessage;
+        let mut app = make_app();
+        app.rewind_flow.open(vec![
+            SelectorMessage {
+                idx: 0,
+                role: "user".to_string(),
+                preview: "a".to_string(),
+                has_tool_use: false,
+            },
+            SelectorMessage {
+                idx: 1,
+                role: "assistant".to_string(),
+                preview: "b".to_string(),
+                has_tool_use: false,
+            },
+        ]);
+        assert_eq!(app.current_key_context(), KeyContext::MessageSelector);
+        let user = clawde_core::keybindings::UserKeybindings {
+            bindings: vec![clawde_core::keybindings::UserBinding {
+                chord: "ctrl+n".to_string(),
+                action: Some("nextMessage".to_string()),
+                context: Some("MessageSelector".to_string()),
+            }],
+            ..clawde_core::keybindings::UserKeybindings::default()
+        };
+        app.keybindings = KeybindingResolver::new(&user);
+        assert_eq!(app.rewind_flow.selector.selected_idx, 1);
+        app.handle_key_event(press_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.rewind_flow.selector.selected_idx, 0);
     }
 
     #[test]
