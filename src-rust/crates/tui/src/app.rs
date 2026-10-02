@@ -10432,12 +10432,11 @@ impl App {
         if self.handle_mcp_view_navigation(&key) {
             return false;
         }
-        // Actions with a `McpView` default (escape/up/down/tab/left/right/h/l/
-        // e/a/r and the pane cycle) are owned by the resolver above; the arms
-        // below cover only what stays view-local: `q` close, the conditional
-        // `j`/`k`, backspace, and typing into the tool filter.
+        // Actions with a `McpView` default (escape/q close, up/down/tab/left/
+        // right/h/l pane cycling, e/a/r) are owned by the resolver above; the
+        // arms below cover only what stays view-local: the conditional `j`/`k`,
+        // backspace, and typing into the tool filter.
         match key.code {
-            KeyCode::Char('q') => self.mcp_view.close(),
             // Always-on j/k in vim normal mode, or while the tool search is
             // empty (the connect-dialog pattern); letters type into it once it
             // has text.
@@ -19378,8 +19377,12 @@ mod tests {
         // Enter toggles the detail panel via the `select` action.
         app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.plugin_list_overlay.as_ref().unwrap().show_detail);
-        // Escape closes the overlay via the `cancel` action.
+        // Escape closes the overlay via the `cancel` action, and `q` is the
+        // other `cancel` chord for this context.
         app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.plugin_list_overlay.is_none());
+        app.plugin_list_overlay = Some(PluginListState::new(vec![item("p1"), item("p2")]));
+        app.handle_key_event(press_key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(app.plugin_list_overlay.is_none());
     }
 
@@ -19485,6 +19488,12 @@ mod tests {
 
         // Escape closes via the `cancel` action.
         app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.mcp_view.visible);
+
+        // `q` is the other `cancel` chord for this context (it used to be a
+        // hardcoded arm in the view's own match).
+        app.mcp_view.open(vec![server("s1"), server("s2")]);
+        app.handle_key_event(press_key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.mcp_view.visible);
 
         app.mcp_view.open(vec![server("s1"), server("s2")]);

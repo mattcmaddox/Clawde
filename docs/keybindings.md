@@ -113,7 +113,7 @@ Active while the plugin-list overlay (bare `/plugin`) is open.
 | `Down` / `j` | next | Move the highlight down |
 | `Shift+K` / `Shift+J` | verticalPrev / verticalNext | Move the highlight up / down (resolved to the arrow keys) |
 | `Enter` | select | Show/hide the detail panel for the highlighted plugin |
-| `Escape` | cancel | Close the overlay |
+| `Escape` / `q` | cancel | Close the overlay |
 
 ### Attachments Context
 
@@ -140,7 +140,7 @@ than reusing `Select`) so `h`/`l` can cycle panes without colliding with
 | `Up` | prev | Move the highlight up |
 | `Down` | next | Move the highlight down |
 | `Tab` / `Left` / `Right` / `h` / `l` | cyclePane | Cycle server list → tool list → tool detail |
-| `Escape` | cancel | Close the view |
+| `Escape` / `q` | cancel | Close the view |
 
 `j`/`k` are not bound here on purpose: in this view they are conditional (they
 type into the tool filter once it has text), so the view's own handler decides

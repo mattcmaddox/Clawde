@@ -467,6 +467,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // into the tool filter once it has text), so the view's own handler
         // applies them behind that guard.
         ("escape", "cancel", KeyContext::McpView),
+        ("q", "cancel", KeyContext::McpView),
         ("up", "prev", KeyContext::McpView),
         ("down", "next", KeyContext::McpView),
         ("tab", "cyclePane", KeyContext::McpView),
@@ -486,6 +487,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("j", "next", KeyContext::Plugin),
         ("enter", "select", KeyContext::Plugin),
         ("escape", "cancel", KeyContext::Plugin),
+        ("q", "cancel", KeyContext::Plugin),
         ("up", "prev", KeyContext::Attachments),
         ("down", "next", KeyContext::Attachments),
         ("shift+k", "verticalPrev", KeyContext::Attachments),
@@ -1374,9 +1376,12 @@ mod tests {
             (KeyContext::McpView, "up", "prev"),
             (KeyContext::McpView, "down", "next"),
             (KeyContext::McpView, "escape", "cancel"),
+            (KeyContext::McpView, "q", "cancel"),
             (KeyContext::McpView, "e", "toggleError"),
             (KeyContext::McpView, "a", "startAuth"),
             (KeyContext::McpView, "r", "reconnect"),
+            (KeyContext::Plugin, "q", "cancel"),
+            (KeyContext::Attachments, "q", "cancel"),
         ];
         for (context, chord, action) in cases {
             let ks = parse_keystroke(chord).unwrap();
