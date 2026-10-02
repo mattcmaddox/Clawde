@@ -149,7 +149,7 @@ cargo check -p clawde-tui --tests
 
 ### Pre-commit hook
 
-`.githooks/pre-commit` runs five checks before a commit lands (see the script
+`.githooks/pre-commit` runs six checks before a commit lands (see the script
 header for the full contract): the gitleaks secret scan, the async file-flush
 audit, rustfmt drift, the TUI test-target compile, an idle-CPU smoke probe, and
 a **live eval gate** (`scripts/eval/run_eval.py --fixture
