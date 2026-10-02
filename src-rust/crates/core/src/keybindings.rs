@@ -422,6 +422,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("enter", "acceptDiff", KeyContext::DiffDialog),
         ("r", "rejectDiff", KeyContext::DiffDialog),
         ("escape", "rejectDiff", KeyContext::DiffDialog),
+        ("q", "cancel", KeyContext::DiffDialog),
         ("pageup", "pageUp", KeyContext::DiffDialog),
         ("pagedown", "pageDown", KeyContext::DiffDialog),
         // ========== MODAL SELECT (Generic) ==========
@@ -459,6 +460,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("l", "effortNext", KeyContext::ModelPicker),
         ("enter", "select", KeyContext::Select),
         ("escape", "cancel", KeyContext::Select),
+        ("q", "cancel", KeyContext::Select),
         ("/", "search", KeyContext::Select),
         // ========== MCP VIEW ==========
         // Its own context (not `Select`) so `h`/`l` cycle panes without
@@ -1382,6 +1384,8 @@ mod tests {
             (KeyContext::McpView, "r", "reconnect"),
             (KeyContext::Plugin, "q", "cancel"),
             (KeyContext::Attachments, "q", "cancel"),
+            (KeyContext::Select, "q", "cancel"),
+            (KeyContext::DiffDialog, "q", "cancel"),
         ];
         for (context, chord, action) in cases {
             let ks = parse_keystroke(chord).unwrap();

@@ -10303,7 +10303,7 @@ impl App {
     /// Dispatch a key against the configured `Select` bindings for the stats
     /// dialog. Returns `true` when a bound action handled it; `false` lets the
     /// caller fall through to the dialog's own controls (tab switching, range
-    /// cycling, `q` close).
+    /// cycling).
     fn handle_stats_dialog_navigation(&mut self, key: &KeyEvent) -> bool {
         let Some(action) = self.resolve_dialog_action(key, &KeyContext::Select) else {
             return false;
@@ -10338,7 +10338,6 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.stats_dialog.close(),
             KeyCode::Tab | KeyCode::Right => self.stats_dialog.next_tab(),
             KeyCode::BackTab | KeyCode::Left => self.stats_dialog.prev_tab(),
             KeyCode::Char('r') => self.stats_dialog.cycle_range(),
@@ -10466,7 +10465,7 @@ impl App {
     /// Dispatch a key against the configured `Select` bindings for the agents
     /// menu list. Returns `true` when a bound action handled it; `false` lets
     /// the caller fall through to the menu's own controls (Left back, Right
-    /// confirm, q/Backspace close).
+    /// confirm, Backspace close).
     fn handle_agents_menu_navigation(&mut self, key: &KeyEvent) -> bool {
         let Some(action) = self.resolve_dialog_action(key, &KeyContext::Select) else {
             return false;
@@ -10523,7 +10522,7 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.agents_menu.go_back(),
+            KeyCode::Esc | KeyCode::Backspace => self.agents_menu.go_back(),
             KeyCode::Enter | KeyCode::Right => self.agents_menu.confirm_selection(),
             KeyCode::Left => self.agents_menu.go_back(),
             _ => {}
@@ -10533,7 +10532,7 @@ impl App {
     /// Dispatch a key against the configured `DiffDialog` bindings for the
     /// diff viewer. Returns `true` when a bound action handled it; `false`
     /// lets the caller fall through to the viewer's own controls (pane
-    /// switching, diff-type toggle, file collapse, `q` close).
+    /// switching, diff-type toggle, file collapse).
     fn handle_diff_viewer_navigation(&mut self, key: &KeyEvent) -> bool {
         let Some(action) = self.resolve_dialog_action(key, &KeyContext::DiffDialog) else {
             return false;
@@ -10578,7 +10577,6 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.diff_viewer.close(),
             KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.diff_viewer.switch_pane(),
             KeyCode::Char('d') => {
                 let root = self.project_root();
@@ -19535,6 +19533,10 @@ mod tests {
         assert_eq!(app.agents_menu.selected_row, 1);
         app.handle_key_event(press_key(KeyCode::Char('h'), KeyModifiers::NONE));
         assert_eq!(app.agents_menu.selected_row, 0);
+        // `q` closes it via the shared `Select` cancel chord (it used to be an
+        // inline arm in the menu handler).
+        app.handle_key_event(press_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.agents_menu.visible);
 
         // Stats dialog shares `Select`; vim h/l scroll it.
         app.agents_menu.visible = false;
@@ -19545,6 +19547,20 @@ mod tests {
         assert_eq!(app.stats_dialog.scroll, 6);
         app.handle_key_event(press_key(KeyCode::Char('h'), KeyModifiers::NONE));
         assert_eq!(app.stats_dialog.scroll, 5);
+        app.handle_key_event(press_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.stats_dialog.visible);
+    }
+
+    #[test]
+    fn diff_viewer_q_close_flows_through_keybindings() {
+        // The diff viewer binds `escape` to `rejectDiff` (not `cancel`); `q` is
+        // the `cancel` chord for the `DiffDialog` context and must close it the
+        // same way the old inline arm did.
+        let mut app = make_app();
+        app.diff_viewer.visible = true;
+        assert_eq!(app.current_key_context(), KeyContext::DiffDialog);
+        app.handle_key_event(press_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.diff_viewer.visible);
     }
 
     #[test]
