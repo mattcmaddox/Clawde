@@ -114,9 +114,10 @@ remain aligned with the rotation rings.
 Provider failures also carry a shared recovery class (`invalid_credential`,
 `rate_limited`, `quota_exhausted`, `transient_provider`, `context_overflow`,
 `malformed_request`, `content_filtered`, and related classes). Free Mode uses
-that classification for fallback decisions: context overflow may move to a
-larger upstream, while malformed requests and content-filter decisions do not
-fan out to every provider. A streamed attempt is considered committed only
+that classification for fallback decisions: context overflow and other request
+rejections fall through to the next upstream (a provider-specific rejection
+must not fail the turn when another upstream may accept it), while
+content-filter decisions do not fan out to every provider. A streamed attempt is considered committed only
 when generated text, reasoning, or tool arguments have been emitted; transport
 metadata alone does not prevent pre-output fallback, and visible output is
 never silently replayed.

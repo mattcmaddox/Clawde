@@ -293,15 +293,18 @@ async fn context_overflow_before_first_byte_falls_through() {
 }
 
 // ---------------------------------------------------------------------------
-// Non-fallbackable request errors are surfaced, not retried
+// Provider-specific request rejections fall through to another upstream
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn malformed_request_is_surfaced_without_fallback() {
+async fn malformed_request_falls_through_to_the_next_upstream() {
     let _dispatch = dispatch_guard().await;
-    // `invalid_request_error` maps to RecoveryClass::MalformedRequest, which
-    // must never be retried on another upstream: it would fail identically
-    // everywhere. The second (healthy) upstream must not be contacted.
+    // A 400 with `invalid_request_error` maps to
+    // RecoveryClass::MalformedRequest. It is fallbackable on purpose: the
+    // classifier cannot tell a genuinely bad request from a provider-specific
+    // rejection (an unsupported parameter, model, or capability), so the next
+    // upstream is tried. A request that is really bad fails on every upstream
+    // and the last error surfaces.
     let chain = Chain::new(
         vec![json_response(
             400,
@@ -309,22 +312,24 @@ async fn malformed_request_is_surfaced_without_fallback() {
             r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#,
         )],
         vec![ScriptedResponse::SseStream {
-            frames: text_stream("poolside/mock-model", "should never be used"),
+            frames: text_stream("poolside/mock-model", "answered by the next upstream"),
         }],
     );
 
-    // The non-fallbackable error is surfaced directly by the dispatch call
-    // (before any stream exists), never turned into a retry on another
-    // upstream.
-    let error = match chain.provider.create_message_stream(request()).await {
-        Err(error) => error,
-        Ok(_) => panic!("malformed request must surface as an error"),
-    };
-    assert_eq!(error.recovery_class(), RecoveryClass::MalformedRequest);
+    let stream = chain
+        .provider
+        .create_message_stream(request())
+        .await
+        .expect("chain falls through to the healthy upstream");
+    let (events, error) = collect(stream).await;
+    assert!(error.is_none());
+    assert_eq!(attribution(&events), Some("poolside"));
+    assert_eq!(text(&events), "answered by the next upstream");
 
+    // The rejected first upstream was tried once; the healthy one served it.
     let (first, second) = chain.requests();
-    assert_eq!(first.len(), 1, "only the first upstream is attempted");
-    assert_eq!(second.len(), 0, "healthy upstream must not be contacted");
+    assert_eq!(first.len(), 1, "the rejecting upstream is tried once");
+    assert_eq!(second.len(), 1, "the healthy upstream serves the request");
 }
 
 // ---------------------------------------------------------------------------

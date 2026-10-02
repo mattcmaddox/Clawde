@@ -18,10 +18,10 @@ next plan row (`crates/api/src/providers/free/impls.rs:1034-1076`). Within an
 upstream, `KeyRotatingProvider` rotates exhausted keys.
 
 The setup is thoughtfully built — Retry-After is honored as a cooldown floor
-(`time_extract.rs`), validation errors are deliberately excluded from fallback
-(`impls.rs:680-687`, matching the industry rule "never fall back on provider
-validation errors"), and capability gating (vision / context window) is done
-up-front. The two focus areas versus the industry consensus in 2026 are:
+(`time_extract.rs`), request rejections fall through to the next upstream
+rather than failing the turn (`impls.rs`; a provider-specific 4xx must not kill
+a chain another upstream can serve), and capability gating (vision / context
+window) is done up-front. The two focus areas versus the industry consensus in 2026 are:
 
 1. **Capacity awareness is deliberately conservative.** Fresh rate-limit
    headers are consulted at dispatch time as a soft demotion signal. Providers
@@ -75,8 +75,11 @@ Within the preferred group, ordering is by dispatch success rate then latency
 
 ### 2.2 Fallback triggers
 
-`should_fallback` (`impls.rs:680-687`) falls through on everything **except**
-`InvalidRequest` and `ContentFiltered`. Within a stream (`RetryingFreeStream`,
+`should_fallback` (`impls.rs`) falls through on everything **except**
+`ContentFiltered` and already-visible stream failures. A malformed/`InvalidRequest`
+4xx also falls through: the classifier cannot distinguish a provider-specific
+rejection from a genuinely bad request, so the next upstream is tried and the
+last error surfaces if the request really is bad. Within a stream (`RetryingFreeStream`,
 `impls.rs:852+`), errors re-dispatch via `start_next_plan_entry`; empty
 completions (HTTP 200 + zero content) route through `advance_after_empty`
 (`impls.rs:1078-1090`), which logs a placeholder notice as a `TextDelta`
@@ -209,6 +212,10 @@ to fit Copilot's 16K but actually too big dies there instead of reaching a
 128K upstream. Note the deliberate design tension: the exclusion is correct
 for genuinely malformed requests; it is wrong for context-length overflows.
 
+**Update 2026-10-02:** `should_fallback` no longer excludes `InvalidRequest`, so
+this finding is closed — an overflow (and every other request rejection) falls
+through to the next upstream.
+
 ### F6. Empty-completion notice pollutes output/history (LOW)
 "(no response from X — retrying…)" is emitted as a `TextDelta`
 (`impls.rs:1356-1363`) — real assistant text that lands in the visible stream
@@ -316,6 +323,11 @@ Keep the exclusion for every other `InvalidRequest`. **Files:**
 `should_fallback` (`impls.rs:680-687`) + error-text classifier (compare to
 `time_extract.rs`'s body-scanning patterns). **Effort:** small. **Risk:** low —
 misclassification only ever enables one extra dispatch attempt.
+
+**Update 2026-10-02:** implemented more broadly than proposed — every
+`InvalidRequest` is fallbackable now (not only recognizable context overflows),
+because the classifier cannot tell a provider-specific rejection from a bad
+request. The credential is not cooled and the same provider is not retried.
 
 #### P6. Out-of-band empty-completion notices
 Emit the "(no response…)" message via an `ProviderAttribution`-adjacent
