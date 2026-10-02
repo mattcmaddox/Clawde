@@ -278,6 +278,18 @@ fn clamp_max_tokens_for(req: &mut ProviderRequest, entry: &FreeEntry) {
     }
 }
 
+/// Provider-option keys [`shape_provider_thinking`] can write, and that
+/// therefore must be cleared before a free-chain attempt re-shapes them for a
+/// different upstream. `thinkingConfig` covers its nested keys
+/// (`includeThoughts` / `thinkingBudget` / `thinkingLevel`).
+const THINKING_OPTION_KEYS: &[&str] = &[
+    "thinkingConfig",
+    "thinking",
+    "reasoningEffort",
+    "enable_thinking",
+    "chat_template_kwargs",
+];
+
 /// Shape an explicit effort override onto the upstream's native thinking
 /// parameters.
 ///
@@ -285,21 +297,36 @@ fn clamp_max_tokens_for(req: &mut ProviderRequest, entry: &FreeEntry) {
 /// (the plan depends on cooldown / latency / task routing), so the chain
 /// re-assembles per-entry request parameters at dispatch time — mirroring the
 /// `build_provider_options` the query layer performs for direct providers.
-/// No-op when the request carries no effort override, or when the upstream's
-/// model family exposes no thinking control. The per-upstream mapping is the
-/// shared [`shape_provider_thinking`] in `effort_shaping`, the same single
-/// source of truth the query layer uses; used by every dispatch site
-/// (non-streaming fallback, streaming fallback, `RetryingFreeStream`
-/// re-dispatch, and the hedge path).
+/// The per-upstream mapping is the shared [`shape_provider_thinking`] in
+/// `effort_shaping`, the same single source of truth the query layer uses;
+/// used by every dispatch site (non-streaming fallback, streaming fallback,
+/// `RetryingFreeStream` re-dispatch, and the hedge path).
+///
+/// The query layer shapes `provider_options` against the *requested* provider
+/// and model. For a `free` request that provider is the composite id, and a
+/// model-gated arm can still fire — a pinned `cline/deepseek/...` trips the
+/// deepseek arm and writes `thinking`. Every attempt here re-dispatches the
+/// cloned request to a different upstream, so an uncleared parameter rides
+/// into a fallback whose API rejects it (Groq: "property 'thinking' is
+/// unsupported"). The stale keys are therefore removed first and the target
+/// upstream re-shaped from scratch; a fallback can never inherit the previous
+/// provider's thinking parameters.
 fn shape_thinking_for_upstream(req: &mut ProviderRequest, entry: &FreeEntry) {
     use crate::providers::effort_shaping::shape_provider_thinking;
 
-    // Only re-shape when the request carries an explicit effort override;
-    // otherwise the upstream's own default (or the query layer's shaping for
-    // direct providers) stands.
-    if req.effort_level.is_none() {
-        return;
+    if let Some(options) = req.provider_options.as_object_mut() {
+        for key in THINKING_OPTION_KEYS {
+            options.remove(*key);
+        }
     }
+
+    // Only re-shape when the request carries an explicit effort override;
+    // otherwise the upstream's own default stands. The clear above still runs:
+    // a stale key can be present with no override, because the query layer's
+    // deepseek arm enables thinking for `effort_level == None` too.
+    let Some(effort_level) = req.effort_level else {
+        return;
+    };
     // Requests assembled without provider options (test-constructed requests)
     // must not silently drop the override — fuse into an object first.
     if !req.provider_options.is_object() {
@@ -315,7 +342,7 @@ fn shape_thinking_for_upstream(req: &mut ProviderRequest, entry: &FreeEntry) {
         options,
         entry.upstream.id,
         &req.model.to_ascii_lowercase(),
-        req.effort_level,
+        Some(effort_level),
         None,
         Some(req.max_tokens),
     );

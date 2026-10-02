@@ -8054,6 +8054,46 @@ mod tests {
             .is_none_or(|o| o.is_empty()));
     }
 
+    #[test]
+    fn shape_thinking_drops_stale_keys_shaped_for_a_different_upstream() {
+        use clawde_core::effort::EffortLevel;
+        // The query layer shapes `provider_options` for the `free` provider
+        // and the pinned model. A `cline/deepseek/...` pin trips the deepseek
+        // arm, which bakes `thinking` + `reasoningEffort` before the chain has
+        // chosen an upstream. A fallback to Groq's gpt-oss must not inherit
+        // them — Groq rejects `thinking` with a 400.
+        let mut req = dummy_request("openai/gpt-oss-120b");
+        req.effort_level = Some(EffortLevel::High);
+        req.provider_options = serde_json::json!({
+            "thinking": { "type": "enabled" },
+            "reasoningEffort": "high",
+        });
+        shape_thinking_for_upstream(&mut req, &entry("groq", true));
+        let opts = req.provider_options.as_object().expect("options");
+        assert!(
+            opts.get("thinking").is_none(),
+            "stale thinking must be cleared"
+        );
+        // gpt-oss is not one of Clawde's OpenAI reasoning families, so no
+        // reasoningEffort is re-added for the Groq attempt either.
+        assert!(opts.get("reasoningEffort").is_none());
+    }
+
+    #[test]
+    fn shape_thinking_drops_stale_keys_without_an_effort_override() {
+        // The deepseek arm of `shape_provider_thinking` writes `thinking` even
+        // when `effort_level` is `None`, so the clear must not be gated on an
+        // override being present.
+        let mut req = dummy_request("openai/gpt-oss-120b");
+        req.provider_options = serde_json::json!({ "thinking": { "type": "enabled" } });
+        shape_thinking_for_upstream(&mut req, &entry("groq", true));
+        let opts = req.provider_options.as_object().expect("options");
+        assert!(
+            opts.get("thinking").is_none(),
+            "stale thinking must be cleared"
+        );
+    }
+
     // -------------------------------------------------------------------
     // End-to-end: effort override → FreeProvider dispatch → upstream request
     // -------------------------------------------------------------------
@@ -8126,6 +8166,64 @@ mod tests {
         let tc = &opts["thinkingConfig"];
         assert_eq!(tc["includeThoughts"], serde_json::json!(false));
         assert_eq!(tc["thinkingBudget"], serde_json::json!(0));
+    }
+
+    /// Regression: a pinned `cline/deepseek/...` model shaped `thinking` into
+    /// `provider_options` (the shared deepseek arm is model-gated, not
+    /// provider-gated, so it fires for the `free` composite too). When cline
+    /// fails and the chain falls through to Groq, the stale `thinking` must
+    /// not ride along — Groq rejects it with "property 'thinking' is
+    /// unsupported", a non-fallbackable `InvalidRequest` that hard-fails the
+    /// whole turn instead of reaching a working upstream.
+    #[tokio::test]
+    async fn fallback_to_groq_drops_thinking_shaped_for_the_pinned_deepseek_model() {
+        use clawde_core::effort::EffortLevel;
+
+        let recorder = Arc::new(Mutex::new(None));
+        let chain = vec![
+            failing_entry("cline", "cline upstream down"),
+            entry_with_request_recorder("groq", recorder.clone()),
+        ];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                // No same-upstream retry: the first cline failure advances
+                // straight to Groq, so the test stays fast and deterministic.
+                fallback_retries: 0,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let mut req = dummy_request("free/cline/deepseek/deepseek-v4-flash");
+        req.effort_level = Some(EffortLevel::High);
+        // What the query layer bakes for the `free` provider + the deepseek
+        // pin before the chain has chosen an upstream.
+        req.provider_options = serde_json::json!({
+            "thinking": { "type": "enabled" },
+            "reasoningEffort": "high",
+        });
+        provider
+            .create_message(req.clone())
+            .await
+            .expect("groq fallback succeeds");
+
+        let seen = recorder
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("groq upstream saw a request");
+        assert_eq!(
+            seen.model, "openai/gpt-oss-120b",
+            "groq's own default model"
+        );
+        let opts = seen.provider_options.as_object().expect("options");
+        assert!(
+            opts.get("thinking").is_none(),
+            "groq must not receive the pinned deepseek model's thinking: {opts:?}"
+        );
+        assert!(opts.get("reasoningEffort").is_none());
     }
 
     #[tokio::test]
