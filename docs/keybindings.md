@@ -162,6 +162,9 @@ dialog.
 
 Vim mode adds `h` / `l` prev/next (its preset extends this context).
 
+The hooks config menu (`/hooks`) shares this context: `Enter` drills into the
+next level and `Escape` / `q` step back one level (closing at the top).
+
 `PageUp` / `PageDown` only act in the stats dialog; the agents menu has nothing
 to page. `/` is bound to `search` for this context but no current select
 consumes it. Keys that stay with each view's own handler: the agents menu's
@@ -190,6 +193,38 @@ nothing here. `Tab` / `Left` / `Right` (switch pane), `d` (toggle diff type) and
 `Space` (collapse the highlighted file in the file list) stay with the view's
 own handler.
 
+### Keybindings Context
+
+Active while the `/keybindings` reference overlay is open.
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Up` / `Down` | prev / next | Scroll one line |
+| `PageUp` / `PageDown` | pageUp / pageDown | Scroll a page |
+| `Home` / `End` | first / last | Jump to the top / bottom |
+| `Escape` / `q` | cancel | Close the overlay |
+
+Vim mode adds `h` / `l` prev/next. `j` / `k` are deliberately **not** bound:
+while the filter is empty they scroll, but once it has text they type into it,
+so the view's own handler decides. The filter bar itself (`Backspace`, printable
+characters) also stays view-local.
+
+### Paste Viewer Context
+
+Active while the read-only paste viewer is open (opened from a
+`[Pasted text #N ...]` placeholder).
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Up` / `k` | prev | Scroll up one row |
+| `Down` / `j` | next | Scroll down one row |
+| `PageUp` / `PageDown` | pageUp / pageDown | Scroll a page |
+| `Home` / `End` | first / last | Jump to the top / bottom |
+| `Escape` / `q` | cancel | Close the viewer |
+
+Vim mode adds `h` / `l` prev/next. `g` / `G` (jump to top / bottom) and `Alt+E`
+(expand the paste in place, then close) stay with the view's own handler.
+
 ---
 
 ## Keybinding Contexts
@@ -212,10 +247,12 @@ These are the contexts the TUI produces while handling keys today.
 | `ThemePicker` | The theme picker and theme creator screens |
 | `Settings` | The settings screen |
 | `DiffDialog` | The diff viewer |
-| `Select` | Generic modal selects: agents menu, stats dialog |
+| `Select` | Generic modal selects: agents menu, stats dialog, hooks config menu |
 | `McpView` | The MCP server/tool view |
 | `KeysDialog` | The `/keys` key-management dialog |
 | `FreeModeDialog` | The Connect-Free upstream dialog |
+| `Keybindings` | The `/keybindings` reference overlay |
+| `PasteViewer` | The read-only paste viewer |
 | `MessageSelector` | Step 1 of the `/rewind` flow (browse messages) |
 | `ModelPicker` | The model picker overlay (open with `Alt+M`, `/model` or `/models`) |
 | `Task` | The task-list overlay (`Ctrl+T`) |

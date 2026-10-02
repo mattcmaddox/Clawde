@@ -78,6 +78,14 @@ pub enum KeyContext {
     Plugin,
     KeysDialog,
     FreeModeDialog,
+    /// The `/keybindings` reference overlay. A dedicated context (not `Help`
+    /// or `Select`) because its `j`/`k` are conditional — once the filter has
+    /// text they type into it — so they stay view-local while the arrows are
+    /// bound here.
+    Keybindings,
+    /// The read-only paste viewer opened from a `[Pasted text #N ...]`
+    /// placeholder. No filter, so the arrows and `j`/`k` are unconditional.
+    PasteViewer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,6 +552,30 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("enter", "select", KeyContext::FreeModeDialog),
         ("backspace", "backspace", KeyContext::FreeModeDialog),
         ("delete", "delete", KeyContext::FreeModeDialog),
+        // ========== KEYBINDINGS REFERENCE OVERLAY ==========
+        // `j`/`k` are deliberately absent: once the filter has text they type
+        // into it, so the view's own handler decides when they navigate (the
+        // same guard `McpView` uses). The arrows are always navigation.
+        ("escape", "cancel", KeyContext::Keybindings),
+        ("q", "cancel", KeyContext::Keybindings),
+        ("up", "prev", KeyContext::Keybindings),
+        ("down", "next", KeyContext::Keybindings),
+        ("pageup", "pageUp", KeyContext::Keybindings),
+        ("pagedown", "pageDown", KeyContext::Keybindings),
+        ("home", "first", KeyContext::Keybindings),
+        ("end", "last", KeyContext::Keybindings),
+        // ========== PASTE VIEWER ==========
+        // Read-only, no filter, so j/k are unconditional navigation.
+        ("escape", "cancel", KeyContext::PasteViewer),
+        ("q", "cancel", KeyContext::PasteViewer),
+        ("up", "prev", KeyContext::PasteViewer),
+        ("k", "prev", KeyContext::PasteViewer),
+        ("down", "next", KeyContext::PasteViewer),
+        ("j", "next", KeyContext::PasteViewer),
+        ("pageup", "pageUp", KeyContext::PasteViewer),
+        ("pagedown", "pageDown", KeyContext::PasteViewer),
+        ("home", "first", KeyContext::PasteViewer),
+        ("end", "last", KeyContext::PasteViewer),
     ];
 
     defaults
@@ -602,6 +634,10 @@ const VIM_PRESET_EXTRAS: &[(&str, &str, KeyContext)] = &[
     ("l", "nextTask", KeyContext::Task),
     ("h", "prevDiff", KeyContext::DiffDialog),
     ("l", "nextDiff", KeyContext::DiffDialog),
+    ("h", "prev", KeyContext::Keybindings),
+    ("l", "next", KeyContext::Keybindings),
+    ("h", "prev", KeyContext::PasteViewer),
+    ("l", "next", KeyContext::PasteViewer),
 ];
 
 /// Emacs (readline-style) additions on top of the defaults.
@@ -1386,6 +1422,15 @@ mod tests {
             (KeyContext::Attachments, "q", "cancel"),
             (KeyContext::Select, "q", "cancel"),
             (KeyContext::DiffDialog, "q", "cancel"),
+            (KeyContext::Keybindings, "q", "cancel"),
+            (KeyContext::Keybindings, "down", "next"),
+            (KeyContext::Keybindings, "home", "first"),
+            (KeyContext::Keybindings, "end", "last"),
+            (KeyContext::Keybindings, "pageup", "pageUp"),
+            (KeyContext::PasteViewer, "q", "cancel"),
+            (KeyContext::PasteViewer, "k", "prev"),
+            (KeyContext::PasteViewer, "j", "next"),
+            (KeyContext::PasteViewer, "pageup", "pageUp"),
         ];
         for (context, chord, action) in cases {
             let ks = parse_keystroke(chord).unwrap();

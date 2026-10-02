@@ -2218,6 +2218,8 @@ fn context_label(ctx: &clawde_core::keybindings::KeyContext) -> &'static str {
         KeyContext::Footer => "Footer",
         KeyContext::KeysDialog => "/keys Dialog",
         KeyContext::FreeModeDialog => "Connect Free",
+        KeyContext::Keybindings => "/keybindings Overlay",
+        KeyContext::PasteViewer => "Paste Viewer",
     }
 }
 

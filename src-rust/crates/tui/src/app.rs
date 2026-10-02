@@ -8728,7 +8728,9 @@ impl App {
             return false;
         }
 
-        // Keybindings overlay: Esc or q to close
+        // Keybindings overlay: navigation resolves through the configurable
+        // `Keybindings` context; only the filter, the vim-search state machine,
+        // and the conditional `j`/`k` stay with the view.
         if self.keybindings_overlay.visible {
             match self
                 .keybindings_overlay
@@ -8746,11 +8748,10 @@ impl App {
                 }
                 VimSearchKey::Passthrough => {}
             }
+            if self.handle_keybindings_overlay_navigation(&key) {
+                return false;
+            }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.keybindings_overlay.close();
-                }
-                KeyCode::Up => self.keybindings_overlay.scroll_up(),
                 // Always-on j/k in vim normal mode, or while the filter is
                 // empty (the connect-dialog pattern); letters type into the
                 // filter once it has text.
@@ -8760,17 +8761,12 @@ impl App {
                 {
                     self.keybindings_overlay.scroll_up()
                 }
-                KeyCode::Down => self.keybindings_overlay.scroll_down(u16::MAX),
                 KeyCode::Char('j')
                     if self.prompt_input.vim_enabled
                         || self.keybindings_overlay.filter.is_empty() =>
                 {
                     self.keybindings_overlay.scroll_down(u16::MAX)
                 }
-                KeyCode::PageUp => self.keybindings_overlay.page_up(),
-                KeyCode::PageDown => self.keybindings_overlay.page_down(u16::MAX),
-                KeyCode::Home => self.keybindings_overlay.scroll_to_top(),
-                KeyCode::End => self.keybindings_overlay.scroll_to_bottom(u16::MAX),
                 KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                     self.keybindings_overlay.pop_filter_char()
                 }
@@ -8950,17 +8946,10 @@ impl App {
             return false;
         }
 
-        // Hooks config menu intercepts navigation and Esc
+        // Hooks config menu: a menu is a select, so its navigation resolves
+        // through the shared `Select` context and stays rebindable.
         if self.hooks_config_menu.visible {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.hooks_config_menu.back(),
-                KeyCode::Enter => self.hooks_config_menu.enter(),
-                KeyCode::Up => self.hooks_config_menu.select_prev(),
-                KeyCode::Char('k') => self.hooks_config_menu.select_prev(),
-                KeyCode::Down => self.hooks_config_menu.select_next(),
-                KeyCode::Char('j') => self.hooks_config_menu.select_next(),
-                _ => {}
-            }
+            self.handle_hooks_config_menu_navigation(&key);
             return false;
         }
 
@@ -9926,6 +9915,12 @@ impl App {
             KeyContext::FreeModeDialog
         } else if self.model_picker.visible {
             KeyContext::ModelPicker
+        } else if self.keybindings_overlay.visible {
+            KeyContext::Keybindings
+        } else if self.hooks_config_menu.visible {
+            KeyContext::Select
+        } else if self.paste_viewer.visible {
+            KeyContext::PasteViewer
         } else if self.tasks_overlay.visible {
             KeyContext::Task
         } else if self.plugin_list_overlay.is_some() {
@@ -12413,16 +12408,14 @@ impl App {
     /// Key handling while the paste viewer modal is open.
     fn handle_paste_viewer_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
+        // Navigation resolves through the configurable `PasteViewer` context;
+        // the `g`/`G` jumps and the Alt+E expand-from-viewer stay view-local.
+        if self.handle_paste_viewer_navigation(&key) {
+            return;
+        }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.paste_viewer.close(),
-            KeyCode::Up => self.paste_viewer.scroll_up(1),
-            KeyCode::Char('k') => self.paste_viewer.scroll_up(1),
-            KeyCode::Down => self.paste_viewer.scroll_down(1),
-            KeyCode::Char('j') => self.paste_viewer.scroll_down(1),
-            KeyCode::PageUp => self.paste_viewer.page_up(),
-            KeyCode::PageDown => self.paste_viewer.page_down(),
-            KeyCode::Home | KeyCode::Char('g') => self.paste_viewer.scroll_to_top(),
-            KeyCode::End | KeyCode::Char('G') => self.paste_viewer.scroll_to_bottom(),
+            KeyCode::Char('g') => self.paste_viewer.scroll_to_top(),
+            KeyCode::Char('G') => self.paste_viewer.scroll_to_bottom(),
             // Alt+E from inside the viewer: same in-place expansion as on the
             // placeholder itself, then close (the body now lives in the
             // prompt buffer).
@@ -12432,6 +12425,116 @@ impl App {
                 self.expand_paste_ref_by_id(id);
             }
             _ => {}
+        }
+    }
+
+    /// Dispatch a key against the configured `Keybindings` bindings for the
+    /// `/keybindings` reference overlay. Returns `true` when a bound action
+    /// handled it; `false` lets the caller fall through to the filter and the
+    /// conditional `j`/`k`.
+    fn handle_keybindings_overlay_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::Keybindings) else {
+            return false;
+        };
+        match action.as_str() {
+            "cancel" => {
+                self.keybindings_overlay.close();
+                true
+            }
+            "prev" => {
+                self.keybindings_overlay.scroll_up();
+                true
+            }
+            "next" => {
+                self.keybindings_overlay.scroll_down(u16::MAX);
+                true
+            }
+            "pageUp" => {
+                self.keybindings_overlay.page_up();
+                true
+            }
+            "pageDown" => {
+                self.keybindings_overlay.page_down(u16::MAX);
+                true
+            }
+            "first" => {
+                self.keybindings_overlay.scroll_to_top();
+                true
+            }
+            "last" => {
+                self.keybindings_overlay.scroll_to_bottom(u16::MAX);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Dispatch a key against the configured `Select` bindings for the hooks
+    /// config menu. A menu is a select, so it reuses that context; unbound keys
+    /// are swallowed by the caller.
+    fn handle_hooks_config_menu_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::Select) else {
+            return false;
+        };
+        match action.as_str() {
+            // At the top level `back()` closes the menu.
+            "cancel" => {
+                self.hooks_config_menu.back();
+                true
+            }
+            "prev" => {
+                self.hooks_config_menu.select_prev();
+                true
+            }
+            "next" => {
+                self.hooks_config_menu.select_next();
+                true
+            }
+            "select" => {
+                self.hooks_config_menu.enter();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Dispatch a key against the configured `PasteViewer` bindings. Returns
+    /// `true` when a bound action handled it; `false` lets the caller fall
+    /// through to the viewer's own controls (`g`/`G` jumps, Alt+E expand).
+    fn handle_paste_viewer_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::PasteViewer) else {
+            return false;
+        };
+        match action.as_str() {
+            "cancel" => {
+                self.paste_viewer.close();
+                true
+            }
+            "prev" => {
+                self.paste_viewer.scroll_up(1);
+                true
+            }
+            "next" => {
+                self.paste_viewer.scroll_down(1);
+                true
+            }
+            "pageUp" => {
+                self.paste_viewer.page_up();
+                true
+            }
+            "pageDown" => {
+                self.paste_viewer.page_down();
+                true
+            }
+            "first" => {
+                self.paste_viewer.scroll_to_top();
+                true
+            }
+            "last" => {
+                self.paste_viewer.scroll_to_bottom();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -15818,6 +15921,74 @@ mod tests {
         assert!(!app.paste_viewer.visible);
         assert_eq!(app.prompt_input.text, "hi l1\nl2\nl3");
         assert!(app.prompt_input.paste_contents.is_empty());
+    }
+
+    #[test]
+    fn paste_viewer_navigation_flows_through_keybindings() {
+        let mut app = make_app();
+        app.paste_viewer.open(1, "l1\nl2\nl3");
+        assert!(app.paste_viewer.visible);
+        assert_eq!(app.current_key_context(), KeyContext::PasteViewer);
+
+        // `k` and the Up arrow both resolve to `prev`.
+        app.paste_viewer.scroll = 3;
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.paste_viewer.scroll, 2);
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.paste_viewer.scroll, 1);
+
+        // `g` stays view-local.
+        app.paste_viewer.scroll = 5;
+        app.handle_key_event(press_key(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.paste_viewer.scroll, 0);
+
+        // `q` is the cancel chord for this context.
+        app.handle_key_event(press_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.paste_viewer.visible);
+    }
+
+    #[test]
+    fn keybindings_overlay_navigation_flows_through_keybindings() {
+        let mut app = make_app();
+        app.keybindings_overlay.visible = true;
+        assert_eq!(app.current_key_context(), KeyContext::Keybindings);
+
+        // Arrows resolve to prev/next; `j`/`k` stay view-local (they must be
+        // able to type into the filter once it has text).
+        app.keybindings_overlay.scroll_offset = 0;
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.keybindings_overlay.scroll_offset, 1);
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.keybindings_overlay.scroll_offset, 0);
+
+        // Escape closes via `cancel`.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.keybindings_overlay.visible);
+
+        // `q` is the other cancel chord (it used to be an inline arm).
+        app.keybindings_overlay.visible = true;
+        app.handle_key_event(press_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.keybindings_overlay.visible);
+    }
+
+    #[test]
+    fn hooks_config_menu_navigation_flows_through_select_context() {
+        use crate::hooks_config_menu::HooksMenuMode;
+        let mut app = make_app();
+        app.hooks_config_menu.visible = true;
+        app.hooks_config_menu.mode = HooksMenuMode::SelectEvent;
+        app.hooks_config_menu.events = vec!["Stop".to_string(), "PreToolUse".to_string()];
+        app.hooks_config_menu.selected = 0;
+        assert_eq!(app.current_key_context(), KeyContext::Select);
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.hooks_config_menu.selected, 1);
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.hooks_config_menu.selected, 0);
+
+        // `q` is the Select cancel chord; at the top level `back()` closes.
+        app.handle_key_event(press_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.hooks_config_menu.visible);
     }
 
     #[test]
