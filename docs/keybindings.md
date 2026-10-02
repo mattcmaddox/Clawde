@@ -146,6 +146,50 @@ than reusing `Select`) so `h`/`l` can cycle panes without colliding with
 type into the tool filter once it has text), so the view's own handler decides
 when they navigate versus type.
 
+### Select Context
+
+Active while a generic modal select is open: the agents menu and the stats
+dialog.
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Up` / `k` | prev | Move the selection, or scroll up (stats dialog) |
+| `Down` / `j` | next | Move the selection, or scroll down (stats dialog) |
+| `Shift+K` / `Shift+J` | verticalPrev / verticalNext | Resolved to the arrow keys |
+| `PageUp` / `PageDown` | pageUp / pageDown | Scroll a page (stats dialog) |
+| `Enter` | select | Confirm the highlighted item |
+| `Escape` / `q` | cancel | Close the dialog |
+
+Vim mode adds `h` / `l` prev/next (its preset extends this context).
+
+`PageUp` / `PageDown` only act in the stats dialog; the agents menu has nothing
+to page. `/` is bound to `search` for this context but no current select
+consumes it. Keys that stay with each view's own handler: the agents menu's
+`Left` (back), `Right` (confirm) and `Backspace` (close); the stats dialog's
+`Tab` / `Right` (next tab), `Shift+Tab` / `Left` (previous tab) and `r` (cycle
+range).
+
+### Diff Dialog Context
+
+Active while the diff viewer is open.
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Up` / `k` | prevDiff | Previous file, or scroll the detail pane up |
+| `Down` / `j` | nextDiff | Next file, or scroll the detail pane down |
+| `Shift+K` / `Shift+J` | verticalPrev / verticalNext | Resolved to the arrow keys |
+| `PageUp` / `PageDown` | pageUp / pageDown | Scroll the detail pane |
+| `Escape` / `r` | rejectDiff | Dismiss the viewer |
+| `q` | cancel | Dismiss the viewer (same effect as `rejectDiff`) |
+
+Vim mode adds `h` / `l` prevDiff/nextDiff.
+
+The read-only viewer does not act on `acceptDiff` (bound to `a` / `Enter`); those
+bindings are declared for symmetry with the diff review flow and currently do
+nothing here. `Tab` / `Left` / `Right` (switch pane), `d` (toggle diff type) and
+`Space` (collapse the highlighted file in the file list) stay with the view's
+own handler.
+
 ---
 
 ## Keybinding Contexts
