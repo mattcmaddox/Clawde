@@ -532,7 +532,7 @@ fetching a model list.
 
 3. **`attempt_plan()`** (free/impls.rs) — Builds ordered `[(idx, model)]` list. Auto = all upstreams with their `default_model`. Pinned = pinned first, then all others in catalog order with defaults.
 
-4. **`should_fallback()`** (free/impls.rs) — Falls through on everything EXCEPT `InvalidRequest` and `ContentFiltered` (user errors that fail identically on every upstream).
+4. **`should_fallback()`** (free/impls.rs) — Falls through on everything EXCEPT `ContentFiltered` and already-visible stream failures. A malformed/`InvalidRequest` 4xx also falls through: the classifier cannot distinguish a genuinely bad request from a provider-specific rejection (e.g. Groq refusing `thinking`), and one upstream's quirk must not fail the turn when another upstream may accept it. It does not cool the key or retry the same provider, and a truly bad request fails on every upstream in turn.
 
 5. **Fallback loop** (free/impls.rs) — Iterates plan, clones request per attempt replacing model, dispatches. Returns first success, falls through on transient errors.
 

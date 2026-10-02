@@ -4360,12 +4360,16 @@ async fn run_query_loop_inner(
                             }
                             // Provider-path failures used to terminate the whole
                             // run even when a configured fallback model could
-                            // safely replay the request. Rotate once for
-                            // credential, quota, model-availability, and
-                            // transient-provider failures; visible partial
-                            // streams and malformed/content-filtered requests
-                            // remain terminal because replay could duplicate or
-                            // corrupt user-visible output.
+                            // safely replay the request. Rotate once on
+                            // `may_fallback()`: credential, quota,
+                            // model-availability, transient-provider, and now
+                            // malformed-request failures. A malformed request is
+                            // included because the classifier cannot tell a
+                            // genuinely bad request from a provider-specific
+                            // rejection, and the fallback model may accept it.
+                            // Visible partial streams and content-filtered
+                            // requests stay terminal: replay could duplicate
+                            // user-visible output or evade moderation.
                             if !used_fallback && e.may_fallback() {
                                 if let Some(fallback) = config
                                     .fallback_model

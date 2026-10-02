@@ -6033,7 +6033,7 @@ mod tests {
     }
 
     #[test]
-    fn context_overflow_invalid_requests_fall_through() {
+    fn invalid_requests_fall_through_so_a_provider_rejection_is_not_terminal() {
         let pid = ProviderId::new("groq");
         assert!(FreeProvider::should_fallback(
             &ProviderError::InvalidRequest {
@@ -6047,10 +6047,13 @@ mod tests {
                 message: "prompt is too long".into(),
             }
         ));
-        assert!(!FreeProvider::should_fallback(
+        // A provider-specific rejection (this is the Groq `thinking` shape) must
+        // reach the next upstream instead of failing the whole turn: the free
+        // chain exists precisely so one upstream's request quirk is not fatal.
+        assert!(FreeProvider::should_fallback(
             &ProviderError::InvalidRequest {
                 provider: pid,
-                message: "tool arguments are malformed".into(),
+                message: "Invalid request: property 'thinking' is unsupported".into(),
             }
         ));
     }
@@ -6072,12 +6075,10 @@ mod tests {
             message: "boom".into(),
             is_retryable: true,
         }));
-        assert!(!FreeProvider::should_fallback(
-            &ProviderError::InvalidRequest {
-                provider: pid.clone(),
-                message: "bad request".into(),
-            }
-        ));
+        // Malformed requests also fall through now (see
+        // `invalid_requests_fall_through_so_a_provider_rejection_is_not_terminal`),
+        // but a content filter is a property of the content, not the upstream,
+        // so it stays terminal.
         assert!(!FreeProvider::should_fallback(
             &ProviderError::ContentFiltered {
                 provider: pid,

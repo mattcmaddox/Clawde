@@ -51,11 +51,27 @@ impl RecoveryClass {
     }
 
     /// Whether the same logical request may be sent to another upstream.
+    ///
+    /// A **malformed request** is fallbackable on purpose. This classification
+    /// cannot tell a genuinely bad request (a broken tool schema, an invalid
+    /// message shape) from a *provider-specific* rejection — an upstream that
+    /// refuses a parameter, model, or capability another upstream accepts. The
+    /// Groq `thinking` 400 is the canonical case: the request was valid for
+    /// every other upstream in the chain, but `MalformedRequest` marked it
+    /// terminal and the whole turn failed instead of moving on.
+    ///
+    /// Trying the next upstream is cheap and bounded: the free chain caps the
+    /// walk with `turn_walk_budget_secs`, and the query layer switches fallback
+    /// models at most once. It does not blame the credential (`cools_key` is
+    /// false) or retry the same provider (`may_retry_same_provider` is false).
+    /// A request that really is bad fails on every upstream and the last error
+    /// surfaces — the same message the caller would have shown anyway.
+    ///
+    /// Content filters and already-visible stream failures stay terminal:
+    /// re-sending filtered content to another provider is evasion, and a
+    /// partially-rendered turn cannot be replayed without duplicating output.
     pub const fn may_fallback(self) -> bool {
-        !matches!(
-            self,
-            Self::MalformedRequest | Self::ContentFiltered | Self::VisibleStreamFailure
-        )
+        !matches!(self, Self::ContentFiltered | Self::VisibleStreamFailure)
     }
 
     /// Whether retrying the same provider can be useful. Key rotation may
@@ -217,6 +233,15 @@ impl ProviderError {
                         Some(413) => RecoveryClass::ContextOverflow,
                         Some(429) => RecoveryClass::RateLimited,
                         Some(408 | 425 | 500..=599) => RecoveryClass::TransientProvider,
+                        // Any other client error is the upstream rejecting the
+                        // request, not a transport or credential problem. Fold
+                        // it into the same class a typed `InvalidRequest` gets
+                        // (which `parse_error_response` produces for bodies that
+                        // carry `invalid_request_error`), so the fallback policy
+                        // no longer depends on whether the body happened to
+                        // name an error code: an untyped 400 and a typed one now
+                        // behave identically.
+                        Some(400..=499) => RecoveryClass::MalformedRequest,
                         _ => RecoveryClass::Unknown,
                     }
                 }
@@ -415,7 +440,11 @@ mod tests {
                     message: "bad parameter".into(),
                 },
                 RecoveryClass::MalformedRequest,
-                false,
+                // Malformed requests are fallbackable: another upstream may
+                // accept what this one rejected. The credential is still not
+                // blamed (cools_key false) and the same provider is not
+                // retried.
+                true,
                 false,
             ),
             (
@@ -435,6 +464,40 @@ mod tests {
             assert_eq!(class.cools_key(), cools_key);
             assert!(!class.as_str().is_empty());
         }
+    }
+
+    #[test]
+    fn untyped_client_errors_classify_as_malformed_and_fall_back() {
+        // The same HTTP status must not mean different things depending on
+        // whether the body carried an `invalid_request_error` code: a 400 with
+        // no code lands in `Other`, and it has to match the typed path.
+        for status in [400u16, 422] {
+            let error = ProviderError::Other {
+                provider: provider(),
+                message: "property 'thinking' is unsupported".into(),
+                status: Some(status),
+                body: Some("{\"error\":\"unsupported\"}".into()),
+            };
+            assert_eq!(
+                error.recovery_class(),
+                RecoveryClass::MalformedRequest,
+                "status {status}"
+            );
+            assert!(error.may_fallback(), "status {status} must fall back");
+            // A rejected request shape is not the credential's fault and must
+            // not be retried on the same upstream.
+            assert!(!error.recovery_class().cools_key());
+            assert!(!error.recovery_class().may_retry_same_provider());
+        }
+    }
+
+    #[test]
+    fn content_filtered_stays_terminal_even_though_malformed_falls_back() {
+        let filtered = ProviderError::ContentFiltered {
+            provider: provider(),
+            message: "blocked".into(),
+        };
+        assert!(!filtered.may_fallback());
     }
 
     #[test]
