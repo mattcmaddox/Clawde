@@ -21,7 +21,7 @@ Nine fix commits in a row were required to get CI green; nearly every failure wa
 
 1. CI: drop `windows-latest` from the test matrix in `.github/workflows/ci.yml`
 2. Release: stop building/publishing `clawde-windows-x86_64.zip` (see `scripts/build.sh` and the README "Supported Platforms" table, line ~104)
-3. Release: drop the Windows leg from the cross-compile plan (local `x86_64-pc-windows-gnu` / `-msvc` targets, TheHive build docs in `.agents/skills/hive-remote-build/SKILL.md`)
+3. Release: drop the Windows leg from the cross-compile plan (local `x86_64-pc-windows-gnu` / `-msvc` targets, the remote-build docs in `.agents/skills/hive-remote-build/SKILL.md`)
 4. Code: optionally remove the Windows-only workarounds that exist purely for this target (`.cargo/config.toml` stack reserve, `cfg(windows)` branches, kitty-keyboard push/pop note in `crates/tui`), or leave them as harmless dead paths
 5. Docs: remove Windows install instructions from `README.md` and `docs/installation.md`
 

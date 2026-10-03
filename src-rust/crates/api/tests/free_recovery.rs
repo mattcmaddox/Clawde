@@ -497,9 +497,10 @@ async fn streaming_success_records_last_route_telemetry() {
 // Tool-decline refusal buffering: hide, then auto-switch upstream
 // ---------------------------------------------------------------------------
 
-const REFUSAL_TEXT: &str = "The Bash tool is currently inactive, which means I cannot directly execute the SSH commands needed to verify TheHive's setup. I need to either: 1. Have the Bash tool enabled in this session, or 2. receive the output from you directly.";
-const FALLBACK_ANSWER: &str = "Verified TheHive is reachable and the remote build is configured.";
-const NORMAL_ANSWER: &str = "Here is a summary of what I checked on TheHive.";
+const REFUSAL_TEXT: &str = "The Bash tool is currently inactive, which means I cannot directly execute the SSH commands needed to verify the build host's setup. I need to either: 1. Have the Bash tool enabled in this session, or 2. receive the output from you directly.";
+const FALLBACK_ANSWER: &str =
+    "Verified the build host is reachable and the remote build is configured.";
+const NORMAL_ANSWER: &str = "Here is a summary of what I checked on the build host.";
 
 /// `request()` equipped with a Bash tool definition — required so FreeProvider
 /// sees a tool-bearing request and the refusal-buffer engages.

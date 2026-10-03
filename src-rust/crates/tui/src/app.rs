@@ -18465,7 +18465,7 @@ mod tests {
         app.ollama_config_dialog.open(None, None);
         app.handle_query_event(QueryEvent::OllamaDiscoveryResult {
             request_id: 6,
-            candidates: vec![("http://192.168.1.45:11434".to_string(), 12, 2)],
+            candidates: vec![("http://192.0.2.45:11434".to_string(), 12, 2)],
             scanned: 254,
         });
         assert_eq!(
@@ -18475,7 +18475,7 @@ mod tests {
         assert_eq!(app.ollama_config_dialog.discovered_hosts.len(), 1);
         assert_eq!(
             app.ollama_config_dialog.discovered_hosts[0].host_url,
-            "http://192.168.1.45:11434"
+            "http://192.0.2.45:11434"
         );
         // Nothing chosen silently — the field stays empty until the user
         // picks from the picker.
@@ -18492,7 +18492,7 @@ mod tests {
         app.ollama_config_dialog.host_url_input = "http://gpu.example.test:11434".to_string();
         app.handle_query_event(QueryEvent::OllamaDiscoveryResult {
             request_id: 7,
-            candidates: vec![("http://192.168.1.99:11434".to_string(), 5, 1)],
+            candidates: vec![("http://192.0.2.99:11434".to_string(), 5, 1)],
             scanned: 254,
         });
         assert_eq!(
@@ -18515,7 +18515,7 @@ mod tests {
         app.ollama_config_dialog.open(None, None);
         app.ollama_config_dialog.set_discovered_hosts(vec![
             crate::ollama_config_dialog::DiscoveredHost {
-                host_url: "http://192.168.1.45:11434".to_string(),
+                host_url: "http://192.0.2.45:11434".to_string(),
                 latency_ms: 12,
                 model_count: 2,
             },
@@ -18524,7 +18524,7 @@ mod tests {
         app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             app.ollama_config_dialog.host_url_input,
-            "http://192.168.1.45:11434"
+            "http://192.0.2.45:11434"
         );
         // No model set yet: the pick chains straight into browsing this
         // server's models (picking one connects).
@@ -18544,7 +18544,7 @@ mod tests {
             .expect("picked host must persist");
         assert_eq!(
             ollama.api_base.as_deref(),
-            Some("http://192.168.1.45:11434/v1")
+            Some("http://192.0.2.45:11434/v1")
         );
     }
 
@@ -18564,7 +18564,7 @@ mod tests {
         // Results in hand: 'd' opens the picker without scanning.
         app.ollama_config_dialog.set_discovered_hosts(vec![
             crate::ollama_config_dialog::DiscoveredHost {
-                host_url: "http://192.168.1.45:11434".to_string(),
+                host_url: "http://192.0.2.45:11434".to_string(),
                 latency_ms: 5,
                 model_count: 1,
             },

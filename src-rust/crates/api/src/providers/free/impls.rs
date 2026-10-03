@@ -8945,7 +8945,7 @@ mod hedge_tests {
     fn is_tool_refusal_matches_bash_inactive_excuse() {
         // The exact failure class reported: the model claims the Bash tool is
         // inactive instead of calling it.
-        let text = "The Bash tool is currently inactive, which means I cannot directly execute the SSH commands needed to verify TheHive's setup for remote builds. The output you provided shows a successful *local* build process, not a remote one on TheHive. To proceed with verifying TheHive's setup, I need to either: 1. Have the Bash tool enabled in this session. 2. Receive the output of the verification commands from you (the user) directly. Please let me know how you'd like to proceed.";
+        let text = "The Bash tool is currently inactive, which means I cannot directly execute the SSH commands needed to verify the build host's setup for remote builds. The output you provided shows a successful *local* build process, not a remote one on the build host. To proceed with verifying the build host's setup, I need to either: 1. Have the Bash tool enabled in this session. 2. Receive the output of the verification commands from you (the user) directly. Please let me know how you'd like to proceed.";
         assert!(
             is_tool_refusal(text),
             "exact reported failure must classify as a refusal"
@@ -8970,7 +8970,7 @@ mod hedge_tests {
         );
         assert!(
             is_tool_refusal(
-                "I would need either a Bash tool enabled or your direct input to verify TheHive."
+                "I would need either a Bash tool enabled or your direct input to verify the build host."
             ),
             "enumerate-choice variant"
         );

@@ -2616,17 +2616,17 @@ mod tests {
         );
         // One host found.
         state.discovered_hosts = vec![DiscoveredHost {
-            host_url: "http://192.168.1.45:11434".to_string(),
+            host_url: "http://192.0.2.45:11434".to_string(),
             latency_ms: 213,
             model_count: 2,
         }];
         assert_eq!(
             state.servers_row_value(),
-            "http://192.168.1.45:11434 — 2 model(s), 213ms"
+            "http://192.0.2.45:11434 — 2 model(s), 213ms"
         );
         // Multiple hosts found.
         state.discovered_hosts.push(DiscoveredHost {
-            host_url: "http://192.168.1.99:11434".to_string(),
+            host_url: "http://192.0.2.99:11434".to_string(),
             latency_ms: 5,
             model_count: 1,
         });
