@@ -1387,9 +1387,9 @@ mod tests {
     #[test]
     fn prompt_shaped_tails_are_detected() {
         for out in [
-            "[sudo] password for churl: ",
+            "[sudo] password for user: ",
             "user@github.com's password: ",
-            "Enter passphrase for key '/home/churl/.ssh/id_ed25519': ",
+            "Enter passphrase for key '/home/user/.ssh/id_ed25519': ",
             "Username for 'https://github.com': ",
             "Overwrite file? [y/N] ",
             "Proceed? [y/N] ",

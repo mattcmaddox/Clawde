@@ -518,7 +518,7 @@ mod tests {
         // Stable across calls when nothing changed.
         assert_eq!(a, fingerprint_of_path(&sub).unwrap());
         // Adding a file changes the manifest fingerprint.
-        std::fs::write(sub.join("01-identity.txt"), "TheDrone").unwrap();
+        std::fs::write(sub.join("01-identity.txt"), "TestHost").unwrap();
         assert_ne!(a, fingerprint_of_path(&sub).unwrap());
     }
 

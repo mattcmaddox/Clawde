@@ -1627,7 +1627,7 @@ mod tests {
         // The regression: the tool-level flag is true for every shell command,
         // so a read-only listing was announced as network-capable.
         let text = rendered_text(&bash_request(
-            "ls -d /home/churl/clawde/src-rust/tmp/clawde_ollama_probe 2>/dev/null && \
+            "ls -d /home/user/clawde/src-rust/tmp/clawde_ollama_probe 2>/dev/null && \
              echo \"exists\" || echo \"not found\"",
         ));
         assert!(

@@ -117,7 +117,7 @@ without a restart. Still to build per this spec: the board web UI + agent
 spawning (§12 agent-execution slice) and the Katban container/caddy-reload
 service (§10.1a units).
 
-**Live bootstrap — done on TheDrone (2026-08-29):** `guest expose
+**Live bootstrap — done on the home server (2026-08-29):** `guest expose
 --subdomain chat.example.com` wrote `/etc/caddy/katban.conf`, the
 one-time `import katban.conf` was added to `/etc/caddy/Caddyfile` (backed up),
 `caddy adapt` validated the route, and `caddy reload` applied it gracefully
@@ -141,7 +141,7 @@ one-time `sudo systemctl enable --now` bootstrap. `systemd-analyze verify`
 passes on all three units.
 
 **Always-on service installed live (2026-08-29, §11 done):** the one-time
-sudo step is complete on TheDrone. `katban.service` (User=user,
+sudo step is complete on the home server. `katban.service` (User=user,
 `Restart=always`, `clawde katban guest serve`) is installed at
 `/etc/systemd/system/`, enabled, and active — the guest server now runs as a
 managed service (verified: active (running), survives the ad-hoc process
@@ -680,8 +680,8 @@ itself.** Two mechanisms; the host-side watcher is the recommended default:
   compatible `caddy` binary, which breaks if the host uses custom caddy
   modules — so this stays a non-default alternative (mostly relevant to the
   container path). Note that `caddy reload --config /etc/caddy/Caddyfile` via
-  the default localhost admin API was proven to work **without root** on
-  TheDrone (2026-08-29).
+  the default localhost admin API was proven to work**without root** on the
+home server (2026-08-29).
 
 **Safety semantics:**
 - Katban writes `katban.conf` **atomically** (write temp file, then `rename()`)
@@ -970,7 +970,7 @@ recommendation; any Phase can be reordered by the user at build time.
 
 | # | Question | Decision |
 |---|---|---|
-| A1 | Deployment target | Home server (the box you run on; here `TheDrone user@192.168.1.55`); base domain `example.com`, projects at `my_project.example.com`. |
+| A1 | Deployment target | Home server (the box you run on; here `user@192.0.2.55`); base domain `example.com`, projects at `my_project.example.com`. |
 | A2 | Public path | User-configured self-hosted side; caddy (bare-metal, `/etc/Caddy`) terminates TLS in front of Katban. |
 | A3 | Katban runtime | **Always-on systemd service** (`katban.service`, rendered by expose; `Restart=always`, non-root user) by default — flipped from container after the caddy mechanics were proven live; SearXNG is the one always-on container; compose at `~/Katban` is the documented alternative for fresh installs. Not foreground. |
 | A4 | Site addressing | **Subdomain per project** (`<project>.example.com`). |
