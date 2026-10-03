@@ -187,11 +187,10 @@ Active while the diff viewer is open.
 
 Vim mode adds `h` / `l` prevDiff/nextDiff.
 
-The read-only viewer does not act on `acceptDiff` (bound to `a` / `Enter`); those
-bindings are declared for symmetry with the diff review flow and currently do
-nothing here. `Tab` / `Left` / `Right` (switch pane), `d` (toggle diff type) and
-`Space` (collapse the highlighted file in the file list) stay with the view's
-own handler.
+The viewer is read-only, so it carries only navigation and dismiss actions —
+there is no pending change to accept. `Tab` / `Left` / `Right` (switch pane),
+`d` (toggle diff type) and `Space` (collapse the highlighted file in the file
+list) stay with the view's own handler.
 
 ### Keybindings Context
 

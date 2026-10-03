@@ -426,8 +426,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("shift+j", "verticalNext", KeyContext::DiffDialog),
         ("k", "prevDiff", KeyContext::DiffDialog),
         ("j", "nextDiff", KeyContext::DiffDialog),
-        ("a", "acceptDiff", KeyContext::DiffDialog),
-        ("enter", "acceptDiff", KeyContext::DiffDialog),
         ("r", "rejectDiff", KeyContext::DiffDialog),
         ("escape", "rejectDiff", KeyContext::DiffDialog),
         ("q", "cancel", KeyContext::DiffDialog),

@@ -2338,7 +2338,6 @@ pub fn render_keybindings_overlay(
                 | "toggleDone"
                 | "prevDiff"
                 | "nextDiff"
-                | "acceptDiff"
                 | "rejectDiff"
                 | "prevMessage"
                 | "nextMessage"
