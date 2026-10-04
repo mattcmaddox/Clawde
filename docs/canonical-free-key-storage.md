@@ -125,7 +125,7 @@ ensures no regressions.
 cargo test -p clawde-core auth_store::tests
 cargo test -p clawde-api providers::free
 cargo test -p clawde-commands keys::tests
-cargo test -p clawde-tui free_mode_dialog::tests
+cargo test -p clawde-tui keys_dialog::tests
 ```
 
 ## Migration Guide

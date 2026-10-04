@@ -137,7 +137,6 @@ pub mod file_injection;
 /// File injection warning dialog (shown when oversized files detected).
 pub mod file_injection_dialog;
 /// Setup dialog for the composite "Free" provider (Zen → OpenRouter).
-pub mod free_mode_dialog;
 pub mod free_model_popup;
 /// Read-only hooks configuration browser.
 pub mod hooks_config_menu;
@@ -151,6 +150,9 @@ pub mod input;
 pub mod invalid_config_dialog;
 /// Scrollable Katban controls menu (Alt+G: guest links, unblock IPs, status).
 pub mod katban_controls;
+/// Key-pool editor state machine and `/keys` renderer (callers own
+/// persistence).
+pub mod key_editor;
 /// Masked text input overlay for entering API keys.
 pub mod key_input_dialog;
 /// `/keys` popup — j/k-navigable key manager with CRUD.
@@ -171,6 +173,8 @@ pub mod messages;
 pub mod mode_panel;
 /// Model picker overlay (/model command).
 pub mod model_picker;
+/// Configurable provider/model menu (/models command).
+pub mod models_menu;
 /// Notification / banner system.
 pub mod notifications;
 /// Modal dialog for configuring Ollama connection (host URL + model picker).
@@ -224,8 +228,6 @@ pub mod transcript_turn;
 pub mod vim_search;
 /// Virtual scrollable list for efficient message rendering.
 pub mod virtual_list;
-/// Push-to-talk voice capture and Whisper transcription.
-pub mod voice_capture;
 /// Voice mode availability notice (shown when voice is available but not enabled).
 pub mod voice_mode_notice;
 
@@ -248,6 +250,9 @@ pub use custom_provider_dialog::{
 pub use desktop_upsell_startup::{
     render_desktop_upsell_startup, DesktopUpsellSelection, DesktopUpsellStartupState,
 };
+pub use device_auth_dialog::{
+    render_device_auth_dialog, DeviceAuthDialogState, DeviceAuthEvent, DeviceAuthStatus,
+};
 pub use dialog_select::{render_dialog_select, DialogSelectState, SelectItem};
 pub use diff_viewer::{
     load_git_diff, parse_unified_diff, render_diff_dialog, DiffPane, DiffType, DiffViewerState,
@@ -257,7 +262,10 @@ pub use elicitation_dialog::{
     ElicitationResult,
 };
 pub use feedback_survey::{FeedbackResponse, FeedbackSurveyStage, FeedbackSurveyState};
-pub use free_mode_dialog::{render_free_mode_dialog, FreeModeDialogState, FreeModeField};
+pub use file_injection::{build_file_blocks, parse_at_refs, AtFileIssue, AtFileRef};
+pub use file_injection_dialog::{
+    render_file_injection_dialog, FileInjectionDialogState, FileInjectionOutcome,
+};
 pub use hooks_config_menu::{HookEntry, HooksConfigMenuState};
 pub use import_config_dialog::{render_import_config_dialog, ImportConfigDialogState};
 pub use input::{is_slash_command, parse_slash_command};
@@ -275,8 +283,9 @@ pub use memory_update_notification::{
     get_relative_memory_path, render_memory_update_notification, MemoryUpdateNotificationState,
 };
 pub use model_picker::{
-    model_supports_effort, render_model_picker, EffortLevel, ModelEntry, ModelPickerState,
+    model_supports_effort, render_model_picker, EffortLevel, FreeTask, ModelEntry, ModelPickerState,
 };
+pub use models_menu::{render_models_menu, ModelsMenuState, ModelsRow};
 pub use notifications::NotificationKind;
 pub use ollama_config_dialog::{
     render_ollama_config_dialog, OllamaConfigDialogState, OllamaConfigField, OllamaConfigPhase,
@@ -299,14 +308,6 @@ pub use tab_status::{
     emit_zellij_action, set_tab_status, zellij_action_sequence, TabStatus, ZellijAction,
 };
 pub use voice_mode_notice::{render_voice_mode_notice, VoiceModeNoticeState};
-// (FreeModeField type is now per-provider; legacy callers may still import both names.)
-pub use device_auth_dialog::{
-    render_device_auth_dialog, DeviceAuthDialogState, DeviceAuthEvent, DeviceAuthStatus,
-};
-pub use file_injection::{build_file_blocks, parse_at_refs, AtFileIssue, AtFileRef};
-pub use file_injection_dialog::{
-    render_file_injection_dialog, FileInjectionDialogState, FileInjectionOutcome,
-};
 
 // ---------------------------------------------------------------------------
 // Terminal initialization / teardown helpers (public API)
@@ -1147,6 +1148,31 @@ mod tests {
     }
 
     #[test]
+    fn test_render_app_url_becomes_an_osc8_hit() {
+        // The live CLI loop scans the completed frame's buffer for URLs and
+        // re-emits them wrapped in OSC 8 escapes (see `osc8::emit_hits`).
+        // This locks the wiring end-to-end: a URL rendered anywhere in the
+        // real UI must survive the scan as a hit, or hyperlinks silently
+        // stop working.
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.push_message(clawde_core::types::Message::user(
+            "see https://example.com/path for details".to_string(),
+        ));
+
+        let completed = terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+
+        let hits = crate::osc8::scan_buffer_for_urls(completed.buffer);
+        assert!(
+            hits.iter().any(|h| h.url.contains("example.com/path")),
+            "expected an OSC 8 hit for the rendered URL, got {hits:?}"
+        );
+    }
+
+    #[test]
     fn test_render_app_keeps_footer_visible_with_slash_suggestions() {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1870,109 +1896,82 @@ mod tests {
     }
 
     #[test]
-    fn test_vim_free_mode_dialog_modal() {
+    fn test_vim_keys_dialog_modal() {
         let mut app = make_app();
         app.prompt_input.vim_enabled = true;
-        app.free_mode_dialog.open(&[]);
+        app.keys_dialog.open(&[]);
 
         // Opens in insert — typing a key works immediately.
         app.handle_key_event(key(KeyCode::Char('x')));
-        assert_eq!(app.free_mode_dialog.fields[0].pending, "x");
+        assert_eq!(app.keys_dialog.fields[0].pending, "x");
 
         // Esc exits insert without clearing the typed key or closing.
         app.handle_key_event(key(KeyCode::Esc));
-        assert!(app.free_mode_dialog.visible);
-        assert_eq!(app.free_mode_dialog.fields[0].pending, "x");
+        assert!(app.keys_dialog.visible);
+        assert_eq!(app.keys_dialog.fields[0].pending, "x");
 
         // Esc in normal mode runs the existing cascade: clear pending...
         app.handle_key_event(key(KeyCode::Esc));
-        assert!(app.free_mode_dialog.visible);
-        assert!(app.free_mode_dialog.fields[0].pending.is_empty());
+        assert!(app.keys_dialog.visible);
+        assert!(app.keys_dialog.fields[0].pending.is_empty());
 
         // ...then close.
         app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.free_mode_dialog.visible);
+        assert!(!app.keys_dialog.visible);
     }
 
     #[test]
-    fn test_vim_free_mode_dialog_hjkl_navigation() {
+    fn test_vim_keys_dialog_hjkl_navigation() {
         let mut app = make_app();
         app.prompt_input.vim_enabled = true;
         let id0 = clawde_api::FREE_CATALOG[0].id;
         let id1 = clawde_api::FREE_CATALOG[1].id;
-        app.free_mode_dialog
-            .open(&[(id0, vec!["k1".to_string()]), (id1, vec!["k2".to_string()])]);
+        app.keys_dialog.open(&[
+            (id0, vec!["k1".to_string(), "k2".to_string()]),
+            (id1, vec!["k3".to_string()]),
+        ]);
 
         // In insert mode, j/k/h/l belong to the typed key.
         app.handle_key_event(key(KeyCode::Char('j')));
-        assert_eq!(app.free_mode_dialog.fields[0].pending, "j");
+        assert_eq!(app.keys_dialog.fields[0].pending, "j");
 
-        // Esc exits insert. With a pending key, hjkl must NOT navigate
+        // Esc exits insert. With a pending key, j/k must NOT navigate
         // (moving rows discards typed text) — the buffer stays intact.
         app.handle_key_event(key(KeyCode::Esc));
         app.handle_key_event(key(KeyCode::Char('j')));
-        assert_eq!(app.free_mode_dialog.active_idx, 0);
-        assert_eq!(app.free_mode_dialog.fields[0].pending, "j");
+        assert_eq!(app.keys_dialog.active_idx, 0);
+        assert_eq!(app.keys_dialog.fields[0].pending, "j");
 
-        // Esc clears the pending text (existing cascade), then hjkl navigate.
+        // Esc clears the pending text, then j/k navigate rows.
         app.handle_key_event(key(KeyCode::Esc));
-        assert!(app.free_mode_dialog.fields[0].pending.is_empty());
+        assert!(app.keys_dialog.fields[0].pending.is_empty());
         app.handle_key_event(key(KeyCode::Char('j')));
-        assert_eq!(app.free_mode_dialog.active_idx, 1);
+        assert_eq!(app.keys_dialog.active_idx, 1);
         app.handle_key_event(key(KeyCode::Char('k')));
-        assert_eq!(app.free_mode_dialog.active_idx, 0);
+        assert_eq!(app.keys_dialog.active_idx, 0);
 
-        // h/l move the horizontal node cursor (new-key line → key dots) with
-        // the same pending-text guard. Field 0 has one key (k1), so there are
-        // two nodes: NewKey → Key(0) → wraps.
+        // h/l walk the expanded key list; Enter reveals row 0 (two keys).
+        app.handle_key_event(key(KeyCode::Enter));
+        assert_eq!(app.keys_dialog.fields[0].revealed, Some(0));
         app.handle_key_event(key(KeyCode::Char('l')));
-        assert_eq!(
-            app.free_mode_dialog.active_node,
-            crate::free_mode_dialog::NodePos::Key(0)
-        );
-        app.handle_key_event(key(KeyCode::Char('l')));
-        assert_eq!(
-            app.free_mode_dialog.active_node,
-            crate::free_mode_dialog::NodePos::NewKey
-        );
+        assert_eq!(app.keys_dialog.fields[0].revealed, Some(1));
         app.handle_key_event(key(KeyCode::Char('h')));
-        assert_eq!(
-            app.free_mode_dialog.active_node,
-            crate::free_mode_dialog::NodePos::Key(0)
-        );
-        app.handle_key_event(key(KeyCode::Char('h')));
-        assert_eq!(
-            app.free_mode_dialog.active_node,
-            crate::free_mode_dialog::NodePos::NewKey
-        );
-
-        // With pending text in the active field, h/l must NOT move the node
-        // cursor (they belong to the typed key).
-        app.handle_key_event(key(KeyCode::Char('i'))); // enter insert
-        app.handle_key_event(key(KeyCode::Char('x'))); // type into pending
-        assert_eq!(app.free_mode_dialog.fields[0].pending, "x");
-        app.handle_key_event(key(KeyCode::Esc)); // exit insert
-        app.handle_key_event(key(KeyCode::Char('l')));
-        assert_eq!(
-            app.free_mode_dialog.active_node,
-            crate::free_mode_dialog::NodePos::NewKey,
-            "h/l must not navigate while pending text is present"
-        );
-        assert_eq!(app.free_mode_dialog.fields[0].pending, "x");
+        assert_eq!(app.keys_dialog.fields[0].revealed, Some(0));
     }
 
     #[test]
-    fn test_free_mode_dialog_typing_unchanged_without_vim() {
+    fn test_keys_dialog_typing_unchanged_without_vim() {
         let mut app = make_app();
-        app.free_mode_dialog.open(&[]);
-        // j with an empty buffer navigates (legacy nav-while-empty); it does
+        app.keys_dialog.open(&[]);
+        // j with an empty buffer navigates (nav-typing·while-empty); it does
         // not type.
         app.handle_key_event(key(KeyCode::Char('j')));
-        assert!(app.free_mode_dialog.fields[0].pending.is_empty());
+        assert!(app.keys_dialog.fields[0].pending.is_empty());
+        assert_eq!(app.keys_dialog.active_idx, 1);
         // Once a key is being typed, letters belong to the key.
         app.handle_key_event(key(KeyCode::Char('a')));
         app.handle_key_event(key(KeyCode::Char('j')));
-        assert_eq!(app.free_mode_dialog.fields[0].pending, "aj");
+        assert_eq!(app.keys_dialog.fields[1].pending, "aj");
     }
 
     #[test]

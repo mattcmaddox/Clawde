@@ -1287,6 +1287,20 @@ pub fn capability_help_text() -> String {
     clawde_api::ModelCapability::help_text()
 }
 
+/// Whether `/model`'s arguments are the `--capability` / `-c` filter flag.
+///
+/// The flag opens the interactive capability-filtered picker (handled by the
+/// TUI layer); it is never a model id. The command layer uses this to avoid
+/// treating the flag string as a model when the same input reaches it (for
+/// example the CLI's parallel dispatch alongside the TUI overlay).
+fn model_args_are_capability_filter(args: &str) -> bool {
+    let args = args.trim_start();
+    args.starts_with("--capability")
+        || args == "-c"
+        || args.starts_with("-c ")
+        || args.starts_with("-c=")
+}
+
 /// Return arg completions for capability values, filtered by the typed prefix.
 fn capability_arg_completions(partial: &str) -> Vec<ArgCompletion> {
     let p = partial.to_lowercase();
@@ -1570,7 +1584,9 @@ impl SlashCommand for ModelCommand {
                 "/model [<model-id>|--capability <cap>]\n\n\
                      Without arguments, shows the current model.\n\
                      With a model ID, switches to that model.\n\
-                     With --capability, opens the model picker filtered by capability.\n\n\
+                     With --capability, opens the model picker filtered by capability.\n\
+                     The picker lists the *current* provider's models; use\n\
+                     /models --capability to filter the free upstream models instead.\n\n\
                      {}\n\n\
                      Examples:\n\
                        /model\n\
@@ -1586,6 +1602,21 @@ impl SlashCommand for ModelCommand {
                 "Current model: {}",
                 ctx.config.effective_model()
             ));
+        }
+
+        // `--capability` opens the interactive picker (TUI layer). Return a
+        // plain Message, not a ConfigChange: the flag is not a model id, and
+        // this path also runs alongside the TUI overlay in the CLI loop, so a
+        // ConfigChange here would silently switch the session to the literal
+        // flag string. The TUI suppresses Message output when it already
+        // opened the picker, so this only surfaces headlessly.
+        if model_args_are_capability_filter(args) {
+            return CommandResult::Message(
+                "/model --capability opens the interactive model picker. \
+                 Without a TUI, list matching models with \
+                 `clawde models --capability <cap>`."
+                    .to_string(),
+            );
         }
 
         // Accept both "provider/model" and bare model names.
@@ -2446,34 +2477,33 @@ impl SlashCommand for TaskCommand {
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let task = args.trim().to_ascii_lowercase();
-        let valid = [
-            "all",
-            "coding",
-            "reasoning",
-            "creative",
-            "fast",
-            "multimodal",
-            "long-context",
-        ];
-        if task.is_empty() {
+        let arg = args.trim().to_ascii_lowercase();
+        if arg.is_empty() {
             return CommandResult::Message(format!(
                 "Current free-model task lane: {}",
                 ctx.config.free_task_sort.as_deref().unwrap_or("all")
             ));
         }
-        if !valid.contains(&task.as_str()) {
+        // One parser shared with the TUI `/task` handler, so both surfaces
+        // accept the same spellings. The persisted value is the canonical
+        // label, which `FreeTask::from_label` restores on restart.
+        let Some(task) = clawde_tui::FreeTask::from_arg(&arg) else {
+            let valid = clawde_tui::FreeTask::ALL
+                .iter()
+                .map(|t| t.label())
+                .collect::<Vec<_>>()
+                .join(", ");
             return CommandResult::Error(format!(
                 "Unknown task '{}'. Choose one of: {}",
-                task,
-                valid.join(", ")
+                arg, valid
             ));
-        }
+        };
+        let canonical = task.label().to_string();
         let mut new_config = ctx.config.clone();
-        new_config.free_task_sort = Some(task.clone());
+        new_config.free_task_sort = Some(canonical.clone());
         CommandResult::ConfigChangeMessage(
             new_config,
-            format!("Free-model task lane set to '{}'.", task),
+            format!("Free-model task lane set to '{}'.", canonical),
         )
     }
 }
@@ -2843,7 +2873,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             target_name: "models",
             slash_aliases: &[],
             slash_description: "Browse free upstream models",
-            slash_help: "Usage: /models [--capability <cap>]",
+            slash_help: "Usage: /models [--capability <cap>] — filters free upstream models; /model --capability filters the current provider",
         }),
     ]
 }
@@ -3502,6 +3532,52 @@ mod tests {
         assert!(find_command("model").is_some());
         assert!(find_command("refresh").is_some());
         assert!(find_command("version").is_some());
+    }
+
+    #[tokio::test]
+    async fn model_capability_flag_is_not_treated_as_a_model() {
+        let mut ctx = make_ctx();
+        let result = ModelCommand.execute("--capability vision", &mut ctx).await;
+        assert!(
+            matches!(result, CommandResult::Message(_)),
+            "--capability must not return a ConfigChange (flag is not a model id)"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_aliases_normalize_to_the_canonical_label() {
+        for (arg, expected) in [
+            ("ctx", "long context"),
+            ("long-context", "long context"),
+            ("context", "long context"),
+            ("code", "coding"),
+            ("reason", "reasoning"),
+            ("multi", "multimodal"),
+        ] {
+            let mut ctx = make_ctx();
+            let result = TaskCommand.execute(arg, &mut ctx).await;
+            match result {
+                CommandResult::ConfigChangeMessage(config, _) => assert_eq!(
+                    config.free_task_sort.as_deref(),
+                    Some(expected),
+                    "arg '{arg}' must persist the canonical label"
+                ),
+                other => panic!("expected a config change for '{arg}', got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_plain_id_still_switches_the_model() {
+        let mut ctx = make_ctx();
+        let result = ModelCommand.execute("openai/gpt-4o", &mut ctx).await;
+        match result {
+            CommandResult::ConfigChangeMessage(config, _) => {
+                assert_eq!(config.model.as_deref(), Some("openai/gpt-4o"));
+                assert_eq!(config.provider.as_deref(), Some("openai"));
+            }
+            other => panic!("expected a model switch, got {:?}", other),
+        }
     }
 
     #[tokio::test]

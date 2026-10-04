@@ -1152,16 +1152,6 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         );
     }
 
-    // "Free" composite-provider setup dialog (Zen + OpenRouter).
-    if app.free_mode_dialog.visible {
-        crate::free_mode_dialog::render_free_mode_dialog(
-            frame,
-            &app.free_mode_dialog,
-            app.prompt_input.vim_enabled,
-            size,
-        );
-    }
-
     // `/keys` management dialog (j/k-navigable key CRUD).
     if app.keys_dialog.visible {
         crate::keys_dialog::render_keys_dialog(
@@ -1170,6 +1160,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             app.prompt_input.vim_enabled,
             size,
         );
+    }
+
+    // `/models` provider menu (Auto + per-provider on/off and selection).
+    if app.models_menu.visible {
+        crate::models_menu::render_models_menu(frame, &app.models_menu, size);
     }
 
     // Smart-router comparison dialog (/compare).
@@ -2482,27 +2477,6 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         right_lines.push(Line::from(chunk.iter().collect::<String>()));
     }
     right_lines.push(Line::from(""));
-
-    // Free mode health badge — shows key count when free mode has keys
-    let free_filled = app.free_mode_dialog.filled_count();
-    if free_filled > 0 {
-        right_lines.push(Line::from(vec![
-            Span::styled(
-                " Free mode ",
-                Style::default()
-                    .fg(Color::Rgb(120, 210, 150))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    "{} key{}",
-                    free_filled,
-                    if free_filled == 1 { "" } else { "s" }
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    }
 
     // Mnemosyne status (audit spec §15.3): one compact line when the project
     // has memory files, so freshness is visible at a glance. Only rendered on
@@ -7074,6 +7048,44 @@ mod ollama_indicator_tests {
             !out.contains("ollama:online"),
             "'ollama:online' must NOT appear in isolated mode. Output: {:?}",
             out
+        );
+    }
+
+    /// The health-sweep `dead` marker is driven by `last_health_sweep`. A
+    /// credential mutation (e.g. `/keys remove`) clears that cache via
+    /// `refresh_free_provider`, so the marker must disappear on the next frame
+    /// rather than lingering until the next scheduled sweep.
+    #[test]
+    fn dead_key_marker_tracks_the_cached_sweep() {
+        let mut app = App::new(
+            Config {
+                provider: Some("free".to_string()),
+                ..Default::default()
+            },
+            CostTracker::new(),
+        );
+        app.status_message = Some("test".to_string());
+
+        // No sweep yet: no marker.
+        assert!(!render_screen(&app).contains("dead"));
+
+        // A sweep that found a dead key lights the marker.
+        app.last_health_sweep = Some(clawde_api::health_poller::ProbeOutcome {
+            checked: 3,
+            unhealthy: 1,
+            results: Vec::new(),
+        });
+        let lit = render_screen(&app);
+        assert!(
+            lit.contains("1 dead"),
+            "unhealthy sweep should show the dead marker: {lit:?}"
+        );
+
+        // Clearing the cached sweep (what a key removal does) hides it.
+        app.last_health_sweep = None;
+        assert!(
+            !render_screen(&app).contains("dead"),
+            "cleared sweep must hide the dead marker"
         );
     }
 

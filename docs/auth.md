@@ -72,8 +72,7 @@ When a free-mode upstream (Groq, Cerebras, Google, Mistral, etc.) succeeds
 using a key from its environment variable and nothing is stored for it yet,
 Clawde persists that key into `~/.clawde/auth.json` automatically. This keeps
 the TUI and future headless runs consistent — an env-only key that works on
-the command line also shows up in `/keys` and the Connect Free dialog after
-its first successful use. Set `persist_env_keys: false` is not required; the
+the command line also shows up in `/keys` after its first successful use. Set `persist_env_keys: false` is not required; the
 import only ever writes a key that was already used successfully.
 
 **Corrupt `auth.json` handling**

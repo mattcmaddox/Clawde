@@ -13,13 +13,14 @@
 // concurrency, preserve ring indexes, and skip providers without keys.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use crate::provider::LlmProvider;
 use crate::providers::free::{probe_upstream_key, UpstreamKeyProbe};
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,39 @@ static LAST_SWEEP: OnceLock<Mutex<Option<ProbeOutcome>>> = OnceLock::new();
 /// TUI event loop).
 static LAST_SWEEP_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// The free composite the poller injects key-exhaustion verdicts into.
+///
+/// Rebuilt (never mutated in place) whenever credentials or routing change:
+/// `ProviderRegistry::rebuild_free`, `reload_provider_runtime_state`, and
+/// `App::refresh_free_provider` all install a *new* `Arc<dyn LlmProvider>`.
+/// The poller therefore cannot capture one at spawn — after the first rebuild
+/// it would call `mark_key_exhausted`/`mark_key_healthy` on a discarded
+/// provider and silently stop benching keys. Every rebuild publishes the
+/// current provider here; each sweep reads it fresh.
+static CURRENT_FREE_PROVIDER: OnceLock<Mutex<Option<Arc<dyn LlmProvider>>>> = OnceLock::new();
+
+fn current_free_provider_slot() -> &'static Mutex<Option<Arc<dyn LlmProvider>>> {
+    CURRENT_FREE_PROVIDER.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish the free composite the health poller should mutate. Call this on
+/// every (re)build of the free provider — startup, `/refresh`, a routing
+/// change, and any credential mutation. Pass `None` when no free provider is
+/// configured so the poller leaves stale state alone.
+pub fn set_current_free_provider(provider: Option<Arc<dyn LlmProvider>>) {
+    if let Ok(mut slot) = current_free_provider_slot().lock() {
+        *slot = provider;
+    }
+}
+
+/// Clone of the currently published free composite, if any.
+fn current_free_provider() -> Option<Arc<dyn LlmProvider>> {
+    current_free_provider_slot()
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
 fn last_sweep_slot() -> &'static Mutex<Option<ProbeOutcome>> {
     LAST_SWEEP.get_or_init(|| Mutex::new(None))
 }
@@ -111,6 +145,22 @@ pub fn take_last_sweep() -> Option<ProbeOutcome> {
     last_sweep_slot().lock().ok().and_then(|g| g.clone())
 }
 
+/// Discard the cached sweep outcome and bump the generation counter.
+///
+/// Called when the credential set changes (a key is added, replaced, or
+/// removed). The stored outcome describes keys that may no longer exist, so
+/// its `unhealthy` count would keep the footer's `⚠ N dead` marker lit until
+/// the next scheduled sweep (up to `health_poll_interval_secs`, default 300s).
+/// Clearing it here hides the marker immediately; the next real sweep
+/// repopulates it from the current key set. The generation bump makes the
+/// TUI's generation-gated poll observe the clear on the next frame.
+pub fn clear_last_sweep() {
+    if let Ok(mut guard) = last_sweep_slot().lock() {
+        *guard = None;
+        LAST_SWEEP_GEN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Monotonic generation counter bumped on every [`store_last_sweep`].
 pub fn last_sweep_generation() -> u64 {
     LAST_SWEEP_GEN.load(Ordering::Relaxed)
@@ -119,13 +169,16 @@ pub fn last_sweep_generation() -> u64 {
 /// Run the health poller async background task.
 ///
 /// * `interval_secs` — 0 disables periodic repeats (startup still runs).
-/// * `free_provider` — the running FreeProvider; unhealthy keys are injected
-///   into its key rings via `mark_key_exhausted` (spec §6.4).
 /// * `report_tx` — optional channel; each sweep's [`ProbeOutcome`] is pushed
 ///   here so the TUI can surface dead keys the moment a probe finds them.
+///
+/// The free composite to mutate is not captured here: it is read from
+/// [`set_current_free_provider`] at the start of every sweep, so a rebuild
+/// that installs a new provider (credential change, routing change, `/refresh`)
+/// takes effect on the next sweep instead of leaving the poller mutating a
+/// discarded one.
 pub async fn run_health_poller(
     interval_secs: u64,
-    free_provider: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
     report_tx: Option<mpsc::UnboundedSender<ProbeOutcome>>,
 ) {
     // Startup sweep — always runs, but deferred briefly so the TUI's first
@@ -134,6 +187,7 @@ pub async fn run_health_poller(
     // async (bounded spawn_blocking), so this only shifts its start; it never
     // blocks the main loop.
     tokio::time::sleep(STARTUP_SWEEP_DELAY).await;
+    let free_provider = current_free_provider();
     poll_and_log(free_provider.as_deref(), report_tx.as_ref()).await;
 
     if interval_secs == 0 {
@@ -144,6 +198,9 @@ pub async fn run_health_poller(
     let interval = Duration::from_secs(interval_secs);
     loop {
         tokio::time::sleep(interval).await;
+        // Re-resolve each cycle: a rebuild between sweeps installs a new
+        // provider, and verdicts must land on the live one.
+        let free_provider = current_free_provider();
         poll_and_log(free_provider.as_deref(), report_tx.as_ref()).await;
     }
 }
@@ -451,10 +508,50 @@ fn build_probe_list(auth_store: &clawde_core::AuthStore) -> Vec<String> {
 mod tests {
     use super::resolve_keys;
     use super::{
-        build_probe_list, last_sweep_generation, probe_sync_for, record_probe_verdict, ProbeOutcome,
+        build_probe_list, current_free_provider, last_sweep_generation, probe_sync_for,
+        record_probe_verdict, set_current_free_provider, ProbeOutcome,
     };
     use crate::providers::free::resolve_free_upstream_keys;
     use crate::providers::free::UpstreamKeyProbe;
+
+    /// A rebuild installs a *new* free provider (`ProviderRegistry::rebuild_free`
+    /// and `reload_provider_runtime_state` both build a fresh `Arc`). The poller
+    /// must mutate whichever one is current, not the one present at spawn —
+    /// otherwise a credential change silently detaches it from every future
+    /// sweep's `mark_key_exhausted`/`mark_key_healthy`.
+    #[test]
+    fn current_free_provider_slot_follows_rebuilds() {
+        use crate::provider::LlmProvider;
+        use crate::providers::openai_compat_providers::provider_for_id;
+        use std::sync::Arc;
+
+        let first: Arc<dyn LlmProvider> = Arc::new(
+            provider_for_id("groq")
+                .expect("groq factory")
+                .with_api_key("k".into()),
+        );
+        let second: Arc<dyn LlmProvider> = Arc::new(
+            provider_for_id("groq")
+                .expect("groq factory")
+                .with_api_key("k".into()),
+        );
+
+        set_current_free_provider(Some(first.clone()));
+        assert!(
+            Arc::ptr_eq(&current_free_provider().unwrap(), &first),
+            "poller must resolve the published provider"
+        );
+
+        // A rebuild swaps the Arc; the next sweep must see the new one.
+        set_current_free_provider(Some(second.clone()));
+        assert!(
+            Arc::ptr_eq(&current_free_provider().unwrap(), &second),
+            "a rebuild must replace the provider the poller mutates"
+        );
+
+        set_current_free_provider(None);
+        assert!(current_free_provider().is_none());
+    }
 
     #[test]
     fn typed_probe_results_distinguish_invalid_and_transient() {

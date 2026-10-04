@@ -11,6 +11,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use std::cell::Cell;
 
+use crate::key_editor::{compose_composite_key, is_composite_key_provider};
 use crate::overlays::{
     centered_rect, render_dark_overlay, render_dialog_bg, CLAWDE_ACCENT, CLAWDE_PANEL_BG,
 };
@@ -104,7 +105,7 @@ impl KeyInputDialogState {
             self.pending_token = Some(token);
             return false;
         }
-        self.input = format!("{}:{}", id, token);
+        self.input = compose_composite_key(&id, &token);
         self.cursor_pos = self.input.len();
         true
     }
@@ -209,7 +210,8 @@ pub fn render_key_input_dialog(
     lines.push(Line::from(""));
 
     // "API Key:" or "Cloudflare Account ID:" label, depending on the step.
-    let awaiting_id = state.pending_token.is_some();
+    let awaiting_id =
+        is_composite_key_provider(&state.provider_id) && state.pending_token.is_some();
     lines.push(Line::from(vec![Span::styled(
         if awaiting_id {
             " Cloudflare Account ID:"
@@ -265,4 +267,48 @@ pub fn render_key_input_dialog(
 
     let para = Paragraph::new(lines).bg(dialog_bg);
     frame.render_widget(para, inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloudflare_two_step_composes_via_the_shared_helper() {
+        let mut s = KeyInputDialogState::new();
+        s.open("cloudflare".into(), "Cloudflare".into());
+        for c in "tok-123456789".chars() {
+            s.insert_char(c);
+        }
+        assert!(s.capture_token());
+        assert_eq!(s.pending_token.as_deref(), Some("tok-123456789"));
+        assert!(s.input.is_empty(), "token prompt clears the input");
+        for c in "acct-987654321".chars() {
+            s.insert_char(c);
+        }
+        assert!(s.compose_with_id());
+        assert_eq!(s.input, "acct-987654321:tok-123456789");
+        assert_eq!(s.pending_token, None);
+    }
+
+    #[test]
+    fn cancel_token_restores_the_input_line() {
+        let mut s = KeyInputDialogState::new();
+        s.open("cloudflare".into(), "Cloudflare".into());
+        s.insert_char('a');
+        s.insert_char('b');
+        assert!(s.capture_token());
+        assert!(s.cancel_token());
+        assert_eq!(s.input, "ab");
+        assert_eq!(s.pending_token, None);
+    }
+
+    #[test]
+    fn compose_with_id_without_a_token_is_a_no_op() {
+        let mut s = KeyInputDialogState::new();
+        s.open("cloudflare".into(), "Cloudflare".into());
+        s.insert_char('x');
+        assert!(!s.compose_with_id());
+        assert_eq!(s.input, "x");
+    }
 }

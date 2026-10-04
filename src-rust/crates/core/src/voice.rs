@@ -308,6 +308,24 @@ fn platform_no_mic_message() -> String {
 // Recording + transcription pipeline
 // ---------------------------------------------------------------------------
 
+/// Pick the explicit transcription endpoint override, if any.
+///
+/// The configured endpoint wins over the `WHISPER_ENDPOINT_URL` env var, and
+/// an empty string counts as unset (so a stray `WHISPER_ENDPOINT_URL=` does
+/// not silently point transcription at nothing). Split out from
+/// [`record_and_transcribe`] so it can be unit-tested without touching the
+/// process-global environment.
+#[cfg(feature = "voice")]
+fn resolve_endpoint_override(
+    config_endpoint: Option<&str>,
+    env_endpoint: Option<&str>,
+) -> Option<String> {
+    config_endpoint
+        .filter(|u| !u.is_empty())
+        .or_else(|| env_endpoint.filter(|u| !u.is_empty()))
+        .map(str::to_string)
+}
+
 /// Captures audio while `is_recording` is `true`, then transcribes and sends
 /// the result over `event_tx`.
 async fn record_and_transcribe(
@@ -353,21 +371,37 @@ async fn record_and_transcribe(
                     .map(|k| (k, false))
             });
 
-        let (api_key, model, endpoint_url) = match key_opt {
-            Some((key, true)) => (
-                key,
-                "whisper-large-v3".to_string(),
-                Some("https://api.groq.com/openai/v1/audio/transcriptions".to_string()),
-            ),
-            Some((key, false)) => (key, config.model.clone(), config.endpoint_url.clone()),
-            None => {
-                let msg = "No API key found for voice transcription. \
-                           Set GROQ_API_KEY (recommended — free), OPENAI_API_KEY, \
-                           or point WHISPER_ENDPOINT_URL to a \
-                           local Whisper server (e.g. whisper.cpp or faster-whisper)."
-                    .to_string();
-                let _ = event_tx.send(VoiceEvent::Error(msg.clone())).await;
-                return Err(anyhow::anyhow!(msg));
+        // A configured endpoint (or `WHISPER_ENDPOINT_URL`) points at a
+        // self-hosted Whisper-compatible server — e.g. whisper.cpp or
+        // faster-whisper — which typically ignores the API key. Honor it
+        // ahead of the cloud defaults and allow a missing key in that case.
+        let env_endpoint = std::env::var("WHISPER_ENDPOINT_URL").ok();
+        let endpoint_override =
+            resolve_endpoint_override(config.endpoint_url.as_deref(), env_endpoint.as_deref());
+
+        let (api_key, model, endpoint_url) = if let Some(url) = endpoint_override {
+            (
+                key_opt.map(|(k, _)| k).unwrap_or_default(),
+                config.model.clone(),
+                Some(url),
+            )
+        } else {
+            match key_opt {
+                Some((key, true)) => (
+                    key,
+                    "whisper-large-v3".to_string(),
+                    Some("https://api.groq.com/openai/v1/audio/transcriptions".to_string()),
+                ),
+                Some((key, false)) => (key, config.model.clone(), None),
+                None => {
+                    let msg = "No API key found for voice transcription. \
+                           Set GROQ_API_KEY (recommended — free), OPENAI_API_KEY, or \
+                           ANTHROPIC_API_KEY, or set WHISPER_ENDPOINT_URL to a local \
+                           Whisper server (e.g. whisper.cpp or faster-whisper)."
+                        .to_string();
+                    let _ = event_tx.send(VoiceEvent::Error(msg.clone())).await;
+                    return Err(anyhow::anyhow!(msg));
+                }
             }
         };
 
@@ -545,12 +579,13 @@ async fn transcribe_audio(
         form = form.text("language", lang.to_string());
     }
 
-    let response = client
-        .post(url)
-        .bearer_auth(api_key)
-        .multipart(form)
-        .send()
-        .await?;
+    // Self-hosted Whisper servers often ignore the key; only send the auth
+    // header when we actually have one.
+    let mut request = client.post(url).multipart(form);
+    if !api_key.is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request.send().await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -700,6 +735,28 @@ mod tests {
         ]);
         let result = check_voice_availability(Some(&tokens));
         assert_eq!(result, VoiceAvailability::Available);
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_resolve_endpoint_override_prefers_config_then_env() {
+        // Config wins over the env var.
+        assert_eq!(
+            resolve_endpoint_override(Some("http://cfg"), Some("http://env")).as_deref(),
+            Some("http://cfg")
+        );
+        // Env used when config is absent or empty.
+        assert_eq!(
+            resolve_endpoint_override(None, Some("http://env")).as_deref(),
+            Some("http://env")
+        );
+        assert_eq!(
+            resolve_endpoint_override(Some(""), Some("http://env")).as_deref(),
+            Some("http://env")
+        );
+        // Empty/absent everywhere means no override.
+        assert_eq!(resolve_endpoint_override(Some(""), Some("")), None);
+        assert_eq!(resolve_endpoint_override(None, None), None);
     }
 
     #[test]

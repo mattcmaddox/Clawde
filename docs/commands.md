@@ -9,7 +9,7 @@ This document is the complete reference for every slash command available in Cla
 1. [Command System Overview](#command-system-overview)
 2. [Session & Navigation](#session--navigation)
 3. [Streaming & Interrupts](#streaming--interrupts)
-4. [Model & Provider](#model--provider) — `/model`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
+4. [Model & Provider](#model--provider) — `/model`, `/models`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
 5. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/autopilot`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
 6. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/spec`, `/spec-mode`, `/spec-review`, `/security-review`, `/init`, `/search`
 7. [Search & Files](#search--files) — `/files`, `/context`
@@ -306,7 +306,10 @@ Esc, Esc     # pause, then hard-stop the turn
 
 ### /model
 
-Open the interactive model picker. Displays a searchable list of available models from all configured providers. The selected model is used for all subsequent inference in the current session.
+Open the interactive model picker for the **active provider** (not every configured
+provider). On the `free` provider the list is a hybrid: `free/auto` first, then
+model families, then one pin per free-catalog upstream. The selected model is used
+for all subsequent inference in the current session.
 
 ```
 /model
@@ -342,6 +345,30 @@ Available capabilities:
 
 ---
 
+### /models
+
+Open the provider menu — one configurable surface for the routing targets. The
+first row is **auto** (route across every enabled provider); each following row
+is a free-catalog upstream with a global on/off toggle and its stored-key count.
+
+```
+/models
+```
+
+Keys: `↑/↓` or `j/k` move, `space` flips the highlighted provider on/off, `enter`
+selects the highlighted row, `esc` closes. The toggle is **global** — turning a
+provider off means every session skips it (persisted under
+`providers.free.options.routing.disabled_upstreams`). Selecting **auto** returns
+to routing across all enabled providers; selecting an upstream pins that
+upstream's default model (still routed through the free composite).
+
+`/model` keeps its own interactive picker; `/models` is the provider/on-off
+menu. The Alt+J/K free-model popup remains the one-keystroke model quick pick.
+`/models --capability <cap>` still opens the free-model picker pre-filtered by
+capability (same values as [`/model --capability`](#capability-filtering---capability)).
+
+---
+
 ### /image
 
 Switch to a model with a specific capability (defaults to vision). After switching, paste an image with Ctrl+V to include it in your prompt.
@@ -371,8 +398,9 @@ List all configured AI providers and their connection status. Shows provider nam
 ### /task
 
 Cycle the free-model task sort, or jump straight to a named task. The task
-sort reorders the `/models` picker so the best-fit models float to the top
-for each common task (see the 1-7 legend in the picker header). Bare `/task`
+sort reorders the free-model picker (Alt+J/K, and `/model` while on the free
+provider) so the best-fit models float to the top for each common task (see
+the 1-7 legend in the picker header). Bare `/task`
 cycles forward; pass a task name to jump directly.
 
 ```
@@ -384,11 +412,10 @@ cycles forward; pass a task name to jump directly.
 ```
 
 Available tasks: `all`, `coding`, `reasoning`, `creative`, `fast`,
-`multimodal`, `context` — plus the short legend forms shown in the picker
-header (`code`, `reason`, `multi`, `ctx`). The same cycle is bound to
-**Alt+T**, and the active sort shows as a badge in the status line when the
-free provider is active. The sort persists across restarts and resets when
-you switch to a non-free provider.
+`multimodal`, `long-context`. The same cycle is bound to **Alt+T**, and the
+active sort shows as a badge in the status line when the free provider is
+active. The sort persists across restarts and resets when you switch to a
+non-free provider.
 
 > Note: `/task` (singular) controls the free-model task **sort**, distinct
 > from `/tasks` (plural), which manages background tasks.
@@ -404,6 +431,11 @@ Connect to a remote AI provider or configure a custom provider endpoint. Support
 /connect <provider-name>
 /connect openai https://api.openai.com/v1
 ```
+
+`/connect free` is an onboarding hand-off, not a key editor: if at least one
+free-upstream key already exists it activates Free mode, otherwise it points
+you at `/keys` to add one. Key entry and provider on/off are handled by `/keys`
+and `/models` respectively.
 
 ---
 

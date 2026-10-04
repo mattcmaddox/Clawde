@@ -77,7 +77,9 @@ pub enum KeyContext {
     McpView,
     Plugin,
     KeysDialog,
-    FreeModeDialog,
+    /// The `/models` provider menu. Its navigation is unconditional (no text
+    /// entry), so `j`/`k` are bound directly rather than conditionally.
+    ModelsMenu,
     /// The `/keybindings` reference overlay. A dedicated context (not `Help`
     /// or `Select`) because its `j`/`k` are conditional — once the filter has
     /// text they type into it — so they stay view-local while the arrows are
@@ -528,28 +530,20 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+enter", "select", KeyContext::KeysDialog),
         ("backspace", "backspace", KeyContext::KeysDialog),
         ("delete", "delete", KeyContext::KeysDialog),
-        // ========== CONNECT-FREE DIALOG ==========
-        // Navigation/selection for the Connect-Free upstream dialog. h/l move
-        // the horizontal node cursor (new-key line ↔ key dots), j/k move
-        // between upstream rows; these are the modes the legacy vim-off paths
-        // used, so they stay in the base table rather than the Vim preset.
-        ("escape", "cancel", KeyContext::FreeModeDialog),
-        ("up", "prev", KeyContext::FreeModeDialog),
-        ("shift+tab", "prev", KeyContext::FreeModeDialog),
-        ("shift+k", "verticalPrev", KeyContext::FreeModeDialog),
-        ("k", "prev", KeyContext::FreeModeDialog),
-        ("down", "next", KeyContext::FreeModeDialog),
-        ("shift+j", "verticalNext", KeyContext::FreeModeDialog),
-        ("j", "next", KeyContext::FreeModeDialog),
-        ("left", "prevKey", KeyContext::FreeModeDialog),
-        ("right", "nextKey", KeyContext::FreeModeDialog),
-        ("h", "prevKey", KeyContext::FreeModeDialog),
-        ("shift+h", "prevKey", KeyContext::FreeModeDialog),
-        ("l", "nextKey", KeyContext::FreeModeDialog),
-        ("shift+l", "nextKey", KeyContext::FreeModeDialog),
-        ("enter", "select", KeyContext::FreeModeDialog),
-        ("backspace", "backspace", KeyContext::FreeModeDialog),
-        ("delete", "delete", KeyContext::FreeModeDialog),
+        // ========== /models PROVIDER MENU ==========
+        // No text entry, so navigation is unconditional. Space flips the
+        // cursor provider on/off; enter selects the Auto/pinned target.
+        ("escape", "cancel", KeyContext::ModelsMenu),
+        ("q", "cancel", KeyContext::ModelsMenu),
+        ("up", "prev", KeyContext::ModelsMenu),
+        ("shift+tab", "prev", KeyContext::ModelsMenu),
+        ("shift+k", "verticalPrev", KeyContext::ModelsMenu),
+        ("k", "prev", KeyContext::ModelsMenu),
+        ("down", "next", KeyContext::ModelsMenu),
+        ("shift+j", "verticalNext", KeyContext::ModelsMenu),
+        ("j", "next", KeyContext::ModelsMenu),
+        ("space", "toggle", KeyContext::ModelsMenu),
+        ("enter", "select", KeyContext::ModelsMenu),
         // ========== KEYBINDINGS REFERENCE OVERLAY ==========
         // `j`/`k` are deliberately absent: once the filter has text they type
         // into it, so the view's own handler decides when they navigate (the
@@ -1373,7 +1367,7 @@ mod tests {
             KeyContext::Select,
             KeyContext::Settings,
             KeyContext::KeysDialog,
-            KeyContext::FreeModeDialog,
+            KeyContext::ModelsMenu,
             KeyContext::ModelPicker,
         ] {
             assert!(bindings.iter().any(|binding| {
@@ -1402,10 +1396,11 @@ mod tests {
             (KeyContext::KeysDialog, "enter", "select"),
             (KeyContext::KeysDialog, "escape", "cancel"),
             (KeyContext::KeysDialog, "delete", "delete"),
-            (KeyContext::FreeModeDialog, "h", "prevKey"),
-            (KeyContext::FreeModeDialog, "l", "nextKey"),
-            (KeyContext::FreeModeDialog, "down", "next"),
-            (KeyContext::FreeModeDialog, "escape", "cancel"),
+            (KeyContext::ModelsMenu, "j", "next"),
+            (KeyContext::ModelsMenu, "k", "prev"),
+            (KeyContext::ModelsMenu, "space", "toggle"),
+            (KeyContext::ModelsMenu, "enter", "select"),
+            (KeyContext::ModelsMenu, "escape", "cancel"),
             (KeyContext::McpView, "h", "cyclePane"),
             (KeyContext::McpView, "l", "cyclePane"),
             (KeyContext::McpView, "tab", "cyclePane"),

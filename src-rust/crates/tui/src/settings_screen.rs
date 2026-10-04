@@ -158,8 +158,6 @@ pub struct SettingsScreen {
     /// Current free-mode routing strategy ("sequential", "random_failover",
     /// "latency_based", "task_based").
     pub routing_strategy: String,
-    /// Comma-separated list of disabled free upstream IDs.
-    pub disabled_upstreams: String,
     /// First-byte watchdog timeout in seconds (0 = disabled).
     pub first_byte_timeout_secs: String,
     /// Whether the parallel probe is enabled (default true).
@@ -262,7 +260,6 @@ impl SettingsScreen {
             file_autocomplete_show_hidden_files: false,
             file_injection_max_size: "100".to_string(),
             routing_strategy: "auto".to_string(),
-            disabled_upstreams: String::new(),
             first_byte_timeout_secs: "0".to_string(),
             staggered_probe: true,
             upstream_5xx_cooldown_secs: "45".to_string(),
@@ -372,22 +369,6 @@ impl SettingsScreen {
             .and_then(|v| v.as_str())
             .unwrap_or("auto")
             .to_string();
-
-        // Read disabled upstreams from provider config
-        self.disabled_upstreams = s
-            .config
-            .provider_configs
-            .get("free")
-            .and_then(|pc| pc.options.get("routing"))
-            .and_then(|v| v.get("disabled_upstreams"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
 
         // Read first-byte timeout from provider config (default 0 = disabled).
         self.first_byte_timeout_secs = s
@@ -853,29 +834,6 @@ impl SettingsScreen {
                             .insert("routing".to_string(), routing);
                     }
                 }
-                "disabled_upstreams" => {
-                    self.disabled_upstreams = value.clone();
-                    let parsed: Vec<String> = value
-                        .split(|c: char| [',', ' '].contains(&c))
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    let mut routing = get_or_create_routing_json(config);
-                    routing["disabled_upstreams"] = serde_json::Value::from(parsed.clone());
-                    config
-                        .provider_configs
-                        .entry("free".to_string())
-                        .or_default()
-                        .options
-                        .insert("routing".to_string(), routing.clone());
-                    self.settings_snapshot
-                        .config
-                        .provider_configs
-                        .entry("free".to_string())
-                        .or_default()
-                        .options
-                        .insert("routing".to_string(), routing);
-                }
                 "ollama_require_explicit_host" => {
                     let val = value == "true";
                     self.ollama_require_explicit_host = val;
@@ -1153,7 +1111,6 @@ fn value_from_settings(settings: &Settings, key: &str) -> String {
         "upstream_5xx_cooldown_secs" => routing_u64_str(c, "upstream_5xx_cooldown_secs"),
         "health_poll_interval_secs" => routing_u64_str(c, "health_poll_interval_secs"),
         "fallback_retries" => routing_u64_str(c, "fallback_retries"),
-        "disabled_upstreams" => routing_disabled_str(c),
         "preferredSearchBackend" => settings.preferred_search_backend.clone(),
         "fileInjectionEnabled" => c.file_injection_enabled.to_string(),
         "fileAutocompleteLimit" => c.file_autocomplete_limit.to_string(),
@@ -1195,7 +1152,6 @@ fn default_value_for(key: &str) -> String {
         "output_style"
         | "compact_threshold"
         | "max_tokens"
-        | "disabled_upstreams"
         | "routing_strategy"
         | "first_byte_timeout_secs"
         | "staggered_probe"
@@ -1282,19 +1238,6 @@ fn routing_bool_str(config: &Config, key: &str) -> String {
         .and_then(|r| r.get(key))
         .and_then(|v| v.as_bool())
         .map(|b| b.to_string())
-        .unwrap_or_default()
-}
-
-fn routing_disabled_str(config: &Config) -> String {
-    routing_json(config)
-        .and_then(|r| r.get("disabled_upstreams"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
         .unwrap_or_default()
 }
 
@@ -1749,16 +1692,6 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
         SettingEffect::Immediate,
         SettingKind::Number,
         screen.fallback_retries.clone(),
-    ));
-    entries.push(make_entry(
-        "disabled_upstreams",
-        "Disabled upstreams",
-        "Free upstreams to skip (comma-separated IDs, e.g. nvidia, groq).",
-        SECTION_FREE_ROUTING,
-        String::new(),
-        SettingEffect::Immediate,
-        SettingKind::Text,
-        screen.disabled_upstreams.clone(),
     ));
 
     // ---- Ollama (local) -------------------------------------------------
@@ -2674,16 +2607,6 @@ fn reset_setting_to_default(screen: &mut SettingsScreen, config: &mut Config, ke
                 .as_object_mut()
                 .map(|r| r.remove("staggered_probe"));
         }
-        "disabled_upstreams" => {
-            c.provider_configs
-                .entry("free".to_string())
-                .or_default()
-                .options
-                .entry("routing".to_string())
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-                .as_object_mut()
-                .map(|r| r.remove("disabled_upstreams"));
-        }
         // Ollama — clear the provider option.
         "ollama_num_ctx" => {
             _ = c
@@ -2822,7 +2745,6 @@ fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
         "upstream_5xx_cooldown_secs" => screen.upstream_5xx_cooldown_secs = "45".to_string(),
         "health_poll_interval_secs" => screen.health_poll_interval_secs = "300".to_string(),
         "fallback_retries" => screen.fallback_retries = "0".to_string(),
-        "disabled_upstreams" => screen.disabled_upstreams = String::new(),
         "ollama_num_ctx" => screen.ollama_num_ctx = "12K".to_string(),
         "ollama_keep_alive" => screen.ollama_keep_alive = "forever".to_string(),
         "ollama_num_predict" => screen.ollama_num_predict = "2K".to_string(),

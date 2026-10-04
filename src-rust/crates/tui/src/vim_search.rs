@@ -31,7 +31,7 @@ impl VimSearch {
     }
 
     /// Enter insert mode immediately. Used by text-entry dialogs (key input,
-    /// custom provider, free-mode fields) whose primary purpose is typing:
+    /// custom provider, the `/keys` editor) whose primary purpose is typing:
     /// they open in insert so typing works right away, and `Esc` exits insert
     /// before the dialog closes (mirroring the search-bar convention).
     pub fn enter_insert(&mut self) {

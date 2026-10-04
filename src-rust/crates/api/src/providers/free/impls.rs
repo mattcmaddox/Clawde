@@ -3083,7 +3083,7 @@ impl Stream for RetryingFreeStream {
 /// If an upstream just succeeded using an env-var key (nothing stored for it
 /// yet), persist that key into the auth store so the TUI and future headless
 /// runs see it automatically — env keys otherwise work headlessly but stay
-/// invisible to `/keys` and the Connect Free dialog.
+/// invisible to `/keys`.
 ///
 /// Called on dispatch success (both `create_message` and stream creation).
 /// Stream creation means the upstream accepted the request; a later mid-stream

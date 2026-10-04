@@ -1659,13 +1659,13 @@ async fn main() -> anyhow::Result<()> {
         // Fire-and-forget startup health probe (non-blocking — the poll
         // runs in the background so the user's prompt is answered without
         // waiting for every upstream to be probed).
-        let free_provider = provider_registry
-            .get(&clawde_core::ProviderId::new("free"))
-            .cloned();
+        clawde_api::health_poller::set_current_free_provider(
+            provider_registry
+                .get(&clawde_core::ProviderId::new("free"))
+                .cloned(),
+        );
         tokio::spawn(clawde_api::health_poller::run_health_poller(
-            0,
-            free_provider,
-            None, // headless — no TUI to report to
+            0, None, // headless — no TUI to report to
         ));
         run_headless(
             &cli,
@@ -2402,6 +2402,59 @@ fn normalize_provider_from_model(config: &mut Config) {
         if let Some((provider, _)) = model.split_once('/') {
             config.provider = Some(provider.to_string());
         }
+    }
+}
+
+/// Whether an arg-bearing `/model …` belongs to the TUI overlay layer rather
+/// than the "set the active model" command path.
+///
+/// `/model <id>` sets the model directly (no overlay), but
+/// `/model --capability <cap>` and the `/model compare …` alias open TUI
+/// dialogs. Treating those as "set state" bypassed the overlay and fed the
+/// flag string itself (`--capability vision`) to the model command as if it
+/// were a model id, silently switching the session to a bogus model.
+fn model_args_use_tui_dialog(args: &str) -> bool {
+    let args = args.trim_start();
+    if args.starts_with("--capability") {
+        return true;
+    }
+    if let Some(rest) = args.strip_prefix("-c") {
+        // `-c <cap>` / `-c=<cap>` short flag; `-codex` and other ids are not
+        // capability flags.
+        if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('=') {
+            return true;
+        }
+    }
+    matches!(args.split_whitespace().next(), Some("compare"))
+}
+
+#[cfg(test)]
+mod model_args_use_tui_dialog_tests {
+    use super::model_args_use_tui_dialog;
+
+    #[test]
+    fn capability_flags_route_to_the_tui_overlay() {
+        assert!(model_args_use_tui_dialog("--capability vision"));
+        assert!(model_args_use_tui_dialog("--capability=vision"));
+        assert!(model_args_use_tui_dialog("-c vision"));
+        assert!(model_args_use_tui_dialog("-c"));
+    }
+
+    #[test]
+    fn compare_alias_routes_to_the_tui_overlay() {
+        assert!(model_args_use_tui_dialog("compare"));
+        assert!(model_args_use_tui_dialog("compare coding"));
+    }
+
+    #[test]
+    fn plain_model_ids_stay_on_the_set_model_path() {
+        assert!(!model_args_use_tui_dialog("claude-sonnet-4-6"));
+        assert!(!model_args_use_tui_dialog("openai/gpt-4o"));
+        assert!(!model_args_use_tui_dialog("--help"));
+        // `-codex` must not be mistaken for the `-c` capability short flag.
+        assert!(!model_args_use_tui_dialog("-codex"));
+        // `comparison` must not be mistaken for the `compare` alias.
+        assert!(!model_args_use_tui_dialog("comparison"));
     }
 }
 
@@ -4192,9 +4245,14 @@ async fn run_interactive(
     let (health_tx, mut health_rx) = mpsc::unbounded_channel();
     let mut last_health_gen = 0u64;
     if let Some(ref provider_registry) = provider_registry {
-        let free_provider = provider_registry
-            .get(&clawde_core::ProviderId::new("free"))
-            .cloned();
+        // Publish the free composite so the poller mutates the live one. It is
+        // refreshed on every rebuild (routing change, credential mutation,
+        // /refresh); the poller re-reads it each sweep instead of capturing it.
+        clawde_api::health_poller::set_current_free_provider(
+            provider_registry
+                .get(&clawde_core::ProviderId::new("free"))
+                .cloned(),
+        );
         let poll_interval = config
             .provider_configs
             .get("free")
@@ -4204,7 +4262,6 @@ async fn run_interactive(
             .unwrap_or(clawde_api::health_poller::DEFAULT_HEALTH_POLL_INTERVAL_SECS);
         tokio::spawn(clawde_api::health_poller::run_health_poller(
             poll_interval,
-            free_provider,
             Some(health_tx),
         ));
     }
@@ -4753,10 +4810,13 @@ async fn run_interactive(
         app.rustail_editor.tick_blink();
         app.notifications.tick();
         // Service the one-shot background loads (welcome-screen "Recent
-        // activity" + the /session browser) that App::run also drives — the
-        // interactive loop owns the frame pump here, so without this call the
-        // welcome list would stay permanently empty.
+        // activity" + the /session browser) — the interactive loop owns the
+        // frame pump here, so without this call the welcome list would stay
+        // permanently empty.
         app.poll_background_loads();
+        // Deliver any voice transcripts that arrived since the last frame
+        // (non-blocking; the interactive loop is the only drain point).
+        app.poll_voice_events();
 
         // Process file injection dialog outcome (if any)
         if let Some((outcome, pending_input, pending_imgs)) =
@@ -4796,8 +4856,19 @@ async fn run_interactive(
             last_scroll_signal = signal;
         }
 
-        // Draw the UI
-        terminal.draw(|f| render_app(f, &app))?;
+        // Draw the UI, then scan the *just-rendered* buffer for URL runs and
+        // re-emit those cells wrapped in OSC 8 hyperlink escapes so terminals
+        // that support them (iTerm2, WezTerm, Kitty, Windows Terminal, …) make
+        // the links Ctrl/Cmd-clickable. Failure is non-fatal — an overlay
+        // glitch must never kill the TUI. ratatui swaps its two buffers at the
+        // end of draw(), so `CompletedFrame.buffer` is the frame we want.
+        let osc8_hits = {
+            let completed = terminal.draw(|f| render_app(f, &app))?;
+            clawde_tui::osc8::scan_buffer_for_urls(completed.buffer)
+        };
+        if let Err(err) = clawde_tui::osc8::emit_hits(&osc8_hits) {
+            tracing::debug!(target: "osc8", "hyperlink overlay write failed: {err}");
+        }
 
         // Level-sync the terminal progress indicator (OSC 9;4) to streaming
         // state, so supporting terminals (iTerm2, WezTerm, Windows Terminal, …)
@@ -5022,6 +5093,9 @@ async fn run_interactive(
                             continue;
                         }
 
+                        // Advisory prompt-injection warning (no API call; never blocks).
+                        app.warn_if_prompt_injection(&input);
+
                         // Check for slash command
                         if input.starts_with('/') {
                             let (cmd_name, cmd_args) =
@@ -5040,17 +5114,15 @@ async fn run_interactive(
                             //   /resume <id>         → load session, don't open browser
                             // Also skip TUI for /vim, /voice, /fast with explicit
                             // on|off args so the blind-toggle doesn't misfire.
+                            // `/model --capability <cap>` and `/model compare` are
+                            // overlay commands despite carrying args, so they are
+                            // exempted via `model_args_use_tui_dialog`.
                             let skip_tui_for_args = !cmd_args.is_empty()
-                                && matches!(
-                                    cmd_name.as_str(),
-                                    "model"
-                                        | "theme"
-                                        | "resume"
-                                        | "session"
-                                        | "vim"
-                                        | "vi"
-                                        | "voice"
-                                );
+                                && match cmd_name.as_str() {
+                                    "model" => !model_args_use_tui_dialog(&cmd_args),
+                                    "theme" | "resume" | "session" | "vim" | "vi" | "voice" => true,
+                                    _ => false,
+                                };
                             let handled_by_tui = if skip_tui_for_args {
                                 false
                             } else {
@@ -5413,6 +5485,12 @@ async fn run_interactive(
                                                         model_registry.as_ref(),
                                                     );
                                                 session.updated_at = chrono::Utc::now();
+                                                clawde_api::health_poller::set_current_free_provider(
+                                                    refreshed
+                                                        .provider_registry
+                                                        .get(&clawde_core::ProviderId::new("free"))
+                                                        .cloned(),
+                                                );
                                                 app.apply_provider_refresh(
                                                     refreshed.config,
                                                     Some(refreshed.provider_registry),
@@ -5643,6 +5721,12 @@ async fn run_interactive(
                                                     Some(refreshed.provider_registry.clone());
                                                 base_query_config.provider_registry =
                                                     Some(refreshed.provider_registry.clone());
+                                                clawde_api::health_poller::set_current_free_provider(
+                                                    refreshed
+                                                        .provider_registry
+                                                        .get(&clawde_core::ProviderId::new("free"))
+                                                        .cloned(),
+                                                );
                                                 app.provider_registry =
                                                     Some(refreshed.provider_registry.clone());
                                             }
@@ -6408,6 +6492,12 @@ async fn run_interactive(
                                     Some(refreshed.provider_registry.clone());
                                 base_query_config.provider_registry =
                                     Some(refreshed.provider_registry.clone());
+                                clawde_api::health_poller::set_current_free_provider(
+                                    refreshed
+                                        .provider_registry
+                                        .get(&clawde_core::ProviderId::new("free"))
+                                        .cloned(),
+                                );
                                 app.provider_registry = Some(refreshed.provider_registry.clone());
                             }
                             Err(e) => {
@@ -6489,11 +6579,6 @@ async fn run_interactive(
                             // Paste into API key input dialog
                             for ch in data.chars() {
                                 app.key_input_dialog.insert_char(ch);
-                            }
-                        } else if app.free_mode_dialog.visible {
-                            // Paste into Free Mode multi-provider dialog
-                            for ch in data.chars() {
-                                app.free_mode_dialog.insert_char(ch);
                             }
                         } else if app.custom_provider_dialog.visible {
                             // Paste into Custom OpenAI-compatible dialog
@@ -7542,9 +7627,7 @@ async fn run_interactive(
         }
 
         // Drain free dialog key validation results (non-blocking).
-        app.poll_free_dialog_validation();
-        app.poll_free_dialog_reprobe();
-        app.poll_keys_dialog_validation();
+        app.poll_key_validation();
         app.poll_image_results();
 
         // Drain ask-user question events (non-blocking).
@@ -8279,6 +8362,14 @@ async fn run_interactive(
                     session.model = clawde_api::effective_model_for_config(
                         &cmd_ctx.config,
                         model_registry.as_ref(),
+                    );
+                    // The reload built a fresh registry — republish its free
+                    // composite so the health poller mutates the live one.
+                    clawde_api::health_poller::set_current_free_provider(
+                        refreshed
+                            .provider_registry
+                            .get(&clawde_core::ProviderId::new("free"))
+                            .cloned(),
                     );
                     app.provider_registry = Some(refreshed.provider_registry);
                     app.has_credentials = true;

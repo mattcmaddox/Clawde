@@ -519,6 +519,69 @@ fn key_ring_lock_can_be_reclaimed(_path: &Path) -> bool {
     true
 }
 
+/// Write `snapshot` to `path` under the per-file lock, with owner-only
+/// permissions and an atomic temp-file rename. Shared by
+/// [`KeyRing::save_to_file`] and [`prune_snapshot_file`] so every writer of a
+/// cooldown snapshot (which contains raw key strings) uses one locked path.
+fn write_snapshot(path: &Path, snapshot: &ProviderKeyRingSnapshot) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    crate::accounts::set_user_only_dir_perms(parent);
+    let Some(_lock) = KeyRingFileLock::acquire(path) else {
+        return;
+    };
+    let json = match serde_json::to_string_pretty(snapshot) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("key-ring-state");
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+    if std::fs::write(&tmp, &json).is_ok() {
+        crate::accounts::set_user_only_perms(&tmp);
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// Remove entries for keys absent from `live_keys` from the persisted snapshot
+/// at `path`, returning `true` when the file changed.
+///
+/// [`KeyRing::apply_snapshot`] matches entries by raw key string, so an entry
+/// left behind for a removed key is inert while that key is gone — but it
+/// silently resurrects the stale cooldown if the exact same string is re-added
+/// later. Credential-removal paths call this so the state file never outlives
+/// its keys. A missing or unparseable file is a no-op (same fail-closed
+/// strategy as [`KeyRing::load_from_file`]).
+///
+/// `live_keys` are compared after trimming; the stored entries already carry
+/// the canonical (trimmed) key from the auth store.
+pub fn prune_snapshot_file(path: &Path, live_keys: &[String]) -> bool {
+    let Ok(json) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(mut snapshot) = serde_json::from_str::<ProviderKeyRingSnapshot>(&json) else {
+        return false;
+    };
+    let before = snapshot.entries.len();
+    snapshot.entries.retain(|entry| {
+        let key = entry.key.trim();
+        live_keys.iter().any(|live| live.trim() == key)
+    });
+    if snapshot.entries.len() == before {
+        return false;
+    }
+    write_snapshot(path, &snapshot);
+    true
+}
+
 impl KeyRing {
     /// Produce a snapshot of current cooldown state for persistence.
     /// Cooldowns are stored as *remaining seconds* so the snapshot is
@@ -595,32 +658,7 @@ impl KeyRing {
     /// rename. Cooldown snapshots contain key identities, so they must receive
     /// the same protection as `auth.json` and must not race another process.
     pub fn save_to_file(&self, path: &Path) {
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-        crate::accounts::set_user_only_dir_perms(parent);
-        let Some(_lock) = KeyRingFileLock::acquire(path) else {
-            return;
-        };
-        let snapshot = self.to_snapshot();
-        let json = match serde_json::to_string_pretty(&snapshot) {
-            Ok(j) => j,
-            Err(_) => return,
-        };
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("key-ring-state");
-        let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
-        if std::fs::write(&tmp, &json).is_ok() {
-            crate::accounts::set_user_only_perms(&tmp);
-            if std::fs::rename(&tmp, path).is_err() {
-                let _ = std::fs::remove_file(&tmp);
-            }
-        }
+        write_snapshot(path, &self.to_snapshot());
     }
 
     /// Load previously-saved cooldown state from a JSON file at `path`.
@@ -1053,6 +1091,57 @@ mod tests {
             let (idx, _) = ring.next_available().unwrap();
             assert_eq!(idx, 0, "k1 should be the active key after load");
         }
+    }
+
+    /// Pruning the persisted snapshot against a live key set drops exactly the
+    /// removed key's entry, leaving the surviving keys' cooldowns intact — the
+    /// shape `AuthStore::remove_key` relies on. Without it a removed key's
+    /// entry survives on disk and its stale cooldown resurrects if the same
+    /// key string is re-added later.
+    #[test]
+    fn prune_snapshot_file_removes_entries_for_absent_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("groq.json");
+
+        let mut ring = make_ring(&["k1", "k2"]);
+        ring.mark_exhausted(1, 600, Some("quota".into()));
+        ring.save_to_file(&path);
+
+        // k2 was removed from the store; only k1 is live.
+        assert!(prune_snapshot_file(&path, &["k1".to_string()]));
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let snapshot: ProviderKeyRingSnapshot = serde_json::from_str(&raw).unwrap();
+        assert_eq!(snapshot.entries.len(), 1, "removed key's entry is gone");
+        assert_eq!(snapshot.entries[0].key, "k1");
+
+        // Re-loading the pruned snapshot leaves k1 active and never revives k2.
+        let mut fresh = make_ring(&["k1"]);
+        fresh.load_from_file(&path);
+        assert_eq!(fresh.active_count(), 1);
+        assert_eq!(fresh.exhausted_count(), 0);
+    }
+
+    #[test]
+    fn prune_snapshot_file_is_noop_when_nothing_was_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("groq.json");
+        let mut ring = make_ring(&["k1", "k2"]);
+        ring.mark_exhausted(1, 60, None);
+        ring.save_to_file(&path);
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(!prune_snapshot_file(
+            &path,
+            &["k1".to_string(), "k2".to_string()]
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // Missing / unparseable files are no-ops too (fail closed).
+        assert!(!prune_snapshot_file(&dir.path().join("absent.json"), &[]));
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, "not json").unwrap();
+        assert!(!prune_snapshot_file(&corrupt, &[]));
     }
 
     #[test]

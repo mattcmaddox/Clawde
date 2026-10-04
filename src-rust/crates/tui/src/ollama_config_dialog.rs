@@ -6,7 +6,7 @@
 //   3. Model picker: pings server, shows available models
 //
 // Health dot (●) next to host: green = reachable, red = unreachable, dim = untested.
-// Follows the free_mode_dialog health dot convention.
+// Follows the key-editor health dot convention.
 
 use ratatui::layout::Rect;
 use ratatui::prelude::Stylize;

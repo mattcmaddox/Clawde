@@ -18,7 +18,6 @@ use crate::overlays::{
 };
 use crate::plugin_views::{PluginHintBanner, PluginListItem, PluginListState};
 use crate::prompt_input::{InputMode, PromptInputState, VimMode};
-use crate::render;
 use crate::rustail_editor::{RustailEditAction, RustailEditor};
 use crate::session_browser::SessionBrowserState;
 use crate::settings_screen::SettingsScreen;
@@ -43,12 +42,9 @@ use clawde_core::types::{ContentBlock, Message, Role};
 use clawde_core::RankedFollowup;
 use clawde_core::{sample_completion_verb, sample_spinner_verb};
 use clawde_query::QueryEvent;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use ratatui::backend::CrosstermBackend;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::style::Color;
-use ratatui::Terminal;
 use std::cell::{Cell, RefCell};
-use std::io::Stdout;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 
@@ -213,9 +209,9 @@ fn detect_env_var_key(upstream_id: &str) -> Option<String> {
 }
 /// All stored keys for a free-catalog upstream: single-key / OAuth
 /// credentials plus rotation keys, deduplicated, with OpenCode Zen sharing
-/// the OpenCode Go slots. Display-oriented — seeds the Connect Free dialog's
-/// per-key health dots (the health poller keeps its own ring-aligned probe
-/// list via `resolve_free_upstream_keys`).
+/// the OpenCode Go slots. Display-oriented — seeds `/keys`' per-key health
+/// dots (the health poller keeps its own ring-aligned probe list via
+/// `resolve_free_upstream_keys`).
 fn free_upstream_stored_keys(auth: &clawde_core::AuthStore, upstream_id: &str) -> Vec<String> {
     clawde_api::providers::free::all_stored_free_upstream_keys(auth, upstream_id)
 }
@@ -1682,6 +1678,9 @@ pub struct App {
     pub effort_picker_applied: bool,
     /// Task-routing pinning dialog (/routing edit — audit spec §8.6).
     pub routing_dialog: crate::routing_dialog::RoutingDialogState,
+    /// Configurable provider/model menu (`/models`): Auto + one row per
+    /// free-catalog upstream with a global on/off toggle.
+    pub models_menu: crate::models_menu::ModelsMenuState,
     /// Spec review dialog (/spec-review <file> — audit spec §10 Accept/Edit/Reject).
     pub spec_review: crate::spec_review::SpecReviewState,
     /// Session identity used to bind spec-review approvals to the active run.
@@ -1717,7 +1716,6 @@ pub struct App {
     /// [`App::maybe_start_auto_ollama_scan`]).
     pub ollama_discovery_last_result: Option<std::time::Instant>,
     /// "Free" composite-provider setup dialog (multi-key health dots).
-    pub free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState,
     /// Alt+G Katban controls menu (guest links, unblock IPs, status).
     pub katban_controls: crate::katban_controls::KatbanControlsState,
     /// /chat Cat Chat popup (guest-link manager: list, new password, delete).
@@ -1914,21 +1912,10 @@ pub struct App {
         Option<tokio::sync::mpsc::UnboundedReceiver<clawde_tools::UserQuestionEvent>>,
     /// State for the model-initiated ask-user question dialog.
     pub ask_user_dialog: crate::ask_user_dialog::AskUserDialogState,
-    /// Receiver for non-blocking key validation results (from free mode dialog).
-    /// Drained each frame so validation status updates as soon as the HTTP
-    /// request completes.
-    pub validation_rx: Option<std::sync::mpsc::Receiver<crate::free_mode_dialog::ValidationPing>>,
-    /// Receiver for `/keys` dialog validation results. Same shape as
-    /// `validation_rx` (free dialog); drained each frame so the `/keys` key
-    /// dots flip green/red as soon as each probe completes.
-    pub keys_dialog_rx: Option<std::sync::mpsc::Receiver<crate::keys_dialog::ValidationPing>>,
-    /// Receiver for health-poller re-probe results (Ctrl+R in the free mode
-    /// dialog — runs the same probe as `/health <upstream>`). Drained each
-    /// frame so the re-probed provider's dots update in place. Each message
-    /// is `(field_idx, outcome)` — the field captured when the probe was
-    /// started, so results land correctly even if the cursor moves mid-probe.
-    pub free_reprobe_rx:
-        Option<std::sync::mpsc::Receiver<(usize, clawde_api::health_poller::ProbeOutcome)>>,
+    /// The key-validation channel for the `/keys` popup. Drained each frame so
+    /// validation status updates as soon as each probe completes; each
+    /// [`crate::key_editor::ValidationPing`] is `(field_idx, key_idx, result)`.
+    pub key_validation_rx: Option<std::sync::mpsc::Receiver<crate::key_editor::ValidationPing>>,
     /// Receiver for non-blocking clipboard image reads (spawned on a background
     /// thread so the TUI never freezes during xclip/wl-paste subprocess calls).
     pub image_rx: Option<std::sync::mpsc::Receiver<Option<crate::image_paste::PastedImage>>>,
@@ -2448,6 +2435,7 @@ impl App {
             effort_picker: crate::effort_picker::EffortPickerState::new(),
             effort_picker_applied: false,
             routing_dialog: crate::routing_dialog::RoutingDialogState::new(),
+            models_menu: crate::models_menu::ModelsMenuState::new(),
             spec_review: crate::spec_review::SpecReviewState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
             keys_dialog: crate::keys_dialog::KeysDialogState::new(),
@@ -2460,7 +2448,6 @@ impl App {
             ollama_discovery_request_id: 0,
             ollama_discovery_pending: false,
             ollama_discovery_last_result: None,
-            free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState::new(),
             katban_controls: crate::katban_controls::KatbanControlsState::default(),
             cat_chat: crate::cat_chat::CatChatState::default(),
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
@@ -2558,9 +2545,7 @@ impl App {
             pending_key: None,
             model_fetch_rx: None,
             user_question_rx: None,
-            validation_rx: None,
-            keys_dialog_rx: None,
-            free_reprobe_rx: None,
+            key_validation_rx: None,
             image_rx: None,
             ask_user_dialog: crate::ask_user_dialog::AskUserDialogState::new(),
             context_window_size: 0,
@@ -3115,88 +3100,51 @@ impl App {
         crate::model_picker::default_model_for_provider(provider_id, &self.model_registry)
     }
 
-    /// Poll the free dialog validation channel (called from main loop).
-    /// Drains any completed validation results and updates the dialog UI.
-    pub fn poll_free_dialog_validation(&mut self) {
-        if let Some(ref rx) = self.validation_rx {
-            match rx.try_recv() {
-                Ok((field_idx, key_idx, result)) => {
-                    self.free_mode_dialog
-                        .set_validation_result(field_idx, key_idx, result);
-                    // Don't clear validation_rx — auto-ping may send
-                    // multiple results (one per upstream). Only clear
-                    // on Disconnected (all threads done).
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.validation_rx = None;
-                }
-            }
-        }
-    }
-
-    /// Poll the `/keys` dialog validation channel (called from main loop).
-    /// Drains completed validation results and updates the key dots.
-    pub fn poll_keys_dialog_validation(&mut self) {
-        if let Some(ref rx) = self.keys_dialog_rx {
+    /// Poll the key-validation channel (called from main loop). Drains every
+    /// completed result into the `/keys` popup. The receiver is cleared only on
+    /// `Disconnected` (all probe threads done), so a multi-key sweep delivers
+    /// every dot.
+    pub fn poll_key_validation(&mut self) {
+        loop {
+            let Some(rx) = self.key_validation_rx.as_ref() else {
+                return;
+            };
             match rx.try_recv() {
                 Ok((field_idx, key_idx, result)) => {
                     self.keys_dialog
                         .set_validation_result(field_idx, key_idx, result);
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.keys_dialog_rx = None;
+                    self.key_validation_rx = None;
+                    return;
                 }
             }
         }
     }
 
-    /// Poll the free dialog re-probe channel (called from main loop).
-    /// Applies a completed health-poller outcome to the active provider's
-    /// health dots — same probe as `/health <upstream>`.
-    pub fn poll_free_dialog_reprobe(&mut self) {
-        if let Some(ref rx) = self.free_reprobe_rx {
-            match rx.try_recv() {
-                Ok((field_idx, outcome)) => {
-                    self.free_mode_dialog
-                        .apply_probe_outcome(field_idx, &outcome);
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.free_reprobe_rx = None;
-                }
-            }
+    /// `/connect free` onboarding hand-off. `/keys` is the single key editor,
+    /// so this never opens one itself: it activates Free mode when at least one
+    /// key exists and otherwise points the user at `/keys`.
+    fn hand_off_free_mode(&mut self) {
+        let has_keys = clawde_api::FREE_CATALOG.iter().any(|u| {
+            !free_upstream_stored_keys(&self.auth_store, u.id).is_empty()
+                || detect_env_var_key(u.id).is_some()
+        });
+        if has_keys {
+            self.activate_provider("free".to_string(), "Free Mode".to_string(), "Connected to");
+        } else {
+            self.status_message = Some(
+                "Free mode needs at least one key — add one with /keys, then run /connect free again."
+                    .to_string(),
+            );
         }
-    }
-
-    /// Commit the free-mode dialog: append any typed new key, persist every
-    /// configured key to the auth store, close the dialog, rebuild the free
-    /// chain, and activate Free mode. Shared by both Ctrl+Enter code paths.
-    /// No-ops (with a hint) when no key is configured — the footer promises
-    /// "paste at least 1 key" before connecting.
-    fn connect_free_mode(&mut self) {
-        if !self.free_mode_dialog.can_submit() {
-            self.status_message = Some("Add at least 1 key to enable Free mode.".to_string());
-            return;
-        }
-        self.free_mode_dialog.append_pending();
-        self.free_mode_dialog.apply_values();
-        // Sync the in-memory auth_store so re-opening the dialog seeds from
-        // the freshly-written store (apply_values writes to a fresh load).
-        self.auth_store = clawde_core::AuthStore::load();
-        self.free_mode_dialog.close();
-        // Rebuild the free chain from the freshly-saved keys so the status
-        // bar and /ctx-viz reflect them now.
-        self.refresh_free_provider();
-        self.activate_provider("free".to_string(), "Free Mode".to_string(), "Connected to");
     }
 
     /// Open the interactive `/keys` management popup: one row per free-catalog
     /// upstream with stored keys shown as health dots, j/k navigation, and
     /// add / reveal / delete controls. Seeds each row from the auth store and
-    /// marks env-var-provided keys read-only (mirrors the Connect Free
-    /// dialog's collection, but for pure key management).
+    /// marks env-var-provided keys read-only.
     pub fn open_keys_dialog(&mut self) {
         // Collect existing keys from auth_store *and* env vars so users see
         // all configured keys — one dot per key.
@@ -3273,21 +3221,47 @@ impl App {
         self.attachments_selected = 0;
     }
 
+    /// The single persistence path for key edits from any dialog: reload the
+    /// auth store (so a long-lived instance never clobbers a newer on-disk
+    /// write), apply the stale-credential removals, apply the canonical key
+    /// writes, save, and rebuild the free chain. Returns the number of keys
+    /// written, for the caller's "Saved N key(s)" status line.
+    ///
+    /// Reloading here is what closes the stale-store race: a caller that
+    /// built its own `AuthStore` could not see edits made through the `/keys`
+    /// popup in the same session.
+    pub fn apply_key_edits(
+        &mut self,
+        updates: &[(&'static str, Vec<String>)],
+        removals: &[&'static str],
+    ) -> usize {
+        self.auth_store.reload();
+        for provider_id in removals {
+            // Drop only a stale legacy single credential; `AuthStore::remove`
+            // would delete the canonical pool too.
+            self.auth_store.remove_credential(provider_id);
+        }
+        for (id, keys) in updates {
+            self.auth_store.set_keys(id, keys.clone());
+        }
+        let total: usize = updates.iter().map(|(_, ks)| ks.len()).sum();
+        self.auth_store.save();
+        // Rebuild the free chain so the saved keys take effect. This also
+        // clears the cached health sweep, whose `unhealthy` count may name a
+        // key that was just deleted (footer `dead` marker).
+        self.refresh_free_provider();
+        total
+    }
+
     /// Persist the `/keys` dialog's edited key map to the auth store, rebuild
     /// the free chain, and fire a background validity sweep. Shared by the
     /// Enter (new key) and Delete (removed key) paths so both reach disk.
     fn persist_keys_dialog(&mut self) {
-        let updates = self.keys_dialog.store_updates();
-        let total: usize = updates.iter().map(|(_, ks)| ks.len()).sum();
-        for (id, keys) in &updates {
-            self.auth_store.set_keys(id, keys.clone());
-        }
-        self.auth_store.save();
+        let (updates, removals) = self.keys_dialog.store_updates();
+        let total = self.apply_key_edits(&updates, &removals);
         self.status_message = Some(format!("\u{2713} Saved {} key(s), validating…", total));
-        // Rebuild the free chain so the saved keys take effect.
-        self.refresh_free_provider();
         if let Some(rx) = self.keys_dialog.start_validate() {
-            self.keys_dialog_rx = Some(rx);
+            self.key_validation_rx = Some(rx);
         }
     }
 
@@ -3334,6 +3308,159 @@ impl App {
             let _ = tx.send(crate::image_paste::read_clipboard_image());
         });
         self.image_rx = Some(rx);
+    }
+
+    /// Build the `/models` menu rows: the Auto row followed by one row per
+    /// free-catalog upstream, with its enabled state (from
+    /// `disabled_upstreams`) and stored-key count.
+    fn models_menu_rows(&self) -> Vec<crate::models_menu::ModelsRow> {
+        let disabled: Vec<String> = clawde_core::config::Settings::load_sync()
+            .map(|s| s.effective_config())
+            .unwrap_or_default()
+            .provider_configs
+            .get("free")
+            .and_then(|pc| pc.options.get("routing"))
+            .and_then(|v| v.get("disabled_upstreams"))
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+            .unwrap_or_default();
+        let mut rows = vec![crate::models_menu::ModelsRow {
+            id: "free".to_string(),
+            title: "auto".to_string(),
+            enabled: true,
+            is_auto: true,
+            key_count: 0,
+        }];
+        for upstream in clawde_api::FREE_CATALOG {
+            rows.push(crate::models_menu::ModelsRow {
+                id: upstream.id.to_string(),
+                title: upstream.title.to_string(),
+                enabled: !disabled.iter().any(|d| d == upstream.id),
+                is_auto: false,
+                key_count: self
+                    .auth_store
+                    .keys_for(upstream.id)
+                    .map(|k| k.len())
+                    .unwrap_or(0),
+            });
+        }
+        rows
+    }
+
+    /// Open the `/models` provider menu.
+    fn open_models_menu(&mut self) {
+        self.dismiss_error_notifications();
+        let rows = self.models_menu_rows();
+        self.models_menu.open(rows);
+    }
+
+    /// Rebuild the menu rows after a toggle, preserving the cursor.
+    fn rebuild_models_menu_rows(&mut self) {
+        let rows = self.models_menu_rows();
+        self.models_menu.set_rows(rows);
+    }
+
+    /// Set a provider's global on/off state. Free-catalog upstreams write
+    /// `providers.free.options.routing.disabled_upstreams`; every other
+    /// provider writes `providers.<id>.enabled`. Rebuilds the free chain so
+    /// the change takes effect immediately.
+    fn set_upstream_enabled(&mut self, id: &str, enabled: bool) {
+        if clawde_core::AuthStore::is_free_upstream(id) {
+            if let Ok(mut settings) = clawde_core::config::Settings::load_sync() {
+                let mut cfg = settings
+                    .config
+                    .provider_configs
+                    .get("free")
+                    .and_then(|pc| pc.options.get("routing"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"strategy": "auto"}));
+                let mut disabled: Vec<String> = cfg
+                    .get("disabled_upstreams")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                disabled.retain(|d| d != id);
+                if !enabled {
+                    disabled.push(id.to_string());
+                }
+                if let Some(obj) = cfg.as_object_mut() {
+                    obj.insert(
+                        "disabled_upstreams".to_string(),
+                        serde_json::json!(disabled),
+                    );
+                }
+                settings
+                    .config
+                    .provider_configs
+                    .entry("free".to_string())
+                    .or_default()
+                    .options
+                    .insert("routing".to_string(), cfg);
+                let _ = settings.save_sync();
+            }
+            self.refresh_free_provider();
+        } else if let Ok(mut settings) = clawde_core::config::Settings::load_sync() {
+            settings
+                .config
+                .provider_configs
+                .entry(id.to_string())
+                .or_default()
+                .enabled = enabled;
+            let _ = settings.save_sync();
+        }
+    }
+
+    /// Apply the cursor row: Auto returns to routing across all enabled
+    /// providers (`free/auto`); an upstream pins that upstream's default model
+    /// (still routed through the free composite, so `config.provider` stays
+    /// `free` — audit P).
+    fn select_models_menu_row(&mut self) {
+        let Some(row) = self.models_menu.current().cloned() else {
+            return;
+        };
+        if row.is_auto {
+            self.set_model("free/auto".to_string());
+            self.status_message =
+                Some("Model: free/auto (routing across enabled providers)".to_string());
+        } else {
+            let default_model = clawde_api::FREE_CATALOG
+                .iter()
+                .find(|u| u.id == row.id)
+                .map(|u| u.default_model)
+                .unwrap_or("auto");
+            self.set_model(format!("{}/{}", row.id, default_model));
+            self.status_message = Some(format!("Model: {}/{} (pinned)", row.id, default_model));
+        }
+        if self.config.provider.as_deref() != Some("free") {
+            self.config.provider = Some("free".to_string());
+        }
+        self.persist_provider_and_model();
+        self.models_menu.close();
+    }
+
+    /// Dispatch a key against the configured bindings for the `/models` menu.
+    /// Returns `true` when a bound action handled it.
+    fn handle_models_menu_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::ModelsMenu) else {
+            return false;
+        };
+        match action.as_str() {
+            "cancel" => self.models_menu.close(),
+            "prev" => self.models_menu.select_prev(),
+            "next" => self.models_menu.select_next(),
+            "toggle" => {
+                if let Some(id) = self.models_menu.toggle_current() {
+                    let enabled = self
+                        .models_menu
+                        .current()
+                        .map(|r| r.enabled)
+                        .unwrap_or(true);
+                    self.set_upstream_enabled(&id, enabled);
+                    self.rebuild_models_menu_rows();
+                }
+            }
+            "select" => self.select_models_menu_row(),
+            _ => return false,
+        }
+        true
     }
 
     fn open_model_picker_for_provider(&mut self, provider_id: &str, title: Option<String>) {
@@ -3438,9 +3565,27 @@ impl App {
         if let Some(ref mut reg_arc) = self.provider_registry {
             let registry = std::sync::Arc::make_mut(reg_arc);
             registry.rebuild_free(&config);
+            // The rebuild installs a *new* free provider, so republish it: the
+            // health poller reads this slot each sweep and would otherwise keep
+            // mutating the discarded one.
+            clawde_api::health_poller::set_current_free_provider(
+                registry.get(&clawde_core::ProviderId::new("free")).cloned(),
+            );
         }
+        // A credential change alters which keys exist, so the cached health
+        // sweep (and the footer's `dead` marker) now describes a key set that
+        // may no longer be current. Clear it here; the next scheduled sweep
+        // repopulates it. Without this the marker stays lit for up to
+        // health_poll_interval_secs after the key it names was removed.
+        clawde_api::health_poller::clear_last_sweep();
+        self.last_health_sweep = None;
         self.free_model_defaults = clawde_api::providers::free::take_free_model_defaults();
         self.free_model_lists = clawde_api::providers::free::take_free_model_lists();
+        // The chain can shrink (removing the last key of an upstream drops it
+        // from `free_model_defaults`). Clamp the Alt+U cycle index so it can
+        // never point past the new list — otherwise the prompt row silently
+        // renders a stale upstream label from the previous chain.
+        self.free_upstream_index = self.free_upstream_index.min(self.free_model_defaults.len());
     }
 
     /// Whether a provider id can affect the free-mode fallback chain — i.e.
@@ -4624,6 +4769,12 @@ impl App {
         self.close_secondary_views();
         self.config = config;
         self.provider_registry = provider_registry;
+        // A full provider reload replaces the credential set, so any cached
+        // health sweep (and the footer's `dead` marker) describes the previous
+        // keys. Clear it here too, not just on the credential-mutation path, so
+        // `/refresh` cannot leave a stale dead-key badge on screen.
+        clawde_api::health_poller::clear_last_sweep();
+        self.last_health_sweep = None;
         self.model_registry = clawde_api::ModelRegistry::new();
         // Re-layer user metadata overrides (issue #309) onto the fresh registry.
         self.model_registry
@@ -4648,7 +4799,6 @@ impl App {
         // it rather than leaving the pill describing a GPU box the session no
         // longer points at.
         self.ollama_vram = clawde_core::config::OllamaVramStatus::default();
-        self.free_mode_dialog = crate::free_mode_dialog::FreeModeDialogState::new();
         self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
         self.device_auth_pending = None;
         self.pending_mcp_panel_auth = None;
@@ -4971,23 +5121,15 @@ impl App {
         }
 
         // /task [<name>]: cycle the free-model task sort, or jump straight to
-        // a named task (all/coding/reasoning/creative/fast/multimodal/context).
+        // a named task. The accepted spellings live in `FreeTask::from_arg`,
+        // shared with the command-layer `/task` so the two surfaces can never
+        // disagree (a mismatch previously made `/task ctx` an error here but
+        // `/task long-context` a different lane in the CLI).
         if cmd == "task" {
             let arg = args.trim();
             if arg.is_empty() {
                 self.cycle_free_task(1);
-            } else if let Some(task) = FreeTask::ALL.iter().copied().find(|t| {
-                // Accept the full label AND the short legend form (e.g.
-                // "reasoning" or the "reason" shown as 3=reason in the picker).
-                t.label() == arg
-                    || matches!(
-                        (t, arg),
-                        (FreeTask::Coding, "code")
-                            | (FreeTask::Reasoning, "reason")
-                            | (FreeTask::Multimodal, "multi")
-                            | (FreeTask::Context, "ctx")
-                    )
-            }) {
+            } else if let Some(task) = FreeTask::from_arg(arg) {
                 self.set_free_task(task);
             } else {
                 self.status_message = Some(format!(
@@ -5279,10 +5421,10 @@ impl App {
                 true
             }
             "models" => {
-                self.open_model_picker_for_provider("free", Some("Free models".to_string()));
-                self.model_picker.loading_models = false;
-                self.model_picker.models_loaded = true;
-                self.model_picker_fetch_pending = false;
+                // Bare /models opens the configurable provider menu. The
+                // `/models --capability <cap>` filter path stays the free
+                // upstream picker (handled earlier, before this dispatch).
+                self.open_models_menu();
                 true
             }
             "task" => {
@@ -5583,7 +5725,6 @@ impl App {
         self.custom_provider_dialog.close();
         self.ollama_config_dialog.close();
         self.keys_dialog.close();
-        self.free_mode_dialog.close();
         self.device_auth_dialog.close();
         self.effort_picker.close();
         self.routing_dialog.close();
@@ -5637,7 +5778,6 @@ impl App {
             || self.custom_provider_dialog.visible
             || self.ollama_config_dialog.visible
             || self.keys_dialog.visible
-            || self.free_mode_dialog.visible
             || self.device_auth_dialog.visible
             || self.command_palette.visible
             || self.katban_controls.visible
@@ -5647,6 +5787,7 @@ impl App {
             || self.effort_picker.visible
             || self.free_model_popup.visible
             || self.routing_dialog.visible
+            || self.models_menu.visible
             || self.session_browser.visible
             || self.session_branching.visible
             || self.export_dialog.visible
@@ -6942,6 +7083,13 @@ impl App {
             return false;
         }
 
+        // /models provider menu (Auto + per-provider on/off and selection).
+        // All of its keys flow through the configurable `ModelsMenu` context.
+        if self.models_menu.visible {
+            self.handle_models_menu_navigation(&key);
+            return false;
+        }
+
         // Spec review dialog (/spec-review — audit spec §10 Accept/Edit/Reject).
         if self.spec_review.visible {
             // Picker sub-mode (several specs in specs/): route its own keys.
@@ -7224,7 +7372,7 @@ impl App {
                     // The first Enter captures the API token and switches the
                     // dialog to the account-ID prompt; the second Enter joins
                     // them and saves the composite key.
-                    if provider_id == "cloudflare" {
+                    if crate::key_editor::is_composite_key_provider(&provider_id) {
                         if self.key_input_dialog.pending_token.is_none() {
                             if self.key_input_dialog.capture_token() {
                                 // Stay open — the dialog now asks for the ID.
@@ -7358,117 +7506,6 @@ impl App {
                 KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
                     let c = self.shift_normalize(c, key.modifiers);
                     self.key_input_dialog.insert_char(c);
-                }
-                _ => {}
-            }
-            return false;
-        }
-
-        // "Free" composite-provider setup dialog — multi-key health dots,
-        // reveal-on-Enter, append-on-Enter, delete-confirm, Ctrl+Enter connect.
-        if self.free_mode_dialog.visible {
-            // Delete-confirmation popup captures all keys while open.
-            if self.free_mode_dialog.delete_confirm.is_some() {
-                match key.code {
-                    KeyCode::Enter => {
-                        self.free_mode_dialog.confirm_delete();
-                    }
-                    KeyCode::Esc => {
-                        self.free_mode_dialog.cancel_delete();
-                    }
-                    KeyCode::Char(c) => match c.to_ascii_lowercase() {
-                        'y' => self.free_mode_dialog.confirm_delete(),
-                        'n' => self.free_mode_dialog.cancel_delete(),
-                        _ => {}
-                    },
-                    _ => {}
-                }
-                return false;
-            }
-            // Vim-modal text entry: the dialog opens in insert (typing keys
-            // works immediately); Esc exits insert before the unreveal → clear
-            // → close cascade runs.
-            match self
-                .free_mode_dialog
-                .vim_search
-                .handle_key(self.prompt_input.vim_enabled, &key)
-            {
-                VimSearchKey::Consumed => return false,
-                VimSearchKey::PushChar(c) => {
-                    let c = self.shift_normalize(c, key.modifiers);
-                    self.free_mode_dialog.insert_char(c);
-                    return false;
-                }
-                VimSearchKey::PopChar => {
-                    self.free_mode_dialog.backspace();
-                    return false;
-                }
-                VimSearchKey::Passthrough => {}
-            }
-            let active_pending_empty = self
-                .free_mode_dialog
-                .fields
-                .get(self.free_mode_dialog.active_idx)
-                .is_none_or(|f| f.pending.is_empty());
-            let active_revealed = self.free_mode_dialog.active_is_revealed();
-            // Navigation/selection flows through the configurable keybindings
-            // (`FreeModeDialog` context). Text entry and the controls left
-            // hardcoded fall through to the match below.
-            if self.handle_free_mode_dialog_navigation(&key, active_pending_empty, active_revealed)
-            {
-                return false;
-            }
-            match key.code {
-                KeyCode::Tab => {
-                    // Tab toggles between show-all and show-configured-only view
-                    self.free_mode_dialog.toggle_show_all();
-                }
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Ctrl+Enter — commit everything and connect Free mode.
-                    self.connect_free_mode();
-                }
-                KeyCode::Char('\n') | KeyCode::Char('\r')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    // Some terminals report Ctrl+Enter as a control character.
-                    self.connect_free_mode();
-                }
-                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 's' => {
-                    // Ctrl+S: Apply/save keys without closing the dialog
-                    self.free_mode_dialog.append_pending();
-                    let saved = self.free_mode_dialog.apply_values();
-                    if saved > 0 {
-                        // Sync the in-memory auth_store so keys show up on re-open.
-                        self.auth_store = clawde_core::AuthStore::load();
-                        self.status_message = Some(format!("\u{2713} Saved {} key(s)", saved));
-                        // Rebuild the free chain so the saved keys take effect.
-                        self.refresh_free_provider();
-                    }
-                }
-                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'v' => {
-                    // Start non-blocking key validation
-                    if let Some(rx) = self.free_mode_dialog.start_validate() {
-                        self.validation_rx = Some(rx);
-                    }
-                }
-                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'r' => {
-                    // Re-probe the active provider's health via the
-                    // health-poller path (same probe as /health <upstream>).
-                    if let Some(rx) = self.free_mode_dialog.start_reprobe() {
-                        self.free_reprobe_rx = Some(rx);
-                    }
-                }
-                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'd' => {
-                    // Toggle enabled/disabled for the active upstream
-                    self.free_mode_dialog.toggle_enabled();
-                }
-                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
-                    // Text entry (vim off). With vim on, text reaches this arm
-                    // only in insert mode, which the vim search state machine
-                    // consumed above; normal-mode letters were handled as
-                    // navigation by `handle_free_mode_dialog_navigation`.
-                    let c = self.shift_normalize(c, key.modifiers);
-                    self.free_mode_dialog.insert_char(c);
                 }
                 _ => {}
             }
@@ -8061,67 +8098,10 @@ impl App {
                                     "Switched to",
                                 );
                             }
-                            // "Free" composite mode — collects any subset of the
-                            // free-tier upstreams (min 1; more = better availability).
-                            "free" => {
-                                // Collect existing keys from auth_store *and* env vars
-                                // so users see all configured keys — one dot per key.
-                                let existing: Vec<(&'static str, Vec<String>)> =
-                                    clawde_api::FREE_CATALOG
-                                        .iter()
-                                        .filter_map(|upstream| {
-                                            let mut keys = free_upstream_stored_keys(
-                                                &self.auth_store,
-                                                upstream.id,
-                                            );
-                                            // Fall back to env var when nothing is stored.
-                                            if keys.is_empty() {
-                                                if let Some(k) = detect_env_var_key(upstream.id) {
-                                                    keys.push(k);
-                                                }
-                                            }
-                                            keys.retain(|k| !k.trim().is_empty());
-                                            if keys.is_empty() {
-                                                None
-                                            } else {
-                                                Some((upstream.id, keys))
-                                            }
-                                        })
-                                        .collect();
-
-                                // Collect env-var-only keys: only mark upstreams as
-                                // "from env" when auth_store has NO key for them.
-                                // (If auth_store already has a key, that takes priority
-                                // and the field should NOT be marked read-only.)
-                                let env_var_keys: Vec<(&'static str, String)> =
-                                    clawde_api::FREE_CATALOG
-                                        .iter()
-                                        .filter_map(|upstream| {
-                                            // Only mark as env-var when auth_store has NO key.
-                                            let already_in_store = !free_upstream_stored_keys(
-                                                &self.auth_store,
-                                                upstream.id,
-                                            )
-                                            .is_empty();
-                                            if already_in_store {
-                                                return None;
-                                            }
-                                            let env_name = env_var_name_for_upstream(upstream.id)?;
-                                            std::env::var(env_name)
-                                                .ok()
-                                                .filter(|v| !v.is_empty())
-                                                .map(|v| (upstream.id, v))
-                                        })
-                                        .collect();
-
-                                self.free_mode_dialog.open(&existing);
-                                // Mark env-var keys as read-only in the dialog.
-                                self.free_mode_dialog.set_env_var_keys(&env_var_keys);
-                                // Auto-ping: validate all non-empty keys in background
-                                if let Some(rx) = self.free_mode_dialog.start_auto_pings() {
-                                    self.validation_rx = Some(rx);
-                                }
-                            }
+                            // "Free" composite mode — an onboarding hand-off.
+                            // `/keys` is the single key editor; here we just route
+                            // when keys exist, or point at `/keys` when none do.
+                            "free" => self.hand_off_free_mode(),
                             "anthropic" => {
                                 // Anthropic: API key from console.anthropic.com.
                                 self.key_input_dialog
@@ -9911,8 +9891,8 @@ impl App {
         // own contexts so they stay rebindable.
         if self.keys_dialog.visible {
             KeyContext::KeysDialog
-        } else if self.free_mode_dialog.visible {
-            KeyContext::FreeModeDialog
+        } else if self.models_menu.visible {
+            KeyContext::ModelsMenu
         } else if self.model_picker.visible {
             KeyContext::ModelPicker
         } else if self.keybindings_overlay.visible {
@@ -10036,80 +10016,6 @@ impl App {
                 // edits the typed new-key text.
                 if !self.keys_dialog.try_open_delete_confirm() && !self.prompt_input.vim_enabled {
                     self.keys_dialog.backspace();
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Dispatch a key against the configured bindings for the Connect-Free
-    /// dialog. Returns `true` when a bound action handled it; `false` lets the
-    /// caller fall through to text entry and the remaining hardcoded controls
-    /// (Tab show-all, Ctrl+S/V/R/D, Ctrl+Enter).
-    fn handle_free_mode_dialog_navigation(
-        &mut self,
-        key: &KeyEvent,
-        pending_empty: bool,
-        revealed: bool,
-    ) -> bool {
-        let Some(action) = self.resolve_dialog_action(key, &KeyContext::FreeModeDialog) else {
-            return false;
-        };
-        let is_char = matches!(key.code, KeyCode::Char(_));
-        match action.as_str() {
-            "cancel" => {
-                // Esc cascade: hide a revealed key → drop typed text → close.
-                if !self.free_mode_dialog.unreveal_active()
-                    && !self.free_mode_dialog.clear_pending()
-                {
-                    self.free_mode_dialog.close();
-                }
-                true
-            }
-            "prev" if !is_char || pending_empty => {
-                self.free_mode_dialog.move_prev();
-                true
-            }
-            "next" if !is_char || pending_empty => {
-                self.free_mode_dialog.move_next();
-                true
-            }
-            // An expanded row: h/l (and the arrows) move the key-selection
-            // cursor. Otherwise they move the node cursor across the new-key
-            // line and the key dots. Letters only do either while the new-key
-            // buffer is empty, so a partially typed key is never discarded.
-            "prevKey" if !is_char || pending_empty => {
-                if revealed {
-                    self.free_mode_dialog.select_prev_key();
-                } else {
-                    self.free_mode_dialog.move_node_prev();
-                }
-                true
-            }
-            "nextKey" if !is_char || pending_empty => {
-                if revealed {
-                    self.free_mode_dialog.select_next_key();
-                } else {
-                    self.free_mode_dialog.move_node_next();
-                }
-                true
-            }
-            "select" => {
-                self.free_mode_dialog.enter_active();
-                true
-            }
-            "backspace" if !self.prompt_input.vim_enabled => {
-                if !self.free_mode_dialog.try_open_delete_confirm() {
-                    self.free_mode_dialog.backspace();
-                }
-                true
-            }
-            "delete" => {
-                if !self.free_mode_dialog.try_open_delete_confirm()
-                    && !self.prompt_input.vim_enabled
-                {
-                    self.free_mode_dialog.backspace();
                 }
                 true
             }
@@ -12022,11 +11928,6 @@ impl App {
             if r.area() > 0 {
                 return Some(r);
             }
-        } else if self.free_mode_dialog.visible {
-            let r = self.free_mode_dialog.last_rect.get();
-            if r.area() > 0 {
-                return Some(r);
-            }
         } else if self.keys_dialog.visible {
             let r = self.keys_dialog.last_rect.get();
             if r.area() > 0 {
@@ -12039,6 +11940,11 @@ impl App {
             }
         } else if self.routing_dialog.visible {
             let r = self.routing_dialog.last_rect.get();
+            if r.area() > 0 {
+                return Some(r);
+            }
+        } else if self.models_menu.visible {
+            let r = self.models_menu.last_rect.get();
             if r.area() > 0 {
                 return Some(r);
             }
@@ -12230,32 +12136,12 @@ impl App {
         }
     }
 
-    /// Returns `true` when the app is in a state where the prompt can accept
-    /// regular text input — used to gate paste-burst detection.
-    fn prompt_is_accepting_text(&self) -> bool {
-        !self.is_streaming
-            && self.permission_request.is_none()
-            && !self.ask_user_dialog.visible
-            && !self.history_search_overlay.visible
-            && self.history_search.is_none()
-            && !self.settings_screen.visible
-            && !self.theme_screen.visible
-            && !self.theme_creator.visible
-            && !self.rustail_editor.visible
-            && !self.free_mode_dialog.visible
-            && !self.key_input_dialog.visible
-            && !self.custom_provider_dialog.visible
-            && !self.ollama_config_dialog.visible
-            && !self.keys_dialog.visible
-            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
-    }
-
     /// Gate for paste-burst detection in the live CLI event loop: keystrokes
     /// are currently flowing into the prompt (no modal is capturing input and
-    /// vim is in insert mode). Unlike `prompt_is_accepting_text`, streaming
-    /// does NOT disable it — the prompt stays editable during a turn for
-    /// queued composition, and a raw-key paste flood must be captured there
-    /// too instead of submitting on every pasted newline.
+    /// vim is in insert mode). Streaming does NOT disable it — the prompt
+    /// stays editable during a turn for queued composition, and a raw-key
+    /// paste flood must be captured there too instead of submitting on every
+    /// pasted newline.
     pub fn paste_burst_allowed(&self) -> bool {
         !self.any_modal_open() && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
     }
@@ -12747,7 +12633,6 @@ impl App {
             || self.custom_provider_dialog.visible
             || self.ollama_config_dialog.visible
             || self.keys_dialog.visible
-            || self.free_mode_dialog.visible
             || self.device_auth_dialog.visible
             || self.command_palette.visible
             || self.katban_controls.visible
@@ -12757,6 +12642,7 @@ impl App {
             || self.effort_picker.visible
             || self.free_model_popup.visible
             || self.routing_dialog.visible
+            || self.models_menu.visible
             || self.session_browser.visible
             || self.session_branching.visible
             || self.export_dialog.visible
@@ -13793,12 +13679,79 @@ impl App {
     // Main run loop
     // -------------------------------------------------------------------
 
+    /// Drain voice transcription events (non-blocking) into the prompt.
+    ///
+    /// Called once per frame by the interactive loop. When the background
+    /// recording/transcription task emits a `TranscriptReady` event we insert
+    /// the text directly into the prompt so the user can review and submit it.
+    /// Without this drain, voice transcripts never reach the prompt.
+    pub fn poll_voice_events(&mut self) {
+        use clawde_core::voice::VoiceEvent;
+        let mut events = Vec::new();
+        if let Some(ref mut rx) = self.voice_event_rx {
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
+            match ev {
+                VoiceEvent::RecordingStarted => {
+                    self.voice_recording = true;
+                    self.status_message =
+                        Some("Recording\u{2026} (Alt+V or Esc to stop)".to_string());
+                }
+                VoiceEvent::RecordingStopped => {
+                    self.voice_recording = false;
+                    self.status_message = Some("Transcribing\u{2026}".to_string());
+                }
+                VoiceEvent::TranscriptReady(text) => {
+                    if !text.is_empty() {
+                        // Append to existing prompt text with a space separator
+                        // so the user can combine voice + typed input.
+                        if !self.prompt_input.text.is_empty()
+                            && !self.prompt_input.text.ends_with(' ')
+                        {
+                            self.prompt_input.paste(" ");
+                        }
+                        self.prompt_input.paste(&text);
+                        self.refresh_prompt_input();
+                        self.status_message =
+                            Some(format!("Transcribed: {}", &text[..text.len().min(60)]));
+                    }
+                    // Clear the channel once we have the result.
+                    self.voice_event_rx = None;
+                }
+                VoiceEvent::Error(msg) => {
+                    self.voice_recording = false;
+                    self.voice_event_rx = None;
+                    self.push_notification(
+                        NotificationKind::Warning,
+                        format!("Voice: {}", msg),
+                        Some(8),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Warn (advisory, no API call) when a submitted prompt matches a common
+    /// prompt-injection / jailbreak pattern. Never blocks submission.
+    pub fn warn_if_prompt_injection(&mut self, text: &str) {
+        if let Some(hint) = detect_injection(text) {
+            self.push_notification(
+                NotificationKind::Warning,
+                format!("Possible prompt injection: {}", hint),
+                Some(5),
+            );
+        }
+    }
+
     /// Poll the background session-list and recent-sessions loads started by
     /// [`App::session_list_pending`] / [`App::recent_sessions_pending`], and
     /// spawn them when requested. Must be called once per UI frame by whatever
-    /// loop owns the terminal (the interactive CLI frame loop and
-    /// [`App::run`]). Without it the welcome screen's "Recent activity" list
-    /// and the `/session` browser stay permanently empty: the loads are
+    /// loop owns the terminal (the interactive CLI frame loop). Without it the
+    /// welcome screen's "Recent activity" list and the `/session` browser
+    /// stay permanently empty: the loads are
     /// one-shot async tasks that only run while this is polled.
     pub fn poll_background_loads(&mut self) {
         // Drain background session-list results.
@@ -14009,232 +13962,6 @@ impl App {
         }
     }
 
-    /// Run the TUI event loop. Returns `Some(input)` when the user submits
-    /// a message, or `None` when the user quits.
-    pub fn run(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> anyhow::Result<Option<String>> {
-        loop {
-            self.frame_count = self.frame_count.wrapping_add(1);
-
-            self.poll_background_loads();
-
-            // Drain voice transcription events (non-blocking).
-            // When the background recording/transcription task emits a
-            // TranscriptReady event we insert the text directly into the
-            // prompt so the user can review and submit it.
-            {
-                use clawde_core::voice::VoiceEvent;
-                let mut events = Vec::new();
-                if let Some(ref mut rx) = self.voice_event_rx {
-                    while let Ok(ev) = rx.try_recv() {
-                        events.push(ev);
-                    }
-                }
-                for ev in events {
-                    match ev {
-                        VoiceEvent::RecordingStarted => {
-                            self.voice_recording = true;
-                            self.status_message =
-                                Some("Recording\u{2026} (Alt+V or Esc to stop)".to_string());
-                        }
-                        VoiceEvent::RecordingStopped => {
-                            self.voice_recording = false;
-                            self.status_message = Some("Transcribing\u{2026}".to_string());
-                        }
-                        VoiceEvent::TranscriptReady(text) => {
-                            if !text.is_empty() {
-                                // Append to existing prompt text with a space separator
-                                // so the user can combine voice + typed input.
-                                if !self.prompt_input.text.is_empty()
-                                    && !self.prompt_input.text.ends_with(' ')
-                                {
-                                    self.prompt_input.paste(" ");
-                                }
-                                self.prompt_input.paste(&text);
-                                self.refresh_prompt_input();
-                                self.status_message =
-                                    Some(format!("Transcribed: {}", &text[..text.len().min(60)]));
-                            }
-                            // Clear the channel once we have the result.
-                            self.voice_event_rx = None;
-                        }
-                        VoiceEvent::Error(msg) => {
-                            self.voice_recording = false;
-                            self.voice_event_rx = None;
-                            self.push_notification(
-                                NotificationKind::Warning,
-                                format!("Voice: {}", msg),
-                                Some(8),
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Draw the frame, and immediately scan the *just-rendered*
-            // buffer for URL runs. ratatui swaps its two buffers at the
-            // end of draw(), so by the time draw() returns,
-            // `terminal.current_buffer_mut()` points at the empty next-frame
-            // slot. `CompletedFrame.buffer` is the one we actually want.
-            let osc8_hits = {
-                let completed = terminal.draw(|f| render::render_app(f, self))?;
-                crate::osc8::scan_buffer_for_urls(completed.buffer)
-            };
-
-            // Post-paint OSC 8 overlay: re-emit URL cells wrapped in
-            // hyperlink escapes so terminals that support OSC 8 (Windows
-            // Terminal, iTerm2, WezTerm, Kitty, Konsole, VS Code, …) make
-            // them Ctrl/Cmd-clickable. Failure is non-fatal — we never want
-            // an overlay glitch to kill the TUI.
-            if let Err(err) = crate::osc8::emit_hits(&osc8_hits) {
-                tracing::debug!(target: "osc8", "hyperlink overlay write failed: {err}");
-            }
-
-            // Replay a key that was saved by try_detect_paste_burst in a
-            // previous iteration (e.g. a modifier key that terminated a burst).
-            let pending = self.pending_key.take();
-
-            // Poll for events with a short timeout so we can redraw for animation
-            let got_event = pending.is_some() || event::poll(std::time::Duration::from_millis(50))?;
-
-            if got_event {
-                let event = if let Some(k) = pending {
-                    Event::Key(k)
-                } else {
-                    event::read()?
-                };
-                match event {
-                    Event::Key(key) => {
-                        // On Windows crossterm fires both Press and Release events.
-                        // We normally skip non-press events, but when voice PTT mode
-                        // is active we need the Release event for the `V` key so we
-                        // can stop recording as soon as the user lifts the key.
-                        if key.kind != crossterm::event::KeyEventKind::Press {
-                            // Handle V-key release to stop PTT recording.
-                            if key.kind == crossterm::event::KeyEventKind::Release
-                                && key.code == KeyCode::Char('v')
-                                && key.modifiers == KeyModifiers::NONE
-                                && self.voice_recording
-                                && self.voice_recorder.is_some()
-                            {
-                                self.handle_voice_ptt_stop();
-                            }
-                            continue;
-                        }
-
-                        // ---- Paste-burst detection -----------------------------------------
-                        // On Windows Terminal, Ctrl+V causes the terminal to write clipboard
-                        // content as raw character events (not as Event::Paste).  Every `\n`
-                        // fires as Enter (submitting the prompt) and stray `v` chars trigger
-                        // voice PTT.  We detect this by draining the event queue with a
-                        // zero-timeout immediately after the first character arrives — a paste
-                        // dumps every character at once while normal typing rarely queues more
-                        // than one char in the same 50 ms window.
-                        if key.modifiers == KeyModifiers::NONE
-                            || key.modifiers == KeyModifiers::SHIFT
-                        {
-                            if let KeyCode::Char(c) = key.code {
-                                if self.prompt_is_accepting_text() {
-                                    if let Some(burst) = self.try_detect_paste_burst(c) {
-                                        self.handle_paste_data(burst);
-                                        self.refresh_prompt_input();
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                        // -------------------------------------------------------------------
-
-                        let should_submit = self.handle_key_event(key);
-                        // Honour `:q`/`:wq` from vim command-line mode
-                        if self.prompt_input.vim_quit_requested {
-                            self.prompt_input.vim_quit_requested = false;
-                            self.should_exit = true;
-                        }
-                        if self.should_exit {
-                            return Ok(None);
-                        }
-                        if should_submit {
-                            // Dismiss any active error modal when the user sends a message
-                            self.dismiss_error_notifications();
-                            // Check if this is a slash command that should open a UI screen
-                            if crate::input::is_slash_command(&self.prompt_input.text) {
-                                let slash_input = self.prompt_input.text.clone();
-                                // Normalize nested command paths before the
-                                // TUI-only interception layer. The command
-                                // crate performs the same normalization for
-                                // non-overlay commands, so both paths share
-                                // one compatibility table.
-                                let dispatch_input =
-                                    clawde_core::slash_commands::normalize_invocation(&slash_input)
-                                        .unwrap_or(slash_input);
-                                let (cmd, args) =
-                                    crate::input::parse_slash_command(&dispatch_input);
-                                if self.intercept_slash_command_with_args(cmd, args) {
-                                    self.clear_prompt();
-                                    continue;
-                                }
-                            }
-                            let input = self.take_input();
-                            if !input.is_empty() {
-                                // Lightweight prompt injection detection — warns
-                                // on known override/probing patterns.
-                                if let Some(hint) = detect_injection(&input) {
-                                    self.push_notification(
-                                        NotificationKind::Warning,
-                                        format!("Possible prompt injection: {}", hint),
-                                        Some(5),
-                                    );
-                                }
-                                return Ok(Some(input));
-                            }
-                        }
-                    }
-                    Event::Paste(data)
-                        if !self.is_streaming
-                            && self.permission_request.is_none()
-                            && !self.history_search_overlay.visible
-                            && self.history_search.is_none() =>
-                    {
-                        if self.free_mode_dialog.visible {
-                            for ch in data.chars() {
-                                self.free_mode_dialog.insert_char(ch);
-                            }
-                        } else if self.key_input_dialog.visible {
-                            for ch in data.chars() {
-                                self.key_input_dialog.insert_char(ch);
-                            }
-                        } else if self.custom_provider_dialog.visible {
-                            for ch in data.chars() {
-                                self.custom_provider_dialog.insert_char(ch);
-                            }
-                        } else if self.ollama_config_dialog.visible {
-                            for ch in data.chars() {
-                                self.ollama_config_dialog.insert_char(ch);
-                            }
-                        } else if self.keys_dialog.visible {
-                            // A paste into `/keys` fills the active row's
-                            // new-key buffer, trimmed to a single token.
-                            // The delete-confirm popup accepts no text.
-                            if self.keys_dialog.delete_confirm.is_none() {
-                                self.keys_dialog.paste_key(&data);
-                            }
-                        } else {
-                            self.handle_paste_data(data);
-                            self.refresh_prompt_input();
-                        }
-                    }
-                    Event::Mouse(mouse_event) => {
-                        self.handle_mouse_event(mouse_event);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
     // ========== NEW KEYBINDING HELPER FUNCTIONS (Phase 1) ==========
 
     /// Jump to the next error/issue in messages.
@@ -14377,6 +14104,108 @@ mod tests {
         let config = Config::default();
         let cost_tracker = clawde_core::cost::CostTracker::new();
         App::new(config, cost_tracker)
+    }
+
+    /// Open the free-upstream picker directly. Bare `/models` now opens the
+    /// `/models` provider menu, so the free-picker task-sort tests drive the
+    /// picker through this helper instead.
+    fn open_free_picker(app: &mut App) {
+        app.open_model_picker_for_provider("free", Some("Free models".to_string()));
+        app.model_picker.loading_models = false;
+        app.model_picker.models_loaded = true;
+        app.model_picker_fetch_pending = false;
+    }
+
+    /// The `disabled_upstreams` list currently persisted under
+    /// `providers.free.options.routing`.
+    fn persisted_disabled_upstreams() -> Vec<String> {
+        clawde_core::config::Settings::load_sync()
+            .unwrap_or_default()
+            .config
+            .provider_configs
+            .get("free")
+            .and_then(|pc| pc.options.get("routing"))
+            .and_then(|v| v.get("disabled_upstreams"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn bare_models_opens_the_provider_menu() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        assert!(!app.models_menu.visible);
+        assert!(app.intercept_slash_command("models"));
+        assert!(app.models_menu.visible, "bare /models opens the menu");
+        assert!(
+            !app.model_picker.visible,
+            "/model keeps the picker, /models does not"
+        );
+        assert_eq!(
+            app.models_menu.current().map(|r| r.is_auto),
+            Some(true),
+            "the first row is Auto"
+        );
+    }
+
+    #[test]
+    fn models_menu_space_toggles_a_provider_in_disabled_upstreams() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        assert!(app.intercept_slash_command("models"));
+        app.models_menu.select_next();
+        let id = app.models_menu.current().map(|r| r.id.clone()).unwrap();
+        assert!(
+            !persisted_disabled_upstreams().contains(&id),
+            "a catalog upstream starts enabled"
+        );
+
+        app.handle_key_event(press_key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            persisted_disabled_upstreams().contains(&id),
+            "space must persist the upstream into disabled_upstreams"
+        );
+        assert!(!app.models_menu.current().map(|r| r.enabled).unwrap());
+
+        app.handle_key_event(press_key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            !persisted_disabled_upstreams().contains(&id),
+            "toggling again must remove it from disabled_upstreams"
+        );
+    }
+
+    #[test]
+    fn connect_free_hand_off_activates_with_a_stored_key_and_never_opens_an_editor() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.auth_store.set_keys(
+            clawde_api::FREE_CATALOG[0].id,
+            vec!["nvidia-key-1234".to_string()],
+        );
+        app.hand_off_free_mode();
+        assert_eq!(app.config.provider.as_deref(), Some("free"));
+        assert!(
+            !app.keys_dialog.visible,
+            "the /connect free hand-off must not open a second editor"
+        );
+    }
+
+    #[test]
+    fn connect_free_hand_off_never_opens_the_editor_without_keys() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.config.provider = Some("ollama".to_string());
+        app.hand_off_free_mode();
+        assert!(!app.keys_dialog.visible);
+        // Without any key (also absent from the environment) the hand-off
+        // points at /keys instead of switching providers.
+        if app.config.provider.as_deref() == Some("ollama") {
+            assert!(app
+                .status_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("/keys"));
+        }
     }
 
     /// Build an `App` whose followup state is scoped to a fresh temp project
@@ -15098,6 +14927,186 @@ mod tests {
         assert!(msg.contains("applied immediately"), "got: {msg}");
         assert!(app.take_routing_changed(), "save must set the rebuild flag");
         assert!(!app.take_routing_changed(), "flag is one-shot");
+    }
+
+    /// A credential mutation rebuilds the free chain and must discard the
+    /// cached health sweep. The footer's `⚠ N dead` badge reads that cached
+    /// `unhealthy` count, so leaving it in place kept the marker lit for up to
+    /// `health_poll_interval_secs` (default 300s) after the key it named was
+    /// removed — the bug this guards.
+    #[test]
+    fn refresh_free_provider_clears_the_cached_health_sweep() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        let sweep = clawde_api::health_poller::ProbeOutcome {
+            checked: 3,
+            unhealthy: 1,
+            results: Vec::new(),
+        };
+        clawde_api::health_poller::store_last_sweep(&sweep);
+        app.last_health_sweep = Some(sweep);
+
+        app.refresh_free_provider();
+
+        assert!(
+            app.last_health_sweep.is_none(),
+            "the badge's cached sweep must clear on a credential rebuild"
+        );
+        assert!(
+            clawde_api::health_poller::take_last_sweep().is_none(),
+            "the shared sweep slot must clear so the next frame observes it"
+        );
+    }
+
+    /// `apply_key_edits` is the single persistence path for both key dialogs:
+    /// it writes the canonical pools once, drops the stale legacy credentials
+    /// named by `removals`, rebuilds the free chain (clearing the cached sweep),
+    /// and returns the saved-key count. The count drives the "Saved N key(s)"
+    /// status line, so it must match the writes exactly.
+    #[test]
+    fn apply_key_edits_persists_keys_removes_credentials_and_counts() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // Seed a stale legacy credential the edit must drop.
+        app.auth_store.set(
+            "nvidia",
+            clawde_core::StoredCredential::ApiKey {
+                key: "stale-nvidia-key".to_string(),
+            },
+        );
+        clawde_api::health_poller::store_last_sweep(&clawde_api::health_poller::ProbeOutcome {
+            checked: 1,
+            unhealthy: 1,
+            results: Vec::new(),
+        });
+
+        let updates: Vec<(&'static str, Vec<String>)> = vec![
+            ("nvidia", vec!["nvidia-key-1".into(), "nvidia-key-2".into()]),
+            ("groq", vec!["groq-key-1".into()]),
+        ];
+        let count = app.apply_key_edits(&updates, &["nvidia"]);
+
+        assert_eq!(count, 3, "count must sum every written key");
+        let reloaded = clawde_core::AuthStore::load();
+        assert_eq!(
+            reloaded.keys_for("nvidia").map(<[String]>::to_vec),
+            Some(vec!["nvidia-key-1".to_string(), "nvidia-key-2".to_string()])
+        );
+        assert_eq!(
+            reloaded.keys_for("groq").map(<[String]>::to_vec),
+            Some(vec!["groq-key-1".to_string()])
+        );
+        assert!(
+            !matches!(
+                reloaded.get("nvidia"),
+                Some(clawde_core::StoredCredential::ApiKey { .. })
+            ),
+            "the stale single credential must be removed"
+        );
+        assert!(
+            app.last_health_sweep.is_none(),
+            "a key edit rebuilds the chain and clears the cached sweep"
+        );
+    }
+
+    /// An empty key list is a deletion: `apply_key_edits` must drop the
+    /// provider's canonical pool entirely rather than leave an empty entry.
+    #[test]
+    fn apply_key_edits_clears_a_pool_for_an_empty_write() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.auth_store.set_keys("groq", vec!["groq-key-1".into()]);
+        app.auth_store = clawde_core::AuthStore::load();
+
+        let count = app.apply_key_edits(&[("groq", Vec::new())], &[]);
+
+        assert_eq!(count, 0);
+        assert_eq!(clawde_core::AuthStore::load().keys_for("groq"), None);
+    }
+
+    /// The single validation channel routes each message to the editor it
+    /// names: each ping carries `(field_idx, key_idx, result)` and lands on the
+    /// `/keys` popup's dot for that key.
+    #[test]
+    fn poll_key_validation_routes_each_message_to_its_editor() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+
+        app.keys_dialog
+            .open(&[(clawde_api::FREE_CATALOG[0].id, vec!["k".into()])]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((0, 0, Ok(()))).unwrap();
+        drop(tx);
+        app.key_validation_rx = Some(rx);
+
+        app.poll_key_validation();
+
+        assert_eq!(app.keys_dialog.fields[0].key_status[0], Some(Ok(())));
+        assert!(
+            app.key_validation_rx.is_none(),
+            "the channel clears when every probe thread has finished"
+        );
+    }
+
+    /// `/refresh` (and OAuth activation) go through `apply_provider_refresh`,
+    /// not `refresh_free_provider`. It replaces the whole credential set, so it
+    /// must clear the cached health sweep for the same reason — otherwise the
+    /// footer keeps a dead-key badge for keys the reload just discarded.
+    #[test]
+    fn apply_provider_refresh_clears_the_cached_health_sweep() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.last_health_sweep = Some(clawde_api::health_poller::ProbeOutcome {
+            checked: 2,
+            unhealthy: 1,
+            results: Vec::new(),
+        });
+        clawde_api::health_poller::store_last_sweep(
+            app.last_health_sweep.as_ref().expect("seeded sweep"),
+        );
+
+        app.apply_provider_refresh(
+            Config::default(),
+            None,
+            clawde_core::AuthStore::default(),
+            false,
+            "reloaded".to_string(),
+        );
+
+        assert!(
+            app.last_health_sweep.is_none(),
+            "a provider reload must clear the cached dead-key sweep"
+        );
+        assert!(clawde_api::health_poller::take_last_sweep().is_none());
+    }
+
+    /// Removing the last key of an upstream shortens the free chain, so the
+    /// Alt+U cycle index must clamp into the new list instead of dangling past
+    /// it and rendering a stale upstream label in the prompt row.
+    #[test]
+    fn refresh_free_provider_clamps_the_upstream_cycle_index() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.free_model_defaults = vec![
+            (
+                "hf".to_string(),
+                "HuggingFace".to_string(),
+                "m1".to_string(),
+            ),
+            ("groq".to_string(), "Groq".to_string(), "m2".to_string()),
+        ];
+        app.free_upstream_index = 2; // points at the second upstream
+
+        // The rebuild reads the (empty) live chain, shrinking the list to 0.
+        app.refresh_free_provider();
+
+        assert!(
+            app.free_upstream_index <= app.free_model_defaults.len(),
+            "cycle index must stay within the rebuilt list (index {} vs len {})",
+            app.free_upstream_index,
+            app.free_model_defaults.len()
+        );
     }
 
     /// Drive a text delta through `handle_query_event` while paused and live;
@@ -16630,7 +16639,7 @@ mod tests {
     fn test_tab_cycles_free_picker_task_sort() {
         let _home = TestHome::acquire();
         let mut app = make_app();
-        assert!(app.intercept_slash_command("models"));
+        open_free_picker(&mut app);
         assert!(app.model_picker.visible);
         assert_eq!(
             app.model_picker.task_sort,
@@ -16666,7 +16675,7 @@ mod tests {
     fn test_number_keys_jump_to_task_in_free_picker() {
         let _home = TestHome::acquire();
         let mut app = make_app();
-        assert!(app.intercept_slash_command("models"));
+        open_free_picker(&mut app);
         // 2 = Coding, 5 = Fast.
         app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
         assert_eq!(
@@ -16712,7 +16721,7 @@ mod tests {
 
         // Set the sort via the picker; the key handler persists it.
         let mut app = make_app();
-        assert!(app.intercept_slash_command("models"));
+        open_free_picker(&mut app);
         app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
         assert_eq!(
             app.model_picker.task_sort,
@@ -17298,7 +17307,7 @@ mod tests {
         let _home = TestHome::acquire();
         let mut app = make_app();
         // Set a non-All task in the free picker.
-        assert!(app.intercept_slash_command("models"));
+        open_free_picker(&mut app);
         app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
         assert_eq!(
             app.model_picker.task_sort,
@@ -17322,7 +17331,7 @@ mod tests {
     fn test_switching_to_free_keeps_task_sort() {
         let _home = TestHome::acquire();
         let mut app = make_app();
-        assert!(app.intercept_slash_command("models"));
+        open_free_picker(&mut app);
         app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
         assert_eq!(
             app.model_picker.task_sort,
@@ -17344,7 +17353,7 @@ mod tests {
         // Set Reasoning, then cycle back to All — the stored value must be
         // cleared so the next launch starts unsorted (not stale Reasoning).
         let mut app = make_app();
-        assert!(app.intercept_slash_command("models"));
+        open_free_picker(&mut app);
         app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
         assert_eq!(
             app.model_picker.task_sort,
@@ -17375,7 +17384,7 @@ mod tests {
         // Confirm the first row (free/auto): the picker was opened for "free",
         // so the selection must route through free mode — not be mangled into
         // "ollama/free/auto" with the provider left on ollama.
-        assert!(app.intercept_slash_command("models"));
+        open_free_picker(&mut app);
         app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             app.config.provider.as_deref(),
@@ -17387,7 +17396,7 @@ mod tests {
         // Same for a model-family row: move down one row and confirm.
         app.config.provider = Some("ollama".to_string());
         app.config.model = None;
-        assert!(app.intercept_slash_command("models"));
+        open_free_picker(&mut app);
         app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
@@ -17407,7 +17416,7 @@ mod tests {
         // with a broken model string.
         app.config.provider = Some("ollama".to_string());
         app.config.model = None;
-        assert!(app.intercept_slash_command("models"));
+        open_free_picker(&mut app);
         let pin_idx = app
             .model_picker
             .models
@@ -19405,44 +19414,6 @@ mod tests {
             normalize_configured_vertical_navigation(key, &app.keybindings, &KeyContext::Chat);
         assert_eq!(out.code, KeyCode::Char('j'));
         assert_eq!(out.modifiers, KeyModifiers::SHIFT);
-    }
-
-    #[test]
-    fn free_mode_dialog_navigation_flows_through_keybindings() {
-        // A user chord bound to a semantic action in the FreeModeDialog
-        // context must drive the dialog — proof its navigation is resolved
-        // through the configurable keybindings rather than matched inline.
-        let mut app = make_app();
-        let id0 = clawde_api::FREE_CATALOG[0].id;
-        let id1 = clawde_api::FREE_CATALOG[1].id;
-        app.free_mode_dialog
-            .open(&[(id0, vec!["k1".to_string()]), (id1, vec!["k2".to_string()])]);
-        let user = clawde_core::keybindings::UserKeybindings {
-            bindings: vec![clawde_core::keybindings::UserBinding {
-                chord: "ctrl+n".to_string(),
-                action: Some("next".to_string()),
-                context: Some("FreeModeDialog".to_string()),
-            }],
-            ..clawde_core::keybindings::UserKeybindings::default()
-        };
-        app.keybindings = KeybindingResolver::new(&user);
-        assert_eq!(app.free_mode_dialog.active_idx, 0);
-        app.handle_key_event(press_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
-        assert_eq!(app.free_mode_dialog.active_idx, 1);
-    }
-
-    #[test]
-    fn free_mode_dialog_shift_tab_moves_previous() {
-        // BackTab is reported as Shift+Tab; it must reach the dialog's `prev`
-        // action like the arrow keys do.
-        let mut app = make_app();
-        let id0 = clawde_api::FREE_CATALOG[0].id;
-        let id1 = clawde_api::FREE_CATALOG[1].id;
-        app.free_mode_dialog
-            .open(&[(id0, vec!["k1".to_string()]), (id1, vec!["k2".to_string()])]);
-        assert_eq!(app.free_mode_dialog.active_idx, 0);
-        app.handle_key_event(press_key(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(app.free_mode_dialog.active_idx, 1);
     }
 
     #[test]

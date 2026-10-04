@@ -111,7 +111,7 @@ fn cycle_ladder(ladder: &[EffortLevel], current: EffortLevel, dir: isize) -> Eff
 }
 
 // ---------------------------------------------------------------------------
-// Provider grouping helpers
+// Formatting helpers
 // ---------------------------------------------------------------------------
 
 /// Format context window tokens for display in the model picker.
@@ -124,94 +124,6 @@ pub fn format_context_window(context_window: u32) -> String {
         }
     } else {
         format!("{}K context", context_window / 1000)
-    }
-}
-
-/// Format a model display line with optional context window and cost info.
-///
-/// Example: `"gpt-4o  128K ctx  $5.00/M"`
-#[allow(dead_code)]
-pub fn format_model_line(
-    model_str: &str,
-    context_window: Option<u32>,
-    cost_per_1m: Option<f64>,
-) -> String {
-    let mut parts = vec![model_str.to_string()];
-    if let Some(ctx) = context_window {
-        parts.push(format_context_window(ctx).replace(" context", " ctx"));
-    }
-    if let Some(cost) = cost_per_1m {
-        if cost == 0.0 {
-            parts.push("free".to_string());
-        } else {
-            parts.push(format!("${:.2}/M", cost));
-        }
-    }
-    parts.join("  ")
-}
-
-/// A group of models belonging to the same provider, for structured display.
-pub struct ProviderSection {
-    pub provider_name: String,
-    pub models: Vec<String>, // model ID strings in "provider/model" format
-}
-
-impl ModelPickerState {
-    /// Build grouped model sections from a flat list of model strings.
-    ///
-    /// Models with a `"provider/model"` slash format are grouped by their
-    /// provider prefix.  Bare model names are heuristically assigned to a
-    /// provider based on the model name pattern.
-    #[allow(dead_code)]
-    pub fn build_provider_sections(models: &[String]) -> Vec<ProviderSection> {
-        use std::collections::HashMap;
-        let mut by_provider: HashMap<String, Vec<String>> = HashMap::new();
-
-        for m in models {
-            let provider = if let Some((p, _)) = m.split_once('/') {
-                p.to_string()
-            } else {
-                // Bare model name — detect provider from model name
-                if m.contains("claude") {
-                    "anthropic".to_string()
-                } else if m.starts_with("gpt") || m.starts_with("o3") || m.starts_with("o4") {
-                    "openai".to_string()
-                } else if m.contains("gemini") {
-                    "google".to_string()
-                } else if m.contains("minimax") {
-                    "minimax".to_string()
-                } else {
-                    "other".to_string()
-                }
-            };
-            by_provider.entry(provider).or_default().push(m.clone());
-        }
-
-        // Define display order
-        let order = ["anthropic", "openai", "google", "ollama", "other"];
-        let mut sections = Vec::new();
-        for provider in order {
-            if let Some(models) = by_provider.remove(provider) {
-                sections.push(ProviderSection {
-                    provider_name: match provider {
-                        "anthropic" => "ANTHROPIC".to_string(),
-                        "openai" => "OPENAI".to_string(),
-                        "google" => "GOOGLE".to_string(),
-                        "ollama" => "OLLAMA".to_string(),
-                        _ => provider.to_uppercase(),
-                    },
-                    models,
-                });
-            }
-        }
-        // Add any remaining providers not in the order list
-        for (provider, models) in by_provider {
-            sections.push(ProviderSection {
-                provider_name: provider.to_uppercase(),
-                models,
-            });
-        }
-        sections
     }
 }
 
@@ -864,15 +776,30 @@ impl FreeTask {
         }
     }
 
+    /// Parse a user-typed task argument. Accepts the canonical label, the
+    /// picker's short legend forms (`code`, `reason`, `multi`, `ctx`), and the
+    /// CLI spelling `long-context` (which the command layer has historically
+    /// advertised). Returns `None` for anything unrecognized so callers can
+    /// report a useful error instead of silently falling back to `All`.
+    pub fn from_arg(value: &str) -> Option<FreeTask> {
+        if let Some(task) = Self::ALL.iter().copied().find(|t| t.label() == value) {
+            return Some(task);
+        }
+        match value {
+            "code" => Some(FreeTask::Coding),
+            "reason" => Some(FreeTask::Reasoning),
+            "multi" => Some(FreeTask::Multimodal),
+            "ctx" | "long-context" | "context" | "long_context" => Some(FreeTask::Context),
+            _ => None,
+        }
+    }
+
     /// Parse a persisted label back into a task; unknown / empty strings
-    /// fall back to [`FreeTask::All`]. Used when restoring the last-used sort
-    /// from settings at startup.
+    /// fall back to [`FreeTask::All`]. Alias-tolerant so a sort persisted by
+    /// the command layer under an older spelling still restores the intended
+    /// lane. Used when restoring the last-used sort from settings at startup.
     pub fn from_label(label: &str) -> FreeTask {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|t| t.label() == label)
-            .unwrap_or(FreeTask::All)
+        Self::from_arg(label).unwrap_or(FreeTask::All)
     }
 
     /// Accent colour for this task (matches the picker header badge).
@@ -2772,6 +2699,29 @@ mod tests {
         assert_eq!(FreeTask::from_label(""), FreeTask::All);
         assert_eq!(FreeTask::from_label("nonsense"), FreeTask::All);
         assert_eq!(FreeTask::from_label("CODING"), FreeTask::All); // case-sensitive
+                                                                   // Alias-tolerant so a lane persisted by the command layer under an
+                                                                   // older spelling still restores.
+        assert_eq!(FreeTask::from_label("long-context"), FreeTask::Context);
+        assert_eq!(FreeTask::from_label("ctx"), FreeTask::Context);
+        assert_eq!(FreeTask::from_label("context"), FreeTask::Context);
+    }
+
+    // from_arg accepts the labels, the picker legend, and the CLI spelling,
+    // and reports unknown values so callers can error instead of silently
+    // falling back to All.
+    #[test]
+    fn task_from_arg_accepts_every_surface_spelling() {
+        for task in FreeTask::ALL {
+            assert_eq!(FreeTask::from_arg(task.label()), Some(task));
+        }
+        assert_eq!(FreeTask::from_arg("code"), Some(FreeTask::Coding));
+        assert_eq!(FreeTask::from_arg("reason"), Some(FreeTask::Reasoning));
+        assert_eq!(FreeTask::from_arg("multi"), Some(FreeTask::Multimodal));
+        assert_eq!(FreeTask::from_arg("ctx"), Some(FreeTask::Context));
+        assert_eq!(FreeTask::from_arg("long-context"), Some(FreeTask::Context));
+        assert_eq!(FreeTask::from_arg("context"), Some(FreeTask::Context));
+        assert_eq!(FreeTask::from_arg("nonsense"), None);
+        assert_eq!(FreeTask::from_arg(""), None);
     }
 
     // task_jump anchors the highlighted model just like task_next/task_prev.

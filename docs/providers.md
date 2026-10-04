@@ -70,6 +70,10 @@ bare token or a key with an empty half is rejected with a format hint.
 /keys add cloudflare abc123def456:your-api-token
 ```
 
+In the interactive `/keys` editor, Cloudflare is entered in two steps: Enter the
+API token first, then the account ID; Clawde joins them into
+`ACCOUNT_ID:API_TOKEN` so a bare token is never stored.
+
 ### Key rotation behavior
 
 - **Rate limited (429):** The exhausted key cools down for 60 seconds (or the
@@ -88,7 +92,7 @@ single-key credentials. The `/keys` command manages this automatically.
 
 Keys are read through a single source of truth in the free-provider module
 (`crates/api/src/providers/free/mod.rs`), which guarantees the health poller,
-the rotation rings, and the Connect Free dialog all agree on which keys exist
+the rotation rings, and the `/keys` popup all agree on which keys exist
 and in what order:
 
 - **`resolve_free_upstream_keys`** — the ring-aligned list used to build
@@ -100,7 +104,7 @@ and in what order:
   slot, else the stored credential (incl. OAuth tokens), else the provider's
   env var.
 - **`all_stored_free_upstream_keys`** — display only: credentials + rotation
-  keys merged and deduplicated for the Connect Free dialog's health dots.
+  keys merged and deduplicated for the `/keys` popup's per-key health dots.
 
 OpenCode Zen reads the `opencode-go` key slots as a fallback in all three
 resolvers.
@@ -173,6 +177,7 @@ selects upstream providers:
 | `/routing lr` / `/lr` | Quick alias for latency |
 | `/routing tr` / `/tr` | Quick alias for task |
 | `/routing edit` | Open the interactive task-pinning dialog in the TUI (spec §8.6) — shows the 7 task types with their assignments and lets you pin/unpin upstreams per task with the space bar |
+| `/models` | Open the TUI provider menu (Auto + one row per free-catalog upstream). `space` flips a provider on/off **globally** — the choice is stored under `providers.free.options.routing.disabled_upstreams` and applies to every session — and `enter` selects the routing target (Auto, or an upstream pin) |
 
 **Examples:**
 

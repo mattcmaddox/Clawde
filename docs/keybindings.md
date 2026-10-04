@@ -249,11 +249,11 @@ These are the contexts the TUI produces while handling keys today.
 | `Select` | Generic modal selects: agents menu, stats dialog, hooks config menu |
 | `McpView` | The MCP server/tool view |
 | `KeysDialog` | The `/keys` key-management dialog |
-| `FreeModeDialog` | The Connect-Free upstream dialog |
+| `ModelsMenu` | The `/models` provider menu (Auto + per-provider on/off) |
 | `Keybindings` | The `/keybindings` reference overlay |
 | `PasteViewer` | The read-only paste viewer |
 | `MessageSelector` | Step 1 of the `/rewind` flow (browse messages) |
-| `ModelPicker` | The model picker overlay (open with `Alt+M`, `/model` or `/models`) |
+| `ModelPicker` | The model picker overlay (open with `Alt+M` or `/model`) |
 | `Task` | The task-list overlay (`Ctrl+T`) |
 | `Plugin` | The plugin-list overlay (bare `/plugin`) |
 | `Attachments` | The attachments overlay (`Alt+Shift+I`) over the prompt's pending images |

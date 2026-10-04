@@ -2081,7 +2081,7 @@ impl UpstreamKeyProbe {
 /// (a prepended credential, merged slots, a retained short key) would mark
 /// the wrong key exhausted.
 ///
-/// For display (Connect Free dialog dots) use
+/// For display (`/keys` dots) use
 /// [`all_stored_free_upstream_keys`], which merges credentials and slots
 /// without ring-alignment constraints.
 pub fn resolve_free_upstream_keys(
@@ -2164,7 +2164,7 @@ pub fn cooling_free_upstreams() -> std::collections::HashSet<String> {
 /// credentials (e.g. github-copilot), deduplicated, with OpenCode Zen sharing
 /// the OpenCode Go slots.
 ///
-/// Display-oriented: seeds the Connect Free dialog's per-key health dots.
+/// Display-oriented: seeds `/keys`' per-key health dots.
 /// Not ring-aligned — the health poller must keep using
 /// [`resolve_free_upstream_keys`] so its probe indices match the rings.
 pub fn all_stored_free_upstream_keys(

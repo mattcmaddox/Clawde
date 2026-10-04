@@ -546,9 +546,17 @@ The bones (species, rarity, stats, eyes, hat, shiny) are never stored and are al
 /voice
 ```
 
-Experimental voice input using the device microphone. When active, spoken input is transcribed and submitted as a prompt. The integration uses the Deepgram streaming STT API.
+Experimental push-to-talk voice input using the device microphone. When enabled, hold `Alt+V` to record; `Alt+V` or `Esc` stops and transcribes. The transcript is inserted into the prompt for review.
 
-The `/voice` command is a toggle. `CLAUDE_CODE_ENABLE_VOICE=1` can be used to pre-enable voice mode.
+Transcription is sent to a Whisper-compatible `/v1/audio/transcriptions` endpoint:
+
+- Default: OpenAI (`whisper-1`), keyed by `OPENAI_API_KEY` (falls back to `ANTHROPIC_API_KEY`).
+- `GROQ_API_KEY` set: automatically uses Groq's `whisper-large-v3` endpoint (free), ignoring the other keys.
+- `WHISPER_ENDPOINT_URL` set: uses that URL instead, for a self-hosted server (whisper.cpp, faster-whisper). Such servers typically ignore the API key.
+
+Audio capture needs a microphone and, on Linux, ALSA (`sudo apt install libasound2-dev`).
+
+`/voice on|off|status` toggles voice and reports the active endpoint; the setting persists to `~/.clawde/ui-settings.json`. Setting `CLAWDE_VOICE_DISABLED` (any value) force-disables voice regardless of the stored setting.
 
 ---
 

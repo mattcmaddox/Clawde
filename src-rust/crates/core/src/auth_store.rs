@@ -163,13 +163,25 @@ impl AuthStore {
         )
     }
 
+    /// Minimum length of a free-upstream key. Free resolver entries reject
+    /// values shorter than this, so the canonical store uses the same boundary
+    /// to never retain placeholder slots.
+    pub const FREE_KEY_MIN_LEN: usize = 8;
+
+    /// Whether a free-upstream key is long enough to be stored and routed.
+    /// The resolvers and the canonical store share this boundary; the editors
+    /// call it to warn about a typed key that would be dropped at save time.
+    pub fn is_usable_free_key(key: &str) -> bool {
+        key.trim().len() >= Self::FREE_KEY_MIN_LEN
+    }
+
     /// Normalize a free-provider key pool. Free resolver entries reject
-    /// values shorter than eight characters, so the canonical store must use
-    /// the same boundary and must never retain placeholder slots.
+    /// values shorter than [`Self::FREE_KEY_MIN_LEN`], so the canonical store
+    /// must use the same boundary and must never retain placeholder slots.
     fn clean_free_keys(keys: impl IntoIterator<Item = String>) -> Vec<String> {
         keys.into_iter()
+            .filter(|key| Self::is_usable_free_key(key))
             .map(|key| key.trim().to_string())
-            .filter(|key| key.len() >= 8)
             .fold(Vec::new(), |mut out, key| {
                 if !out.contains(&key) {
                     out.push(key);
@@ -298,6 +310,7 @@ impl AuthStore {
         }
         if changed {
             self.save();
+            Self::prune_key_ring_state(provider_id, &self.remaining_ring_keys(provider_id));
         }
         changed
     }
@@ -622,6 +635,37 @@ impl AuthStore {
             self.keys.remove(provider_id);
         }
         self.save();
+        Self::prune_key_ring_state(provider_id, &self.remaining_ring_keys(provider_id));
+    }
+
+    /// Drop persisted key-ring entries for keys no longer in this provider's
+    /// rotation pool, so a removed key's cooldown cannot resurrect if the same
+    /// key string is re-added later. Best-effort: a missing state file or an
+    /// I/O failure is a no-op.
+    ///
+    /// The live set is the provider's own slot list. OpenCode Zen/Go share one
+    /// ring, so the sibling alias is included for either id — pruning a shared
+    /// ring against only one slot would drop the other's live keys.
+    fn prune_key_ring_state(provider_id: &str, live_keys: &[String]) {
+        let path = crate::key_ring::KeyRing::default_state_path(provider_id);
+        crate::key_ring::prune_snapshot_file(&path, live_keys);
+    }
+
+    /// Keys that should remain in `provider_id`'s ring after a mutation,
+    /// including the OpenCode Zen/Go sibling slot for the shared ring.
+    fn remaining_ring_keys(&self, provider_id: &str) -> Vec<String> {
+        let mut live: Vec<String> = self
+            .keys_for(provider_id)
+            .map(|keys| keys.to_vec())
+            .unwrap_or_default();
+        if matches!(provider_id, "opencode-zen" | "opencode-go") {
+            for sibling in ["opencode-zen", "opencode-go"] {
+                if let Some(keys) = self.keys_for(sibling) {
+                    live.extend(keys.iter().cloned());
+                }
+            }
+        }
+        live
     }
 
     /// Remove only a legacy API-key credential while preserving any canonical
@@ -636,6 +680,7 @@ impl AuthStore {
         let removed = remove && self.credentials.remove(provider_id).is_some();
         if removed {
             self.save();
+            Self::prune_key_ring_state(provider_id, &self.remaining_ring_keys(provider_id));
         }
         removed
     }
@@ -700,6 +745,7 @@ impl AuthStore {
                 self.keys.remove(provider_id);
             }
             self.save();
+            Self::prune_key_ring_state(provider_id, &self.remaining_ring_keys(provider_id));
         }
         removed
     }
@@ -1108,6 +1154,39 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0], "k1");
         assert_eq!(keys[1], "k3");
+    }
+
+    /// Removing a rotation key must also drop its persisted key-ring entry.
+    /// The ring snapshot is matched by raw key string, so an orphaned entry
+    /// silently resurrects the old cooldown when the same key is re-added.
+    #[test]
+    fn remove_key_prunes_the_removed_keys_ring_state() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.set_keys(
+            "groq",
+            vec!["gsk-key-1-000000".into(), "gsk-key-2-000000".into()],
+        );
+
+        // Exhaust the second key and persist the ring snapshot.
+        let path = crate::key_ring::KeyRing::default_state_path("groq");
+        let mut ring =
+            crate::key_ring::KeyRing::new("groq", store.keys_for("groq").unwrap().to_vec());
+        ring.mark_exhausted(1, 600, Some("quota".into()));
+        ring.save_to_file(&path);
+
+        assert!(store.remove_key("groq", 1));
+
+        // The removed key's entry is gone; the survivor stays.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("gsk-key-2-000000"),
+            "removed key must not remain in the ring snapshot: {raw}"
+        );
+        assert!(
+            raw.contains("gsk-key-1-000000"),
+            "surviving key stays: {raw}"
+        );
     }
 
     #[test]

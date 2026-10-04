@@ -1,86 +1,31 @@
-// `/keys` popup — a j/k-navigable key manager with CRUD.
+// keys_dialog.rs — the `/keys` popup: a thin renderer over the shared key
+// editor.
 //
-// The popup shows one row per free-tier upstream (in FREE_CATALOG order,
-// matching fallback priority). Each row lists that upstream's stored
-// rotation keys masked as health dots. Enter expands the active row to show
-// every one of its keys inline with a selection cursor on one of them;
-// Left/Right (or h/l in vim normal mode) move that cursor, typing into the
-// pending line appends a new key, and Delete on the selected key asks for
-// confirmation before removing it. `store_updates()` returns the edited key
-// map; the App persists it to the AuthStore.
+// The state machine (navigation, reveal, append, delete-confirm, validation)
+// lives in `crate::key_editor`. This module owns only the `/keys`-specific
+// rendering and re-exports the state type so existing call sites keep working.
 //
 // Stored keys are NEVER shown by default — a row's key list is only visible
-// while `revealed` is `Some` (the value is the selection cursor). Expanding
-// is view-only: typing/pasting is blocked until the row is collapsed again,
-// so an accidental keystroke can never corrupt a stored key. The state is
-// deliberately decoupled from `AuthStore` so the App owns persistence,
-// mirroring `FreeModeDialogState` in `free_mode_dialog.rs`.
+// while `revealed` is `Some` (the value is the selection cursor). Expanding is
+// view-only: typing/pasting is blocked until the row is collapsed again, so an
+// accidental keystroke can never corrupt a stored key. The state is
+// deliberately decoupled from `AuthStore` so the App owns persistence.
 
 use ratatui::layout::Rect;
-use ratatui::prelude::Stylize;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::style::{Color, Style};
+use ratatui::text::Line;
 use ratatui::Frame;
 
-use clawde_api::{FreeUpstream, FREE_CATALOG};
+pub use crate::key_editor::ValidationPing;
+use crate::key_editor::{render_key_editor, KeyEditorChrome, KeyEditorState, KeyRow};
 
-use crate::overlays::{
-    centered_rect, render_dark_overlay, render_dialog_bg, CLAWDE_ACCENT, CLAWDE_PANEL_BG,
-};
-use crate::vim_search::VimSearch;
-use std::cell::Cell;
+/// Backward-compatible alias: one row in the editor.
+pub type KeysField = KeyRow;
 
-pub use crate::free_mode_dialog::ValidationPing;
-
-/// One row in the dialog — one upstream's key list plus the new-key buffer.
-#[derive(Debug, Clone)]
-pub struct KeysField {
-    pub upstream: &'static FreeUpstream,
-    /// Stored rotation keys (one per ring slot, rendered as dots).
-    pub keys: Vec<String>,
-    /// Parallel to `keys`: per-key validation status (`None` = not tested,
-    /// `Some(Ok(()))` = valid, `Some(Err(_))` = invalid).
-    pub key_status: Vec<Option<Result<(), String>>>,
-    /// New-key input buffer — the blank line that accepts new keys.
-    pub pending: String,
-    /// `Some(i)` = the row is expanded: every stored key is shown inline and
-    /// key `i` is the highlighted selection cursor. `None` = masked (health
-    /// dots only). The row is view-only while expanded.
-    pub revealed: Option<usize>,
-    /// When `true`, the keys came from environment variables and are
-    /// read-only in this dialog (cannot be edited, appended to, or deleted).
-    pub from_env: bool,
-}
-
-/// State for the "delete this key?" confirmation popup.
-#[derive(Debug, Clone, Copy)]
-pub struct KeysDeleteConfirm {
-    pub field_idx: usize,
-    pub key_idx: usize,
-}
-
-/// Number of rows shown at once in the scrolling viewport.
-pub const VISIBLE_ROWS: usize = 10;
-
+/// State for the `/keys` popup. A newtype over the shared [`KeyEditorState`]
+/// with `Deref`, so every navigation/CRUD method is the shared implementation.
 pub struct KeysDialogState {
-    pub visible: bool,
-    /// The area used by this dialog in the last render (for click-outside detection).
-    pub last_rect: Cell<Rect>,
-    pub fields: Vec<KeysField>,
-    /// Active provider row.
-    pub active_idx: usize,
-    /// First visible field index (for scrolling when fields > viewport).
-    pub scroll_offset: usize,
-    /// When set, the delete-confirmation popup is open and captures input.
-    pub delete_confirm: Option<KeysDeleteConfirm>,
-    /// Vim-modal insert state (only used when vim is enabled). The dialog is
-    /// a key-entry form, so it opens in insert; `Esc` exits insert before
-    /// the unreveal → clear → close cascade runs.
-    pub vim_search: VimSearch,
-    /// `true` while a background validation sweep is in flight (its results
-    /// land on the rows' `key_status` dots via `set_validation_result`).
-    pub is_validating: bool,
+    pub editor: KeyEditorState,
 }
 
 impl Default for KeysDialogState {
@@ -91,456 +36,27 @@ impl Default for KeysDialogState {
 
 impl KeysDialogState {
     pub fn new() -> Self {
-        let fields = FREE_CATALOG
-            .iter()
-            .map(|upstream| KeysField {
-                upstream,
-                keys: Vec::new(),
-                key_status: Vec::new(),
-                pending: String::new(),
-                revealed: None,
-                from_env: false,
-            })
-            .collect();
         Self {
-            visible: false,
-            fields,
-            active_idx: 0,
-            scroll_offset: 0,
-            delete_confirm: None,
-            last_rect: Cell::new(Rect::default()),
-            vim_search: VimSearch::new(),
-            is_validating: false,
-        }
-    }
-
-    /// Open the dialog, pre-populating each row from `existing[upstream.id]`
-    /// when present. Each string is one stored key (rendered as a dot).
-    pub fn open(&mut self, existing: &[(&str, Vec<String>)]) {
-        self.visible = true;
-        self.delete_confirm = None;
-        self.is_validating = false;
-        self.vim_search.enter_insert();
-        // Reset every field; the dialog is re-seeded from the store each
-        // time it opens so discarded edits never leak back in. `from_env` is
-        // rederived by the caller via `set_env_var_keys` after `open`.
-        for field in &mut self.fields {
-            field.keys.clear();
-            field.key_status.clear();
-            field.pending.clear();
-            field.revealed = None;
-            field.from_env = false;
-        }
-        for (id, keys) in existing {
-            if let Some(field) = self.fields.iter_mut().find(|f| f.upstream.id == *id) {
-                // Don't overwrite env-var keys with auth_store keys (env var wins).
-                if !field.from_env {
-                    field.keys = keys
-                        .iter()
-                        .filter(|k| !k.trim().is_empty())
-                        .cloned()
-                        .collect();
-                    field.key_status = vec![None; field.keys.len()];
-                }
-            }
-        }
-        self.active_idx = self.visible_field_indices().first().copied().unwrap_or(0);
-        self.scroll_offset = 0;
-        self.ensure_active_visible();
-    }
-
-    /// Mark upstreams whose keys came from environment variables. These are
-    /// shown as read-only in the dialog.
-    pub fn set_env_var_keys(&mut self, env_var_keys: &[(&str, String)]) {
-        for (id, _key) in env_var_keys {
-            if let Some(field) = self.fields.iter_mut().find(|f| f.upstream.id == *id) {
-                field.from_env = true;
-            }
-        }
-    }
-
-    /// Close the dialog, discarding transient + seeded state (next `open()`
-    /// re-seeds from the auth store).
-    pub fn close(&mut self) {
-        self.visible = false;
-        self.active_idx = 0;
-        self.scroll_offset = 0;
-        self.delete_confirm = None;
-        self.vim_search.reset();
-        self.is_validating = false;
-        for field in &mut self.fields {
-            field.keys.clear();
-            field.key_status.clear();
-            field.pending.clear();
-            field.revealed = None;
-        }
-    }
-
-    /// Return indices of fields that currently hold at least one key. The
-    /// dialog only navigates rows with keys so empty upstreams stay out of
-    /// the way unless the user explicitly starts adding to them.
-    /// Indices of every provider row in catalog order, so the user can also
-    /// pick an unconfigured upstream and add its first key there.
-    pub fn visible_field_indices(&self) -> Vec<usize> {
-        (0..self.fields.len()).collect()
-    }
-
-    fn ensure_active_visible(&mut self) {
-        let visible = self.visible_field_indices();
-        if visible.is_empty() {
-            return;
-        }
-        let pos = visible
-            .iter()
-            .position(|i| *i == self.active_idx)
-            .unwrap_or(0);
-        if pos < self.scroll_offset {
-            self.scroll_offset = pos;
-        } else if pos >= self.scroll_offset + VISIBLE_ROWS {
-            self.scroll_offset = pos + 1 - VISIBLE_ROWS;
-        }
-    }
-
-    /// Move to the next provider row, discarding transient state.
-    pub fn move_next(&mut self) {
-        self.unreveal_and_clear();
-        let visible = self.visible_field_indices();
-        if visible.is_empty() {
-            return;
-        }
-        let pos = visible.iter().position(|i| *i == self.active_idx);
-        self.active_idx = match pos {
-            Some(p) if p + 1 < visible.len() => visible[p + 1],
-            _ => visible[0],
-        };
-        self.ensure_active_visible();
-    }
-
-    /// Move to the previous provider row, discarding transient state.
-    pub fn move_prev(&mut self) {
-        self.unreveal_and_clear();
-        let visible = self.visible_field_indices();
-        if visible.is_empty() {
-            return;
-        }
-        let pos = visible.iter().position(|i| *i == self.active_idx);
-        self.active_idx = match pos {
-            Some(p) if p > 0 => visible[p - 1],
-            _ => *visible.last().unwrap(),
-        };
-        self.ensure_active_visible();
-    }
-
-    /// Discard revealed key + typed text on the active row before nav.
-    fn unreveal_and_clear(&mut self) {
-        if let Some(field) = self.fields.get_mut(self.active_idx) {
-            field.revealed = None;
-            field.pending.clear();
-        }
-    }
-
-    /// Whether the active row's new-key buffer is empty. Gates vim-style
-    /// j/k navigation — once the user starts typing a key, those letters
-    /// belong to the key, not the cursor.
-    pub fn pending_is_empty(&self) -> bool {
-        self.fields
-            .get(self.active_idx)
-            .map(|f| f.pending.is_empty())
-            .unwrap_or(true)
-    }
-
-    /// Enter on the active row: append a typed new key (create), else toggle
-    /// the row's key list. Expanding shows every stored key inline with the
-    /// selection cursor on the first one; a second Enter collapses the row.
-    /// Returns `true` when a new key was appended — the caller then persists
-    /// and fires a validity check.
-    pub fn enter_active(&mut self) -> bool {
-        if self.append_pending() {
-            return true;
-        }
-        let Some(field) = self.fields.get_mut(self.active_idx) else {
-            return false;
-        };
-        if field.revealed.is_some() {
-            field.revealed = None;
-        } else if !field.keys.is_empty() {
-            field.revealed = Some(0);
-        }
-        false
-    }
-
-    /// Whether the active row is currently expanded (its key list is shown).
-    pub fn active_is_revealed(&self) -> bool {
-        self.fields
-            .get(self.active_idx)
-            .map(|f| f.revealed.is_some())
-            .unwrap_or(false)
-    }
-
-    /// Number of stored keys on the active row (0 for an unknown row).
-    pub fn active_key_count(&self) -> usize {
-        self.fields
-            .get(self.active_idx)
-            .map(|f| f.keys.len())
-            .unwrap_or(0)
-    }
-
-    /// Move the selection cursor to the next key on the expanded active row.
-    /// No-op unless the row is expanded; wraps at the end.
-    pub fn select_next_key(&mut self) {
-        let Some(field) = self.fields.get_mut(self.active_idx) else {
-            return;
-        };
-        let Some(i) = field.revealed else {
-            return;
-        };
-        if field.keys.is_empty() {
-            field.revealed = None;
-            return;
-        }
-        field.revealed = Some((i + 1) % field.keys.len());
-    }
-
-    /// Move the selection cursor to the previous key on the expanded active
-    /// row. No-op unless the row is expanded; wraps at the start.
-    pub fn select_prev_key(&mut self) {
-        let Some(field) = self.fields.get_mut(self.active_idx) else {
-            return;
-        };
-        let Some(i) = field.revealed else {
-            return;
-        };
-        if field.keys.is_empty() {
-            field.revealed = None;
-            return;
-        }
-        let len = field.keys.len();
-        field.revealed = Some((i + len - 1) % len);
-    }
-
-    /// Commit the typed new-key buffer as an additional stored key (a new
-    /// dot). Returns `true` when a key was appended.
-    pub fn append_pending(&mut self) -> bool {
-        let Some(field) = self.fields.get_mut(self.active_idx) else {
-            return false;
-        };
-        if field.from_env {
-            return false;
-        }
-        let key = field.pending.trim().to_string();
-        if key.is_empty() {
-            return false;
-        }
-        field.keys.push(key);
-        field.key_status.push(None);
-        field.pending.clear();
-        field.revealed = None;
-        self.ensure_active_visible();
-        true
-    }
-
-    /// Committed key count across every row (for the title / status line).
-    pub fn filled_count(&self) -> usize {
-        self.fields.iter().map(|f| f.keys.len()).sum()
-    }
-
-    /// Discard the active row's typed new-key text. Returns `true` if there
-    /// was anything to clear (Esc cascade: reveal → clear → close).
-    pub fn clear_pending(&mut self) -> bool {
-        if let Some(field) = self.fields.get_mut(self.active_idx) {
-            if !field.pending.is_empty() {
-                field.pending.clear();
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Re-mask the revealed key of the active row. Returns `true` if a key
-    /// was revealed (and is now hidden again).
-    pub fn unreveal_active(&mut self) -> bool {
-        if let Some(field) = self.fields.get_mut(self.active_idx) {
-            if field.revealed.is_some() {
-                field.revealed = None;
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Insert a character into the active row's new-key buffer. Ignored while
-    /// the row is expanded (view-only) so a keystroke cannot corrupt a key.
-    pub fn insert_char(&mut self, c: char) {
-        if let Some(field) = self.fields.get_mut(self.active_idx) {
-            if !field.from_env && field.revealed.is_none() {
-                field.pending.push(c);
-            }
-        }
-    }
-
-    /// Paste clipboard text (Ctrl+V) into the active row's new-key buffer.
-    /// Newlines and surrounding whitespace are trimmed so a pasted key that
-    /// carries a trailing line feed lands as a single token.
-    pub fn paste_key(&mut self, text: &str) {
-        if let Some(field) = self.fields.get_mut(self.active_idx) {
-            if field.from_env || field.revealed.is_some() {
-                return;
-            }
-            let cleaned = text.trim();
-            if cleaned.is_empty() {
-                return;
-            }
-            field.pending.push_str(cleaned);
-        }
-    }
-
-    /// Backspace the active row's new-key buffer. Ignored while the row is
-    /// expanded (view-only).
-    pub fn backspace(&mut self) {
-        if let Some(field) = self.fields.get_mut(self.active_idx) {
-            if field.revealed.is_none() {
-                field.pending.pop();
-            }
-        }
-    }
-
-    /// Offer the delete-confirmation popup for the active row's selected key.
-    /// Returns `true` when the popup opened.
-    pub fn try_open_delete_confirm(&mut self) -> bool {
-        let Some(field) = self.fields.get(self.active_idx) else {
-            return false;
-        };
-        if field.from_env {
-            return false;
-        }
-        if let Some(i) = field.revealed {
-            if i < field.keys.len() {
-                self.delete_confirm = Some(KeysDeleteConfirm {
-                    field_idx: self.active_idx,
-                    key_idx: i,
-                });
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Confirm the pending delete: remove the selected key (and its dot)
-    /// locally and keep the row expanded with the cursor clamped onto a
-    /// surviving key. Returns `true` when a key was actually removed — the
-    /// caller then persists the edited map to the auth store.
-    pub fn confirm_delete(&mut self) -> bool {
-        let Some(dc) = self.delete_confirm.take() else {
-            return false;
-        };
-        let Some(field) = self.fields.get_mut(dc.field_idx) else {
-            return false;
-        };
-        if dc.key_idx >= field.keys.len() {
-            return false;
-        }
-        field.keys.remove(dc.key_idx);
-        field.key_status.remove(dc.key_idx);
-        if field.keys.is_empty() {
-            field.revealed = None;
-        } else {
-            // Keep the row expanded; land the cursor on the next surviving
-            // key (or the last one when the removed key was the tail).
-            field.revealed = Some(dc.key_idx.min(field.keys.len() - 1));
-        }
-        true
-    }
-
-    /// Cancel the delete popup (key is kept).
-    pub fn cancel_delete(&mut self) {
-        self.delete_confirm = None;
-    }
-
-    /// Collect the edited key map, keyed by upstream id — the caller applies
-    /// it to the AuthStore. Every non-env row is included, even empty ones:
-    /// an empty list clears that upstream's stored keys (deleting the last
-    /// key must reach the store, and an upstream the user never touched must
-    /// also keep its stored zero).
-    pub fn store_updates(&self) -> Vec<(&'static str, Vec<String>)> {
-        self.fields
-            .iter()
-            .filter(|f| !f.from_env)
-            .map(|f| (f.upstream.id, f.keys.clone()))
-            .collect()
-    }
-
-    /// Fire a background validation sweep over every stored key in the
-    /// dialog. Each key gets probed by `validate_upstream_key` and the
-    /// result lands on its dot via `set_validation_result`. Returns a
-    /// `Receiver` the main loop drains with `poll_keys_dialog_validation`,
-    /// or `None` when there is nothing to probe or a sweep is already
-    /// running. Mirrors `FreeModeDialogState::start_validate`.
-    pub fn start_validate(&mut self) -> Option<std::sync::mpsc::Receiver<ValidationPing>> {
-        if self.is_validating {
-            return None;
-        }
-        let targets: Vec<(usize, usize, String, String)> = self
-            .fields
-            .iter()
-            .enumerate()
-            .flat_map(|(fi, f)| {
-                if f.from_env {
-                    return Vec::new();
-                }
-                f.keys
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, k)| !k.trim().is_empty())
-                    .map(|(ki, k)| (fi, ki, f.upstream.id.to_string(), k.trim().to_string()))
-                    .collect()
-            })
-            .collect();
-        if targets.is_empty() {
-            return None;
-        }
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.is_validating = true;
-        for (fi, ki, upstream_id, key) in targets {
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                let result = clawde_api::providers::free::validate_upstream_key(&upstream_id, &key);
-                // Best-effort send; silently fails if the dialog was closed.
-                let _ = tx.send((fi, ki, result));
-            });
-        }
-        drop(tx);
-        Some(rx)
-    }
-
-    /// Record the outcome of one probed key. Called from the main loop as
-    /// validation results arrive.
-    pub fn set_validation_result(
-        &mut self,
-        field_idx: usize,
-        key_idx: usize,
-        result: Result<(), String>,
-    ) {
-        self.is_validating = false;
-        if let Some(field) = self.fields.get_mut(field_idx) {
-            if let Some(slot) = field.key_status.get_mut(key_idx) {
-                *slot = Some(result);
-            }
+            editor: KeyEditorState::new(),
         }
     }
 }
 
-/// Health-dot color for a stored key's status.
-fn dot_color(status: &Option<Result<(), String>>) -> Color {
-    match status {
-        Some(Ok(())) => Color::Rgb(120, 210, 150),
-        Some(Err(_)) => Color::Rgb(230, 110, 110),
-        None => Color::Rgb(140, 140, 140),
+impl std::ops::Deref for KeysDialogState {
+    type Target = KeyEditorState;
+    fn deref(&self) -> &Self::Target {
+        &self.editor
+    }
+}
+
+impl std::ops::DerefMut for KeysDialogState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.editor
     }
 }
 
 /// Render the `/keys` popup: j/k-navigable row list with masked key dots,
-/// reveal-on-Enter, a pending new-key line, and the delete-confirm popup.
+/// reveal-on-Enter, a pending new-key line, and the inline delete prompt.
 pub fn render_keys_dialog(
     frame: &mut Frame,
     state: &KeysDialogState,
@@ -550,211 +66,30 @@ pub fn render_keys_dialog(
     if !state.visible {
         return;
     }
-
-    let pink = CLAWDE_ACCENT;
-    let dim = Color::Rgb(90, 90, 90);
-    let muted = Color::Rgb(180, 180, 180);
-    let tip = Color::Rgb(120, 210, 150);
-    let dialog_bg = CLAWDE_PANEL_BG;
-
-    render_dark_overlay(frame, area);
-
-    let width = 88u16.min(area.width.saturating_sub(4));
-    let height = 30u16.min(area.height.saturating_sub(2));
-    let dialog_area = centered_rect(width, height, area);
-    state.last_rect.set(dialog_area);
-    render_dialog_bg(frame, dialog_area);
-
-    let inner = Rect {
-        x: dialog_area.x + 1,
-        y: dialog_area.y + 1,
-        width: dialog_area.width.saturating_sub(2),
-        height: dialog_area.height.saturating_sub(2),
-    };
-
     let total_keys = state.filled_count();
-    let title_text = format!(
-        "/keys — {} key{}",
-        total_keys,
-        if total_keys == 1 { "" } else { "s" }
-    );
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // Title row.
-    lines.push(Line::from(vec![Span::styled(
-        format!(" {}", title_text),
-        Style::default().fg(pink).add_modifier(Modifier::BOLD),
-    )]));
-    lines.push(Line::styled(
-        "  j/k nav · enter reveal/add · ←/→ select key · del delete · ctrl+v paste · esc close",
-        Style::default().fg(dim),
-    ));
-    lines.push(Line::styled("", Style::default()));
-
-    // Rows.
-    let visible = state.visible_field_indices();
-    for (row, fi) in visible.iter().enumerate().skip(state.scroll_offset) {
-        if row >= state.scroll_offset + VISIBLE_ROWS {
-            break;
-        }
-        let Some(field) = state.fields.get(*fi) else {
-            continue;
-        };
-        let is_active = *fi == state.active_idx;
-        let fg = if is_active { pink } else { muted };
-
-        // Provider name + key count.
-        let key_count = field.keys.len();
-        let key_label = if key_count == 1 { "key" } else { "keys" };
-        let env_marker = if field.from_env {
-            " · env-read-only"
-        } else {
-            ""
-        };
-        let name_style = if is_active {
-            Style::default().fg(fg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(fg)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(
-                    "  {}{}",
-                    field.upstream.title,
-                    if is_active { " ▸" } else { "" }
-                ),
-                name_style,
+    let chrome = KeyEditorChrome {
+        width: 88,
+        height: 30,
+        title: format!(
+            "/keys \u{2014} {} key{}",
+            total_keys,
+            if total_keys == 1 { "" } else { "s" }
+        ),
+        description: vec![
+            Line::styled(
+                "  j/k nav \u{00b7} enter reveal/add \u{00b7} \u{2190}/\u{2192} select key \u{00b7} del delete \u{00b7} ctrl+v paste \u{00b7} esc close",
+                Style::default().fg(Color::Rgb(90, 90, 90)),
             ),
-            Span::styled(
-                format!("   ({} {}{})", key_count, key_label, env_marker),
-                Style::default().fg(dim),
-            ),
-        ]));
-
-        // Key line — health dots when masked, one key per line (with the
-        // selection cursor highlighted) when the row is expanded.
-        if field.keys.is_empty() {
-            lines.push(Line::styled("      (no keys)", Style::default().fg(dim)));
-        } else if let Some(sel) = field.revealed {
-            // Vertical list: one key per line so long keys stay readable.
-            for (ki, key) in field.keys.iter().enumerate() {
-                let all: Vec<char> = key.chars().collect();
-                let body: String = if all.len() > 64 {
-                    format!("{}…", all.iter().take(64).collect::<String>())
-                } else {
-                    key.clone()
-                };
-                let selected = ki == sel;
-                let marker = if selected {
-                    Span::styled(
-                        "\u{25b8} ",
-                        Style::default().fg(pink).add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    Span::styled("  ", Style::default().fg(dim))
-                };
-                let style = if selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(pink)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(muted)
-                };
-                lines.push(Line::from(vec![
-                    Span::styled("      ", Style::default()),
-                    marker,
-                    Span::styled(format!("[{}]", body), style),
-                ]));
-            }
-            lines.push(Line::styled(
-                format!(
-                    "      key {}/{} · \u{2190}/\u{2192} select · del delete · esc hide",
-                    sel + 1,
-                    field.keys.len()
-                ),
-                Style::default().fg(dim),
-            ));
-        } else {
-            let mut spans: Vec<Span<'static>> = vec![Span::styled("      ", Style::default())];
-            for status in field.key_status.iter() {
-                spans.push(Span::styled(
-                    "\u{25cf} ",
-                    Style::default().fg(dot_color(status)),
-                ));
-            }
-            lines.push(Line::from(spans));
-        }
-
-        // Pending new-key line (only for the active row when it has no
-        // from_env restriction, so the key counts as typed to the row).
-        let pending_style = Style::default().fg(if is_active { tip } else { dim });
-        let pending_label = if field.from_env {
-            "      env-provided key — edit in your shell profile".to_string()
-        } else if field.pending.is_empty() {
-            if is_active {
-                "      new key…".to_string()
-            } else {
-                String::new()
-            }
-        } else {
-            format!(
-                "      {}{}",
-                field.pending,
-                if is_active { "▍" } else { "" }
-            )
-        };
-        if !pending_label.is_empty() {
-            lines.push(Line::styled(pending_label, pending_style));
-        }
-    }
-
-    // Delete-confirm subpopup.
-    if let Some(dc) = state.delete_confirm {
-        if let Some(field) = state.fields.get(dc.field_idx) {
-            let key_preview: String = field
-                .keys
-                .get(dc.key_idx)
-                .map(|k| format!("{}…", k.chars().take(12).collect::<String>()))
-                .unwrap_or("?".to_string());
-            lines.push(Line::styled(
-                format!(
-                    "  \u{26a0} Delete key {} from {}?  [y]es / [n]o  — {}",
-                    dc.key_idx + 1,
-                    field.upstream.id,
-                    key_preview,
-                ),
-                Style::default().fg(Color::Rgb(230, 160, 60)),
-            ));
-        }
-    }
-
-    let para = Paragraph::new(lines).bg(dialog_bg);
-    frame.render_widget(para, inner);
-
-    // Static keybind footer (vim vs arrows).
-    let footer = if vim_enabled {
-        "  j/k move · h/l select key · enter reveal/add → auto-save+validate · del confirm delete · esc close"
-    } else {
-        "  ↑/↓ move · ←/→ select key · enter reveal/add → auto-save+validate · del confirm delete · esc close"
+            Line::styled("", Style::default()),
+        ],
     };
-    let footer_widget =
-        Paragraph::new(Line::styled(footer, Style::default().fg(dim))).bg(dialog_bg);
-    frame.render_widget(
-        footer_widget,
-        Rect {
-            x: inner.x,
-            y: inner.y + inner.height.saturating_sub(2),
-            width: inner.width,
-            height: 1,
-        },
-    );
+    render_key_editor(frame, state, vim_enabled, area, &chrome);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clawde_api::FREE_CATALOG;
 
     fn seeded() -> KeysDialogState {
         let mut s = KeysDialogState::new();
@@ -933,6 +268,41 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_entry_is_two_step_in_manage_too() {
+        // Audit A: `/keys` must never store a bare Cloudflare token — the
+        // shared append_pending owns the composite flow for both purposes.
+        let cf_idx = FREE_CATALOG
+            .iter()
+            .position(|u| u.id == "cloudflare")
+            .expect("cloudflare in catalog");
+        let mut s = KeysDialogState::new();
+        s.open(&[]);
+        s.active_idx = cf_idx;
+        for c in "tok-123456789".chars() {
+            s.insert_char(c);
+        }
+        assert!(s.append_pending());
+        assert_eq!(
+            s.fields[cf_idx].pending_token.as_deref(),
+            Some("tok-123456789"),
+            "first Enter captures the token"
+        );
+        assert!(
+            s.fields[cf_idx].keys.is_empty(),
+            "no key stored until the account ID is entered"
+        );
+        for c in "acct-987654321".chars() {
+            s.insert_char(c);
+        }
+        assert!(s.append_pending());
+        assert_eq!(
+            s.fields[cf_idx].keys,
+            vec!["acct-987654321:tok-123456789"],
+            "second Enter joins the ID and token"
+        );
+    }
+
+    #[test]
     fn delete_requires_an_expanded_key_then_confirms() {
         let mut s = seeded();
         // Not expanded — no confirm popup.
@@ -980,9 +350,10 @@ mod tests {
     #[test]
     fn store_updates_includes_empty_rows_to_clear_store() {
         let s = seeded();
-        let updates = s.store_updates();
+        let (updates, removals) = s.store_updates();
         // Every non-env field is present — an empty row signals "clear".
         assert_eq!(updates.len(), s.fields.len());
+        assert!(removals.is_empty(), "Manage never removes credentials");
         let (id, keys) = &updates[0];
         assert_eq!(*id, FREE_CATALOG[0].id);
         assert_eq!(*keys, vec!["k1", "k2"]);
@@ -994,7 +365,7 @@ mod tests {
         s.open(&[]);
         s.set_env_var_keys(&[(FREE_CATALOG[1].id, "env-key".into())]);
         assert!(s.fields[1].from_env);
-        let updates = s.store_updates();
+        let (updates, _removals) = s.store_updates();
         assert!(
             !updates.iter().any(|(id, _)| *id == FREE_CATALOG[1].id),
             "env-var rows never reach the auth store"
@@ -1007,5 +378,18 @@ mod tests {
     fn filled_count_sums_all_rows() {
         let s = seeded();
         assert_eq!(s.filled_count(), 2);
+    }
+
+    #[test]
+    fn short_pending_key_is_flagged_before_it_is_dropped() {
+        // Audit G: a typed key under the store minimum must be surfaced, not
+        // silently discarded at save time.
+        let mut s = seeded();
+        s.fields[0].pending = "abc".into();
+        assert!(s.pending_key_too_short());
+        s.fields[0].pending = "gsk-12345678".into();
+        assert!(!s.pending_key_too_short());
+        s.fields[0].pending = "   ".into();
+        assert!(!s.pending_key_too_short(), "blank pending is not a key");
     }
 }
