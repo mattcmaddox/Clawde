@@ -187,20 +187,6 @@ fn help_overlay_entries(
 // Provider connection helpers
 // ---------------------------------------------------------------------------
 
-/// Return the environment variable name for a given provider ID.
-/// Delegates to the shared ProviderMetadata table in the API crate.
-#[allow(dead_code)]
-fn get_env_var_for_provider(id: &str) -> &'static str {
-    clawde_api::providers::env_var_for(id)
-}
-
-/// Return a URL hint for obtaining an API key from a given provider.
-/// Delegates to the shared ProviderMetadata table in the API crate.
-#[allow(dead_code)]
-fn get_url_for_provider(id: &str) -> &'static str {
-    clawde_api::providers::key_url_for(id)
-}
-
 /// Try to read an API key from environment variables for a free upstream.
 /// Returns `Some(key)` if the env var is set and non-empty.
 fn detect_env_var_key(upstream_id: &str) -> Option<String> {

@@ -9,7 +9,7 @@ This document is the complete reference for every slash command available in Cla
 1. [Command System Overview](#command-system-overview)
 2. [Session & Navigation](#session--navigation)
 3. [Streaming & Interrupts](#streaming--interrupts)
-4. [Model & Provider](#model--provider) — `/model`, `/models`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
+4. [Model & Provider](#model--provider) — `/model`, `/models`, `/keys`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
 5. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/autopilot`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
 6. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/spec`, `/spec-mode`, `/spec-review`, `/security-review`, `/init`, `/search`
 7. [Search & Files](#search--files) — `/files`, `/context`
@@ -392,6 +392,40 @@ List all configured AI providers and their connection status. Shows provider nam
 ```
 /providers
 ```
+
+---
+
+### /keys
+
+Open the interactive key manager — the single place to view, add, and remove
+API keys. Bare `/keys` opens a popup with one row per free-catalog upstream;
+`/connect free` hands off here rather than editing keys itself.
+
+```
+/keys
+```
+
+Editor keys: `j/k` (or `↑/↓`) move between providers, `enter` reveals a
+provider's keys or appends the key you typed, `←/→` select a key within an
+expanded row, `del` removes the selected key (with a confirm), `ctrl+v` pastes,
+and `esc` re-masks then closes. Keys are masked by default; a row backed by an
+environment variable is read-only.
+
+Subcommands stay at the command layer (useful headless):
+
+```
+/keys                              — list providers with stored keys
+/keys list [<provider>]            — show keys for one provider
+/keys set <provider> <k1> [k2 ...] — replace all keys for a provider
+/keys add <provider> <key>         — append a key
+/keys remove <provider> <index>    — remove the key at a 1-based index
+/keys health [<provider>]          — runtime key status, cooldowns, last fail
+/keys doctor                       — diagnose the credential store itself
+```
+
+Cloudflare keys are the composite `ACCOUNT_ID:API_TOKEN`. Providers with 2+
+keys rotate automatically when one is exhausted, in list order. Removing a key
+also drops its persisted cooldown, so re-adding the same value starts clean.
 
 ---
 

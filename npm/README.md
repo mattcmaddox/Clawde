@@ -28,9 +28,10 @@ clawde -p "fix this bug"  # headless one-shot
 
 | Platform | Architecture |
 |----------|-------------|
-| macOS    | x64, arm64 (Apple Silicon) |
 | Linux    | x64, arm64 |
-| Windows  | x64 |
+
+Only the Linux legs are published. On any other platform the install step
+errors with a "build from source" hint.
 
 ## Links
 

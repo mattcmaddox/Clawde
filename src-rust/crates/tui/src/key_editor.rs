@@ -275,6 +275,7 @@ impl KeyEditorState {
         let pos = visible.iter().position(|i| *i == self.active_idx);
         self.active_idx = match pos {
             Some(p) if p > 0 => visible[p - 1],
+            // `visible` is non-empty (guarded at the top of this fn).
             _ => *visible.last().unwrap(),
         };
         self.ensure_active_visible();

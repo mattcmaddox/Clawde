@@ -1,7 +1,10 @@
 # Decision note: drop Windows support
 
 **Recorded:** 2026-09-16
-**Status:** Proposed — owner decision pending
+**Status:** Accepted — implemented. The install/release paths no longer advertise
+Windows (or macOS) archives; see `docs/build-release-refactor-spec.md` for the
+release-flow side and the guard in `scripts/validate-acp-template.py` that keeps
+the ACP template honest.
 
 Windows has been a recurring CI and support burden disproportionate to its use.
 
@@ -17,13 +20,17 @@ Nine fix commits in a row were required to get CI green; nearly every failure wa
 - Four katban systemd-exposure tests impossible on Windows (systemd is a Linux surface)
 - Local/CI clippy version skew (0.1.91 vs 1.98) compounded the noise
 
-## Scope of removal (when approved)
+## Scope of removal (implemented)
 
 1. CI: drop `windows-latest` from the test matrix in `.github/workflows/ci.yml`
 2. Release: stop building/publishing `clawde-windows-x86_64.zip` (see `scripts/build.sh` and the README "Supported Platforms" table, line ~104)
 3. Release: drop the Windows leg from the cross-compile plan (local `x86_64-pc-windows-gnu` / `-msvc` targets, the remote-build docs in `.agents/skills/hive-remote-build/SKILL.md`)
 4. Code: optionally remove the Windows-only workarounds that exist purely for this target (`.cargo/config.toml` stack reserve, `cfg(windows)` branches, kitty-keyboard push/pop note in `crates/tui`), or leave them as harmless dead paths
 5. Docs: remove Windows install instructions from `README.md` and `docs/installation.md`
+
+Items 1, 2, and 5 are done (plus macOS, dropped from distribution
+2026-08-22). Item 4's dead paths were left in place — they cost nothing and
+keep the source building on those hosts for anyone who compiles from source.
 
 ## Cost of keeping it
 
