@@ -9,18 +9,9 @@
     "Matt Maddox"
   ],
   "license": "GPL-3.0",
+  "license_url": "https://github.com/mattcmaddox/Clawde/blob/main/LICENSE.md",
   "distribution": {
     "binary": {
-      "darwin-aarch64": {
-        "archive": "https://github.com/mattcmaddox/Clawde/releases/download/v0.3.6/clawde-macos-aarch64.tar.gz",
-        "cmd": "./clawde",
-        "args": ["acp"]
-      },
-      "darwin-x86_64": {
-        "archive": "https://github.com/mattcmaddox/Clawde/releases/download/v0.3.6/clawde-macos-x86_64.tar.gz",
-        "cmd": "./clawde",
-        "args": ["acp"]
-      },
       "linux-aarch64": {
         "archive": "https://github.com/mattcmaddox/Clawde/releases/download/v0.3.6/clawde-linux-aarch64.tar.gz",
         "cmd": "./clawde",
@@ -29,11 +20,6 @@
       "linux-x86_64": {
         "archive": "https://github.com/mattcmaddox/Clawde/releases/download/v0.3.6/clawde-linux-x86_64.tar.gz",
         "cmd": "./clawde",
-        "args": ["acp"]
-      },
-      "windows-x86_64": {
-        "archive": "https://github.com/mattcmaddox/Clawde/releases/download/v0.3.6/clawde-windows-x86_64.zip",
-        "cmd": "./clawde.exe",
         "args": ["acp"]
       }
     }

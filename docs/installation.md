@@ -10,10 +10,8 @@ into `~/.clawde/bin` and add that directory to your `PATH` automatically.
 
 | Platform | Architecture | Minimum OS |
 |----------|-------------|------------|
-| Linux    | x86_64      | glibc 2.17+ (most distros from 2014 onward) |
-| Linux    | aarch64     | glibc 2.17+ (Raspberry Pi 4, AWS Graviton, etc.) |
-| macOS    | x86_64      | macOS 11 Big Sur |
-| macOS    | aarch64     | macOS 11 Big Sur (Apple Silicon: M1/M2/M3) |
+| Linux    | x86_64      | glibc 2.36+ (Debian 12+, Ubuntu 22.04+, Raspberry Pi OS Bookworm) |
+| Linux    | aarch64     | glibc 2.36+ (Raspberry Pi 4, AWS Graviton, etc.) |
 
 There are no other runtime dependencies. The binary is statically linked where
 possible; on Linux it links against the system glibc.
@@ -22,7 +20,7 @@ possible; on Linux it links against the system glibc.
 
 ## Quick install (recommended)
 
-### Linux / macOS
+### Linux
 
 ```bash
 curl -fsSL https://github.com/mattcmaddox/Clawde/releases/latest/download/install.sh | bash
@@ -35,8 +33,6 @@ The installer:
 3. Extracts `clawde` into `~/.clawde/bin/`.
 4. Appends that directory to your shell config (`.bashrc`, `.zshrc`,
    `.config/fish/config.fish`).
-5. On macOS, strips the quarantine attribute so Gatekeeper does not block the
-   unsigned binary.
 
 Open a new terminal afterwards (or `source` the modified shell config) so
 the updated `PATH` takes effect, then run `clawde --version` to verify.
@@ -83,7 +79,6 @@ bunx clawde         # via bun
 | Platform | Architecture |
 |----------|-------------|
 | Linux    | x86_64, aarch64 |
-| macOS    | x86_64 (Intel), aarch64 (Apple Silicon) |
 
 ---
 
@@ -112,8 +107,6 @@ If you'd rather not run an install script, grab archives directly from
 |---------|----------|
 | `clawde-linux-x86_64.tar.gz` | Linux x86_64 |
 | `clawde-linux-aarch64.tar.gz` | Linux ARM64 |
-| `clawde-macos-x86_64.tar.gz` | macOS Intel |
-| `clawde-macos-aarch64.tar.gz` | macOS Apple Silicon |
 
 Every archive contains a single binary named `clawde`.
 Extract it and put it somewhere on your `PATH`. For example on Linux:
@@ -123,13 +116,6 @@ curl -L https://github.com/mattcmaddox/Clawde/releases/latest/download/clawde-li
   | tar -xz
 chmod +x clawde
 sudo mv clawde /usr/local/bin/
-```
-
-On macOS, also strip the quarantine flag so Gatekeeper allows the unsigned
-binary:
-
-```bash
-xattr -rd com.apple.quarantine /usr/local/bin/clawde
 ```
 
 ### User-local install without sudo
@@ -160,7 +146,7 @@ clawde 0.3.6
 To confirm the binary is the one you installed:
 
 ```bash
-which clawde          # Linux / macOS
+which clawde
 ```
 
 ---
@@ -291,7 +277,7 @@ the [Upgrading](#upgrading) section above.
 If you used the install script, remove the install directory:
 
 ```bash
-rm -rf ~/.clawde/bin                    # Linux / macOS
+rm -rf ~/.clawde/bin
 ```
 
 For manual installs:

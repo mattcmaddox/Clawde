@@ -149,10 +149,12 @@ cargo check -p clawde-tui --tests
 
 ### Pre-commit hook
 
-`.githooks/pre-commit` runs six checks before a commit lands (see the script
+`.githooks/pre-commit` runs seven checks before a commit lands (see the script
 header for the full contract): the gitleaks secret scan, the async file-flush
-audit, rustfmt drift, the TUI test-target compile, an idle-CPU smoke probe, and
-a **live eval gate** (`scripts/eval/run_eval.py --fixture
+audit, rustfmt drift, the TUI test-target compile, an idle-CPU smoke probe, an
+**ACP registry-template guard** (`scripts/validate-acp-template.py`, runs only
+when the template, its vendored schema, or the validator is staged), and a
+**live eval gate** (`scripts/eval/run_eval.py --fixture
 scripts/eval/fixtures/catalog-order`) that runs the real free-provider chain and
 blocks the commit if it stops enumerating `FREE_CATALOG` order. The two slow
 checks self-skip when the debug binary is missing or older than the staged Rust
@@ -168,6 +170,7 @@ Skip the secret scan only: `CLAWDE_HOOK_SKIP_GITLEAKS=1 git commit ...`
 Skip the slower cargo check + probes: `CLAWDE_HOOK_SKIP_TESTS=1 git commit ...`
 Skip only the idle-CPU probe: `CLAWDE_HOOK_SKIP_IDLE_CPU=1 git commit ...`
 Skip only the live eval gate: `CLAWDE_HOOK_SKIP_EVAL=1 git commit ...`
+Skip only the ACP template guard: `CLAWDE_HOOK_SKIP_ACP=1 git commit ...`
 
 The secret scan (check 0) blocks any commit staging credentials in any file
 type, via `gitleaks protect --staged` with the repo baseline `gitleaks.toml`
@@ -394,11 +397,10 @@ scripts/build.sh release --version vX.Y.Z
 ```
 
 This stamps the version (`scripts/bump-version.py`, a clean `X.Y.Z` — no `+N`),
-commits + pushes the bump, builds every platform leg this machine can (native +
-cross via Docker; macOS/Windows legs are built by running the same script on
-those machines and copying `dist/` artifacts in), packages archives +
-`SHA256SUMS` into `dist/`, publishes a GitHub Release via `gh release create`,
-and dispatches the npm publish workflow. Use `--dry-run` to preview without
+commits + pushes the bump, builds every platform leg this machine can (the two
+Linux legs, natively and cross via Docker), packages archives + `SHA256SUMS`
+into `dist/`, publishes a GitHub Release via `gh release create`, and
+dispatches the npm publish workflow. Use `--dry-run` to preview without
 side effects. Versioning is forward-only — every fix cuts a new version; tags
 are never force-moved.
 
@@ -514,8 +516,8 @@ so the registry, health poller, and TUI dialog can never disagree:
    with the same trim + >=8 guard and Zen/Go alias. A placeholder in slot 0
    does not shadow a valid slot-1 key.
 3. **`all_stored_free_upstream_keys()`** (`free/mod.rs`) — **display-oriented**:
-   merges credentials + rotation keys, deduped, for the Connect Free dialog's
-   per-key health dots. NOT ring-aligned — never used for probing.
+   merges credentials + rotation keys, deduped, for `/keys`' per-key health
+   dots. NOT ring-aligned — never used for probing.
 
 Model discovery fetches use `first_upstream_key()` (`free/discovery.rs`), which
 is keys-first (ring order) with a credential fallback — any valid key works for
@@ -591,6 +593,21 @@ only). Purpose: bench a *definitively dead* key (401/403 → `mark_key_exhausted
 300s) in the running ring before the user's first request pays for it. The
 `key_idx` it forwards is ring-aligned with `build_free_provider`
 (`poller_probe_list_aligns_with_registry_ring_keys` locks that alignment).
+
+The poller does **not** capture a provider at spawn. It re-reads the live slot
+published by `set_current_free_provider` (`CURRENT_FREE_PROVIDER`) at the start
+of every sweep, so a rebuild that installs a *new* `Arc<dyn LlmProvider>`
+(`App::refresh_free_provider`, `reload_provider_runtime_state`, and the other
+`crates/cli/src/main.rs` rebuild sites) can never leave the poller mutating a
+discarded ring. `current_free_provider_slot_follows_rebuilds` pins that.
+
+A credential mutation or full provider reload also calls `clear_last_sweep()`,
+which drops the cached `ProbeOutcome` the footer's `⚠ N dead` badge reads
+(`take_last_sweep` / `last_sweep_generation` are generation-gated so the TUI
+observes the clear on the next frame). Without it the badge stayed lit for up to
+`health_poll_interval_secs` after the key it named was removed; `KeyRing`
+snapshots are pruned on credential removal too, so a removed key cannot
+resurrect a stale cooldown if the identical string is re-added.
 
 - A rate limit (429) and any 5xx/connection failure classify as `Transient` and
   must **never** bench a key: these endpoints are shared capacity, and busy is

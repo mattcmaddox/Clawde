@@ -11,7 +11,8 @@ Touches:
   - docs/index.md                       **Version:** line
   - docs/installation.md                "clawde X.Y.Z" sample output
   - src-rust/crates/acp/registry-template/agent.json
-                                        version field + 5 release download URLs
+                                        version field + release download URLs (one per
+                                        published platform; Linux-only today)
 
 Fails loudly if any expected pattern is missing — that means the file shape
 changed and the script needs updating, not silently producing a half-stamped
@@ -127,11 +128,15 @@ def main() -> None:
         count=1,
     )
 
-    # 7. ACP registry template — version field + 5 release download URLs
+    # 7. ACP registry template — version field + release download URLs
     agent = ROOT / "src-rust" / "crates" / "acp" / "registry-template" / "agent.json"
     text = agent.read_text(encoding="utf-8")
     text, n_v = re.subn(r'"version": "\d+\.\d+\.\d+"', f'"version": "{version}"', text, count=1)
-    text, n_u = re.subn(r"/releases/download/v\d+\.\d+\.\d+/", f"/releases/download/v{version}/", text)
+    text, n_u = re.subn(
+        r"/releases/download/v\d+\.\d+\.\d+/",
+        f"/releases/download/v{version}/",
+        text,
+    )
     if n_v != 1:
         die("agent.json: version field not found")
     if n_u == 0:

@@ -18,23 +18,18 @@ function getPlatform() {
   const platform = process.platform;
   const arch = process.arch;
 
-  // Windows is not built or published (see docs/decisions/drop-windows-support.md);
-  // win32 falls through to the unsupported-platform error below.
+  // Only the two Linux legs are built and published. Windows and macOS are
+  // unsupported (see docs/decisions/drop-windows-support.md) and fall through
+  // to the error below rather than downloading an archive that does not exist.
   if (platform === 'linux' && arch === 'x64') {
-    return { artifact: 'clawde-linux-x86_64', ext: '', archive: '.tar.gz' };
+    return { artifact: 'clawde-linux-x86_64' };
   }
   if (platform === 'linux' && arch === 'arm64') {
-    return { artifact: 'clawde-linux-aarch64', ext: '', archive: '.tar.gz' };
-  }
-  if (platform === 'darwin' && arch === 'x64') {
-    return { artifact: 'clawde-macos-x86_64', ext: '', archive: '.tar.gz' };
-  }
-  if (platform === 'darwin' && arch === 'arm64') {
-    return { artifact: 'clawde-macos-aarch64', ext: '', archive: '.tar.gz' };
+    return { artifact: 'clawde-linux-aarch64' };
   }
   throw new Error(
     `Unsupported platform: ${platform}/${arch}.\n` +
-    `Install manually from: https://github.com/${REPO}/releases/tag/v${VERSION}`
+    `Build from source: https://github.com/${REPO}#build-from-source`
   );
 }
 
@@ -69,11 +64,12 @@ function download(url, dest) {
 }
 
 async function main() {
-  const { artifact, ext, archive } = getPlatform();
+  const { artifact } = getPlatform();
+  const archive = '.tar.gz';
   const archiveName = `${artifact}${archive}`;
   const url = `${BASE_URL}/${archiveName}`;
   const tmpPath = path.join(os.tmpdir(), `clawde-install-${process.pid}${archive}`);
-  const binaryDest = path.join(NATIVE_DIR, `clawde${ext}`);
+  const binaryDest = path.join(NATIVE_DIR, 'clawde');
 
   if (fs.existsSync(binaryDest)) {
     console.log('clawde: native binary already present, skipping download.');
@@ -87,14 +83,7 @@ async function main() {
   await download(url, tmpPath);
 
   console.log('clawde: extracting...');
-  if (archive === '.zip') {
-    execFileSync('powershell', [
-      '-NoProfile', '-NonInteractive', '-Command',
-      `Expand-Archive -Force -Path "${tmpPath}" -DestinationPath "${NATIVE_DIR}"`
-    ]);
-  } else {
-    execFileSync('tar', ['-xzf', tmpPath, '-C', NATIVE_DIR]);
-  }
+  execFileSync('tar', ['-xzf', tmpPath, '-C', NATIVE_DIR]);
 
   try { fs.unlinkSync(tmpPath); } catch (_) {}
 
@@ -102,9 +91,7 @@ async function main() {
     throw new Error(`Extraction succeeded but binary not found at ${binaryDest}`);
   }
 
-  if (ext === '') {
-    fs.chmodSync(binaryDest, 0o755);
-  }
+  fs.chmodSync(binaryDest, 0o755);
 
   console.log(`clawde: ready — run \`clawde\` to start.`);
 }

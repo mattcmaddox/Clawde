@@ -30,6 +30,13 @@
 #      stops enumerating the FREE_CATALOG order (answer-quality regression).
 #      Same binary staleness skip as the probe; skips when no free keys are
 #      configured; exit 2 (provider error / timeout) warns without blocking.
+#   6. ACP template guard (`scripts/validate-acp-template.py`) — runs when the
+#      registry template, its vendored schema, or the validator itself is
+#      staged. Validates the manifest against the ACP schema AND against the
+#      legs build.sh actually builds, so the template cannot re-advertise a
+#      macOS/Windows archive that no release publishes (registry CI would fail).
+#      Instant; stdlib-only tier always runs, deep schema tier when jsonschema
+#      is importable.
 #
 # Skip for a single commit:  SKIP_CLAWDE_HOOK=1 git commit ...
 # Skip the secret scan (gitleaks):
@@ -40,6 +47,8 @@
 #   CLAWDE_HOOK_SKIP_IDLE_CPU=1 git commit ...
 # Skip the live eval gate (catalog-order fixture, runs the free provider):
 #   CLAWDE_HOOK_SKIP_EVAL=1 git commit ...
+# Skip the ACP template guard:
+#   CLAWDE_HOOK_SKIP_ACP=1 git commit ...
 set -u
 
 if [ "${SKIP_CLAWDE_HOOK:-0}" = "1" ]; then
@@ -80,6 +89,24 @@ elif [ -z "${CLAWDE_GITLEAKS_HINT_SHOWN:-}" ]; then
     echo "pre-commit: gitleaks not found — secret scan skipped (install:"
     echo "  https://github.com/gitleaks/gitleaks#installing) to enable check 0."
     CLAWDE_GITLEAKS_HINT_SHOWN=1
+fi
+
+# ---- ACP registry template guard -----------------------------------------
+# Runs before the Rust-only early-exit because the template is JSON, not .rs.
+# The template advertises release archives; if it lists a platform build.sh does
+# not build, the registry CI rejects the manifest and editors offer a download
+# that 404s. The validator self-tests its own detector on every run.
+if [ "${CLAWDE_HOOK_SKIP_ACP:-0}" != "1" ] && command -v python3 >/dev/null 2>&1; then
+    if git diff --cached --name-only | grep -q \
+        -e '^src-rust/crates/acp/registry-template/agent\.json$' \
+        -e '^scripts/registry-agent\.schema\.json$' \
+        -e '^scripts/validate-acp-template\.py$'; then
+        if ! python3 "$ROOT/scripts/validate-acp-template.py" --quiet; then
+            echo "pre-commit: ACP registry template validation FAILED (see above)."
+            echo "  Fix the manifest, or bypass this check with CLAWDE_HOOK_SKIP_ACP=1."
+            exit 1
+        fi
+    fi
 fi
 
 # Only relevant when Rust sources are staged.

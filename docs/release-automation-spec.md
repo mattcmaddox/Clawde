@@ -1,5 +1,20 @@
 # Release Automation — Zero-Command Pipeline
 
+Status: **Abandoned** — kept as the design record for the auto-release idea.
+
+> **Historical — do not follow this document.** The zero-command pipeline it
+> describes was tried and then turned off:
+> - **Auto-release on push was disabled 2026-08-30** (`.github/workflows/release.yml`).
+>   It force-bumped the patch version on every merge and clobbered deliberate
+>   re-anchors. Releases are now deliberate only: `scripts/build.sh release
+>   --version vX.Y.Z` (see `docs/build-release-refactor-spec.md`).
+> - **The build no longer runs in Actions.** Building/publishing moved to the
+>   local `scripts/build.sh`; Actions only *dispatches* npm publish. See
+>   `docs/build-release-refactor-spec.md`.
+> - **Windows and macOS are unsupported.** Only the two Linux legs are built, so
+>   the three-platform matrix below is historical. See
+>   `docs/decisions/drop-windows-support.md`.
+
 ## Problem
 
 After pushing code to `main`, npm users running `npm update -g clawde` must
@@ -48,7 +63,7 @@ steps.
 
 ### Step 2: Build All Platforms (parallel jobs)
 
-Three parallel build jobs, one per platform:
+*(historical)* Three parallel build jobs, one per platform:
 
 | Job | Runner | What it produces |
 |-----|--------|------------------|
@@ -56,15 +71,10 @@ Three parallel build jobs, one per platform:
 | `build-linux-aarch64` | `ubuntu-latest` (cross + Docker) | `clawde-linux-aarch64.tar.gz` |
 | `build-windows-x86_64` | `windows-latest` | `clawde-windows-x86_64.zip` |
 
-Each job:
-- Checks out the repo
-- Installs Rust toolchain
-- Runs `scripts/build.sh build-one <platform>`
-- Uploads the binary archive as a GitHub Actions artifact
-
-All three run in parallel. The Windows job uses `windows-latest` with MSVC
-(yes, GitHub Actions has Windows runners with MSVC preinstalled — no NASM
-or extra setup needed).
+Today the two Linux legs are built by the local `scripts/build.sh`, not by
+Actions jobs; the Windows leg and its `windows-latest` runner are gone. The
+`install.js` unsupported-platform error mentioned below still applies — it now
+covers macOS and Windows alike.
 
 ### Step 3: Collect + Package
 
@@ -138,9 +148,11 @@ If tests/clippy/fmt fail on the push, the release workflow never starts.
 Only green commits on `main` produce releases.
 
 ### Build fails for one platform → partial release
-If Windows build fails, Linux binaries still publish. The release is created
-with whatever platforms succeeded. The `install.js` handles missing platforms
-gracefully (shows "Unsupported platform" error).
+If a leg fails to build, the release still publishes the legs that succeeded
+(pass `--allow-partial`); by default `release` refuses to publish with a
+missing artifact. The `install.js` handles unsupported platforms gracefully
+(shows "Unsupported platform" error) — that is now how macOS and Windows are
+reported, since neither is built.
 
 ### Multiple pushes in quick succession
 The workflow has `concurrency: cancel-in-progress: true` — if two pushes
@@ -175,6 +187,9 @@ or by filtering on the committer (GitHub Actions bot).
 | `scripts/build.sh` | Minor: support `--ci` flag for non-interactive mode |
 | `npm/install.js` | No change needed (already correct) |
 
+*(historical)* The Windows/macOS build jobs named above were removed after this
+spec was written; the pipeline it describes is not the one in use.
+
 ## What Does NOT Change
 
 - `scripts/bump-version.py` — unchanged, used by the workflow
@@ -189,4 +204,4 @@ or by filtering on the committer (GitHub Actions bot).
 1. Dry-run the workflow on a branch (not main) to verify build steps
 2. Create a test release on a fork or use `--dry-run` flags
 3. Verify `npm update -g clawde` picks up the new version
-4. Verify Windows binary is downloadable from the release
+4. Verify each built binary is downloadable from the release

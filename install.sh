@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Clawde installer for Linux and macOS.
+# Clawde installer for Linux (x86_64 / aarch64).
 #
 # Usage (one-liner):
 #   curl -fsSL https://github.com/mattcmaddox/Clawde/releases/latest/download/install.sh | bash
@@ -112,12 +112,15 @@ detect_target() {
     local raw_os arch
     raw_os=$(uname -s)
     case "$raw_os" in
-        Darwin*)              os="macos" ;;
         Linux*)               os="linux" ;;
+        Darwin*)
+            print_message error "macOS is not supported: no macOS binary is built or published."
+            print_message info "Build from source instead: https://github.com/${REPO}#build-from-source"
+            exit 1
+            ;;
         MINGW*|MSYS*|CYGWIN*)
-            print_message error "Detected Windows-like environment ($raw_os)."
-            print_message info "Run install.ps1 in PowerShell instead:"
-            print_message info "  irm https://github.com/${REPO}/releases/latest/download/install.ps1 | iex"
+            print_message error "Windows is not supported: no Windows binary is built or published."
+            print_message info "Build from source instead: https://github.com/${REPO}#build-from-source"
             exit 1
             ;;
         *)
@@ -135,14 +138,6 @@ detect_target() {
             exit 1
             ;;
     esac
-
-    # Apple Silicon under Rosetta: prefer the native arm64 binary.
-    if [ "$os" = "macos" ] && [ "$arch" = "x86_64" ]; then
-        rosetta_flag=$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)
-        if [ "$rosetta_flag" = "1" ]; then
-            arch="aarch64"
-        fi
-    fi
 
     target="${os}-${arch}"
 }
@@ -280,11 +275,6 @@ install_binary() {
 
     cp "$source" "$target_path"
     chmod 755 "$target_path"
-
-    # On macOS, strip the quarantine attribute so Gatekeeper doesn't block the unsigned binary.
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        xattr -dr com.apple.quarantine "$target_path" 2>/dev/null || true
-    fi
 
     print_message success "Installed: $target_path"
 }

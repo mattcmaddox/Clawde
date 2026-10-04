@@ -70,13 +70,7 @@ Activate `/caveman` to compress model responses by 40–85%, saving tokens in lo
 **1. Install**
 
 ```bash
-# Linux / macOS
 curl -fsSL https://github.com/mattcmaddox/Clawde/releases/latest/download/install.sh | bash
-```
-
-```powershell
-# Windows (PowerShell)
-irm https://github.com/mattcmaddox/Clawde/releases/latest/download/install.ps1 | iex
 ```
 
 The installer auto-detects your platform/arch, drops `clawde` into

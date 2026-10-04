@@ -57,13 +57,7 @@ Clawde's Free Mode now routes each request across your configured free upstreams
 
 ## Quick install (one-liner)
 
-**Linux / macOS:**
-
-```bash
-curl -fsSL https://github.com/mattcmaddox/Clawde/releases/latest/download/install.sh | bash
-```
-
-**Linux / macOS:**
+**Linux:**
 
 ```bash
 curl -fsSL https://github.com/mattcmaddox/Clawde/releases/latest/download/install.sh | bash
@@ -120,8 +114,6 @@ If you'd rather grab the binary yourself, the latest archives are on [**GitHub R
 |----------|---------|
 | **Linux** x86_64 | `clawde-linux-x86_64.tar.gz` |
 | **Linux** aarch64 | `clawde-linux-aarch64.tar.gz` |
-| **macOS** Intel | `clawde-macos-x86_64.tar.gz` |
-| **macOS** Apple Silicon | `clawde-macos-aarch64.tar.gz` |
 
 Each archive contains a single `clawde` binary. Extract it and put it on your `PATH`.
 

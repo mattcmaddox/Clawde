@@ -8,6 +8,8 @@ on:
       - 'scripts/probes/tui-permissions-smoke.py'
       - 'scripts/audit-env-tests.py'
       - 'scripts/audit-tokio-file-flush.py'
+      - 'scripts/validate-acp-template.py'
+      - 'scripts/registry-agent.schema.json'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
@@ -16,6 +18,8 @@ on:
       - 'scripts/probes/tui-permissions-smoke.py'
       - 'scripts/audit-env-tests.py'
       - 'scripts/audit-tokio-file-flush.py'
+      - 'scripts/validate-acp-template.py'
+      - 'scripts/registry-agent.schema.json'
       - '.github/workflows/ci.yml'
 
 concurrency:
@@ -93,6 +97,21 @@ jobs:
       - name: Async file-flush audit
         if: runner.os == 'Linux'
         run: python3 scripts/audit-tokio-file-flush.py
+
+      # ACP registry manifest guard: validates the template against the vendored
+      # registry schema and against the legs build.sh actually builds. Without
+      # it, the template can re-advertise a macOS/Windows archive no release
+      # publishes and only the registry's own CI would catch it, on the PR.
+      # jsonschema enables the deep schema tier. The install is best-effort
+      # (PEP 668 externally-managed Pythons reject a bare pip install) and the
+      # guard always self-tests and runs its stdlib structural + leg tiers, so
+      # a skipped install degrades the check rather than failing the step.
+      - name: ACP registry template guard
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m pip install --quiet jsonschema \
+            || echo "jsonschema install skipped; running structural tier only"
+          python3 scripts/validate-acp-template.py
 
       # Dead-code guard: rustc's `dead_code` lint never fires for `pub` items,
       # so every workspace crate carries a `test_no_unreferenced_pub_functions_in_workspace`
