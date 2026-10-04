@@ -129,6 +129,9 @@ pub enum OrchestrationError {
     ToolError,
     /// The model acted on stale context (repo changed underneath it).
     StaleContext,
+    /// A mid-stream failure that already exposed output to the user. Replaying
+    /// the request would duplicate visible text, so it is never retried.
+    VisibleStreamFailure,
     /// Authentication/key failure — never retry blindly.
     AuthFailed,
     /// Security/policy rejection — human decision required.
@@ -173,6 +176,10 @@ pub fn decide_recover(
         OrchestrationError::ToolError => Recovery::Replan,
         // stale context: refresh the evidence, keep the plan
         OrchestrationError::StaleContext => Recovery::Refresh,
+        // visible output cannot be replayed: retrying would duplicate what the
+        // user already saw. The free chain continues such interruptions
+        // in-stream, so by the time this surfaces there is no safe recovery.
+        OrchestrationError::VisibleStreamFailure => Recovery::GiveUp,
         // same error twice in a row: change approach (no-progress detector)
         _ if last_error == Some(err) => Recovery::Replan,
         // security/policy/key: never retry blindly
@@ -186,16 +193,24 @@ pub fn decide_recover(
 /// Single source of truth for the query loop's stream-error recovery
 /// (Babu & Agrawal 2026: "observable failure signal → inferred failure
 /// class → targeted recovery"). Transient signals (rate limits, quota,
-/// mid-stream hiccups, retryable server errors) classify to retry-class
-/// buckets; auth and malformed-request signals classify to never-retry
-/// buckets so the loop does not burn its budget blindly.
+/// mid-stream hiccups with no committed output, retryable server errors)
+/// classify to retry-class buckets; auth and malformed-request signals classify
+/// to never-retry buckets so the loop does not burn its budget blindly. A
+/// mid-stream failure that already exposed output is a
+/// [`OrchestrationError::VisibleStreamFailure`] — re-issuing the request would
+/// duplicate text the user has already seen.
 pub fn classify_provider_error(err: &ProviderError) -> OrchestrationError {
     match err {
         ProviderError::RateLimited { .. } => OrchestrationError::RateLimited,
         ProviderError::QuotaExceeded { .. } => OrchestrationError::QuotaExceeded,
         ProviderError::AuthFailed { .. } => OrchestrationError::AuthFailed,
-        // Mid-stream failures are transient by nature (the provider's own
-        // `is_retryable` agrees) — treat like a rate-limit-class retry.
+        // A mid-stream failure that carried partial output already reached the
+        // user, so re-issuing the request would duplicate it — never retry.
+        // A mid-stream failure with no committed output stays retryable.
+        ProviderError::StreamError {
+            partial_response: Some(_),
+            ..
+        } => OrchestrationError::VisibleStreamFailure,
         ProviderError::StreamError { .. } => OrchestrationError::RateLimited,
         // 5xx server errors retry only when the provider flags them retryable.
         ProviderError::ServerError {
@@ -685,6 +700,25 @@ mod tests {
                 partial_response: None,
             }),
             OrchestrationError::RateLimited
+        );
+        // A mid-stream failure that already carried visible output must not be
+        // retried: replaying the request would duplicate the partial text.
+        assert_eq!(
+            classify_provider_error(&Pe::StreamError {
+                provider: pid(),
+                message: "mid-stream".into(),
+                partial_response: Some("half an answer".into()),
+            }),
+            OrchestrationError::VisibleStreamFailure
+        );
+        assert_eq!(
+            decide_recover(
+                OrchestrationError::VisibleStreamFailure,
+                3,
+                Some(OrchestrationError::RateLimited)
+            ),
+            Recovery::GiveUp,
+            "visible stream failures are never retried, budget or not"
         );
         assert_eq!(
             classify_provider_error(&Pe::ServerError {

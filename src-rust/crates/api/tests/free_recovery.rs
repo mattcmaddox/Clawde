@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use clawde_api::provider::LlmProvider;
-use clawde_api::provider_error::{ProviderError, RecoveryClass};
+use clawde_api::provider_error::ProviderError;
 use clawde_api::provider_types::{ProviderRequest, StreamEvent};
 use clawde_api::providers::{
     catalog_entry, FreeEntry, FreeProvider, OpenAiCompatProvider, RoutingConfig, RoutingStrategy,
@@ -333,16 +333,17 @@ async fn malformed_request_falls_through_to_the_next_upstream() {
 }
 
 // ---------------------------------------------------------------------------
-// Mid-stream truncation: no replay after visible output
+// Mid-stream truncation: continue on the next upstream, never replay
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn mid_stream_truncation_surfaces_error_without_replay() {
+async fn mid_stream_truncation_continues_without_replaying() {
     let _dispatch = dispatch_guard().await;
     // The first upstream emits partial visible text, then the connection dies
-    // before the declared Content-Length is satisfied. Replaying the request
-    // on the second upstream would duplicate visible output, so the error must
-    // surface instead and the healthy upstream must never be contacted.
+    // before the declared Content-Length is satisfied. Replaying the request on
+    // the second upstream would duplicate visible output, so instead the partial
+    // is appended as an assistant turn plus a user continuation instruction and
+    // the second upstream resumes the response.
     let chain = Chain::new(
         vec![ScriptedResponse::SseTruncated {
             frames: vec![
@@ -351,7 +352,7 @@ async fn mid_stream_truncation_surfaces_error_without_replay() {
             ],
         }],
         vec![ScriptedResponse::SseStream {
-            frames: text_stream("poolside/mock-model", "must not replay"),
+            frames: text_stream("poolside/mock-model", "continues here."),
         }],
     );
 
@@ -362,31 +363,49 @@ async fn mid_stream_truncation_surfaces_error_without_replay() {
         .expect("stream opens against the first upstream");
     let (events, error) = collect(stream).await;
 
-    // The partial text was exposed before the failure...
-    assert_eq!(text(&events), "partial visible output");
-    // ...and the failure is surfaced, not swallowed into a silent retry.
-    let error = error.expect("mid-stream failure must surface as an error");
-    assert_eq!(
-        error.recovery_class(),
-        RecoveryClass::VisibleStreamFailure,
-        "a read error after visible output must be replay-unsafe: {error:?}"
+    assert!(
+        error.is_none(),
+        "the interruption must be continued, not surfaced: {error:?}"
     );
-    // The adapter must carry the already-exposed content so any caller (not
-    // just RetryingFreeStream) can refuse to replay it.
-    match &error {
-        ProviderError::StreamError {
-            partial_response, ..
-        } => assert_eq!(
-            partial_response.as_deref(),
-            Some("partial visible output"),
-            "partial output must be attached to the stream error"
-        ),
-        other => panic!("expected StreamError, got: {other:?}"),
-    }
+    assert_eq!(
+        text(&events),
+        "partial visible outputcontinues here.",
+        "the partial streams exactly once, then the continuation"
+    );
+    let served = events.iter().rev().find_map(|event| match event {
+        StreamEvent::ProviderAttribution { upstream_id, .. } => Some(upstream_id.as_str()),
+        _ => None,
+    });
+    assert_eq!(
+        served,
+        Some("poolside"),
+        "the surviving upstream serves the continuation"
+    );
 
+    // The first upstream's partial reached the second upstream as an assistant
+    // turn, followed by a user instruction to continue — the request was not
+    // replayed verbatim.
     let (first, second) = chain.requests();
     assert_eq!(first.len(), 1, "first upstream is attempted exactly once");
-    assert_eq!(second.len(), 0, "no replay after visible output");
+    assert_eq!(second.len(), 1, "the healthy upstream is contacted once");
+    let body: serde_json::Value =
+        serde_json::from_str(&second[0].body).expect("continuation body is JSON");
+    let messages = body["messages"].as_array().expect("messages array");
+    assert!(
+        messages
+            .iter()
+            .any(|m| { m["role"] == "assistant" && m["content"] == "partial visible output" }),
+        "the partial is appended as an assistant turn: {messages:?}"
+    );
+    assert!(
+        messages.last().is_some_and(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("interrupted"))
+        }),
+        "the request ends with a user continuation instruction: {messages:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

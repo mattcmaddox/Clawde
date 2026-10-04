@@ -590,6 +590,11 @@ pub enum QueryEvent {
         /// Total wait planned for this retry, for a progress hint.
         total_secs: u64,
     },
+    /// The composite (`free`) provider interrupted a response after committing
+    /// text and is resuming it on another upstream instead of replaying it.
+    /// Carries no content — consumers render a brief activity note so the seam
+    /// between the two halves of an answer is visible rather than silent.
+    UpstreamContinuation { upstream_id: String, model: String },
 }
 
 /// One cycle of the continuous server-info poll. `model` is the model the
@@ -2350,6 +2355,44 @@ mod stall_timeout_tests {
             );
         }
     }
+}
+
+/// A content block observed while streaming a provider response, in the order
+/// the provider emitted it.
+struct StreamedBlock {
+    index: usize,
+    kind: StreamedBlockKind,
+}
+
+enum StreamedBlockKind {
+    Text(String),
+    Thinking { text: String, signature: String },
+    Tool,
+}
+
+/// Assistant content blocks kept from an interrupted turn — text and thinking
+/// only. On a mid-stream failure the assembled turn is discarded, but the user
+/// already saw the streamed text, so it is committed to the conversation to
+/// keep history and screen in step. Tool blocks are dropped: a truncated call
+/// cannot be paired with a `tool_result`, and a half-written one must never be
+/// executed.
+fn partial_blocks_from_stream(streamed: &[StreamedBlock]) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    for block in streamed {
+        match &block.kind {
+            StreamedBlockKind::Text(text) if !text.is_empty() => {
+                blocks.push(ContentBlock::Text { text: text.clone() });
+            }
+            StreamedBlockKind::Thinking { text, signature } if !text.is_empty() => {
+                blocks.push(ContentBlock::Thinking {
+                    thinking: text.clone(),
+                    signature: signature.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    blocks
 }
 
 /// Run the agentic query loop.
@@ -4412,15 +4455,6 @@ async fn run_query_loop_inner(
                     // reasoning_content replay is emitted by the adapter as a
                     // top-level field, so this ordering is safe for strict
                     // backends (DeepSeek etc.).
-                    enum StreamedBlockKind {
-                        Text(String),
-                        Thinking { text: String, signature: String },
-                        Tool,
-                    }
-                    struct StreamedBlock {
-                        index: usize,
-                        kind: StreamedBlockKind,
-                    }
                     let mut streamed_blocks: Vec<StreamedBlock> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
                     // thought_signature carries Gemini's opaque per-call signature
@@ -4507,6 +4541,17 @@ async fn run_query_loop_inner(
                                                         reason: reason.clone(),
                                                         remaining_secs: *remaining_secs,
                                                         total_secs: *total_secs,
+                                                    });
+                                                }
+                                            }
+                                            clawde_api::StreamEvent::UpstreamContinuation {
+                                                upstream_id,
+                                                model,
+                                            } => {
+                                                if let Some(ref tx) = event_tx {
+                                                    let _ = tx.send(QueryEvent::UpstreamContinuation {
+                                                        upstream_id: upstream_id.clone(),
+                                                        model: model.clone(),
                                                     });
                                                 }
                                             }
@@ -4861,6 +4906,17 @@ async fn run_query_loop_inner(
                             recovery = ?recovery,
                             "Provider stream error — not retryable; aborting turn"
                         );
+                        // The user already saw the streamed output, but the
+                        // assembled turn is discarded on error. Commit the
+                        // text/thinking it produced so the conversation history
+                        // matches the screen and the next turn has a record of
+                        // what was said. Tool blocks are dropped: a truncated
+                        // call cannot be paired with a `tool_result`, and a
+                        // half-written one must never be executed.
+                        let partial_blocks = partial_blocks_from_stream(&streamed_blocks);
+                        if !partial_blocks.is_empty() {
+                            messages.push(Message::assistant_blocks(partial_blocks));
+                        }
                         return QueryOutcome::Error(ClaudeError::Api(format!(
                             "Provider '{}' stream error (model '{}'): {} (recovery: {recovery:?})",
                             provider_id_str, model_id_str, err
@@ -6718,6 +6774,50 @@ mod tests {
     use super::*;
     use clawde_api::SystemPrompt;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn partial_blocks_keep_text_and_thinking_but_drop_tools() {
+        // A failed turn must leave the conversation with exactly what the user
+        // saw: text and thinking. A truncated tool call cannot be paired with a
+        // `tool_result` and a half-written one must never be executed, so it is
+        // dropped.
+        let streamed = vec![
+            StreamedBlock {
+                index: 0,
+                kind: StreamedBlockKind::Text("half an ".into()),
+            },
+            StreamedBlock {
+                index: 1,
+                kind: StreamedBlockKind::Thinking {
+                    text: "reasoning".into(),
+                    signature: "sig".into(),
+                },
+            },
+            StreamedBlock {
+                index: 2,
+                kind: StreamedBlockKind::Tool,
+            },
+            StreamedBlock {
+                index: 3,
+                kind: StreamedBlockKind::Text(String::new()),
+            },
+        ];
+        let blocks = partial_blocks_from_stream(&streamed);
+        assert_eq!(blocks.len(), 2, "empty text and the tool block are dropped");
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "half an "));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Thinking { thinking, signature }
+                if thinking == "reasoning" && signature == "sig"
+        ));
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+            "no tool block may survive a partial commit"
+        );
+        assert!(partial_blocks_from_stream(&[]).is_empty());
+    }
 
     #[test]
     fn guard_blocks_text_user_messages_only() {

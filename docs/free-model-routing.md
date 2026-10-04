@@ -89,6 +89,50 @@ A parallel first-byte watchdog (§6.5) fires at `first_byte_timeout_secs` on
 auto routes: it launches a *second concurrent* request on the next non-cooled
 plan entry (`impls.rs:1164-1256`) and switches to whichever returns first.
 
+A rate limit (429) **fails over before it waits**: while another plan entry is
+dispatchable, the throttled upstream is abandoned immediately so a healthy
+provider answers the turn instead of the user waiting out the cooldown. Only
+when the whole chain is rate-limited does the walk wait, for the shortest
+recovery among the throttled upstreams (the `Retry-After` hint, or a 20s window
+floor when none was sent; the live 5xx / empty-completion cooldown remaining,
+for an upstream skipped as "in cooldown"), then retry the upstream that recovers
+soonest. The recovery **repeats** while `turn_walk_budget_secs` allows, so a
+wait that turns out too short self-corrects instead of failing the turn; a wait
+that would overshoot the remaining budget is not started. Each upstream keeps a
+single candidate entry holding its latest hint, so an upstream whose window
+moved out cannot starve a sooner-recovering sibling. This replaces the old
+per-upstream rate-limit wait, which paused on a still-throttled provider before
+trying the next one. `fallback_retries: 0` disables the whole-chain recovery
+too.
+
+A **mid-stream** failure is handled differently from a pre-first-byte one,
+because output has already reached the user. `RetryingFreeStream` *continues* the
+response on the next upstream instead of replaying it: the committed text
+(before the first tool call) is appended as an assistant turn plus a user
+instruction to continue — the form Anthropic's 4.6+ docs recommend, since a
+trailing assistant prefill is now rejected — and the next upstream resumes from
+there. The seam is announced out-of-band as
+`StreamEvent::UpstreamContinuation` (rendered as a brief "continuing on …"
+note), never as content. This never duplicates or re-plays the visible text.
+
+A tool block is **held** out of the consumer from its first event until it
+stops. If the attempt is abandoned mid-call the held block is dropped with it,
+so the query loop never sees — and never executes — a half-written call, and the
+continuation resumes from the text prefix instead of re-issuing (and thereby
+running twice) a call whose arguments were never complete. A stopped tool block
+is flushed in order before any later event.
+
+When there is nothing to continue from (no committed text), the failure falls
+through to the normal replay-safe failover. When the interruption cannot be
+recovered at all — continuation budget spent, or no route left — the error
+surfaces and the query loop treats a visible-output stream failure as
+non-retryable (`decide::classify_provider_error` → `Recovery::GiveUp`), so it is
+not re-issued either; the text/thinking already streamed is committed to the
+conversation (`partial_blocks_from_stream`, `query/src/lib.rs`) so history
+matches the screen and the next turn has a record of what was said. Continuation
+is capped at `MAX_CONTINUATION_ROUNDS` (`impls.rs`) and gated by the same route
+availability as the whole-chain recovery.
+
 Every walk is bounded by `turn_walk_budget_secs` (default 240s, `0` disables)
 and every same-upstream retry wait reports its countdown as
 `StreamEvent::UpstreamRetryProgress` — see §14.

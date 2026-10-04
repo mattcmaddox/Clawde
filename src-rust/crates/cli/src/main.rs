@@ -3389,6 +3389,19 @@ async fn run_headless(
                     }
                 }
             }
+            QueryEvent::UpstreamContinuation { upstream_id, .. } => {
+                let msg = format!("{upstream_id}: continuing interrupted response");
+                status_messages.push(msg.clone());
+                if is_stream_json {
+                    let ev = serde_json::json!({ "type": "status", "status": msg });
+                    println!("{}", ev);
+                } else if is_json_output {
+                    let ev = serde_json::json!({ "type": "status", "status": msg });
+                    eprintln!("{}", ev);
+                } else {
+                    eprintln!("\n[status] {}", msg);
+                }
+            }
             QueryEvent::Error(msg) => {
                 if is_json_output {
                     let ev = serde_json::json!({ "type": "error", "error": msg });
@@ -7792,10 +7805,14 @@ async fn run_interactive(
         let gen = clawde_api::health_poller::last_sweep_generation();
         if gen != last_health_gen {
             last_health_gen = gen;
-            if let Some(sweep) = clawde_api::health_poller::take_last_sweep() {
-                if app.last_health_sweep.as_ref() != Some(&sweep) {
+            match clawde_api::health_poller::take_last_sweep() {
+                Some(sweep) if app.last_health_sweep.as_ref() != Some(&sweep) => {
                     app.last_health_sweep = Some(sweep);
                 }
+                None if app.last_health_sweep.is_some() => {
+                    app.last_health_sweep = None;
+                }
+                _ => {}
             }
         }
 

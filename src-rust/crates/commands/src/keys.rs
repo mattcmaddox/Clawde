@@ -468,6 +468,10 @@ impl SlashCommand for KeysCommand {
                 let zero_based = one_based - 1;
                 let mut store = AuthStore::load();
                 if store.remove_key(provider, zero_based) {
+                    // Clear the TUI's cached health-sweep so the "⚠ N dead" footer
+                    // marker updates immediately rather than waiting for the next
+                    // scheduled health-poller sweep (which runs every 300s).
+                    clawde_api::health_poller::clear_last_sweep();
                     let remaining = store.keys_for(provider).map(|k| k.len()).unwrap_or(0);
                     CommandResult::Message(format!(
                         "Removed key {} from '{}' — {} key{} remaining.",

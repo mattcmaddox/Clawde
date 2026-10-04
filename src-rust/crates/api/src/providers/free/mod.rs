@@ -4,8 +4,12 @@
 // `free/auto` synthetic model id. The chain is iterated in priority
 // order on every request — if an upstream fails (auth, rate limit,
 // server error, request error) *before* any data has been streamed,
-// the same request is retried against the next upstream. Mid-stream
-// failures are surfaced as-is; we don't replay partial conversations.
+// the same request is retried against the next upstream. A mid-stream
+// failure that has exposed pure text (and no tool call) is *continued*
+// on the next upstream: the partial text is appended as an assistant
+// turn plus a user instruction, so the response resumes instead of
+// being duplicated or replayed. Anything else mid-stream is surfaced
+// as-is.
 //
 // Inspired by https://github.com/tashfeenahmed/freellmapi — the same
 // "aggregate the free tiers from many providers behind one OpenAI-

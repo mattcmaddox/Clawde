@@ -13316,6 +13316,13 @@ impl App {
                 self.is_verifying = false;
             }
 
+            QueryEvent::UpstreamContinuation { upstream_id, .. } => {
+                // A response interrupted after committing text is being resumed
+                // on another upstream. Show a short note so the seam is visible
+                // rather than a silent pause between two halves of an answer.
+                self.status_message = Some(format!("continuing on {upstream_id}…"));
+            }
+
             QueryEvent::UpstreamRetryProgress {
                 upstream_id,
                 model,

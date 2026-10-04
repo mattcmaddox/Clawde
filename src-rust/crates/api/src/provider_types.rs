@@ -255,6 +255,19 @@ pub enum StreamEvent {
         /// Total wait planned for this retry, for a progress hint.
         total_secs: u64,
     },
+
+    /// The composite (`free`) provider interrupted a response after committing
+    /// text and is resuming it on another upstream rather than replaying it.
+    ///
+    /// Carries no content and commits nothing (`committed_output_text()` is
+    /// `None`); consumers render it as a one-line activity note so the seam
+    /// between the two halves of the answer is visible instead of silent.
+    UpstreamContinuation {
+        /// Catalog id of the upstream taking over the continuation.
+        upstream_id: String,
+        /// Model the continuation will use.
+        model: String,
+    },
 }
 
 impl StreamEvent {

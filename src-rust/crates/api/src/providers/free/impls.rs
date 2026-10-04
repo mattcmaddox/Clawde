@@ -22,7 +22,7 @@ use crate::provider_types::{
     SystemPromptStyle,
 };
 use clawde_core::effort::EffortLevel;
-use clawde_core::types::{ContentBlock, MessageContent};
+use clawde_core::types::{ContentBlock, Message, MessageContent};
 use rand::seq::SliceRandom;
 
 use super::*;
@@ -50,6 +50,21 @@ const RETRY_PROGRESS_TICK: std::time::Duration = std::time::Duration::from_secs(
 /// this feature targets.
 const BUFFER_CAP_SECS: u64 = 25;
 
+/// Appended as a user turn when a mid-stream interruption must be *continued*
+/// rather than replayed. Deliberately a user instruction, not an assistant
+/// prefill: newer Anthropic models reject a trailing assistant message ("the
+/// conversation must end with a user message"), and prefill-based continuation
+/// broke mid-stream fallback for those targets (litellm#27967). A user turn
+/// also ends the request, which every provider accepts.
+const CONTINUATION_INSTRUCTION: &str =
+    "Your previous response was interrupted mid-stream. Continue from exactly \
+     where it left off and do not repeat or restate what you already wrote.";
+
+/// Cap on continuation rewrites per turn. Each round appends the newly
+/// committed text as an assistant turn plus the continuation instruction, so an
+/// upstream that keeps failing cannot grow the conversation without bound.
+const MAX_CONTINUATION_ROUNDS: u32 = 2;
+
 /// Exponential backoff delay for same-upstream retries (500ms base, 2x,
 /// capped at 8s). Mirrors sub2api's `sameAccountRetryDelayFor` pattern:
 /// transient errors get a short backoff on the same upstream before the
@@ -65,37 +80,112 @@ fn same_upstream_retry_delay_ms(retry_count: u32) -> u64 {
     BASE_MS.saturating_mul(1_u64 << shift).min(MAX_MS)
 }
 
-/// Delay for a same-upstream retry of a rate-limited request that carried no
-/// server hint. Free tiers commonly enforce per-minute token/request windows
-/// and omit `Retry-After` (verified live against Mistral: HTTP 429 code 1300,
-/// no header); the 0.5–8s exponential schedule cannot clear such a window.
-/// Start at 20s and double, capped at 60s — one cleared window is usually
-/// enough. Only reached when same-upstream retries are configured
-/// (`fallback_retries > 0`), i.e. pinned/single-entry chains.
-fn rate_limit_retry_delay_ms(retry_count: u32) -> u64 {
-    const BASE_MS: u64 = 20_000;
-    const MAX_MS: u64 = 60_000;
-    let shift = retry_count.min(2); // 20s -> 40s -> 60s (capped)
-    BASE_MS.saturating_mul(1_u64 << shift).min(MAX_MS)
+/// Fallback wait (seconds) for a rate-limited upstream that sent no
+/// `Retry-After` hint. Free tiers commonly enforce per-minute token/request
+/// windows and omit the header (verified live against Mistral: HTTP 429 code
+/// 1300, no header); a sub-second backoff cannot clear such a window. 20s is
+/// the shortest window that reliably does.
+const RATE_LIMIT_WINDOW_FLOOR_SECS: u64 = 20;
+
+/// Merge the latest rate-limit recovery for `idx` into `candidates`,
+/// replacing any earlier entry for the same upstream.
+///
+/// Replacing (rather than appending) matters because the whole-chain recovery
+/// can now repeat: an upstream that answers a retry with a *longer* hint must
+/// not leave its earlier, stale hint in the list, or the walk would keep
+/// retrying a provider whose window moved out while a sooner-recovering
+/// sibling waits.
+fn upsert_rate_limit_recovery(
+    candidates: &mut Vec<(usize, String, u64)>,
+    idx: usize,
+    model: &str,
+    wait_secs: u64,
+) {
+    let wait_secs = wait_secs.clamp(1, MAX_RETRY_AFTER_WAIT_SECS);
+    match candidates.iter_mut().find(|(i, _, _)| *i == idx) {
+        Some(slot) => {
+            slot.1 = model.to_string();
+            slot.2 = wait_secs;
+        }
+        None => candidates.push((idx, model.to_string(), wait_secs)),
+    }
+}
+
+/// Whether a recovery wait of `wait_secs` completes before the walk budget
+/// deadline. A `None` deadline is an unbounded walk (`turn_walk_budget_secs`).
+/// Without this the walk could schedule a wait that runs past its own budget
+/// and then report exhaustion anyway — a spinner that outlives the deadline.
+fn wait_fits_budget(walk_deadline: Option<Instant>, wait_secs: u64) -> bool {
+    walk_deadline.is_none_or(|deadline| {
+        Instant::now() + std::time::Duration::from_secs(wait_secs) <= deadline
+    })
+}
+
+/// The model an entry would serve: its auto-detected override when set, else
+/// the upstream default.
+fn entry_model(chain: &[FreeEntry], idx: usize) -> String {
+    chain[idx]
+        .effective_model
+        .clone()
+        .unwrap_or_else(|| chain[idx].upstream.default_model.to_string())
+}
+
+/// Soonest upstream recovery across the rate-limit hints seen this walk and the
+/// upstreams currently in a 5xx / empty-completion cooldown, as
+/// `(chain_idx, model, wait_secs)` with the wait clamped to
+/// `[1, MAX_RETRY_AFTER_WAIT_SECS]`.
+///
+/// Consulting the live cooldown (not only the hints) is what lets an
+/// all-throttled walk wait the *actually* shortest gap: an upstream skipped as
+/// "in cooldown" contributed no 429 hint but still has a known remaining time.
+/// The soonest entry wins; ties go to the first considered (the hints, in walk
+/// order, before the cooldown scan).
+fn soonest_chain_recovery(
+    chain: &[FreeEntry],
+    cooldown: &Mutex<CooldownState>,
+    candidates: &[(usize, String, u64)],
+) -> Option<(usize, String, u64)> {
+    let mut cd = cooldown.lock().unwrap();
+    cd.prune_expired();
+    let mut best: Option<(usize, String, u64)> = None;
+    let mut consider = |idx: usize, model: String, secs: u64| {
+        let secs = secs.clamp(1, MAX_RETRY_AFTER_WAIT_SECS);
+        if best.as_ref().is_none_or(|(_, _, cur)| secs < *cur) {
+            best = Some((idx, model, secs));
+        }
+    };
+    for (idx, model, secs) in candidates {
+        consider(*idx, model.clone(), *secs);
+    }
+    for idx in 0..chain.len() {
+        if let Some(secs) = cd
+            .cooldown_remaining_secs(idx)
+            .or_else(|| cd.empty_cooldown_remaining_secs(idx))
+        {
+            consider(idx, entry_model(chain, idx), secs);
+        }
+    }
+    best
 }
 
 /// Which backoff schedule a same-upstream retry should use.
 enum SameRetryDelay {
-    /// The upstream rate-limited the request. Uses the server's hint when it
-    /// sent one (capped), otherwise the window-scale schedule.
-    RateLimited { hint_secs: Option<u64> },
+    /// The whole walk of the chain was rate-limited and this is the bounded
+    /// recovery: wait for the soonest upstream to come back, then retry it.
+    /// The upstream is chosen by [`FreeProvider::soonest_chain_recovery`], and
+    /// the recovery may repeat while the walk budget allows.
+    RateLimited { wait_secs: u64 },
     /// Any other transient failure (5xx, timeout, empty completion) — the
-    /// short exponential schedule.
+    /// short exponential same-upstream schedule.
     Transient,
 }
 
 impl SameRetryDelay {
     fn resolve(&self, retry_count: u32) -> u64 {
         match self {
-            Self::RateLimited { hint_secs: Some(s) } => s
+            Self::RateLimited { wait_secs } => wait_secs
                 .saturating_mul(1000)
                 .clamp(1_000, MAX_RETRY_AFTER_WAIT_SECS * 1000),
-            Self::RateLimited { hint_secs: None } => rate_limit_retry_delay_ms(retry_count),
             Self::Transient => same_upstream_retry_delay_ms(retry_count),
         }
     }
@@ -105,16 +195,14 @@ impl SameRetryDelay {
     /// which is a log-line suffix.
     fn reason(&self) -> &'static str {
         match self {
-            Self::RateLimited { hint_secs: Some(_) } => "rate limited (server asked for a pause)",
-            Self::RateLimited { hint_secs: None } => "rate limited",
+            Self::RateLimited { .. } => "rate limited (waiting for the soonest upstream)",
             Self::Transient => "transient failure",
         }
     }
 
     fn label(&self) -> &'static str {
         match self {
-            Self::RateLimited { hint_secs: Some(_) } => " (honoring Retry-After)",
-            Self::RateLimited { hint_secs: None } => " (rate-limit window wait)",
+            Self::RateLimited { .. } => " (shortest chain cooldown)",
             Self::Transient => "",
         }
     }
@@ -1111,6 +1199,26 @@ impl FreeProvider {
         cd.is_in_cooldown(idx) || cd.is_in_empty_cooldown(idx)
     }
 
+    /// Whether `plan` still holds an entry whose upstream can be dispatched
+    /// (not in a circuit-breaker / 5xx / empty-completion cooldown).
+    ///
+    /// Drives rate-limit failover: a rate-limited upstream only waits out its
+    /// cooldown when nothing else in the plan can serve; while another entry
+    /// is dispatchable it hands off instead of stalling the turn.
+    fn plan_has_servable_entry(&self, plan: &std::collections::VecDeque<(usize, String)>) -> bool {
+        plan.iter().any(|(idx, _)| !self.is_in_cooldown(*idx))
+    }
+
+    /// Soonest upstream recovery across the rate-limit hints seen this walk and
+    /// the upstreams currently in a 5xx / empty-completion cooldown, as
+    /// `(chain_idx, model, wait_secs)`. See [`soonest_chain_recovery`].
+    fn chain_recovery_candidate(
+        &self,
+        candidates: &[(usize, String, u64)],
+    ) -> Option<(usize, String, u64)> {
+        soonest_chain_recovery(&self.chain, &self.cooldown, candidates)
+    }
+
     /// Record a successful request at `idx` with the given `elapsed` duration.
     /// `task` is the request's classified [`TaskType`] — the dispatch is also
     /// credited to the per-task success-rate view (spec §8.6).
@@ -1365,6 +1473,22 @@ fn format_upstream_error(upstream_id: &str, error: &ProviderError) -> String {
     )
 }
 
+/// The stream index a content-block event belongs to, if it carries one.
+/// Message-level events (`MessageStart`, `MessageDelta`, `MessageStop`, …)
+/// return `None`.
+fn stream_event_index(event: &StreamEvent) -> Option<usize> {
+    match event {
+        StreamEvent::TextDelta { index, .. }
+        | StreamEvent::ThinkingDelta { index, .. }
+        | StreamEvent::ReasoningDelta { index, .. }
+        | StreamEvent::InputJsonDelta { index, .. }
+        | StreamEvent::SignatureDelta { index, .. }
+        | StreamEvent::ContentBlockStart { index, .. }
+        | StreamEvent::ContentBlockStop { index } => Some(*index),
+        _ => None,
+    }
+}
+
 /// Return whether a provider event has exposed generated content or a tool
 /// argument. Transport metadata such as `MessageStart` and rate-limit headers
 /// must not commit the attempt: a failure after metadata but before output can
@@ -1587,6 +1711,33 @@ struct RetryingFreeStream {
     /// Per-upstream same-upstream retry counts. Transient errors before
     /// first byte retry the same upstream with exponential backoff.
     same_upstream_retries: HashMap<usize, u32>,
+    /// Rate-limit recovery candidates seen this walk: `(chain_idx, model,
+    /// wait_secs)` — one entry per upstream, holding its most recent hint (or
+    /// [`RATE_LIMIT_WINDOW_FLOOR_SECS`]) so the soonest recovery can be picked
+    /// across repeated whole-chain rounds.
+    rate_limit_recoveries: Vec<(usize, String, u64)>,
+    /// How many times the request has been rewritten to continue an interrupted
+    /// response (see [`CONTINUATION_INSTRUCTION`]). Bounds the continuation
+    /// loop so a repeatedly-failing upstream cannot append turns forever.
+    continuation_rounds: u32,
+    /// Index of an in-flight (started, not yet stopped) tool content block
+    /// whose events are held out of the consumer until it stops. Holding lets
+    /// an interruption mid-tool-call be dropped and continued instead of
+    /// leaking a half-written call the query loop would try to execute (or
+    /// would report as a bogus tool error), after which a continuation would
+    /// re-issue the call and run it twice.
+    tool_block_index: Option<usize>,
+    /// Committed text emitted before the attempt's first tool block — the
+    /// prefix a continuation resumes from. Text after a tool call is dropped
+    /// with the call, so the resumed answer never references a call that no
+    /// longer exists.
+    continuation_prefix: String,
+    /// Whether the current attempt has started a tool block. Once set, later
+    /// text is not appended to [`Self::continuation_prefix`].
+    tool_seen: bool,
+    /// Set when a continuation was scheduled, so the next attempt announces it
+    /// ([`StreamEvent::UpstreamContinuation`]) before its first content.
+    continuation_notice_pending: bool,
     /// Active backoff timer for same-upstream retry. When set, poll_next
     /// returns Poll::Pending until the timer fires, then launches the retry.
     retry_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
@@ -1688,6 +1839,12 @@ impl RetryingFreeStream {
             upstream_errors,
             hedge_state: HedgeState::default(),
             same_upstream_retries: HashMap::new(),
+            rate_limit_recoveries: Vec::new(),
+            continuation_rounds: 0,
+            tool_block_index: None,
+            continuation_prefix: String::new(),
+            tool_seen: false,
+            continuation_notice_pending: false,
             retry_sleep: None,
             retry_target: None,
             retry_deadline: None,
@@ -1806,8 +1963,9 @@ impl RetryingFreeStream {
             return false;
         }
         // A hedge would race the refusal-buffer: stealing `current` mid-deferral
-        // would orphan the withheld text. Suppressed while buffering.
-        if self.waiting_refusal {
+        // would orphan the withheld text. Suppressed while buffering, and while
+        // a tool block is held — a stream switch would orphan it.
+        if self.waiting_refusal || self.tool_block_index.is_some() {
             return false;
         }
         if self.hedge_state.hedge_in_flight {
@@ -1934,17 +2092,121 @@ impl RetryingFreeStream {
         walk_budget_note(self.walk_deadline, self.routing.turn_walk_budget_secs).is_some()
     }
 
-    /// Schedule a same-upstream retry after an exponential backoff delay.
-    /// Called when a transient failure occurs before first byte and retries
-    /// remain. The sleep future is polled at the top of `poll_next` and
-    /// launches the retry when it fires.
+    /// Whether the remaining plan still holds an entry whose upstream can be
+    /// dispatched. Mirrors [`FreeProvider::plan_has_servable_entry`] for the
+    /// stream's own plan deque.
+    fn has_servable_plan_entry(&self) -> bool {
+        let mut cd = self.cooldown.lock().unwrap();
+        cd.prune_expired();
+        self.remaining_plan
+            .iter()
+            .any(|(idx, _)| !cd.is_in_cooldown(*idx) && !cd.is_in_empty_cooldown(*idx))
+    }
+
+    /// Whether an interrupted response can be continued instead of replayed.
     ///
-    /// `delay` selects the schedule: a rate limit waits on the server's
-    /// `Retry-After` hint when present (capped to [`MAX_RETRY_AFTER_WAIT_SECS`]
-    /// — a bounded wait is strictly better on a pinned/single-entry chain,
-    /// where falling through is impossible and a short fixed backoff cannot
-    /// clear a tokens-per-minute window), or the window-scale schedule when
-    /// the server sent no hint.
+    /// Replaying the whole request would duplicate the text already on screen,
+    /// so only a partial made of pure text qualifies. A tool call in flight
+    /// cannot be resumed safely (its arguments may be half-written), and with
+    /// no committed text at all (e.g. thinking only) there is nothing to
+    /// continue from. Bounded by [`MAX_CONTINUATION_ROUNDS`], and only when a
+    /// route to another attempt exists.
+    fn can_continue_after_interrupt(&self) -> bool {
+        self.first_byte_received
+            && !self.continuation_prefix.trim().is_empty()
+            && self.continuation_rounds < MAX_CONTINUATION_ROUNDS
+            && (self.routing.fallback_retries > 0 || !self.remaining_plan.is_empty())
+    }
+
+    /// Rewrite the request so the next dispatch continues the interrupted
+    /// response: append the text already shown as an assistant turn, then a user
+    /// instruction to continue. Every later attempt clones `self.request`, so the
+    /// continuation carries through the rest of the walk.
+    fn apply_continuation(&mut self) {
+        let partial = self.continuation_prefix.trim_end().to_string();
+        self.request.messages.push(Message::assistant(partial));
+        self.request
+            .messages
+            .push(Message::user(CONTINUATION_INSTRUCTION));
+        self.continuation_rounds += 1;
+        self.continuation_notice_pending = true;
+    }
+
+    /// Decide whether a failure of the current upstream (before first byte)
+    /// should be retried instead of advancing to the next plan entry.
+    ///
+    /// Rate limits fail over immediately while another entry is dispatchable;
+    /// once the whole chain has been rate-limited, a single bounded wait for
+    /// the soonest-recovering upstream runs instead. Transient failures (5xx,
+    /// timeout) keep the short same-upstream backoff. Returns `true` when a
+    /// retry was scheduled (the caller should `continue`), `false` when the
+    /// caller should advance the plan.
+    fn schedule_rate_limit_or_transient_retry(&mut self, err: &ProviderError) -> bool {
+        let rate_limited = matches!(err, ProviderError::RateLimited { .. });
+        if rate_limited {
+            let model = self.current_model.clone();
+            upsert_rate_limit_recovery(
+                &mut self.rate_limit_recoveries,
+                self.current_idx,
+                &model,
+                err.retry_after_secs()
+                    .unwrap_or(RATE_LIMIT_WINDOW_FLOOR_SECS),
+            );
+        }
+        let chain_recovery = rate_limited
+            && self.routing.fallback_retries > 0
+            && !self.walk_budget_exhausted()
+            && !self.has_servable_plan_entry();
+        if chain_recovery {
+            // Repeatable: each round waits only for the soonest recovery, then
+            // retries it. If that retry is still throttled it loops — bounded
+            // by the walk budget — instead of failing the turn after one
+            // too-short wait. A wait that would overshoot the budget is not
+            // started; the caller reports exhaustion instead.
+            if let Some((idx, model, wait_secs)) =
+                soonest_chain_recovery(&self.chain, &self.cooldown, &self.rate_limit_recoveries)
+            {
+                if wait_fits_budget(self.walk_deadline, wait_secs) {
+                    tracing::warn!(
+                        "FreeProvider: whole chain rate-limited — waiting {}s for {} before retrying it",
+                        wait_secs,
+                        self.chain[idx].upstream.id,
+                    );
+                    self.schedule_same_upstream_retry(
+                        idx,
+                        model,
+                        SameRetryDelay::RateLimited { wait_secs },
+                    );
+                    return true;
+                }
+                tracing::warn!(
+                    "FreeProvider: whole chain rate-limited — soonest recovery ({}s on {}) exceeds the walk budget; giving up",
+                    wait_secs,
+                    self.chain[idx].upstream.id,
+                );
+            }
+        }
+        if !rate_limited
+            && self.can_retry_same_upstream(self.current_idx)
+            && err.recovery_class().may_retry_same_provider()
+        {
+            let model = self.current_model.clone();
+            let idx = self.current_idx;
+            self.schedule_same_upstream_retry(idx, model, SameRetryDelay::Transient);
+            return true;
+        }
+        false
+    }
+
+    /// Schedule a same-upstream retry after a backoff delay. Called when a
+    /// failure occurs before first byte and a retry is warranted. The sleep
+    /// future is polled at the top of `poll_next` and launches the retry when
+    /// it fires.
+    ///
+    /// `delay` selects the schedule: [`SameRetryDelay::Transient`] is the short
+    /// same-upstream exponential backoff, while
+    /// [`SameRetryDelay::RateLimited`] is the single whole-chain recovery that
+    /// targets the soonest-recovering upstream after a bounded wait.
     fn schedule_same_upstream_retry(&mut self, idx: usize, model: String, delay: SameRetryDelay) {
         let retry_count = self.same_upstream_retries.get(&idx).copied().unwrap_or(0);
         self.same_upstream_retries.insert(idx, retry_count + 1);
@@ -2163,6 +2425,9 @@ impl RetryingFreeStream {
         self.final_usage = None;
         self.deferred_deltas.clear();
         self.deferred_head = None;
+        self.tool_block_index = None;
+        self.continuation_prefix.clear();
+        self.tool_seen = false;
         self.waiting_refusal =
             FreeProvider::request_has_tools(&self.request) && !self.remaining_plan.is_empty();
         self.buffering_since = if self.waiting_refusal {
@@ -2182,6 +2447,9 @@ impl RetryingFreeStream {
         self.deferred_head = None;
         self.waiting_refusal = false;
         self.buffering_since = None;
+        // A held (unstopped) tool block is uncommitted output: dropping it is
+        // the whole point, so an abandoned attempt never leaks a half call.
+        self.tool_block_index = None;
     }
 
     /// Record first-visible-output (TTFT) for routing, exactly once, the first
@@ -2362,11 +2630,16 @@ impl Stream for RetryingFreeStream {
             // Gated on `!waiting_refusal`: while still buffering we must NOT
             // pop and emit withheld events (that would defeat the hold).
             if !self.waiting_refusal {
-                if let Some(evt) = self.deferred_deltas.pop_front() {
-                    if event_commits_output(&evt) {
-                        self.mark_output_emitted();
+                // Held tool-block events are queued here in order; they must not
+                // leave until the block stops (or the attempt is abandoned), so
+                // an interruption mid-call can be dropped and continued.
+                if self.tool_block_index.is_none() {
+                    if let Some(evt) = self.deferred_deltas.pop_front() {
+                        if event_commits_output(&evt) {
+                            self.mark_output_emitted();
+                        }
+                        return Poll::Ready(Some(Ok(evt)));
                     }
-                    return Poll::Ready(Some(Ok(evt)));
                 }
                 if let Some(evt) = self.deferred_head.take() {
                     if event_commits_output(&evt) {
@@ -2382,6 +2655,10 @@ impl Stream for RetryingFreeStream {
                 if let Some(hedge_stream) = self.poll_hedge() {
                     self.current = Some(hedge_stream);
                     self.pending_attribution = true;
+                    // A held tool block belongs to the abandoned primary.
+                    if self.tool_block_index.is_some() {
+                        self.discard_deferred();
+                    }
                     // Cancel any in-flight hedge
                     self.cancel_hedge();
                     // Cancel pending same-upstream retry — the hedge
@@ -2470,23 +2747,13 @@ impl Stream for RetryingFreeStream {
                                 .lock()
                                 .unwrap()
                                 .record_failure_reason(self.current_idx, reason.clone());
-                            // Same-upstream retry before advancing: transient
-                            // errors (5xx, rate limits) often resolve with a
-                            // short backoff. Don't push to upstream_errors
-                            // yet — only push when the upstream is abandoned.
-                            if self.can_retry_same_upstream(self.current_idx)
-                                && err.recovery_class().may_retry_same_provider()
-                            {
-                                let model = self.current_model.clone();
-                                let idx = self.current_idx;
-                                let delay = if matches!(err, ProviderError::RateLimited { .. }) {
-                                    SameRetryDelay::RateLimited {
-                                        hint_secs: err.retry_after_secs(),
-                                    }
-                                } else {
-                                    SameRetryDelay::Transient
-                                };
-                                self.schedule_same_upstream_retry(idx, model, delay);
+                            // Rate limits fail over to another provider while
+                            // one is still dispatchable, and otherwise run the
+                            // single whole-chain recovery; transient errors
+                            // keep the short same-upstream backoff. Don't push
+                            // to upstream_errors yet — only when the upstream is
+                            // abandoned.
+                            if self.schedule_rate_limit_or_transient_retry(&err) {
                                 continue;
                             }
                             self.upstream_errors.push(reason);
@@ -2554,6 +2821,7 @@ impl Stream for RetryingFreeStream {
                 && self.routing.staggered_probe
                 && self.routing.first_byte_timeout_secs > 0
                 && !self.first_byte_received
+                && self.tool_block_index.is_none()
                 && self.parallel_starting.is_none();
             if watchdog_can_fire {
                 if let Some(start) = self.attempt_start {
@@ -2656,6 +2924,16 @@ impl Stream for RetryingFreeStream {
                 })));
             }
 
+            // Announce a resumed response so the seam is visible. Emitted after
+            // the attribution and before any content, as an activity note.
+            if self.continuation_notice_pending {
+                self.continuation_notice_pending = false;
+                return Poll::Ready(Some(Ok(StreamEvent::UpstreamContinuation {
+                    upstream_id: self.chain[self.current_idx].upstream.id.to_string(),
+                    model: self.current_model.clone(),
+                })));
+            }
+
             // Poll the active stream.
             let Some(ref mut current) = self.current else {
                 return Poll::Ready(None);
@@ -2676,22 +2954,31 @@ impl Stream for RetryingFreeStream {
                         )
                     {
                         // The model is doing real work: commit the withheld
-                        // preamble, then the tool call. Stop buffering.
+                        // preamble, then hold the tool block until it stops.
                         self.attempt_tool_count += 1;
+                        self.tool_seen = true;
                         self.waiting_refusal = false;
                         self.buffering_since = None;
-                        self.deferred_head = Some(evt);
-                        continue; // drain withheld content, then this tool-start head
+                        self.tool_block_index = stream_event_index(&evt);
+                        self.deferred_deltas.push_back(evt);
+                        continue; // drain withheld content, then held tool events
                     }
+                    let holding_tool = self
+                        .tool_block_index
+                        .is_some_and(|idx| stream_event_index(&evt) == Some(idx));
                     let withholding = self.waiting_refusal && should_defer_while_waiting(&evt);
                     // Record TTFT only for output that actually leaves this
-                    // stream; withheld events must not mark first-byte.
-                    if !withholding && event_commits_output(&evt) {
+                    // stream; withheld and held tool-block events must not mark
+                    // first-byte (the user has not seen them yet).
+                    if !withholding && !holding_tool && event_commits_output(&evt) {
                         self.mark_output_emitted();
                     }
                     match &evt {
                         StreamEvent::TextDelta { text, .. } => {
                             self.attempt_text.push_str(text);
+                            if !self.tool_seen {
+                                self.continuation_prefix.push_str(text);
+                            }
                         }
                         StreamEvent::ThinkingDelta { thinking, .. } => {
                             self.attempt_thinking.push_str(thinking);
@@ -2701,6 +2988,7 @@ impl Stream for RetryingFreeStream {
                             ..
                         } => {
                             self.attempt_tool_count += 1;
+                            self.tool_seen = true;
                         }
                         StreamEvent::MessageDelta {
                             usage: Some(usage), ..
@@ -2890,6 +3178,40 @@ impl Stream for RetryingFreeStream {
                             });
                         }
                     }
+                    // Hold an in-flight tool block out of the consumer until it
+                    // stops. A partial tool call must never reach the query
+                    // loop: it would either execute half-written arguments or
+                    // surface a bogus tool error, and a continuation would then
+                    // re-issue the call and run it twice. Held events are
+                    // dropped with `discard_deferred` when the attempt is
+                    // abandoned, which is how a continuation drops a partial
+                    // call and resumes from the text prefix instead.
+                    if matches!(
+                        &evt,
+                        StreamEvent::ContentBlockStart {
+                            content_block: ContentBlock::ToolUse { .. },
+                            ..
+                        }
+                    ) {
+                        self.tool_block_index = stream_event_index(&evt);
+                        self.deferred_deltas.push_back(evt);
+                        continue;
+                    }
+                    if let Some(idx) = self.tool_block_index {
+                        if stream_event_index(&evt) == Some(idx) {
+                            if matches!(&evt, StreamEvent::ContentBlockStop { .. }) {
+                                self.tool_block_index = None;
+                            }
+                            self.deferred_deltas.push_back(evt);
+                            continue;
+                        }
+                        // A message-level event with the block still open: the
+                        // provider omitted `ContentBlockStop`. Commit what we
+                        // held and emit this event after it.
+                        self.tool_block_index = None;
+                        self.deferred_head = Some(evt);
+                        continue;
+                    }
                     if withholding {
                         // Hold the event; it is replayed if the attempt is kept,
                         // discarded if the attempt turns out to be a refusal.
@@ -2899,69 +3221,57 @@ impl Stream for RetryingFreeStream {
                     return Poll::Ready(Some(Ok(evt)));
                 }
                 Poll::Ready(Some(Err(err))) => {
-                    // Once any real output has left this stream, replaying the
-                    // full request on another upstream would duplicate visible
-                    // assistant output. Record the failure but surface it to
-                    // the caller instead of silently switching streams.
+                    self.record_failure(self.current_idx);
+                    self.maybe_cooldown_upstream_for_5xx(self.current_idx, &err);
+                    // Once output has left the stream the request can no longer
+                    // be replayed — that would duplicate visible text. When the
+                    // committed output is pure text, rewrite the request to
+                    // *continue* the interrupted response on the next upstream
+                    // instead; otherwise the interruption cannot be recovered
+                    // and the caller sees the error.
                     if self.first_byte_received {
-                        self.record_failure(self.current_idx);
-                        self.maybe_cooldown_upstream_for_5xx(self.current_idx, &err);
-                        return Poll::Ready(Some(Err(err)));
+                        if !self.can_continue_after_interrupt() {
+                            return Poll::Ready(Some(Err(err)));
+                        }
+                        self.apply_continuation();
                     }
-                    // No output was committed here: either nothing arrived yet,
-                    // or the refusal-buffer still holds withheld, uncommitted
-                    // content. Both are replay-safe, so fall through on ANY
-                    // error class when nothing has left the stream — including
-                    // a mid-stream "VisibleStreamFailure" whose partial wire
-                    // output is withheld and discarded by discard_deferred()
-                    // ahead of the next attempt (never a partial-relay leak).
-                    if !self.first_byte_received || FreeProvider::should_fallback(&err) {
-                        self.record_failure(self.current_idx);
-                        self.maybe_cooldown_upstream_for_5xx(self.current_idx, &err);
-                        let uid = self.chain[self.current_idx].upstream.id;
-                        let reason = format_upstream_error(uid, &err);
-                        self.latencies
-                            .lock()
-                            .unwrap()
-                            .record_failure_reason(self.current_idx, reason.clone());
-                        self.current = None;
-                        // Same-upstream retry before advancing: no content
-                        // was exposed, so replaying is safe. Don't push to
-                        // upstream_errors yet — only when abandoned.
-                        // Discard any withheld (uncommitted) partial output so a
-                        // same-upstream retry never replays half a message.
-                        self.discard_deferred();
-                        if self.can_retry_same_upstream(self.current_idx)
-                            && err.recovery_class().may_retry_same_provider()
-                        {
-                            let model = self.current_model.clone();
-                            let idx = self.current_idx;
-                            let delay = if matches!(err, ProviderError::RateLimited { .. }) {
-                                SameRetryDelay::RateLimited {
-                                    hint_secs: err.retry_after_secs(),
-                                }
-                            } else {
-                                SameRetryDelay::Transient
-                            };
-                            self.schedule_same_upstream_retry(idx, model, delay);
-                            continue;
-                        }
-                        self.upstream_errors.push(reason);
-                        if !self.start_next_plan_entry() {
-                            let msg = format!(
-                                "free-mode upstreams exhausted: {}",
-                                join_capped_upstream_errors(&self.upstream_errors)
-                            );
-                            return Poll::Ready(Some(Err(ProviderError::ServerError {
-                                provider: ProviderId::new("free"),
-                                status: None,
-                                message: msg,
-                                is_retryable: false,
-                            })));
-                        }
+                    // Nothing committed, or a continuation was just set up:
+                    // both are safe to re-dispatch. With no committed byte this
+                    // is a plain failover (any withheld refusal buffer is
+                    // discarded below); with one it continues the interrupted
+                    // response. Don't push to upstream_errors yet — only when
+                    // the upstream is abandoned.
+                    let uid = self.chain[self.current_idx].upstream.id;
+                    let reason = format_upstream_error(uid, &err);
+                    self.latencies
+                        .lock()
+                        .unwrap()
+                        .record_failure_reason(self.current_idx, reason.clone());
+                    self.current = None;
+                    // Discard any withheld (uncommitted) partial output so a
+                    // same-upstream retry never replays half a message.
+                    self.discard_deferred();
+                    // Rate limits fail over to another provider while one is
+                    // still dispatchable, and otherwise run the repeatable
+                    // whole-chain recovery; transient errors keep the short
+                    // same-upstream backoff.
+                    if self.schedule_rate_limit_or_transient_retry(&err) {
                         continue;
                     }
-                    return Poll::Ready(Some(Err(err)));
+                    self.upstream_errors.push(reason);
+                    if !self.start_next_plan_entry() {
+                        let msg = format!(
+                            "free-mode upstreams exhausted: {}",
+                            join_capped_upstream_errors(&self.upstream_errors)
+                        );
+                        return Poll::Ready(Some(Err(ProviderError::ServerError {
+                            provider: ProviderId::new("free"),
+                            status: None,
+                            message: msg,
+                            is_retryable: false,
+                        })));
+                    }
+                    continue;
                 }
                 Poll::Ready(None) => {
                     let was_empty = self.is_empty_attempt();
@@ -3183,6 +3493,11 @@ impl LlmProvider for FreeProvider {
         let mut plan_deque: std::collections::VecDeque<(usize, String)> =
             plan.into_iter().collect();
         let walk_deadline = self.routing.turn_walk_budget();
+        // Rate-limit recovery candidates seen this walk: (chain_idx, model,
+        // wait_secs) — one per upstream, holding its most recent hint. Drives
+        // the whole-chain recovery, which may repeat while the walk budget
+        // allows.
+        let mut rate_limit_candidates: Vec<(usize, String, u64)> = Vec::new();
 
         while let Some((idx, upstream_model)) = plan_deque.pop_front() {
             if let Some(note) = walk_budget_note(walk_deadline, self.routing.turn_walk_budget_secs)
@@ -3247,31 +3562,65 @@ impl LlmProvider for FreeProvider {
                     // model retired so the next plan drops this upstream before
                     // spending another request on it.
                     self.observe_liveness(idx, &upstream_model, Some(&err));
-                    // Same-upstream retry for transient errors (5xx, rate
-                    // limits) before advancing to the next plan entry.
-                    // Mirrors sub2api's RetryableOnSameAccount pattern:
-                    // exponential backoff (500ms base, 2x, capped at 8s).
+                    let rate_limited = matches!(err, ProviderError::RateLimited { .. });
+                    if rate_limited {
+                        upsert_rate_limit_recovery(
+                            &mut rate_limit_candidates,
+                            idx,
+                            &upstream_model,
+                            err.retry_after_secs()
+                                .unwrap_or(RATE_LIMIT_WINDOW_FLOOR_SECS),
+                        );
+                    }
+                    // Failover-first: a rate-limited upstream hands off to the
+                    // next provider while one is still dispatchable. Only when
+                    // the whole chain is rate-limited does it wait for the
+                    // soonest recovery, on the upstream that recovers soonest.
+                    // The recovery may repeat while the walk budget allows, so a
+                    // wait that turns out too short self-corrects instead of
+                    // failing the turn. Transient errors (5xx, timeouts) keep
+                    // the short same-upstream exponential backoff.
                     let retry_count = same_upstream_retries.get(&idx).copied().unwrap_or(0);
-                    let can_retry_same = max_same_retries > 0
+                    let chain_recovery_target = if rate_limited
+                        && max_same_retries > 0
+                        && walk_budget_note(walk_deadline, self.routing.turn_walk_budget_secs)
+                            .is_none()
+                        && !self.plan_has_servable_entry(&plan_deque)
+                    {
+                        self.chain_recovery_candidate(&rate_limit_candidates)
+                            .filter(|(_, _, wait_secs)| wait_fits_budget(walk_deadline, *wait_secs))
+                    } else {
+                        None
+                    };
+                    let can_retry_same = !rate_limited
+                        && max_same_retries > 0
                         && retry_count < max_same_retries
                         && err.recovery_class().may_retry_same_provider();
-                    if can_retry_same {
-                        same_upstream_retries.insert(idx, retry_count + 1);
-                        let delay = if matches!(err, ProviderError::RateLimited { .. }) {
-                            SameRetryDelay::RateLimited {
-                                hint_secs: err.retry_after_secs(),
+                    if can_retry_same || chain_recovery_target.is_some() {
+                        let (retry_idx, retry_model, delay) = match chain_recovery_target {
+                            Some((best_idx, best_model, wait_secs)) => {
+                                tracing::warn!(
+                                    "FreeProvider: whole chain rate-limited — waiting {}s for {} before retrying it",
+                                    wait_secs,
+                                    self.chain[best_idx].upstream.id,
+                                );
+                                (
+                                    best_idx,
+                                    best_model,
+                                    SameRetryDelay::RateLimited { wait_secs },
+                                )
                             }
-                        } else {
-                            SameRetryDelay::Transient
+                            None => (idx, upstream_model.clone(), SameRetryDelay::Transient),
                         };
+                        same_upstream_retries.insert(retry_idx, retry_count + 1);
                         let delay_ms = delay.resolve(retry_count);
                         tracing::warn!(
-                            "FreeProvider: {} failed ({}s): {} — retrying same upstream ({}/{}){}",
+                            "FreeProvider: {} failed ({}s): {} — retrying upstream {} in {}ms{}",
                             entry.upstream.id,
                             self.routing.upstream_timeout_secs,
                             err,
-                            retry_count + 1,
-                            max_same_retries,
+                            retry_idx,
+                            delay_ms,
                             delay.label(),
                         );
                         self.record_failure_reason(
@@ -3279,11 +3628,11 @@ impl LlmProvider for FreeProvider {
                             format_upstream_error(entry.upstream.id, &err),
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        // Re-queue the same entry at the front of the plan.
-                        // Note: don't push to upstream_errors here — the
-                        // error is only counted once when the upstream is
-                        // abandoned (retries exhausted) below.
-                        plan_deque.push_front((idx, upstream_model));
+                        // Re-queue the retry target at the front of the plan.
+                        // Note: don't push to upstream_errors here — the error
+                        // is only counted once when the upstream is abandoned
+                        // (retries exhausted) below.
+                        plan_deque.push_front((retry_idx, retry_model));
                         continue;
                     }
                     tracing::warn!(
@@ -3408,6 +3757,9 @@ impl LlmProvider for FreeProvider {
             plan_vec.into_iter().collect();
         let mut pos = 0usize;
         let walk_deadline = self.routing.turn_walk_budget();
+        // Rate-limit recovery candidates seen this walk: (chain_idx, model,
+        // wait_secs). Used for the single whole-chain recovery.
+        let mut rate_limit_candidates: Vec<(usize, String, u64)> = Vec::new();
 
         while let Some((idx, upstream_model)) = plan_deque.pop_front() {
             if let Some(note) = walk_budget_note(walk_deadline, self.routing.turn_walk_budget_secs)
@@ -3472,28 +3824,60 @@ impl LlmProvider for FreeProvider {
                     )));
                 }
                 Ok(Err(err)) if Self::should_fallback(&err) => {
-                    // Same-upstream retry for transient errors before
-                    // advancing, matching the non-streaming path.
-                    // This loop can hand off at most once per upstream: the
-                    // returned stream owns every remaining retry, so the count
-                    // it used to keep here is always the first one.
-                    let can_retry_same =
-                        max_same_retries > 0 && err.recovery_class().may_retry_same_provider();
-                    if can_retry_same {
-                        let delay = if matches!(err, ProviderError::RateLimited { .. }) {
-                            SameRetryDelay::RateLimited {
-                                hint_secs: err.retry_after_secs(),
+                    let rate_limited = matches!(err, ProviderError::RateLimited { .. });
+                    if rate_limited {
+                        upsert_rate_limit_recovery(
+                            &mut rate_limit_candidates,
+                            idx,
+                            &upstream_model,
+                            err.retry_after_secs()
+                                .unwrap_or(RATE_LIMIT_WINDOW_FLOOR_SECS),
+                        );
+                    }
+                    // Failover-first: a rate-limited upstream hands off to the
+                    // next provider while one is still dispatchable, and waits
+                    // for the soonest recovery only when nothing else can serve.
+                    // The wait is handed to the returned stream, which runs the
+                    // same repeatable recovery for every later attempt.
+                    // Transient errors hand one same-upstream retry to the
+                    // stream (which reports its wait); the count is always the
+                    // first.
+                    let chain_recovery_target = if rate_limited
+                        && max_same_retries > 0
+                        && walk_budget_note(walk_deadline, self.routing.turn_walk_budget_secs)
+                            .is_none()
+                        && !self.plan_has_servable_entry(&plan_deque)
+                    {
+                        self.chain_recovery_candidate(&rate_limit_candidates)
+                            .filter(|(_, _, wait_secs)| wait_fits_budget(walk_deadline, *wait_secs))
+                    } else {
+                        None
+                    };
+                    let can_retry_same = !rate_limited
+                        && max_same_retries > 0
+                        && err.recovery_class().may_retry_same_provider();
+                    if can_retry_same || chain_recovery_target.is_some() {
+                        let (retry_idx, retry_model, delay) = match chain_recovery_target {
+                            Some((best_idx, best_model, wait_secs)) => {
+                                tracing::warn!(
+                                    "FreeProvider: whole chain rate-limited — waiting {}s for {} before retrying it",
+                                    wait_secs,
+                                    self.chain[best_idx].upstream.id,
+                                );
+                                (
+                                    best_idx,
+                                    best_model,
+                                    SameRetryDelay::RateLimited { wait_secs },
+                                )
                             }
-                        } else {
-                            SameRetryDelay::Transient
+                            None => (idx, upstream_model.clone(), SameRetryDelay::Transient),
                         };
                         tracing::warn!(
-                            "FreeProvider: {} stream failed ({}s): {} — retrying same upstream ({}/{}){}",
+                            "FreeProvider: {} stream failed ({}s): {} — retrying upstream {}{}",
                             entry.upstream.id,
                             self.routing.upstream_timeout_secs,
                             err,
-                            1,
-                            max_same_retries,
+                            retry_idx,
                             delay.label(),
                         );
                         self.record_failure_reason(
@@ -3521,8 +3905,8 @@ impl LlmProvider for FreeProvider {
                             self.routing.clone(),
                             self.profiles.clone(),
                             request,
-                            idx,
-                            upstream_model,
+                            retry_idx,
+                            retry_model,
                             remaining,
                             is_auto,
                             upstream_errors,
@@ -4447,6 +4831,18 @@ mod tests {
         stream_ok: bool,
         text: Option<&'static str>,
         fail_after_text: bool,
+        /// When set, the first `rate_limit_calls` dispatches return
+        /// `RateLimited` carrying this `Retry-After` hint, then the provider
+        /// streams normally — models a transient throttle that clears.
+        retry_after: Option<u64>,
+        rate_limit_calls: Mutex<u32>,
+        /// When set, records every stream dispatch's full request so tests can
+        /// assert what a continuation attempt actually sent.
+        seen_request: Option<Arc<Mutex<Vec<ProviderRequest>>>>,
+        /// When set, emit a `ToolUse` content-block start after the text — so a
+        /// mid-stream failure has a tool call in flight and must NOT be
+        /// continued.
+        tool_start: bool,
     }
 
     #[async_trait]
@@ -4473,6 +4869,21 @@ mod tests {
             Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
             ProviderError,
         > {
+            if let Some(log) = &self.seen_request {
+                if let Ok(mut g) = log.lock() {
+                    g.push(request.clone());
+                }
+            }
+            {
+                let mut left = self.rate_limit_calls.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(ProviderError::RateLimited {
+                        provider: self.id.clone(),
+                        retry_after: self.retry_after,
+                    });
+                }
+            }
             if !self.stream_ok {
                 return Err(ProviderError::ServerError {
                     provider: self.id.clone(),
@@ -4493,6 +4904,26 @@ mod tests {
                     text: text.into(),
                 }));
             }
+            if self.tool_start {
+                events.push(Ok(StreamEvent::ContentBlockStart {
+                    index: 1,
+                    content_block: ContentBlock::ToolUse {
+                        id: "stub-tool".into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    },
+                }));
+                events.push(Ok(StreamEvent::InputJsonDelta {
+                    index: 1,
+                    partial_json: "{\"cmd\":\"ls\"}".into(),
+                }));
+                // A completed block emits its stop; an interrupted one does not
+                // (which is exactly what leaves it held and dropped).
+                if !self.fail_after_text {
+                    events.push(Ok(StreamEvent::ContentBlockStop { index: 1 }));
+                }
+            }
             if self.fail_after_text {
                 events.push(Err(ProviderError::ServerError {
                     provider: self.id.clone(),
@@ -4502,9 +4933,14 @@ mod tests {
                 }));
                 return Ok(Box::pin(futures::stream::iter(events)));
             }
+            let stop_reason = if self.tool_start {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            };
             events.extend([
                 Ok(StreamEvent::MessageDelta {
-                    stop_reason: Some(StopReason::EndTurn),
+                    stop_reason: Some(stop_reason),
                     usage: Some(UsageInfo::default()),
                 }),
                 Ok(StreamEvent::MessageStop),
@@ -4545,12 +4981,76 @@ mod tests {
                 stream_ok,
                 text,
                 fail_after_text: false,
+                retry_after: None,
+                rate_limit_calls: Mutex::new(0),
+                seen_request: None,
+                tool_start: false,
             }),
             effective_model: None,
         }
     }
 
+    /// Entry whose stream dispatch is rate-limited for its first
+    /// `rate_limit_calls` attempts (carrying `retry_after`), then succeeds
+    /// with a fixed text — models a throttle that clears after a cooldown.
+    fn stream_rate_limited_entry(
+        id: &'static str,
+        retry_after: u64,
+        rate_limit_calls: u32,
+    ) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StreamStubProvider {
+                id: ProviderId::new(id),
+                stream_ok: true,
+                text: Some("recovered answer"),
+                fail_after_text: false,
+                retry_after: Some(retry_after),
+                rate_limit_calls: Mutex::new(rate_limit_calls),
+                seen_request: None,
+                tool_start: false,
+            }),
+            effective_model: None,
+        }
+    }
+
+    /// Entry that streams `text` then fails mid-stream (after first byte), with
+    /// no tool call — the pure-text interruption the continuation path targets.
     fn stream_error_entry(id: &'static str, text: &'static str) -> FreeEntry {
+        stream_error_entry_with(id, text, false)
+    }
+
+    /// Like [`stream_error_entry`], but starts a `ToolUse` block before failing
+    /// so a tool call is in flight when the stream dies.
+    fn stream_tool_then_error_entry(id: &'static str, text: &'static str) -> FreeEntry {
+        stream_error_entry_with(id, text, true)
+    }
+
+    /// Entry that streams `text` and then a *complete* tool call, end to end.
+    fn stream_tool_entry(id: &'static str, text: &'static str) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StreamStubProvider {
+                id: ProviderId::new(id),
+                stream_ok: true,
+                text: Some(text),
+                fail_after_text: false,
+                retry_after: None,
+                rate_limit_calls: Mutex::new(0),
+                seen_request: None,
+                tool_start: true,
+            }),
+            effective_model: None,
+        }
+    }
+
+    fn stream_error_entry_with(
+        id: &'static str,
+        text: &'static str,
+        tool_start: bool,
+    ) -> FreeEntry {
         let upstream = *catalog_entry(id).expect("catalog entry");
         FreeEntry {
             upstream,
@@ -4559,6 +5059,34 @@ mod tests {
                 stream_ok: true,
                 text: Some(text),
                 fail_after_text: true,
+                retry_after: None,
+                rate_limit_calls: Mutex::new(0),
+                seen_request: None,
+                tool_start,
+            }),
+            effective_model: None,
+        }
+    }
+
+    /// Entry that streams `text` and records every request it is dispatched, so
+    /// tests can assert the continuation request's message shape.
+    fn stream_recording_entry(
+        id: &'static str,
+        text: &'static str,
+        log: Arc<Mutex<Vec<ProviderRequest>>>,
+    ) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StreamStubProvider {
+                id: ProviderId::new(id),
+                stream_ok: true,
+                text: Some(text),
+                fail_after_text: false,
+                retry_after: None,
+                rate_limit_calls: Mutex::new(0),
+                seen_request: Some(log),
+                tool_start: false,
             }),
             effective_model: None,
         }
@@ -6415,7 +6943,7 @@ mod tests {
             std::collections::VecDeque::from(vec![(1, "model".to_string())]),
             true,
             Vec::new(),
-            SameRetryDelay::RateLimited { hint_secs: Some(1) },
+            SameRetryDelay::RateLimited { wait_secs: 1 },
         );
 
         let first = stream
@@ -6507,6 +7035,376 @@ mod tests {
         assert_eq!(progress[1].2, 0, "the launch report clears the indicator");
     }
 
+    /// A rate-limited upstream must hand off to the next provider instead of
+    /// waiting out its `Retry-After`. Before failover-first this stream paused
+    /// for the whole 60s hint before trying the healthy upstream.
+    #[tokio::test]
+    async fn rate_limited_upstream_fails_over_without_waiting() {
+        use futures::StreamExt;
+
+        let provider = FreeProvider::with_routing(
+            vec![
+                stream_rate_limited_entry("cerebras", 60, 1),
+                stream_entry("poolside", true, Some("fallback answer")),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+
+        let (text, waits) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut text = String::new();
+            let mut waits: Vec<u64> = Vec::new();
+            while let Some(event) = stream.next().await {
+                match event.expect("no stream error expected") {
+                    StreamEvent::TextDelta { text: t, .. } => text.push_str(&t),
+                    StreamEvent::UpstreamRetryProgress { remaining_secs, .. } => {
+                        waits.push(remaining_secs)
+                    }
+                    _ => {}
+                }
+            }
+            (text, waits)
+        })
+        .await
+        .expect("a rate-limited upstream must not wait out its cooldown");
+
+        assert!(
+            text.contains("fallback answer"),
+            "the next provider should have answered, got: {text:?}"
+        );
+        assert!(
+            waits.iter().all(|s| *s == 0),
+            "no positive wait should be announced, got: {waits:?}"
+        );
+    }
+
+    /// Non-streaming dispatch must also fail over on a rate limit instead of
+    /// sleeping out the (20s, hintless) window before advancing.
+    #[tokio::test]
+    async fn rate_limited_upstream_fails_over_in_create_message() {
+        let provider = FreeProvider::with_routing(
+            vec![entry("cerebras", false), entry("poolside", true)],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.create_message(dummy_request("free/auto")),
+        )
+        .await
+        .expect("a rate-limited upstream must not wait out its cooldown")
+        .expect("the next provider should answer");
+        assert_eq!(resp.id, "msg");
+    }
+
+    /// When the whole chain is rate-limited, the stream waits exactly once for
+    /// the soonest-recovering upstream (the shorter hint) and retries it — not
+    /// the longer one, and not a per-upstream pause on each side.
+    #[tokio::test]
+    async fn whole_chain_rate_limit_waits_for_soonest_upstream() {
+        use futures::StreamExt;
+
+        let provider = FreeProvider::with_routing(
+            vec![
+                stream_rate_limited_entry("cerebras", 1, 1),
+                stream_rate_limited_entry("sambanova", 5, 1),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let started = std::time::Instant::now();
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+
+        let mut text = String::new();
+        let mut waits: Vec<(u64, u64)> = Vec::new();
+        let mut attributions: Vec<String> = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("no stream error expected") {
+                StreamEvent::TextDelta { text: t, .. } => text.push_str(&t),
+                StreamEvent::UpstreamRetryProgress {
+                    remaining_secs,
+                    total_secs,
+                    ..
+                } => waits.push((remaining_secs, total_secs)),
+                StreamEvent::ProviderAttribution { upstream_id, .. } => {
+                    attributions.push(upstream_id)
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            text.contains("recovered answer"),
+            "the soonest upstream should recover and answer, got: {text:?}"
+        );
+        assert_eq!(
+            attributions.last().map(String::as_str),
+            Some("cerebras"),
+            "recovery must retry the upstream with the shortest cooldown"
+        );
+        assert_eq!(
+            waits.first(),
+            Some(&(1, 1)),
+            "one announced 1s wait (cerebras), not sambanova's 5s: {waits:?}"
+        );
+        let secs = started.elapsed().as_secs();
+        assert!(
+            (1..5).contains(&secs),
+            "recovery should wait the 1s hint, not 5s; took {secs}s"
+        );
+    }
+
+    /// If the soonest recovery's retry is *still* throttled, the whole-chain
+    /// recovery must run again rather than fail the turn. Before the recovery
+    /// became repeatable, the single shot would surface exhaustion here even
+    /// though the upstream clears on its next attempt.
+    #[tokio::test]
+    async fn whole_chain_recovery_repeats_until_an_upstream_recovers() {
+        use futures::StreamExt;
+
+        let provider = FreeProvider::with_routing(
+            vec![
+                stream_rate_limited_entry("cerebras", 1, 2),
+                stream_rate_limited_entry("sambanova", 20, 1),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let started = std::time::Instant::now();
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+
+        let mut text = String::new();
+        let mut waits = 0_usize;
+        let mut last_attribution = String::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("the retried upstream should eventually answer") {
+                StreamEvent::TextDelta { text: t, .. } => text.push_str(&t),
+                StreamEvent::UpstreamRetryProgress { remaining_secs, .. } => {
+                    if remaining_secs > 0 {
+                        waits += 1;
+                    }
+                }
+                StreamEvent::ProviderAttribution { upstream_id, .. } => {
+                    last_attribution = upstream_id
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            text.contains("recovered answer"),
+            "the recovered upstream should answer, got: {text:?}"
+        );
+        assert_eq!(
+            last_attribution, "cerebras",
+            "the retried upstream serves the turn"
+        );
+        assert!(
+            waits >= 2,
+            "the recovery must run once per throttled attempt, got {waits}"
+        );
+        let secs = started.elapsed().as_secs();
+        assert!(
+            secs < 8,
+            "two 1s recoveries should finish quickly; took {secs}s"
+        );
+    }
+
+    /// A recovery wait that would overshoot the walk budget must not be
+    /// started: the walk reports exhaustion promptly instead of sleeping past
+    /// its own deadline and then failing anyway.
+    #[tokio::test]
+    async fn whole_chain_recovery_skips_a_wait_past_the_walk_budget() {
+        let provider = FreeProvider::with_routing(
+            vec![
+                stream_rate_limited_entry("cerebras", 30, 1),
+                stream_rate_limited_entry("sambanova", 30, 1),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                turn_walk_budget_secs: 2,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let started = std::time::Instant::now();
+        let err = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .err()
+            .expect("a 30s recovery cannot fit a 2s walk budget");
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "the walk must not sleep out the 30s hint: {err}"
+        );
+    }
+
+    /// A mid-stream failure with a *half-written* tool call must not surface a
+    /// dead turn: the partial call is held back from the consumer, dropped when
+    /// the attempt is abandoned, and the text prefix is continued on the next
+    /// upstream. The dropped call is never emitted, so the query loop never sees
+    /// (and never tries to execute) it.
+    #[tokio::test]
+    async fn mid_stream_interruption_drops_a_partial_tool_call_and_continues() {
+        use futures::StreamExt;
+
+        let requests: Arc<Mutex<Vec<ProviderRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let provider = FreeProvider::with_routing(
+            vec![
+                stream_tool_then_error_entry("cerebras", "let me run that"),
+                stream_recording_entry("poolside", " done.", requests.clone()),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                fallback_retries: 0,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+        let mut text = String::new();
+        let mut saw_tool_block = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("the interruption must be continued, not surfaced") {
+                StreamEvent::TextDelta { text: t, .. } => text.push_str(&t),
+                StreamEvent::ContentBlockStart {
+                    content_block: ContentBlock::ToolUse { .. },
+                    ..
+                } => saw_tool_block = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            text, "let me run that done.",
+            "the text prefix streams once, then the continuation"
+        );
+        assert!(
+            !saw_tool_block,
+            "the half-written tool call must never reach the consumer"
+        );
+
+        // The continuation request carries only the text prefix — never the
+        // dropped tool call, which would otherwise be re-issued and run twice.
+        let reqs = requests.lock().unwrap();
+        let last = reqs.last().expect("the healthy upstream was dispatched");
+        assert!(
+            last.messages.iter().any(|m| matches!(
+                &m.content,
+                MessageContent::Text(t) if t.as_str() == "let me run that"
+            )),
+            "the text prefix is appended as an assistant turn: {:?}",
+            last.messages
+        );
+        assert!(
+            !last.messages.iter().any(|m| matches!(
+                &m.content,
+                MessageContent::Blocks(blocks)
+                    if blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            )),
+            "the dropped tool call must not be replayed: {:?}",
+            last.messages
+        );
+    }
+
+    /// A *complete* tool call must be released in order once its block stops —
+    /// the hold must not swallow a finished call, and the stop must arrive
+    /// before the message ends.
+    #[tokio::test]
+    async fn a_complete_tool_call_is_delivered_in_order() {
+        use futures::StreamExt;
+
+        let provider = FreeProvider::with_routing(
+            vec![stream_tool_entry("cerebras", "running it")],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+        let mut kinds: Vec<&'static str> = Vec::new();
+        let mut tool_args = String::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("a complete tool call must not error") {
+                StreamEvent::ContentBlockStart {
+                    content_block: ContentBlock::ToolUse { name, .. },
+                    ..
+                } => {
+                    assert_eq!(name, "bash");
+                    kinds.push("start");
+                }
+                StreamEvent::InputJsonDelta { partial_json, .. } => {
+                    tool_args.push_str(&partial_json);
+                    kinds.push("args");
+                }
+                StreamEvent::ContentBlockStop { .. } => kinds.push("stop"),
+                StreamEvent::MessageDelta {
+                    stop_reason: Some(StopReason::ToolUse),
+                    ..
+                } => kinds.push("delta"),
+                StreamEvent::MessageStop => kinds.push("message_stop"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec!["start", "args", "stop", "delta", "message_stop"],
+            "the held block is released in order before the message ends"
+        );
+        assert_eq!(tool_args, "{\"cmd\":\"ls\"}");
+    }
+
+    /// The candidate list keeps one entry per upstream: a newer hint replaces
+    /// the stale one, so an upstream whose window moved out cannot keep winning
+    /// the "soonest recovery" pick against a sibling that clears sooner.
+    #[test]
+    fn upsert_rate_limit_recovery_replaces_an_upstreams_stale_hint() {
+        let mut candidates: Vec<(usize, String, u64)> = Vec::new();
+        upsert_rate_limit_recovery(&mut candidates, 0, "m", 5);
+        upsert_rate_limit_recovery(&mut candidates, 1, "n", 30);
+        upsert_rate_limit_recovery(&mut candidates, 0, "m", 60);
+        assert_eq!(
+            candidates,
+            vec![(0, "m".to_string(), 60), (1, "n".to_string(), 30)]
+        );
+        // The clamp still applies on update.
+        upsert_rate_limit_recovery(&mut candidates, 1, "n", 99_999);
+        assert_eq!(candidates[1].2, MAX_RETRY_AFTER_WAIT_SECS);
+    }
+
     #[tokio::test]
     async fn walk_budget_bounds_the_plan_and_same_upstream_retries() {
         let chain = vec![entry("groq", true), entry("cerebras", true)];
@@ -6565,17 +7463,29 @@ mod tests {
         );
     }
 
+    /// Regression guard for mid-stream failover: a post-first-byte failure whose
+    /// committed output is pure text is *continued* on the next upstream — the
+    /// partial is appended as an assistant turn plus a user instruction — so the
+    /// text the user already saw is never duplicated or replayed.
+    ///
+    /// This test formerly asserted the opposite (`the mid-stream error must
+    /// reach the caller`, no second attribution). That contract was changed
+    /// deliberately: the interruption now resumes instead of surfacing.
     #[tokio::test]
-    async fn mid_stream_failure_does_not_replay_on_next_upstream() {
+    async fn mid_stream_failure_continues_on_next_upstream_without_replaying() {
         use futures::StreamExt;
 
+        let requests: Arc<Mutex<Vec<ProviderRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let provider = FreeProvider::with_routing(
             vec![
                 stream_error_entry("poolside", "partial answer"),
-                stream_entry("groq", true, Some("replacement answer")),
+                stream_recording_entry("groq", " continues.", requests.clone()),
             ],
             RoutingConfig {
                 strategy: RoutingStrategy::Sequential,
+                // Hand straight to the next upstream instead of retrying the
+                // interrupted one, which is what this test pins.
+                fallback_retries: 0,
                 ..Default::default()
             },
             false,
@@ -6584,31 +7494,47 @@ mod tests {
             .create_message_stream(dummy_request("free/auto"))
             .await
             .expect("stream should start");
-        let mut saw_partial = false;
-        let mut saw_error = false;
-        let mut saw_second_attribution = false;
+
+        let mut text = String::new();
+        let mut continued_on = String::new();
+        let mut announced = String::new();
         while let Some(event) = stream.next().await {
-            match event {
-                Ok(StreamEvent::TextDelta { text, .. }) if text == "partial answer" => {
-                    saw_partial = true;
-                }
-                Ok(StreamEvent::ProviderAttribution { upstream_id, .. })
-                    if upstream_id == "groq" =>
-                {
-                    saw_second_attribution = true;
-                }
-                Err(error) => {
-                    saw_error = error.to_string().contains("stream failed after first byte");
-                    break;
-                }
+            match event.expect("continuation must not surface the interruption") {
+                StreamEvent::TextDelta { text: t, .. } => text.push_str(&t),
+                StreamEvent::ProviderAttribution { upstream_id, .. } => continued_on = upstream_id,
+                StreamEvent::UpstreamContinuation { upstream_id, .. } => announced = upstream_id,
                 _ => {}
             }
         }
-        assert!(saw_partial, "the first upstream must emit partial content");
-        assert!(saw_error, "the mid-stream error must reach the caller");
+        assert_eq!(
+            text, "partial answer continues.",
+            "the partial must stream exactly once, then the continuation"
+        );
+        assert_eq!(
+            continued_on, "groq",
+            "the surviving upstream serves the continuation"
+        );
+        assert_eq!(
+            announced, "groq",
+            "the continuation is announced out-of-band so the seam is visible"
+        );
+
+        let reqs = requests.lock().unwrap();
+        let last = reqs.last().expect("the healthy upstream was dispatched");
         assert!(
-            !saw_second_attribution,
-            "a post-first-byte failure must not replay on another upstream"
+            last.messages.iter().any(|m| matches!(
+                &m.content,
+                MessageContent::Text(t) if t.as_str() == "partial answer"
+            )),
+            "the partial is appended as an assistant turn: {:?}",
+            last.messages
+        );
+        assert!(
+            last.messages
+                .last()
+                .is_some_and(|m| m.get_text().is_some_and(|t| t.contains("interrupted"))),
+            "the request must end with a user continuation instruction: {:?}",
+            last.messages
         );
     }
 
