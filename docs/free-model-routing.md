@@ -11,7 +11,7 @@ the header/quota plumbing that feeds both.
 ## 1. Executive summary
 
 `free/auto` routes each request through an ordered chain of free-tier
-upstreams (13 in `FREE_CATALOG`). The chain is **error-driven and reactive**:
+upstreams (12 in `FREE_CATALOG`). The chain is **error-driven and reactive**:
 on every fallbackable error (429 quota/rate, 401/403 auth, 5xx, timeout, empty
 completion, concurrency) the *same request is re-dispatched verbatim* to the
 next plan row (`crates/api/src/providers/free/impls.rs:1034-1076`). Within an
@@ -436,7 +436,6 @@ claim the quota is *not* per key:
 | Google | Project | "Rate limits are applied per project, not per API key" |
 | OpenRouter | Global | "Making additional accounts or API keys will not affect your rate limits, as we govern capacity globally" |
 | Cerebras | Organization | "Rate limits apply at the organization level, not the user level" |
-| Mistral | Organization | "API rate limits define how much traffic your Organization can send" |
 
 If true, rotating spends one real request per stored key to rediscover that the
 next key is throttled too, and adds load to an account already refusing work.
@@ -494,7 +493,7 @@ All inconclusive for a stated reason, not a guess:
 | NVIDIA | Catalog default is EOL (below). With a live model (`openai/gpt-oss-20b`) the drain completed 150 requests without a single 429, so the free-tier ceiling is above that. |
 | Cloudflare | No 429 after 400 requests on `@cf/meta/llama-3.2-3b-instruct`, nor after 150 on the catalog probe model `@cf/qwen/qwen3-30b-a3b-fp8`. The documented 300 RPM text-generation ceiling was not reached. |
 | Cline | HTTP 402 `insufficient_credits`, balance `-$0.00`. |
-| Google, OpenRouter, Mistral, Cerebras, SambaNova, Poolside | Fewer than 2 stored keys, so there is nothing to compare. |
+| Google, OpenRouter, Cerebras, SambaNova, Poolside | Fewer than 2 stored keys, so there is nothing to compare. |
 
 The probe reports INCONCLUSIVE rather than a verdict whenever the key was never
 actually seen to return 429, or when the comparison model turned out to be
@@ -510,8 +509,9 @@ Reverting was correct, and the measurement is why: the premise was not merely
 unproven, it is false for the one provider measurable here. Two further reasons
 would have applied regardless:
 
-1. It was wrong for Mistral. Mistral was labelled `per-key` and used as the
-   "independent keys" test exemplar while the same doc page said the opposite.
+1. The premise was wrong for the provider that originally motivated it: that
+   provider was labelled `per-key` and used as the "independent keys" test
+   exemplar while the same doc page said the opposite.
 2. The axis is the user's key set, not the provider. Quota sharing depends on how
    many Organizations/Projects the stored keys span — and Google's docs note all
    keys created in AI Studio live in one project, so the shared case is the
@@ -649,13 +649,12 @@ upstream using the real key, base url and headers, and reports the status. A
 | groq | 200 | OK |
 | sambanova | 429 | OK (rate-limited = exists) |
 | cline | 429 | OK — the `cline-free/` + `X-CLIENT-TYPE` fix works |
-| mistral | 429 | OK (rate-limited = exists) |
 | opencode-zen | 200 | OK |
 | zai | 429 | OK (rate-limited = exists) |
 | cloudflare | 200 | OK |
 | openrouter | — | no key configured, not checked |
 
-**10/12 healthy.** Both catalog fixes made earlier are confirmed end to end.
+**9/11 healthy.** Both catalog fixes made earlier are confirmed end to end.
 
 ### Cerebras is not a free tier
 

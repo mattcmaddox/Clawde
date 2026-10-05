@@ -176,7 +176,6 @@ pub fn task_preference_ids(task: TaskType) -> &'static [&'static str] {
             "poolside",
             "groq",
             "cline",
-            "mistral",
             "opencode-zen",
         ],
         // Fast, instruction-following models for iterating on existing code.
@@ -195,7 +194,7 @@ pub fn task_preference_ids(task: TaskType) -> &'static [&'static str] {
         // Fastest, cheapest tokens — a check needs speed, not depth.
         TaskType::Verification => &["groq", "cloudflare", "opencode-zen", "zai", "cerebras"],
         // Cheapest available — a typo fix shouldn't burn a strong model.
-        TaskType::SimpleEdit => &["zai", "opencode-zen", "sambanova", "nvidia", "mistral"],
+        TaskType::SimpleEdit => &["zai", "opencode-zen", "sambanova", "nvidia"],
         // Tool-calling only: any capable upstream, fast ones first.
         TaskType::Search => &[
             "cloudflare",

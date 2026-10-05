@@ -453,19 +453,6 @@ pub(crate) fn variant_effort_keys(
             }
         }
         "@ai-sdk/google-vertex" | "@ai-sdk/google" => google_thinking_variant_keys(id),
-        "@ai-sdk/mistral" => {
-            const MISTRAL_REASONING_IDS: &[&str] = &[
-                "mistral-small-2603",
-                "mistral-small-latest",
-                "mistral-medium-3.5",
-                "mistral-medium-2604",
-            ];
-            if !MISTRAL_REASONING_IDS.iter().any(|m| id.contains(m)) {
-                Vec::new()
-            } else {
-                vec!["high"]
-            }
-        }
         "@ai-sdk/groq" => vec!["none", "low", "medium", "high"],
         "@ai-sdk/perplexity" => Vec::new(),
         "@jerome-benoit/sap-ai-provider-v2" => {

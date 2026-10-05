@@ -134,7 +134,7 @@ pub use providers::CopilotProvider;
 
 // Phase 2B re-exports — OpenAI-compatible generic adapter + common factories.
 pub use providers::{
-    deepseek, groq, lm_studio, mistral, ollama, opencode_zen, openrouter, xai, OpenAiCompatProvider,
+    deepseek, groq, lm_studio, ollama, opencode_zen, openrouter, xai, OpenAiCompatProvider,
 };
 
 // ---------------------------------------------------------------------------
@@ -800,11 +800,6 @@ pub mod client {
                         "Model '{}' is an xAI model. Use `--provider xai` or set XAI_API_KEY.",
                         model
                     )
-                } else if model.starts_with("mistral") || model.starts_with("codestral") {
-                    format!(
-                        "Model '{}' is a Mistral model. Use `--provider mistral` or set MISTRAL_API_KEY.",
-                        model
-                    )
                 } else if model.starts_with("llama") {
                     format!(
                         "Model '{}' looks like a Llama model. Use `--provider groq` (set GROQ_API_KEY) or `--provider ollama` for local.",
@@ -923,8 +918,6 @@ pub mod client {
                         "Model '{}' is an xAI model. Use `--provider xai` or set XAI_API_KEY.",
                         model
                     )
-                } else if model.starts_with("mistral") || model.starts_with("codestral") {
-                    format!("Model '{}' is a Mistral model. Use `--provider mistral` or set MISTRAL_API_KEY.", model)
                 } else if model.starts_with("llama") {
                     format!("Model '{}' looks like a Llama model. Use `--provider groq` or `--provider ollama` for local.", model)
                 } else {

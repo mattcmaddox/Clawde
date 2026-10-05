@@ -452,13 +452,6 @@ fn provider_picker_items() -> Vec<SelectItem> {
             badge: None,
         },
         SelectItem {
-            id: "mistral".into(),
-            title: "Mistral".into(),
-            description: "Hosted Mistral models".into(),
-            category: "Other".into(),
-            badge: None,
-        },
-        SelectItem {
             id: "togetherai".into(),
             title: "Together AI".into(),
             description: "Open model hosting".into(),

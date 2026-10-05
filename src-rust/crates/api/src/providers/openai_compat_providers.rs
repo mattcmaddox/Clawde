@@ -28,7 +28,6 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "perplexity" => Some(perplexity()),
         "venice" => Some(venice()),
         "qwen" | "alibaba" => Some(qwen()),
-        "mistral" => Some(mistral()),
         "openrouter" => Some(openrouter()),
         "sambanova" => Some(sambanova()),
         "nvidia" => Some(nvidia()),
@@ -289,29 +288,6 @@ pub fn qwen() -> OpenAiCompatProvider {
     .with_api_key(key)
     .with_quirks(ProviderQuirks {
         default_temperature: Some(0.55),
-        ..Default::default()
-    })
-}
-
-/// Mistral AI — Reads `MISTRAL_API_KEY`.
-/// Uses OpenAI-compatible format with Mistral-specific quirks:
-///   - Tool call IDs must be alphanumeric only, truncated to 9 chars and
-///     right-padded with zeroes to exactly 9 chars.
-///   - An assistant "Done." turn is inserted between tool→user message transitions.
-pub fn mistral() -> OpenAiCompatProvider {
-    let key = std::env::var("MISTRAL_API_KEY").unwrap_or_default();
-    OpenAiCompatProvider::new(
-        ProviderId::MISTRAL,
-        "Mistral AI",
-        "https://api.mistral.ai/v1",
-    )
-    .with_api_key(key)
-    .with_quirks(ProviderQuirks {
-        tool_id_max_len: Some(9),
-        tool_id_alphanumeric_only: true,
-        fix_tool_user_sequence: true,
-        include_usage_in_stream: true,
-        overflow_patterns: vec!["too large for model with".to_string()],
         ..Default::default()
     })
 }

@@ -747,7 +747,7 @@ const GOAL_REANCHOR_INTERVAL: u32 = 6;
 
 // Spinner verbs are imported from clawde_core::spinner
 
-const FREE_NO_CREDENTIALS_HINT: &str = "Free mode has no configured upstream keys. Configure the default free router with `clawde -p \"/keys set <upstream> <key>\"` (for example, `/keys set groq gsk_...`), or set GROQ_API_KEY, GOOGLE_API_KEY, CEREBRAS_API_KEY, MISTRAL_API_KEY, or another free-upstream key. Use `clawde --check-keys` to validate the store.";
+const FREE_NO_CREDENTIALS_HINT: &str = "Free mode has no configured upstream keys. Configure the default free router with `clawde -p \"/keys set <upstream> <key>\"` (for example, `/keys set groq gsk_...`), or set GROQ_API_KEY, GOOGLE_API_KEY, CEREBRAS_API_KEY, or another free-upstream key. Use `clawde --check-keys` to validate the store.";
 
 /// Strip thinking blocks from assistant messages in the trajectory.
 /// Used when the provider switches mid-task (e.g., free tier exhausts and
@@ -5363,7 +5363,6 @@ async fn run_query_loop_inner(
                             "google" => "Set GOOGLE_API_KEY or run `clawde auth login --provider google`.".to_string(),
                             "openai" => "Set OPENAI_API_KEY or run `clawde auth login --provider openai`.".to_string(),
                             "groq" => "Set GROQ_API_KEY.".to_string(),
-                            "mistral" => "Set MISTRAL_API_KEY.".to_string(),
                             "deepseek" => "Set DEEPSEEK_API_KEY.".to_string(),
                             "xai" => "Set XAI_API_KEY.".to_string(),
                             "github-copilot" => "Reconnect GitHub Copilot via /connect, or set GITHUB_TOKEN.".to_string(),

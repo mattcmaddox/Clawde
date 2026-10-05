@@ -812,7 +812,6 @@ pub mod config {
             "cerebras" => &["CEREBRAS_API_KEY"],
             "sambanova" => &["SAMBANOVA_API_KEY"],
             "deepseek" => &["DEEPSEEK_API_KEY"],
-            "mistral" => &["MISTRAL_API_KEY"],
             "openrouter" => &["OPENROUTER_API_KEY"],
             "togetherai" | "together-ai" => &["TOGETHER_API_KEY"],
             "perplexity" => &["PERPLEXITY_API_KEY"],
@@ -3315,7 +3314,6 @@ pub mod config {
                 Some("groq") => "groq/llama-3.3-70b-versatile",
                 Some("cerebras") => "cerebras/llama-3.3-70b",
                 Some("deepseek") => "deepseek/deepseek-v4-pro",
-                Some("mistral") => "mistral/mistral-large-latest",
                 Some("xai") => "xai/grok-2",
                 Some("openrouter") => "openrouter/anthropic/claude-sonnet-4",
                 Some("togetherai") | Some("together-ai") => {
@@ -8196,7 +8194,6 @@ pub mod cost {
         "groq",
         "sambanova",
         "cline",
-        "mistral",
         "opencode-zen",
         "opencode-go",
         "zai",
@@ -10240,10 +10237,6 @@ mod tests {
         );
         assert_eq!(
             cost::ModelPricing::for_model("google/gemini-2.5-flash"),
-            cost::ModelPricing::FREE
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("mistral/mistral-large-latest"),
             cost::ModelPricing::FREE
         );
         assert_eq!(

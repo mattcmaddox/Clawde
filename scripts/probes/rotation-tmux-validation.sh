@@ -299,7 +299,7 @@ if not entry.get("cooldown_remaining_secs"):
     print("FAIL: throttled key persisted without a cooldown", file=sys.stderr)
     raise SystemExit(1)
 
-# Scope, not duration: a per-model upstream (groq, cerebras, sambanova, mistral,
+# Scope, not duration: a per-model upstream (groq, cerebras, sambanova,
 # google, openrouter, cline) benches only the model it 429'd on and stays usable
 # for every other model, while a per-key upstream (the default: nvidia, zai,
 # opencode-zen) benches the key outright. Read from the same profile file the

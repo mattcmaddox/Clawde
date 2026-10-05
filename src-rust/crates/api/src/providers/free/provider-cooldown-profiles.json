@@ -48,14 +48,6 @@
       "respects_retry_after": false,
       "notes": "Zhipu AI GLM. Conservative estimate pending research."
     },
-    "mistral": {
-      "rate_limit_cooldown_secs": 90,
-      "server_error_cooldown_secs": 60,
-      "max_cooldown_secs": 600,
-      "respects_retry_after": true,
-      "limit_scope": "per-model",
-      "notes": "Docs: 'Completion rate limits are listed per model' — each model gets its own tokens-per-minute and requests-per-second limit, viewable at admin.mistral.ai/plateforme/limits. Free mode exists ('lets you create API keys and use included monthly usage'). NOTE: the same page says rate limits 'define how much traffic your Organization can send', so keys in one Organization share a quota — but that is a property of the USER'S key set (how many Organizations their keys span), not a per-provider constant, so nothing is encoded for it here. See docs/free-model-routing.md section 8."
-    },
     "google": {
       "rate_limit_cooldown_secs": 60,
       "server_error_cooldown_secs": 30,

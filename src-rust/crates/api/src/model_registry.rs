@@ -995,11 +995,6 @@ impl ModelRegistry {
             Some(ProviderId::GOOGLE)
         } else if model_name.starts_with("deepseek") {
             Some(ProviderId::DEEPSEEK)
-        } else if model_name.starts_with("mistral")
-            || model_name.starts_with("codestral")
-            || model_name.starts_with("pixtral")
-        {
-            Some(ProviderId::MISTRAL)
         } else if model_name.starts_with("grok") {
             Some(ProviderId::XAI)
         } else if model_name.starts_with("sonar") {
@@ -1710,8 +1705,6 @@ const PREFERRED_FLAGSHIPS: &[&str] = &[
     "glm-5",       // Z.ai
     "deepseek-v4", // DeepSeek
     "deepseek-reasoner",
-    "mistral-large",
-    "mistral-medium",
     "sonar-pro",     // Perplexity
     "claude-sonnet", // Anthropic mid-tier (below opus, above haiku)
     "-pro",          // generic flagship tier (Gemini pro, gpt-5-pro, …)
@@ -1840,7 +1833,6 @@ fn small_patterns_for(provider_id: &str) -> &'static [&'static str] {
             "gemini-2.0-flash",
         ],
         "deepseek" => &["deepseek-v4-flash", "deepseek-chat"],
-        "mistral" => &["mistral-small", "mistral-nemo"],
         "xai" => &["grok-3-mini", "grok-2-mini"],
         "groq" => &["llama-3.1-8b", "gemma2-9b"],
         "openrouter" => &[

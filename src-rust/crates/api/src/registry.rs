@@ -1122,12 +1122,6 @@ impl ProviderRegistry {
         {
             self.register(Arc::new(p::qwen()));
         }
-        if std::env::var("MISTRAL_API_KEY")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        {
-            self.register(Arc::new(p::mistral()));
-        }
         if std::env::var("SAMBANOVA_API_KEY")
             .map(|v| !v.is_empty())
             .unwrap_or(false)
@@ -1294,16 +1288,14 @@ mod tests {
     }
 
     /// Seed a fake key for an upstream that has no live model discovery
-    /// (mistral → `FreeModelDiscovery::None`) so `build_free_provider` builds
-    /// its chain without a live-discovery call. (The unconditional
+    /// (github-copilot → `FreeModelDiscovery::None`) so `build_free_provider`
+    /// builds its chain without a live-discovery call. (The unconditional
     /// `fetch_best_free_models_from_modelsdev` OnceLock may still attempt one
     /// HTTP fetch per test process; it degrades to an empty map on failure.)
     fn seed_key(store: &mut clawde_core::AuthStore) {
-        store.set(
-            "mistral",
-            clawde_core::StoredCredential::ApiKey {
-                key: "fake-mistral-key-1234567890".to_string(),
-            },
+        store.set_keys(
+            "github-copilot",
+            vec!["ghu_fake00000000000000000000000000000009".to_string()],
         );
     }
 
@@ -1372,8 +1364,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_free_provider_honors_env_base_url_override() {
-        // CLAWDE_FREE_BASE_URL_MISTRAL points mistral's chat dispatch at a
-        // dead port. A fake key against the real endpoint would 401, so a
+        // CLAWDE_FREE_BASE_URL_GROQ points groq's chat dispatch at a dead
+        // port. A fake key against the real endpoint would 401, so a
         // transport error mentioning the mock host proves the override
         // reached the inner provider through build_free_provider — the
         // end-to-end wiring the dev-only env hook exists for.
@@ -1381,13 +1373,18 @@ mod tests {
         use clawde_core::types::Message;
 
         let (mut store, _home) = crate::test_support::test_auth_store();
-        seed_key(&mut store);
+        store.set(
+            "groq",
+            clawde_core::StoredCredential::ApiKey {
+                key: "gsk-fake-key-1234567890".to_string(),
+            },
+        );
         let _guard = crate::test_support::EnvVarGuard::set(
-            "CLAWDE_FREE_BASE_URL_MISTRAL",
+            "CLAWDE_FREE_BASE_URL_GROQ",
             "http://127.0.0.1:1",
         );
 
-        // Disable every upstream except mistral so a developer machine with
+        // Disable every upstream except groq so a developer machine with
         // real *_API_KEY env vars can't build other upstreams into the chain
         // (which would dispatch a real network call instead of the dead port).
         let mut options = std::collections::HashMap::new();
@@ -1396,8 +1393,8 @@ mod tests {
             serde_json::json!({
                 "disabled_upstreams": [
                     "huggingface", "nvidia", "cerebras", "google", "cloudflare",
-                    "groq", "sambanova", "cline", "cohere", "opencode-zen",
-                    "zai", "openrouter"
+                    "sambanova", "cline", "cohere", "opencode-zen",
+                    "zai", "openrouter", "github-copilot"
                 ]
             }),
         );

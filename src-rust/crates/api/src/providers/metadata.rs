@@ -167,11 +167,6 @@ pub const ALL_PROVIDERS: &[ProviderMetadata] = &[
         key_url: "platform.minimaxi.com",
     },
     ProviderMetadata {
-        id: "mistral",
-        env_var: "MISTRAL_API_KEY",
-        key_url: "console.mistral.ai/api-keys",
-    },
-    ProviderMetadata {
         id: "moonshotai",
         env_var: "MOONSHOT_API_KEY",
         key_url: "the provider's website",

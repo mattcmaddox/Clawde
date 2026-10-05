@@ -36,7 +36,6 @@ impl ProviderId {
     pub const AMAZON_BEDROCK: &'static str = "amazon-bedrock";
     pub const AZURE: &'static str = "azure";
     pub const GITHUB_COPILOT: &'static str = "github-copilot";
-    pub const MISTRAL: &'static str = "mistral";
     pub const XAI: &'static str = "xai";
     pub const GROQ: &'static str = "groq";
     pub const DEEPINFRA: &'static str = "deepinfra";
@@ -136,7 +135,6 @@ impl ProviderId {
                 | Self::AZURE
                 | Self::GITHUB_COPILOT
                 | Self::CODEX
-                | Self::MISTRAL
                 | Self::XAI
                 | Self::GROQ
                 | Self::DEEPINFRA

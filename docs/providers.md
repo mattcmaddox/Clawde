@@ -228,7 +228,7 @@ override uses it verbatim; tasks without one keep their built-in defaults:
 
 Upstream ids must match the free catalog (e.g. `groq`, `cerebras`,
 `google`, `openrouter`, `zai`, `opencode-zen`, `cloudflare`,
-`sambanova`, `nvidia`, `mistral`, `cline`, `poolside`).
+`sambanova`, `nvidia`, `cline`, `poolside`).
 
 ### Router behaviour (audit spec Phase 2)
 
@@ -845,31 +845,6 @@ OpenAI-compatible API with extended reasoning output via a `reasoning_content` f
   "providers": {
     "deepseek": {
       "api_key": "sk-..."
-    }
-  }
-}
-```
-
----
-
-### Mistral AI
-
-OpenAI-compatible API with Mistral-specific protocol quirks (tool call ID formatting, tool-user sequence injection).
-
-**Authentication:** `MISTRAL_API_KEY` environment variable.
-
-**Base URL:** `https://api.mistral.ai/v1`
-
-**Default model:** `mistral-large-latest`
-
-**Configuration:**
-
-```json
-{
-  "provider": "mistral",
-  "providers": {
-    "mistral": {
-      "api_key": "..."
     }
   }
 }

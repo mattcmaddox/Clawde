@@ -68,7 +68,7 @@ $env:ANTHROPIC_API_KEY = "sk-ant-api03-..."
 
 **Automatic import from environment variables (free mode)**
 
-When a free-mode upstream (Groq, Cerebras, Google, Mistral, etc.) succeeds
+When a free-mode upstream (Groq, Cerebras, Google, etc.) succeeds
 using a key from its environment variable and nothing is stored for it yet,
 Clawde persists that key into `~/.clawde/auth.json` automatically. This keeps
 the TUI and future headless runs consistent — an env-only key that works on
@@ -507,7 +507,6 @@ providers. Each provider looks for credentials in this order:
 | `groq` | `GROQ_API_KEY` |
 | `cerebras` | `CEREBRAS_API_KEY` |
 | `deepseek` | `DEEPSEEK_API_KEY` |
-| `mistral` | `MISTRAL_API_KEY` |
 | `xai` | `XAI_API_KEY` |
 | `openrouter` | `OPENROUTER_API_KEY` |
 | `togetherai` | `TOGETHER_API_KEY` |

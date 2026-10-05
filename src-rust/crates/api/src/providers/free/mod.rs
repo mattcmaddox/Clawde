@@ -2308,7 +2308,6 @@ pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, 
         "groq" => "https://api.groq.com/openai/v1/models",
         "openrouter" => "https://openrouter.ai/api/v1/models",
         "sambanova" => "https://api.sambanova.ai/v1/models",
-        "mistral" => "https://api.mistral.ai/v1/models",
         "opencode-zen" => "https://api.opencode.ai/v1/models",
         "zai" => "https://open.bigmodel.cn/api/paas/v4/models",
         "cline" => "https://api.cline.bot/api/v1/ai/cline/recommended-models",
@@ -2701,7 +2700,6 @@ pub fn probe_upstream_key(upstream_id: &str, key: &str) -> UpstreamKeyProbe {
         "groq" => "https://api.groq.com/openai/v1/models",
         "openrouter" => "https://openrouter.ai/api/v1/models",
         "sambanova" => "https://api.sambanova.ai/v1/models",
-        "mistral" => "https://api.mistral.ai/v1/models",
         "opencode-zen" => "https://api.opencode.ai/v1/models",
         "zai" => "https://open.bigmodel.cn/api/paas/v4/models",
         "cline" => "https://api.cline.bot/api/v1/ai/cline/recommended-models",
@@ -2905,7 +2903,7 @@ mod cache_tests {
                     {{"upstream": "nvidia", "consecutive_empties": 2, "empty_cooldown_until_unix": {}}},
                     {{"upstream": "cerebras", "consecutive_empties": 0, "cooldown_until_unix": {}}},
                     {{"upstream": "groq", "consecutive_empties": 1, "empty_cooldown_until_unix": {}}},
-                    {{"upstream": "mistral", "consecutive_empties": 1, "empty_cooldown_until_unix": null}}
+                    {{"upstream": "zai", "consecutive_empties": 1, "empty_cooldown_until_unix": null}}
                 ]"#,
                 now_unix + 600,
                 now_unix + 600,
@@ -2927,7 +2925,7 @@ mod cache_tests {
             "expired entries ignored: {cooling:?}"
         );
         assert!(
-            !cooling.contains("mistral"),
+            !cooling.contains("zai"),
             "no active track means not cooling: {cooling:?}"
         );
     }
@@ -3588,18 +3586,17 @@ mod cooldown_profile_audit {
     /// (checked 2026-09-27). Each of these docs keys its limits table by model
     /// id with distinct values per row, so a rate limit on one model leaves
     /// the key usable for the others.
-    const VERIFIED_PER_MODEL: [&str; 6] = [
+    const VERIFIED_PER_MODEL: [&str; 5] = [
         "cerebras",   // "vary based on the model"; limits table keyed by model id
         "groq",       // free-plan table keyed by MODEL ID
         "google",     // "Limits vary depending on the specific model being used"
         "sambanova",  // 20 RPM / 20 RPD / 200K TPD granted per model
-        "mistral",    // "Completion rate limits are listed per model"
         "openrouter", // "different rate limits for different models" (RPM only)
     ];
 
-    /// Guards the regression that motivated this audit: cerebras, sambanova and
-    /// mistral were all unlabelled, so a one-model rate limit benched the key
-    /// for every model on those upstreams. cerebras runs 1-5 free-tier RPM and
+    /// Guards the regression that motivated this audit: cerebras and sambanova
+    /// were both unlabelled, so a one-model rate limit benched the key for
+    /// every model on those upstreams. cerebras runs 1-5 free-tier RPM and
     /// sambanova 20, so both fire in normal use.
     #[test]
     fn verified_per_model_upstreams_are_labelled() {

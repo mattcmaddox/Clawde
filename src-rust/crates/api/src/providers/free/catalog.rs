@@ -309,27 +309,6 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         usage: "auto-pick · 8K",
     },
     FreeUpstream {
-        id: "mistral",
-        title: "Mistral",
-        key_url: "console.mistral.ai/api-keys",
-        // Free "Experiment" tier reality (probed 2026-09-06): Large-tier
-        // models are hard-gated (403 tier_not_allowed; not even listed in
-        // /models), so the default must be Small. When the tier's token pool
-        // is exhausted, chat requests 429 with x-ratelimit-limit-req-minute:
-        // 0 until the pool resets — a calendar wait, not a per-minute one.
-        default_model: "mistral-small-latest",
-        model_family: "mistral-small",
-        note: "Mistral Small (free-tier ceiling) · Large is tier-gated",
-        tool_calling: true,
-        vision: false,
-        thinking: false,
-        max_tokens_cap: None,
-        context_window: 128_000,
-        fallback_models: &["mistral-small-2603"],
-        specialty: "creative",
-        usage: "free tier · 128K",
-    },
-    FreeUpstream {
         id: "opencode-zen",
         title: "OpenCode Zen",
         key_url: "opencode.ai/auth",

@@ -9,7 +9,7 @@ from budget-eaten thinking, silent clamping, "why is my effort being ignored" �
 without adding a single new user knob.
 
 Deliberately **not** an editor. Tuners were rejected: the thinking space is a
-provider × model × effort matrix, not a dial; `free/auto` routes to any of 13
+provider × model × effort matrix, not a dial; `free/auto` routes to any of 12
 upstreams so a per-provider slider would be a lie; and the raw wire params
 (`thinking.type`, `reasoning_effort`, `chat_template_kwargs`) are exactly the
 foot-guns the effort ladder exists to hide. Users who want precision already
@@ -55,7 +55,7 @@ Input: `provider_id`, `model_id`, `effort_level`, `max_tokens` (the request's),
 
 | Row | Shown value | Source (existing) | Notes |
 |---|---|---|---|
-| Provider | upstream title + id | `take_free_model_defaults()` triple, joined to `FreeUpstream` by id | For `free/auto` show "auto — first healthy of 13" |
+| Provider | upstream title + id | `take_free_model_defaults()` triple, joined to `FreeUpstream` by id | For `free/auto` show "auto — first healthy of 12" |
 | Thinking mode | `enabled` / `disabled` / `n/a` | `shape_provider_thinking` gate logic | `n/a` when the model has no knob (plain openai-compat chat) — answers story #2 |
 | Wire param | exact key+value sent | `shape_provider_thinking` | e.g. `reasoning_effort: "high"`, `thinking.type: "enabled"`, `thinkingBudget: 20000`, `enable_thinking: true` |
 | Control type | **budget** vs **behavioral** | per-provider map | Gemini `thinkingBudget`/Anthropic `budget_tokens` are hard budgets; Claude `output_config.effort`, OpenAI `reasoning_effort` are *behavioral signals* ("not a strict token budget" — Claude platform docs). Show "behavioral — no hard budget" instead of a fake number for those. |
@@ -122,7 +122,7 @@ the default path — this matters more than the non-streaming hook).
   budget), OpenAI `none`→`xhigh`, Google `low`/`high` — plus user-defined
   variants with a `variant_cycle` keybind. This is the strongest counterexample
   to "no tuner": variants work for OpenCode because its model surface is
-  narrow and per-model. Clawde's 13-upstream `free/auto` matrix makes the
+  narrow and per-model. Clawde's 12-upstream `free/auto` matrix makes the
   analogue dishonest — a "high effort" variant means different wire params
   depending on which upstream answers. The read-only inspector keeps the
   precision knob where it belongs: `provider_configs.options`.

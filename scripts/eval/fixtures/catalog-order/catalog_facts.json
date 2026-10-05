@@ -1,6 +1,6 @@
 {
   "source": "src-rust/crates/api/src/providers/free/catalog.rs",
-  "source_sha256": "113103ccc7ed41b9ffc57908eff972e9467ba5a1feea504b8469264cc655e5fd",
+  "source_sha256": "480ec2672dfc0c6444b07bcbe38421b35e6e2e7bb72a185ed18f7de9538a3c78",
   "upstreams": [
     {
       "id": "github-copilot",
@@ -48,11 +48,6 @@
       "default_model": "cline-free/deepseek-v4.1-flash"
     },
     {
-      "id": "mistral",
-      "title": "Mistral",
-      "default_model": "mistral-small-latest"
-    },
-    {
       "id": "opencode-zen",
       "title": "OpenCode Zen",
       "default_model": "deepseek-v4-flash-free"
@@ -78,7 +73,6 @@
     "groq",
     "sambanova",
     "cline",
-    "mistral",
     "opencode-zen",
     "zai",
     "openrouter"

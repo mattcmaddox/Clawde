@@ -93,9 +93,6 @@ pub fn discovery_for(upstream_id: &str) -> FreeModelDiscovery {
         "opencode-zen" => FreeModelDiscovery::OpenCodeZenFreeModels {
             base_url: "https://opencode.ai/zen/v1",
         },
-        "mistral" => FreeModelDiscovery::OpenAiModelList {
-            base_url: "https://api.mistral.ai/v1",
-        },
         "sambanova" => FreeModelDiscovery::OpenAiModelList {
             base_url: "https://api.sambanova.ai/v1",
         },
@@ -897,14 +894,9 @@ const KNOWN_FREE_MODELS: &[(&str, &[&str])] = &[
         "poolside",
         &["poolside/laguna-s-2.1", "poolside/laguna-xs-2.1"],
     ),
-    // Mistral's models.dev free pick (labs-devstral-small-2512) is retired
-    // (3/31/2026). Free-tier reality (probed 2026-09-06): Large-tier models
-    // are hard-gated (403 tier_not_allowed, absent from a free key's
-    // /models), so prefer Small — the highest tier a free key can serve.
     // Z.AI's docs mark GLM-4.7-Flash / GLM-4.5-Flash free
     // (GLM-4.7 itself is paid); models.dev agrees but the catalog fallback
     // must never land on the paid variant.
-    ("mistral", &["mistral-small-latest", "mistral-small-2603"]),
     ("zai", &["glm-4.7-flash", "glm-4.5-flash"]),
 ];
 
@@ -913,10 +905,8 @@ const KNOWN_FREE_MODELS: &[(&str, &[&str])] = &[
 /// give monthly token credits rather than per-model free access, so the
 /// Alt+J/K popup should show every model the API returns.
 ///
-/// - Mistral: Experiment tier (credit-based; Large tier-gated — picks must
-///   stay on Small or lower)
 /// - SambaNova: Developer tier (~600M tokens/month, all models)
-const CREDIT_BASED_FREE: &[&str] = &["mistral", "sambanova"];
+const CREDIT_BASED_FREE: &[&str] = &["sambanova"];
 
 /// Shared selection rule for live model lists: prefer the curated
 /// known-free allowlist when it matches, then the models.dev auto-detected
@@ -1053,8 +1043,8 @@ fn select_available_models_from(
             }
         }
     }
-    // For credit-based free tiers (Mistral Experiment, SambaNova Developer),
-    // ALL models on the live list are usable within the monthly allowance.
+    // For credit-based free tiers (SambaNova Developer), ALL models on the
+    // live list are usable within the monthly allowance.
     // Append every remaining live model so the Alt+J/K popup shows the full
     // catalog, not just the curated picks.
     if CREDIT_BASED_FREE.contains(&upstream_id) {
@@ -1531,22 +1521,6 @@ mod tests {
     }
 
     #[test]
-    fn select_available_model_mistral_pins_current_model_over_retired_modelsdev_pick() {
-        // models.dev still marks labs-devstral-small-2512 (retired 3/31/2026)
-        // as free; the allowlist must win and pin the free tier's ceiling —
-        // Small (Large is tier-gated, probed 2026-09-06).
-        let available: Vec<&str> = vec!["labs-devstral-small-2512", "mistral-small-latest"];
-        let auto = HashMap::from([(
-            "mistral".to_string(),
-            "labs-devstral-small-2512".to_string(),
-        )]);
-        assert_eq!(
-            select_available_model("mistral", &available, &auto).as_deref(),
-            Some("mistral-small-latest")
-        );
-    }
-
-    #[test]
     fn select_available_model_zai_pins_free_flash_over_paid_catalog_default() {
         // GLM-4.7 (catalog's old default) is paid; the allowlist must pick the
         // free flash variant even though models.dev also knows it.
@@ -1623,27 +1597,24 @@ mod tests {
 
     #[test]
     fn credit_based_providers_include_full_live_list() {
-        // Mistral and SambaNova have credit-based free tiers where ALL models
-        // are usable. The full list must include every live model, not just
-        // the curated allowlist pick.
+        // SambaNova has a credit-based free tier where ALL models are usable.
+        // The full list must include every live model, not just the curated
+        // allowlist pick.
         let available: Vec<&str> = vec![
-            "mistral-large-2512",
-            "mistral-small-latest",
-            "codestral-latest",
-            "pixtral-12b",
+            "Meta-Llama-3.3-70B-Instruct",
+            "DeepSeek-V3-0324",
+            "Qwen3-32B",
         ];
-        let list = select_available_models_from("mistral", &available, &HashMap::new(), &[]);
-        // Allowlisted model is first: the free tier's ceiling is Small
-        // (Large is tier-gated), so mistral-large-2512 must NOT lead.
+        let list = select_available_models_from("sambanova", &available, &HashMap::new(), &[]);
+        // Allowlisted model leads the full list.
         assert_eq!(
             list.first().map(String::as_str),
-            Some("mistral-small-latest")
+            Some("Meta-Llama-3.3-70B-Instruct")
         );
         // All live models are present.
-        assert_eq!(list.len(), 4);
-        assert!(list.contains(&"mistral-small-latest".to_string()));
-        assert!(list.contains(&"codestral-latest".to_string()));
-        assert!(list.contains(&"pixtral-12b".to_string()));
+        assert_eq!(list.len(), 3);
+        assert!(list.contains(&"DeepSeek-V3-0324".to_string()));
+        assert!(list.contains(&"Qwen3-32B".to_string()));
     }
 
     #[test]

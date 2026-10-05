@@ -577,7 +577,7 @@ pub enum AuthMethod {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiKeyHeader {
-    /// `x-api-key: <key>` (Anthropic, Mistral, …)
+    /// `x-api-key: <key>` (Anthropic, …)
     XApiKey,
     /// `Authorization: Bearer <key>` (OpenAI, Groq, …)
     Authorization,

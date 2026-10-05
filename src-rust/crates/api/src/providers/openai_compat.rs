@@ -33,7 +33,7 @@ use super::request_options::merge_openai_compatible_options;
 #[derive(Debug, Clone)]
 pub struct ProviderQuirks {
     /// Truncate tool call IDs to at most this many characters before sending.
-    /// For example, Mistral requires tool IDs of at most 9 characters.
+    /// For example, some providers cap tool IDs at 9 characters.
     pub tool_id_max_len: Option<usize>,
 
     /// If `true`, strip all non-alphanumeric characters from tool IDs.
@@ -50,8 +50,8 @@ pub struct ProviderQuirks {
     /// Override the sampling temperature when the request does not specify one.
     pub default_temperature: Option<f64>,
 
-    /// Some providers (e.g. older Mistral releases) reject a message sequence
-    /// that goes …tool_result → user… without an intervening assistant turn.
+    /// Some providers reject a message sequence that goes
+    /// …tool_result → user… without an intervening assistant turn.
     /// When `true`, an `{"role":"assistant","content":"Done."}` message is
     /// inserted between any `role: tool` message and a following `role: user`
     /// message.
@@ -2076,8 +2076,8 @@ mod tests {
     }
 
     #[test]
-    fn mistral_tool_ids_match_opencode_style() {
-        let provider = OpenAiCompatProvider::new("mistral", "Mistral", "https://example.com")
+    fn tool_ids_are_truncated_to_nine_and_zero_padded() {
+        let provider = OpenAiCompatProvider::new("acme", "Acme", "https://example.com")
             .with_quirks(ProviderQuirks {
                 tool_id_max_len: Some(9),
                 tool_id_alphanumeric_only: true,

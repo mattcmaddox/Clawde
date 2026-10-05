@@ -474,16 +474,15 @@ Level 1: FreeProvider (across providers) — order is FREE_CATALOG order
   ├── upstream[6]:  Groq
   ├── upstream[7]:  SambaNova
   ├── upstream[8]:  Cline
-  ├── upstream[9]:  Mistral
-  ├── upstream[10]: OpenCode Zen
-  ├── upstream[11]: Z.AI
-  └── upstream[12]: OpenRouter
+  ├── upstream[9]:  OpenCode Zen
+  ├── upstream[10]: Z.AI
+  └── upstream[11]: OpenRouter
 
 Level 2: KeyRotatingProvider (within each upstream, 2+ keys)
   └── key[0], key[1], key[2], ...  (round-robins on exhaustion)
 ```
 
-The list above is a snapshot (2026-09-18). `FREE_CATALOG` in
+The list above is a snapshot (2026-10-05). `FREE_CATALOG` in
 `crates/api/src/providers/free/catalog.rs` is authoritative; when it changes,
 change this diagram in the same commit.
 
@@ -647,7 +646,7 @@ Synthetic only — never calls upstream `discover_models()`. Produces one `free/
 
 ### Chain Assembly (`build_free_provider`)
 
-- `FREE_CATALOG` in `crates/api/src/providers/free/catalog.rs` defines the upstreams by priority (13 as of 2026-09-18)
+- `FREE_CATALOG` in `crates/api/src/providers/free/catalog.rs` defines the upstreams by priority (12 as of 2026-10-05)
 - Each `FreeUpstream` has: id, title, key_url, default_model, fallback_models, model_family, note, specialty, usage, tool_calling, vision, thinking, context_window, max_tokens_cap
 - Cloudflare: OpenAI-compat endpoint embeds the account ID in the URL path,
   so its stored key is the composite `ACCOUNT_ID:API_TOKEN`; key validation
@@ -657,5 +656,6 @@ Synthetic only — never calls upstream `discover_models()`. Produces one `free/
 - OpenCode Zen/Go key sharing: checks both auth store slots
 - Silent skip for unconfigured upstreams (no error)
 - Catalog order = fallback priority (GitHub Copilot first). Retired upstreams
-  are removed, not commented out: GitHub Models (2026-07-30), Hugging Face and
-  Cohere are no longer in the catalog.
+  are removed, not commented out: GitHub Models (2026-07-30), Hugging Face,
+  Cohere, and Mistral (2026-10-05 — the free tier for direct API inference was
+  disabled upstream) are no longer in the catalog.

@@ -1594,8 +1594,8 @@ mod tests {
         }
     }
 
-    /// Build a config whose free chain is exactly one upstream (mistral) with
-    /// Ollama isolated, so a fresh single-key setup exercises the
+    /// Build a config whose free chain is exactly one upstream (github-copilot)
+    /// with Ollama isolated, so a fresh single-key setup exercises the
     /// performance-row path (no key rings) without network calls.
     fn single_upstream_config() -> clawde_core::config::Config {
         use clawde_core::config::ProviderConfig;
@@ -1642,14 +1642,14 @@ mod tests {
         use clawde_api::ProviderRegistry;
 
         let _home = TestHome::acquire();
-        // Seed a single mistral key into the temp home's auth store (set()
-        // persists to CLAWDE_HOME/auth.json immediately).
+        // Seed a single github-copilot key into the temp home's auth store
+        // (set_keys() persists to CLAWDE_HOME/auth.json immediately). GitHub
+        // Copilot has no live model discovery, so the chain builds without a
+        // network call.
         let mut store = clawde_core::AuthStore::load();
-        store.set(
-            "mistral",
-            clawde_core::StoredCredential::ApiKey {
-                key: "fake-mistral-key-1234567890".to_string(),
-            },
+        store.set_keys(
+            "github-copilot",
+            vec!["ghu_fake00000000000000000000000000000009".to_string()],
         );
 
         let config = single_upstream_config();
@@ -1671,13 +1671,13 @@ mod tests {
                 row.total_keys, row.label
             );
         }
-        let mistral = state
+        let copilot = state
             .live_provider_health
             .iter()
-            .find(|r| r.label == "free/mistral");
-        assert!(mistral.is_some(), "free/mistral row must be present");
-        assert_eq!(mistral.unwrap().success_rate, None);
-        assert_eq!(mistral.unwrap().avg_latency, None);
+            .find(|r| r.label == "free/github-copilot");
+        assert!(copilot.is_some(), "free/github-copilot row must be present");
+        assert_eq!(copilot.unwrap().success_rate, None);
+        assert_eq!(copilot.unwrap().avg_latency, None);
     }
 
     #[test]

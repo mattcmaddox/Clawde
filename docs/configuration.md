@@ -513,7 +513,6 @@ via the `provider` key in settings or the `--provider` CLI flag.
 | `groq` | `llama-3.3-70b-versatile` |
 | `cerebras` | `llama-3.3-70b` |
 | `deepseek` | `deepseek-chat` |
-| `mistral` | `mistral-large-latest` |
 | `xai` | `grok-2` |
 | `openrouter` | `anthropic/claude-sonnet-4` |
 | `togetherai` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` |
@@ -580,7 +579,6 @@ and `api_base` override the corresponding environment variables.
 | `GOOGLE_API_KEY` | API key for the `google` provider. |
 | `GROQ_API_KEY` | API key for the `groq` provider. |
 | `XAI_API_KEY` | API key for the `xai` provider. |
-| `MISTRAL_API_KEY` | API key for the `mistral` provider. |
 | `OPENROUTER_API_KEY` | API key for the `openrouter` provider. |
 | `DEEPSEEK_API_KEY` | API key for the `deepseek` provider. |
 | `COHERE_API_KEY` | API key for the `cohere` provider. |

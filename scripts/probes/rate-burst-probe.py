@@ -41,7 +41,6 @@ BASE_URLS = {
     "cerebras": "https://api.cerebras.ai/v1",
     "groq": "https://api.groq.com/openai/v1",
     "sambanova": "https://api.sambanova.ai/v1",
-    "mistral": "https://api.mistral.ai/v1",
 }
 
 

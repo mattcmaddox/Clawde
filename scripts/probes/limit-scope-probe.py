@@ -48,7 +48,6 @@ MODELS = {
         "@cf/qwen/qwen3-30b-a3b-fp8",
         "@cf/openai/gpt-oss-120b",
     ),
-    "mistral": ("mistral-small-latest", "mistral-medium-latest"),
     "cerebras": ("llama3.1-8b", "llama-3.3-70b"),
     "openrouter": ("meta-llama/llama-3.3-70b-instruct:free", "qwen/qwen-3-8b:free"),
 }
@@ -58,7 +57,6 @@ BASE_URLS = {
     "groq": "https://api.groq.com/openai/v1",
     "nvidia": "https://integrate.api.nvidia.com/v1",
     "sambanova": "https://api.sambanova.ai/v1",
-    "mistral": "https://api.mistral.ai/v1",
     "cerebras": "https://api.cerebras.ai/v1",
     "openrouter": "https://openrouter.ai/api/v1",
 }

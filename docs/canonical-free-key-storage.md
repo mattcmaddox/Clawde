@@ -103,7 +103,6 @@ ensures no regressions.
 | groq | API key |
 | sambanova | API key |
 | cline | API key |
-| mistral | API key |
 | opencode-zen | API key (shared with opencode-go) |
 | opencode-go | Alias for opencode-zen, not a catalog entry |
 | zai | API key |

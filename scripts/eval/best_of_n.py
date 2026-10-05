@@ -472,7 +472,7 @@ FIXTURES: dict[str, dict] = {
 # free chain's own convention.
 CATALOG_IDS = [
     "github-copilot", "poolside", "nvidia", "cerebras", "google", "cloudflare",
-    "groq", "sambanova", "cline", "mistral", "opencode-zen", "zai", "openrouter",
+    "groq", "sambanova", "cline", "opencode-zen", "zai", "openrouter",
 ]
 
 DEFAULT_VERIFY_TIMEOUT_SECS = 120

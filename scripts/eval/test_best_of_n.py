@@ -276,7 +276,7 @@ class RateLimitRetryTests(unittest.TestCase):
         self.assertFalse(best_of_n._is_rate_limit_error(
             "clawde exited 1 [quota_exhausted]: [cerebras] Error 402: Payment required"))
         self.assertFalse(best_of_n._is_rate_limit_error(
-            "clawde exited 1 [invalid_credential]: [mistral] tier_not_allowed"))
+            "clawde exited 1 [invalid_credential]: [zai] tier_not_allowed"))
         self.assertFalse(best_of_n._is_rate_limit_error(
             "empty completion: no text, no tool calls, 0 output tokens (provider flake)"))
         self.assertFalse(best_of_n._is_rate_limit_error(""))

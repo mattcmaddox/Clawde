@@ -99,7 +99,6 @@ fn known_provider_ids() -> Vec<&'static str> {
         P::AMAZON_BEDROCK,
         P::AZURE,
         P::GITHUB_COPILOT,
-        P::MISTRAL,
         P::XAI,
         P::GROQ,
         P::DEEPINFRA,

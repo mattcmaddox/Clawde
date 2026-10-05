@@ -92,7 +92,6 @@ pub fn is_openaiish_provider(provider_id: &str) -> bool {
         "openai"
             | "azure"
             | "groq"
-            | "mistral"
             | "deepseek"
             | "xai"
             | "openrouter"

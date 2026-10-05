@@ -1248,7 +1248,7 @@ async fn main() -> anyhow::Result<()> {
                         "No API key found. Options:\n\
                          - Configure free mode (the default): `clawde -p \"/keys set <upstream> <key>\"` \
                          (e.g. /keys set groq gsk_...) — free tiers from Groq, Cerebras, \
-                         Google, Mistral and more\n\
+                         Google and more\n\
                          - Set GROQ_API_KEY for Groq (fast, free tier available)\n\
                          - Set GOOGLE_API_KEY for Google Gemini\n\
                          - Set OPENAI_API_KEY for OpenAI\n\

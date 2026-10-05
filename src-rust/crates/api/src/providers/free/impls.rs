@@ -82,9 +82,9 @@ fn same_upstream_retry_delay_ms(retry_count: u32) -> u64 {
 
 /// Fallback wait (seconds) for a rate-limited upstream that sent no
 /// `Retry-After` hint. Free tiers commonly enforce per-minute token/request
-/// windows and omit the header (verified live against Mistral: HTTP 429 code
-/// 1300, no header); a sub-second backoff cannot clear such a window. 20s is
-/// the shortest window that reliably does.
+/// windows and omit the header (verified live: HTTP 429 with no header); a
+/// sub-second backoff cannot clear such a window. 20s is the shortest window
+/// that reliably does.
 const RATE_LIMIT_WINDOW_FLOOR_SECS: u64 = 20;
 
 /// Merge the latest rate-limit recovery for `idx` into `candidates`,
@@ -4494,7 +4494,7 @@ mod tests {
             );
         }
         // Everything else validates the key on the models endpoint.
-        for id in ["groq", "cerebras", "google", "mistral", "zai", "cline"] {
+        for id in ["groq", "cerebras", "google", "zai", "cline"] {
             assert!(
                 models_endpoint_validates_auth(id),
                 "{} should validate auth",
@@ -5471,18 +5471,18 @@ mod tests {
 
     #[test]
     fn task_plan_without_request_uses_code_generation_prefs() {
-        let provider = task_provider(&["zai", "mistral"]);
+        let provider = task_provider(&["nvidia", "groq"]);
         // No request (e.g. a plan built for the stream re-dispatch without
-        // classification) degrades to the code-generation defaults: mistral
-        // is in that preference list and leads, the rest follow in catalog
-        // order. Mistral contributes TWO rows since its catalog entry gained
-        // a fallback model (primary + fallback), so its id maps twice.
+        // classification) degrades to the code-generation defaults: groq is in
+        // that preference list and leads, the rest follow in catalog order.
+        // NVIDIA contributes TWO rows since its catalog entry carries a
+        // fallback model (primary + fallback), so its id maps twice.
         let plan = provider.attempt_plan(&Route::Auto, None);
         let order: Vec<&str> = plan
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(order, vec!["mistral", "mistral", "zai"]);
+        assert_eq!(order, vec!["groq", "nvidia", "nvidia"]);
     }
 
     #[test]
@@ -5605,8 +5605,8 @@ mod tests {
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
         // CodeGeneration prefs include openrouter, cerebras, poolside, groq,
-        // cline, mistral, opencode-zen. Filtered to the chain:
-        // cerebras leads, groq follows (in prefs order), sambanova last.
+        // cline, opencode-zen. Filtered to the chain: cerebras leads, groq
+        // follows (in prefs order), sambanova last.
         assert_eq!(order, vec!["cerebras", "groq", "sambanova"]);
     }
 
@@ -8146,9 +8146,9 @@ mod tests {
 
     #[test]
     fn clamp_max_tokens_for_noop_when_no_cap() {
-        // mistral catalog entry has max_tokens_cap = None.
-        let entry = entry("mistral", true);
-        let mut req = dummy_request("mistral/x");
+        // groq catalog entry has max_tokens_cap = None.
+        let entry = entry("groq", true);
+        let mut req = dummy_request("groq/x");
         req.max_tokens = 16_384;
         clamp_max_tokens_for(&mut req, &entry);
         assert_eq!(req.max_tokens, 16_384, "no cap means no clamping");
@@ -9676,9 +9676,9 @@ fn first_free_upstream_key_opencode_zen_shares_go_slots() {
 /// temp dir containing a copy of it.
 ///
 /// This exercises the full disk→resolver path against a realistic store
-/// shape: 5 upstreams with 2+ keys (ring paths), 6 single-key slots, cloudflare
-/// composite keys, and credentials separate from the keys map. The fixture is
-/// git-ignored and holds only fake keys.
+/// shape: 5 upstreams with 2+ keys (ring paths), 7 single-key slots, cloudflare
+/// composite keys, and credentials separate from the keys map. The fixture
+/// holds only fake keys.
 #[test]
 fn resolvers_agree_on_synthetic_fixture_store() {
     let _home = crate::test_support::TestHome::new();
@@ -9712,14 +9712,7 @@ fn resolvers_agree_on_synthetic_fixture_store() {
     }
 
     // Single-key upstreams resolve through the single-key chain path.
-    for upstream in [
-        "cerebras",
-        "zai",
-        "sambanova",
-        "mistral",
-        "google",
-        "poolside",
-    ] {
+    for upstream in ["cerebras", "zai", "sambanova", "google", "poolside"] {
         assert!(
             first_free_upstream_key(&store, upstream).is_some(),
             "{upstream}: single-key chain path must resolve"
@@ -9779,7 +9772,6 @@ fn free_catalog_and_core_predicate_agree_bidirectionally() {
         "groq",
         "google",
         "cloudflare",
-        "mistral",
         "opencode-zen",
         // opencode-go omitted: intentional alias, not a catalog entry
         "zai",

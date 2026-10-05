@@ -37,7 +37,7 @@ Clawde runs a multi-turn loop: it streams a response from the model, executes an
 - **Task management** — create, track, and complete tasks
 
 ### 15+ LLM providers
-Free Mode (`free/auto`) across configured free upstreams by default, plus Anthropic Claude, OpenAI, Google Gemini, AWS Bedrock, Azure OpenAI, Ollama, Groq, Mistral, DeepSeek, xAI, Cohere, OpenRouter, Together AI, Perplexity, GitHub Copilot, Cerebras, LM Studio, and LLaMA.cpp.
+Free Mode (`free/auto`) across configured free upstreams by default, plus Anthropic Claude, OpenAI, Google Gemini, AWS Bedrock, Azure OpenAI, Ollama, Groq, DeepSeek, xAI, Cohere, OpenRouter, Together AI, Perplexity, GitHub Copilot, Cerebras, LM Studio, and LLaMA.cpp.
 
 ### AMOLED terminal UI
 A ratatui-based TUI with real-time streaming, syntax-highlighted code blocks, diff viewer, permission dialogs, slash command autocomplete, session browser, and a full keybinding system.

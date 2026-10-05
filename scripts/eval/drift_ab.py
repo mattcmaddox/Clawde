@@ -195,7 +195,7 @@ def dump_task_state(binary: Path, home: Path, cwd: Path, session_id: str) -> dic
 # watchdog has no second plan entry to probe either.
 CATALOG_IDS = [
     "github-copilot", "poolside", "nvidia", "cerebras", "google", "cloudflare",
-    "groq", "sambanova", "cline", "mistral", "opencode-zen", "zai", "openrouter",
+    "groq", "sambanova", "cline", "opencode-zen", "zai", "openrouter",
 ]
 
 

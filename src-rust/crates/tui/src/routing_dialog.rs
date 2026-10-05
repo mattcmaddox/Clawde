@@ -1236,10 +1236,10 @@ mod tests {
         // learning; an upstream with no snapshot data → no history, trailing.
         let groq = rows.iter().find(|r| r.upstream_id == "groq").unwrap();
         let cerebras = rows.iter().find(|r| r.upstream_id == "cerebras").unwrap();
-        let mistral = rows.iter().find(|r| r.upstream_id == "mistral").unwrap();
+        let no_history = rows.iter().find(|r| r.upstream_id == "sambanova").unwrap();
         assert_eq!(groq.tier, 0);
         assert_eq!(cerebras.tier, 1);
-        assert_eq!(mistral.tier, 2);
+        assert_eq!(no_history.tier, 2);
         assert_eq!(groq.dispatches, 8);
         assert_eq!(cerebras.dispatches, 2);
         let groq_pos = rows.iter().position(|r| r.upstream_id == "groq").unwrap();
@@ -1247,12 +1247,12 @@ mod tests {
             .iter()
             .position(|r| r.upstream_id == "cerebras")
             .unwrap();
-        let mistral_pos = rows
+        let no_history_pos = rows
             .iter()
-            .position(|r| r.upstream_id == "mistral")
+            .position(|r| r.upstream_id == "sambanova")
             .unwrap();
         assert!(groq_pos < cerebras_pos);
-        assert!(cerebras_pos < mistral_pos);
+        assert!(cerebras_pos < no_history_pos);
     }
 
     #[test]
