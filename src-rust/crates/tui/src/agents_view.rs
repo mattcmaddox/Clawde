@@ -236,7 +236,6 @@ pub struct AgentsMenuState {
     pub route: AgentsRoute,
     pub definitions: Vec<AgentDefinition>,
     pub active_agents: Vec<AgentInfo>,
-    pub list_scroll: usize,
     pub selected_row: usize,
     pub project_root: Option<PathBuf>,
     pub editor: AgentEditorState,
@@ -249,7 +248,6 @@ impl AgentsMenuState {
             route: AgentsRoute::List,
             definitions: Vec::new(),
             active_agents: Vec::new(),
-            list_scroll: 0,
             selected_row: 0,
             project_root: None,
             editor: AgentEditorState::new(),
@@ -259,7 +257,6 @@ impl AgentsMenuState {
     pub fn open(&mut self, project_root: &std::path::Path) {
         self.definitions = load_agent_definitions(project_root);
         self.selected_row = 0;
-        self.list_scroll = 0;
         self.route = AgentsRoute::List;
         self.project_root = Some(project_root.to_path_buf());
         self.visible = true;
@@ -654,10 +651,19 @@ fn render_agents_list(state: &AgentsMenuState, area: Rect, buf: &mut Buffer) {
     ));
     lines.push(Line::from(""));
 
-    let max_visible = (area.height as usize).saturating_sub(lines.len() + 1);
-    let start = state
-        .list_scroll
-        .min(state.definitions.len().saturating_sub(max_visible));
+    // Keep the highlighted definition inside the viewport. `selected_row` is
+    // offset by one because row 0 is the "Create new agent" entry, which is
+    // always rendered above the scrollable definition list.
+    let max_visible = (area.height as usize)
+        .saturating_sub(lines.len() + 1)
+        .max(1);
+    let selected_def = state.selected_row.saturating_sub(1);
+    let start = if selected_def < max_visible {
+        0
+    } else {
+        selected_def + 1 - max_visible
+    };
+    let start = start.min(state.definitions.len().saturating_sub(max_visible));
 
     for (i, def) in state.definitions[start..].iter().enumerate() {
         if i >= max_visible {
@@ -773,7 +779,7 @@ fn render_agent_editor(state: &AgentsMenuState, area: Rect, buf: &mut Buffer) {
         }
     };
 
-    let mut lines = vec![
+    let header = vec![
         render_editor_field("Name", &editor.name, field_style(AgentEditorField::Name)),
         render_editor_field("Model", &editor.model, field_style(AgentEditorField::Model)),
         render_editor_field(
@@ -797,37 +803,88 @@ fn render_agent_editor(state: &AgentsMenuState, area: Rect, buf: &mut Buffer) {
     ];
 
     let prompt_style = field_style(AgentEditorField::Prompt);
-    let prompt_lines = if editor.prompt.is_empty() {
+    let prompt_lines: Vec<Line> = if editor.prompt.is_empty() {
         vec![Line::from(vec![Span::styled(
             "(empty)",
             prompt_style.add_modifier(Modifier::ITALIC),
         )])]
     } else {
-        editor
-            .prompt
-            .lines()
-            .map(|line| Line::from(vec![Span::styled(line.to_string(), prompt_style)]))
-            .collect::<Vec<_>>()
+        let width = area.width as usize;
+        let mut out = Vec::new();
+        for logical in editor.prompt.split('\n') {
+            for chunk in wrap_preserving(logical, width) {
+                out.push(Line::from(vec![Span::styled(chunk, prompt_style)]));
+            }
+        }
+        out
     };
-    lines.extend(prompt_lines);
-    lines.push(Line::default());
 
+    let mut footer: Vec<Line> = vec![Line::default()];
     if let Some(msg) = editor.saved_message.as_ref() {
-        lines.push(Line::from(vec![Span::styled(
+        footer.push(Line::from(vec![Span::styled(
             msg.clone(),
             Style::default().fg(Color::Green),
         )]));
     }
     if let Some(err) = editor.error.as_ref() {
-        lines.push(Line::from(vec![Span::styled(
+        footer.push(Line::from(vec![Span::styled(
             err.clone(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )]));
     }
 
+    // Pin the field header and the message footer; the prompt body is the only
+    // part that grows, so it is the only part that scrolls. Showing the tail
+    // keeps the text just typed in view.
+    let avail = (area.height as usize).saturating_sub(header.len() + footer.len());
+    let start = prompt_lines.len().saturating_sub(avail);
+    let mut lines = header;
+    lines.extend(prompt_lines.into_iter().skip(start));
+    lines.extend(footer);
+
     Paragraph::new(lines)
         .style(Style::default().bg(CLAWDE_PANEL_BG))
         .render(area, buf);
+}
+
+/// Wrap one logical line to `width` display columns, preserving leading
+/// whitespace (unlike `dialogs::word_wrap`, which collapses runs of spaces).
+/// Used for the agent prompt, where indentation is meaningful.
+fn wrap_preserving(line: &str, width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if width == 0 || UnicodeWidthStr::width(line) <= width {
+        return vec![line.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut rest = line;
+    while UnicodeWidthStr::width(rest) > width {
+        let mut w = 0usize;
+        let mut cut = 0usize;
+        let mut last_space: Option<usize> = None;
+        for (idx, ch) in rest.char_indices() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > width {
+                break;
+            }
+            w += cw;
+            cut = idx + ch.len_utf8();
+            if ch == ' ' {
+                last_space = Some(cut);
+            }
+        }
+        if cut == 0 {
+            // A single character wider than `width`: take it whole so the loop
+            // always makes progress.
+            cut = rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        }
+        let take = last_space.filter(|&s| s <= cut && s > 0).unwrap_or(cut);
+        out.push(rest[..take].to_string());
+        rest = &rest[take..];
+    }
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
 }
 
 fn render_editor_field(label: &str, value: &str, value_style: Style) -> Line<'static> {
@@ -969,5 +1026,91 @@ pub fn render_coordinator_status(agents: &[AgentInfo], area: Rect, buf: &mut Buf
 
         let line = Line::from(spans);
         Paragraph::new(line).render(row_area, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn make_definition(name: &str) -> AgentDefinition {
+        AgentDefinition {
+            file_path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
+            name: name.to_string(),
+            source: "user".to_string(),
+            model: Some("claude-sonnet-4-6".to_string()),
+            memory_scope: None,
+            description: "A test agent".to_string(),
+            tools: Vec::new(),
+            shadowed_by: None,
+            instructions: "Do the thing.".to_string(),
+        }
+    }
+
+    #[test]
+    fn agents_list_scrolls_to_selected_definition() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut state = AgentsMenuState::new();
+        state.visible = true;
+        state.definitions = (0..40)
+            .map(|i| make_definition(&format!("agent-{i:02}")))
+            .collect();
+        // The last definition is selected (`selected_row` is offset by the
+        // "Create new agent" row).
+        state.selected_row = state.definitions.len();
+        terminal
+            .draw(|frame| render_agents_menu(&state, frame.area(), frame.buffer_mut()))
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .clone()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            content.contains("agent-39"),
+            "selected definition must scroll into view: {content:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_preserving_keeps_leading_indentation() {
+        let wrapped = wrap_preserving("    indented long line that must wrap here", 20);
+        assert!(wrapped.len() > 1, "long line must wrap");
+        assert!(
+            wrapped[0].starts_with("    "),
+            "leading indentation must be preserved: {wrapped:?}"
+        );
+        for line in &wrapped {
+            assert!(line.chars().count() <= 20, "line too wide: {line:?}");
+        }
+    }
+
+    #[test]
+    fn agent_editor_prompt_tail_stays_visible() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut state = AgentsMenuState::new();
+        state.visible = true;
+        state.open_editor(None);
+        state.editor.prompt = format!("{}LONGPROMPTTAIL", "filler line\n".repeat(40));
+        terminal
+            .draw(|frame| render_agents_menu(&state, frame.area(), frame.buffer_mut()))
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .clone()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            content.contains("LONGPROMPTTAIL"),
+            "the editor must scroll to the prompt tail: {content:?}"
+        );
     }
 }

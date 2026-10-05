@@ -11,6 +11,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use std::cell::Cell;
 
+use crate::input_layout::{byte_offset_of_char, split_at_display_col, WrappedInput};
 use crate::key_editor::{compose_composite_key, is_composite_key_provider};
 use crate::overlays::{
     centered_rect, render_dark_overlay, render_dialog_bg, CLAWDE_ACCENT, CLAWDE_PANEL_BG,
@@ -142,6 +143,43 @@ impl KeyInputDialogState {
         }
     }
 
+    /// Delete the character under the cursor.
+    pub fn delete_char(&mut self) {
+        if self.cursor_pos < self.input.len() {
+            self.input.remove(self.cursor_pos);
+        }
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        if self.cursor_pos == 0 {
+            return;
+        }
+        self.cursor_pos = self.input[..self.cursor_pos]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        if self.cursor_pos >= self.input.len() {
+            return;
+        }
+        self.cursor_pos += self.input[self.cursor_pos..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| self.input.len() - self.cursor_pos);
+    }
+
+    pub fn move_cursor_home(&mut self) {
+        self.cursor_pos = 0;
+    }
+
+    pub fn move_cursor_end(&mut self) {
+        self.cursor_pos = self.input.len();
+    }
+
     /// Take the entered key and close the dialog.
     pub fn take_key(&mut self) -> String {
         let key = self.input.clone();
@@ -174,27 +212,52 @@ pub fn render_key_input_dialog(
     render_dark_overlay(frame, area);
 
     // ── Dialog size ──
+    // Width (and therefore wrap width) is fixed first; the lines are then
+    // built and the height sized to fit, so a long key grows the dialog
+    // instead of being clipped.
     let width = 60u16.min(area.width.saturating_sub(4));
-    let height = 9u16;
-    let dialog_area = centered_rect(width, height, area);
-    state.last_rect.set(dialog_area);
+    let inner_w = width.saturating_sub(2);
+    let wrap_w = inner_w.saturating_sub(1) as usize;
 
-    // ── Fill dialog background (no border) ──
-    render_dialog_bg(frame, dialog_area);
+    // "API Key:" or "Cloudflare Account ID:" label, depending on the step.
+    let awaiting_id =
+        is_composite_key_provider(&state.provider_id) && state.pending_token.is_some();
 
-    let inner = Rect {
-        x: dialog_area.x + 1,
-        y: dialog_area.y + 1,
-        width: dialog_area.width.saturating_sub(2),
-        height: dialog_area.height.saturating_sub(2),
+    // Masked key display (show last 4 chars, mask the rest). During the
+    // two-step flow the placeholder asks for the account ID explicitly.
+    let masked = if state.input.is_empty() {
+        if awaiting_id {
+            "Paste your Cloudflare ID now...".to_string()
+        } else {
+            "paste your API key here...".to_string()
+        }
+    } else {
+        mask_key(&state.input)
     };
+    // The mask preserves the character count, so map the raw char-indexed
+    // cursor back to a byte offset in the masked string.
+    let cursor = if state.input.is_empty() {
+        0
+    } else {
+        let char_index = state.input[..state.cursor_pos.min(state.input.len())]
+            .chars()
+            .count();
+        byte_offset_of_char(&masked, char_index)
+    };
+
+    let input_style = if state.input.is_empty() {
+        Style::default().fg(dim)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let masked_layout = WrappedInput::layout(&masked, cursor, wrap_w);
 
     // ── Build lines ──
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // Title row: "Connect {provider}" on left, "esc" on right
     let title_text = format!("Connect {}", state.provider_name);
-    let title_pad = inner.width.saturating_sub(title_text.len() as u16 + 5) as usize;
+    let title_pad = inner_w.saturating_sub(title_text.len() as u16 + 5) as usize;
     lines.push(Line::from(vec![
         Span::styled(
             format!(" {}", title_text),
@@ -209,9 +272,6 @@ pub fn render_key_input_dialog(
     // Blank line
     lines.push(Line::from(""));
 
-    // "API Key:" or "Cloudflare Account ID:" label, depending on the step.
-    let awaiting_id =
-        is_composite_key_provider(&state.provider_id) && state.pending_token.is_some();
     lines.push(Line::from(vec![Span::styled(
         if awaiting_id {
             " Cloudflare Account ID:"
@@ -221,33 +281,23 @@ pub fn render_key_input_dialog(
         Style::default().fg(Color::Rgb(180, 180, 180)),
     )]));
 
-    // Masked key display (show last 4 chars, mask the rest). During the
-    // two-step flow the placeholder asks for the account ID explicitly.
-    let masked = if state.input.is_empty() {
-        if awaiting_id {
-            "Paste your Cloudflare ID now...".to_string()
+    // One `Line` per wrapped row, with a block cursor at the insertion point.
+    for (i, line_text) in masked_layout.lines.iter().enumerate() {
+        let mut spans = vec![Span::styled(" ".to_string(), input_style)];
+        if i == masked_layout.cursor_row {
+            let (before, after) = split_at_display_col(line_text, masked_layout.cursor_col);
+            if !before.is_empty() {
+                spans.push(Span::styled(before, input_style));
+            }
+            spans.push(Span::styled("█".to_string(), Style::default().fg(pink)));
+            if !after.is_empty() {
+                spans.push(Span::styled(after, input_style));
+            }
         } else {
-            "paste your API key here...".to_string()
+            spans.push(Span::styled(line_text.clone(), input_style));
         }
-    } else {
-        let len = state.input.len();
-        if len <= 4 {
-            state.input.clone()
-        } else {
-            format!("{}{}", "\u{2022}".repeat(len - 4), &state.input[len - 4..])
-        }
-    };
-
-    let input_style = if state.input.is_empty() {
-        Style::default().fg(dim)
-    } else {
-        Style::default().fg(Color::White)
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled(format!(" {}", masked), input_style),
-        Span::styled("_", Style::default().fg(pink)), // cursor
-    ]));
+        lines.push(Line::from(spans));
+    }
 
     // Blank line
     lines.push(Line::from(""));
@@ -265,8 +315,35 @@ pub fn render_key_input_dialog(
     }
     lines.push(Line::from(hint_spans));
 
+    let height = (lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(9);
+    let dialog_area = centered_rect(width, height, area);
+    state.last_rect.set(dialog_area);
+
+    // ── Fill dialog background (no border) ──
+    render_dialog_bg(frame, dialog_area);
+
+    let inner = Rect {
+        x: dialog_area.x + 1,
+        y: dialog_area.y + 1,
+        width: dialog_area.width.saturating_sub(2),
+        height: dialog_area.height.saturating_sub(2),
+    };
+
     let para = Paragraph::new(lines).bg(dialog_bg);
     frame.render_widget(para, inner);
+}
+
+/// Mask an API key, keeping only the last four characters visible.
+fn mask_key(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 4 {
+        value.to_string()
+    } else {
+        let visible: String = chars[chars.len() - 4..].iter().collect();
+        format!("{}{}", "\u{2022}".repeat(chars.len() - 4), visible)
+    }
 }
 
 #[cfg(test)]
@@ -310,5 +387,44 @@ mod tests {
         s.insert_char('x');
         assert!(!s.compose_with_id());
         assert_eq!(s.input, "x");
+    }
+
+    #[test]
+    fn cursor_edits_at_insertion_point() {
+        let mut s = KeyInputDialogState::new();
+        s.open("openrouter".into(), "OpenRouter".into());
+        for c in "helo".chars() {
+            s.insert_char(c);
+        }
+        s.move_cursor_left(); // between 'l' and 'o'
+        s.insert_char('l');
+        assert_eq!(s.input, "hello");
+        assert_eq!(s.cursor_pos, 4);
+
+        s.move_cursor_home();
+        s.delete_char(); // delete the leading 'h'
+        assert_eq!(s.input, "ello");
+
+        s.move_cursor_end();
+        s.backspace();
+        assert_eq!(s.input, "ell");
+    }
+
+    #[test]
+    fn mask_key_keeps_the_last_four_characters() {
+        assert_eq!(mask_key("abcd"), "abcd");
+        let expected = format!("{}{}", "\u{2022}".repeat(9), "1234");
+        assert_eq!(mask_key("sk-or-v1-1234"), expected);
+    }
+
+    #[test]
+    fn long_key_wraps_instead_of_clipping() {
+        let key = "sk-or-v1-".to_string() + &"a".repeat(80);
+        let masked = mask_key(&key);
+        let layout = WrappedInput::layout(&masked, masked.len(), 40);
+        assert!(layout.lines.len() > 1, "a long masked key must wrap");
+        for line in &layout.lines {
+            assert!(line.chars().count() <= 40);
+        }
     }
 }

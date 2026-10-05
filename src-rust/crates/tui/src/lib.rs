@@ -146,6 +146,8 @@ pub mod image_paste;
 pub mod import_config_dialog;
 /// Input helpers: slash command parsing.
 pub mod input;
+/// Shared wrapped-input layout used by the typed-input dialogs.
+pub mod input_layout;
 /// Startup dialog for malformed settings.json or AGENTS.md.
 pub mod invalid_config_dialog;
 /// Scrollable Katban controls menu (Alt+G: guest links, unblock IPs, status).

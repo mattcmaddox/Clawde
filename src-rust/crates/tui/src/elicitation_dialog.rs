@@ -22,6 +22,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use std::cell::Cell;
 use std::collections::HashMap;
 
+use crate::input_layout::{split_at_display_col, WrappedInput};
 use crate::vim_search::VimSearch;
 
 // ---------------------------------------------------------------------------
@@ -64,6 +65,8 @@ pub struct ElicitationField {
     /// Current text value (for Text/Url fields).  For Enum: the selected value.
     /// For Boolean: "true" or "false".  For MultiEnum: unused (use checked list).
     pub value: String,
+    /// Byte cursor into `value` for Text/Url fields. Unused for other kinds.
+    pub cursor: usize,
     /// Whether a non-empty value is required.
     pub required: bool,
     /// Validation error to show next to the field.
@@ -79,6 +82,7 @@ impl ElicitationField {
             description: None,
             kind: ElicitationFieldKind::Text { format: None },
             value: String::new(),
+            cursor: 0,
             required: true,
             error: None,
         }
@@ -97,6 +101,7 @@ impl ElicitationField {
             description: None,
             kind: ElicitationFieldKind::Enum { options },
             value: first_value,
+            cursor: 0,
             required: false,
             error: None,
         }
@@ -110,6 +115,7 @@ impl ElicitationField {
             description: None,
             kind: ElicitationFieldKind::Boolean,
             value: "false".to_string(),
+            cursor: 0,
             required: false,
             error: None,
         }
@@ -254,6 +260,7 @@ impl ElicitationDialogState {
     pub fn next_field(&mut self) {
         if !self.fields.is_empty() {
             self.active_field = (self.active_field + 1) % self.fields.len();
+            self.focus_active_end();
         }
     }
 
@@ -261,10 +268,25 @@ impl ElicitationDialogState {
     pub fn prev_field(&mut self) {
         if !self.fields.is_empty() {
             self.active_field = (self.active_field + self.fields.len() - 1) % self.fields.len();
+            self.focus_active_end();
         }
     }
 
-    /// Append a character to the active text/url/enum-typeahead field.
+    /// Park the active text/url field's cursor at the end of its value.
+    fn focus_active_end(&mut self) {
+        let Some(field) = self.fields.get_mut(self.active_field) else {
+            return;
+        };
+        if matches!(
+            field.kind,
+            ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url
+        ) {
+            field.cursor = field.value.len();
+        }
+    }
+
+    /// Insert a character at the cursor in the active text/url field (or run
+    /// the enum typeahead).
     pub fn insert_char(&mut self, ch: char) {
         let Some(field) = self.fields.get_mut(self.active_field) else {
             return;
@@ -272,7 +294,8 @@ impl ElicitationDialogState {
         field.error = None;
         match &mut field.kind {
             ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url => {
-                field.value.push(ch);
+                field.value.insert(field.cursor, ch);
+                field.cursor += ch.len_utf8();
             }
             ElicitationFieldKind::Enum { options } => {
                 // Typeahead: find first option whose label starts with the current
@@ -289,16 +312,131 @@ impl ElicitationDialogState {
         }
     }
 
-    /// Delete the last character from the active text/url field.
+    /// Delete the character before the cursor in the active text/url field.
     pub fn backspace(&mut self) {
         let Some(field) = self.fields.get_mut(self.active_field) else {
             return;
         };
-        match &field.kind {
-            ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url => {
-                field.value.pop();
-            }
-            _ => {}
+        if !matches!(
+            field.kind,
+            ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url
+        ) {
+            return;
+        }
+        if field.cursor > 0 {
+            let prev = field.value[..field.cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            field.value.remove(prev);
+            field.cursor = prev;
+        }
+    }
+
+    /// Delete the character under the cursor in the active text/url field.
+    pub fn delete_char(&mut self) {
+        let Some(field) = self.fields.get_mut(self.active_field) else {
+            return;
+        };
+        if matches!(
+            field.kind,
+            ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url
+        ) && field.cursor < field.value.len()
+        {
+            field.value.remove(field.cursor);
+        }
+    }
+
+    /// Move the active text/url field's cursor one character left.
+    pub fn move_cursor_left(&mut self) {
+        let Some(field) = self.fields.get_mut(self.active_field) else {
+            return;
+        };
+        if !matches!(
+            field.kind,
+            ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url
+        ) {
+            return;
+        }
+        if field.cursor > 0 {
+            field.cursor = field.value[..field.cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    /// Move the active text/url field's cursor one character right.
+    pub fn move_cursor_right(&mut self) {
+        let Some(field) = self.fields.get_mut(self.active_field) else {
+            return;
+        };
+        if !matches!(
+            field.kind,
+            ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url
+        ) {
+            return;
+        }
+        if field.cursor < field.value.len() {
+            field.cursor += field.value[field.cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| field.value.len() - field.cursor);
+        }
+    }
+
+    /// Move the active text/url field's cursor to the start.
+    pub fn move_cursor_home(&mut self) {
+        let Some(field) = self.fields.get_mut(self.active_field) else {
+            return;
+        };
+        if matches!(
+            field.kind,
+            ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url
+        ) {
+            field.cursor = 0;
+        }
+    }
+
+    /// Move the active text/url field's cursor to the end.
+    pub fn move_cursor_end(&mut self) {
+        let Some(field) = self.fields.get_mut(self.active_field) else {
+            return;
+        };
+        if matches!(
+            field.kind,
+            ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url
+        ) {
+            field.cursor = field.value.len();
+        }
+    }
+
+    /// Whether the active field accepts free text (Text/Url).
+    pub fn active_field_is_text(&self) -> bool {
+        matches!(
+            self.fields.get(self.active_field).map(|f| &f.kind),
+            Some(ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url)
+        )
+    }
+
+    /// Left arrow: move the text cursor, or cycle an enum value backward.
+    pub fn arrow_left(&mut self) {
+        if self.active_field_is_text() {
+            self.move_cursor_left();
+        } else {
+            self.cycle_enum_prev();
+        }
+    }
+
+    /// Right arrow: move the text cursor, or cycle an enum value forward.
+    pub fn arrow_right(&mut self) {
+        if self.active_field_is_text() {
+            self.move_cursor_right();
+        } else {
+            self.cycle_enum_next();
         }
     }
 
@@ -405,11 +543,99 @@ pub fn render_elicitation_dialog(
         return;
     }
 
-    // Compute dialog size (wider if there are many fields)
-    let field_count = state.fields.len() as u16;
-    let needed_h = (6 + field_count * 3).min(area.height.saturating_sub(2));
-    let dialog_h = needed_h.max(12).min(area.height);
+    // The dialog width is fixed first so the wrap width is known; the lines
+    // are then built and the height sized to fit (wrapped long values and
+    // descriptions grow the dialog instead of clipping).
     let dialog_w = 64u16.min(area.width.saturating_sub(4));
+    let inner_w = dialog_w.saturating_sub(4) as usize;
+    let value_wrap_w = inner_w.saturating_sub(3);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Optional request message
+    if let Some(msg) = &state.request_message {
+        lines.push(Line::from(""));
+        for chunk in wrap_str(msg, inner_w) {
+            lines.push(Line::from(vec![Span::styled(
+                chunk,
+                Style::default().fg(Color::White),
+            )]));
+        }
+        lines.push(Line::from(""));
+    } else {
+        lines.push(Line::from(""));
+    }
+
+    // Fields
+    let mut active_start: usize = 0;
+    for (idx, field) in state.fields.iter().enumerate() {
+        let focused = idx == state.active_field;
+        if focused {
+            active_start = lines.len();
+        }
+        let label_style = if focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        // Label line: "> Label  [required]"
+        let mut label_spans = vec![
+            Span::styled(if focused { "> " } else { "  " }, label_style),
+            Span::styled(field.title.clone(), label_style),
+        ];
+        if field.required {
+            label_spans.push(Span::styled(" *", Style::default().fg(Color::Red)));
+        }
+        if let Some(err) = &field.error {
+            label_spans.push(Span::styled(
+                format!("  ← {err}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        lines.push(Line::from(label_spans));
+
+        // Value line(s) — Text/Url wrap and carry a cursor.
+        lines.extend(render_field_value_lines(
+            field,
+            focused,
+            inner_w,
+            value_wrap_w,
+        ));
+
+        // Optional description (wrapped so a long one is not clipped).
+        if let Some(desc) = &field.description {
+            for chunk in wrap_str(desc, value_wrap_w) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("   {chunk}"),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+        }
+    }
+
+    // Hint line — with vim mode on, show the modal-mode legend and a dim
+    // `-- INSERT --` while typing (mirrors the popup search-bar convention).
+    let hint = if vim_enabled && state.vim_search.insert {
+        "-- INSERT --   Esc: exit insert   Enter: submit"
+    } else if vim_enabled {
+        "  i: type   Tab/jk: next   Enter: submit   Esc: cancel"
+    } else {
+        "  Tab: next field   Enter: submit   Esc: cancel"
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    // Size the dialog to the content (clamped to the terminal).
+    let dialog_h = (lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(12)
+        .min(area.height);
     let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
     let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
     let dialog_area = Rect {
@@ -441,116 +667,59 @@ pub fn render_elicitation_dialog(
         height: dialog_area.height.saturating_sub(2),
     };
 
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Optional request message
-    if let Some(msg) = &state.request_message {
-        lines.push(Line::from(""));
-        for chunk in wrap_str(msg, inner.width as usize) {
-            lines.push(Line::from(vec![Span::styled(
-                chunk,
-                Style::default().fg(Color::White),
-            )]));
-        }
-        lines.push(Line::from(""));
-    } else {
-        lines.push(Line::from(""));
-    }
-
-    // Fields
-    for (idx, field) in state.fields.iter().enumerate() {
-        let focused = idx == state.active_field;
-        let label_style = if focused {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-
-        // Label line: "> Label  [required]"
-        let mut label_spans = vec![
-            Span::styled(if focused { "> " } else { "  " }, label_style),
-            Span::styled(field.title.clone(), label_style),
-        ];
-        if field.required {
-            label_spans.push(Span::styled(" *", Style::default().fg(Color::Red)));
-        }
-        if let Some(err) = &field.error {
-            label_spans.push(Span::styled(
-                format!("  ← {err}"),
-                Style::default().fg(Color::Red),
-            ));
-        }
-        lines.push(Line::from(label_spans));
-
-        // Value line
-        let value_line = render_field_value_line(field, focused, inner.width as usize);
-        lines.push(value_line);
-
-        // Optional description
-        if let Some(desc) = &field.description {
-            lines.push(Line::from(vec![Span::styled(
-                format!("   {desc}"),
-                Style::default().fg(Color::DarkGray),
-            )]));
-        }
-    }
-
-    // Hint line — with vim mode on, show the modal-mode legend and a dim
-    // `-- INSERT --` while typing (mirrors the popup search-bar convention).
-    // Keep each hint short enough to fit the 64-wide dialog without wrapping.
-    let hint = if vim_enabled && state.vim_search.insert {
-        "-- INSERT --   Esc: exit insert   Enter: submit"
-    } else if vim_enabled {
-        "  i: type   Tab/jk: next   Enter: submit   Esc: cancel"
-    } else {
-        "  Tab: next field   Enter: submit   Esc: cancel"
-    };
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        hint,
-        Style::default().fg(Color::DarkGray),
-    )]));
-
-    // Render with scroll if needed
+    // Scroll so the focused field stays visible when the form overflows;
+    // otherwise the top of the form is shown.
     let total = lines.len();
     let visible_h = inner.height as usize;
-    let scroll = total.saturating_sub(visible_h);
+    let scroll = if total > visible_h {
+        active_start.min(total - visible_h)
+    } else {
+        0
+    };
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).collect();
     Paragraph::new(visible_lines).render(inner, buf);
 }
 
-fn render_field_value_line<'a>(
+fn render_field_value_lines<'a>(
     field: &'a ElicitationField,
     focused: bool,
     width: usize,
-) -> Line<'a> {
+    wrap_w: usize,
+) -> Vec<Line<'a>> {
     let input_bg = if focused {
         Color::Rgb(30, 30, 60)
     } else {
         Color::Rgb(20, 20, 30)
     };
     let input_fg = if focused { Color::White } else { Color::Gray };
+    let value_style = Style::default().fg(input_fg).bg(input_bg);
 
     match &field.kind {
         ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Url => {
-            let display = if field.value.is_empty() && !focused {
-                "(empty)".to_string()
-            } else {
-                // Show cursor at end when focused
-                let v = field.value.clone();
-                if focused {
-                    format!("{v}_")
+            if field.value.is_empty() && !focused {
+                let padded = format!("   {:<width$}", "(empty)", width = width.saturating_sub(3));
+                return vec![Line::from(vec![Span::styled(padded, value_style)])];
+            }
+            let cursor = field.cursor.min(field.value.len());
+            let layout = WrappedInput::layout(&field.value, cursor, wrap_w.max(1));
+            let mut out = Vec::new();
+            for (i, text) in layout.lines.iter().enumerate() {
+                let mut spans = vec![Span::styled("   ".to_string(), value_style)];
+                if focused && i == layout.cursor_row {
+                    let (before, after) = split_at_display_col(text, layout.cursor_col);
+                    if !before.is_empty() {
+                        spans.push(Span::styled(before, value_style));
+                    }
+                    spans.push(Span::styled("█".to_string(), value_style));
+                    if !after.is_empty() {
+                        spans.push(Span::styled(after, value_style));
+                    }
                 } else {
-                    v
+                    spans.push(Span::styled(text.clone(), value_style));
                 }
-            };
-            let padded = format!("   {:<width$}", display, width = width.saturating_sub(3));
-            Line::from(vec![Span::styled(
-                padded,
-                Style::default().fg(input_fg).bg(input_bg),
-            )])
+                out.push(Line::from(spans));
+            }
+            out
         }
 
         ElicitationFieldKind::Enum { options } => {
@@ -564,7 +733,7 @@ fn render_field_value_line<'a>(
             } else {
                 ""
             };
-            Line::from(vec![
+            vec![Line::from(vec![
                 Span::styled("   ", Style::default()),
                 Span::styled(
                     format!(" {label} "),
@@ -578,7 +747,7 @@ fn render_field_value_line<'a>(
                         }),
                 ),
                 Span::styled(hint, Style::default().fg(Color::DarkGray)),
-            ])
+            ])]
         }
 
         ElicitationFieldKind::MultiEnum { options, checked } => {
@@ -599,7 +768,7 @@ fn render_field_value_line<'a>(
                 let _ = v; // suppress unused warning
                 spans.push(Span::styled(format!("{check}{lbl}  "), style));
             }
-            Line::from(spans)
+            vec![Line::from(spans)]
         }
 
         ElicitationFieldKind::Boolean => {
@@ -626,13 +795,13 @@ fn render_field_value_line<'a>(
             } else {
                 ""
             };
-            Line::from(vec![
+            vec![Line::from(vec![
                 Span::raw("   "),
                 Span::styled(" Yes ", yes_style),
                 Span::raw("  "),
                 Span::styled(" No ", no_style),
                 Span::styled(hint, Style::default().fg(Color::DarkGray)),
-            ])
+            ])]
         }
     }
 }
@@ -827,6 +996,7 @@ mod tests {
                     checked: vec![false, false, false],
                 },
                 value: "0".to_string(), // sub-cursor at index 0
+                cursor: 0,
                 required: false,
                 error: None,
             }],
@@ -943,5 +1113,78 @@ mod tests {
         for line in &result {
             assert!(line.len() <= 12, "line too long: {line:?}");
         }
+    }
+
+    #[test]
+    fn elicitation_text_cursor_edits_at_insertion_point() {
+        let mut s = ElicitationDialogState::new();
+        s.show(
+            "srv",
+            None::<String>,
+            vec![ElicitationField::text("username", "Username")],
+        );
+        s.active_field = 0;
+        for c in "helo".chars() {
+            s.insert_char(c);
+        }
+        s.move_cursor_left(); // between 'l' and 'o'
+        s.insert_char('l');
+        assert_eq!(s.fields[0].value, "hello");
+        assert_eq!(s.fields[0].cursor, 4);
+
+        s.move_cursor_home();
+        s.delete_char(); // delete the leading 'h'
+        assert_eq!(s.fields[0].value, "ello");
+
+        s.move_cursor_end();
+        s.backspace();
+        assert_eq!(s.fields[0].value, "ell");
+    }
+
+    #[test]
+    fn elicitation_arrows_move_text_cursor_but_cycle_enums() {
+        let mut s = make_dialog();
+        // Field 0 is a Text field: arrows move the cursor.
+        s.active_field = 0;
+        s.fields[0].value = "ab".to_string();
+        s.fields[0].cursor = 2;
+        s.arrow_left();
+        assert_eq!(s.fields[0].cursor, 1);
+        assert_eq!(s.fields[0].value, "ab", "arrows must not alter text");
+        // Field 2 is an Enum: arrows cycle the value.
+        s.active_field = 2;
+        assert_eq!(s.fields[2].value, "prod");
+        s.arrow_right();
+        assert_eq!(s.fields[2].value, "dev");
+    }
+
+    #[test]
+    fn long_field_value_and_description_wrap_and_grow_the_dialog() {
+        let mut s = ElicitationDialogState::new();
+        let long_url = format!("https://example.com/{}tailmarker", "segment/".repeat(12));
+        let mut field = ElicitationField::text("endpoint", "Endpoint");
+        field.description = Some("descriptionword ".repeat(12) + "desctail");
+        s.show("srv", None::<String>, vec![field]);
+        s.fields[0].value = long_url.clone();
+        s.fields[0].cursor = long_url.len();
+        s.active_field = 0;
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_elicitation_dialog(&s, area, false, &mut buf);
+        let rendered: String = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+        assert!(
+            rendered.contains("tailmarker"),
+            "wrapped URL tail was clipped"
+        );
+        assert!(
+            rendered.contains("desctail"),
+            "wrapped description tail was clipped"
+        );
     }
 }

@@ -96,8 +96,6 @@ pub struct McpViewState {
     pub selected_server: usize,
     pub selected_tool: usize,
     pub tool_search: String,
-    pub server_scroll: usize,
-    pub tool_scroll: usize,
     /// Whether the full error detail for the selected server is expanded.
     pub error_expanded: bool,
     /// Vim-modal insert-mode state for the tool filter (only used when vim is enabled).
@@ -113,8 +111,6 @@ impl McpViewState {
             selected_server: 0,
             selected_tool: 0,
             tool_search: String::new(),
-            server_scroll: 0,
-            tool_scroll: 0,
             error_expanded: false,
             vim_search: VimSearch::new(),
         }
@@ -372,62 +368,41 @@ fn render_server_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
         height: area.height.saturating_sub(2),
     };
 
-    // Group by transport
-    let stdio: Vec<_> = state
-        .servers
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.transport == "stdio")
-        .collect();
-    let sse: Vec<_> = state
-        .servers
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.transport == "sse")
-        .collect();
-    let http: Vec<_> = state
-        .servers
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.transport == "http")
-        .collect();
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-    let mut row = 0u16;
-
-    let render_group = |group: &Vec<(usize, &McpServerView)>,
-                        label: &str,
-                        row: &mut u16,
-                        area: Rect,
-                        buf: &mut Buffer,
-                        selected: usize,
-                        focused: bool| {
+    // Flatten the transport groups into a single row list so the viewport can
+    // scroll to keep the highlighted server reachable. Without this the list
+    // was clipped at the pane height and any selection past it was invisible.
+    struct ServerRow {
+        line: Line<'static>,
+        /// Server index this row highlights, or `None` for group headers and
+        /// error detail rows.
+        server: Option<usize>,
+    }
+    let mut rows: Vec<ServerRow> = Vec::new();
+    for (transport, label) in [("stdio", "stdio"), ("sse", "SSE"), ("http", "HTTP")] {
+        let group: Vec<(usize, &McpServerView)> = state
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.transport == transport)
+            .collect();
         if group.is_empty() {
-            return;
+            continue;
         }
-        if *row >= area.height {
-            return;
-        }
-        Paragraph::new(Line::from(vec![Span::styled(
-            label.to_string(),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )]))
-        .render(
-            Rect {
-                x: area.x,
-                y: area.y + *row,
-                width: area.width,
-                height: 1,
-            },
-            buf,
-        );
-        *row += 1;
+        rows.push(ServerRow {
+            line: Line::from(vec![Span::styled(
+                label.to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )]),
+            server: None,
+        });
         for (idx, server) in group {
-            if *row >= area.height {
-                break;
-            }
-            let sel = *idx == selected && focused;
+            let sel = idx == state.selected_server && focused;
             let prefix = if sel { "› " } else { "  " };
             let row_text = pad_line(
                 &format!(
@@ -439,78 +414,59 @@ fn render_server_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
                     server.resource_count,
                     server.prompt_count
                 ),
-                area.width,
+                inner.width,
             );
-            let line = Line::from(vec![Span::styled(
-                row_text,
-                if sel {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(CLAWDE_ACCENT)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(CLAWDE_TEXT)
-                },
-            )]);
-            Paragraph::new(line).render(
-                Rect {
-                    x: area.x,
-                    y: area.y + *row,
-                    width: area.width,
-                    height: 1,
-                },
-                buf,
-            );
+            rows.push(ServerRow {
+                line: Line::from(vec![Span::styled(
+                    row_text,
+                    if sel {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(CLAWDE_ACCENT)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(CLAWDE_TEXT)
+                    },
+                )]),
+                server: Some(idx),
+            });
             if let Some(err) = &server.error_message {
-                *row += 1;
-                if *row < area.height {
-                    let short: String = err.chars().take(area.width as usize - 4).collect();
-                    Paragraph::new(Line::from(vec![Span::styled(
+                let avail = (inner.width as usize).saturating_sub(4);
+                let short: String = err.chars().take(avail).collect();
+                rows.push(ServerRow {
+                    line: Line::from(vec![Span::styled(
                         format!("    {}", short),
                         Style::default().fg(Color::Red),
-                    )]))
-                    .render(
-                        Rect {
-                            x: area.x,
-                            y: area.y + *row,
-                            width: area.width,
-                            height: 1,
-                        },
-                        buf,
-                    );
-                }
+                    )]),
+                    server: None,
+                });
             }
-            *row += 1;
         }
-    };
+    }
 
-    render_group(
-        &stdio,
-        "stdio",
-        &mut row,
-        inner,
-        buf,
-        state.selected_server,
-        focused,
-    );
-    render_group(
-        &sse,
-        "SSE",
-        &mut row,
-        inner,
-        buf,
-        state.selected_server,
-        focused,
-    );
-    render_group(
-        &http,
-        "HTTP",
-        &mut row,
-        inner,
-        buf,
-        state.selected_server,
-        focused,
-    );
+    let viewport = inner.height as usize;
+    let selected_row = rows
+        .iter()
+        .position(|row| row.server == Some(state.selected_server))
+        .unwrap_or(0);
+    let start = if selected_row < viewport {
+        0
+    } else {
+        selected_row + 1 - viewport
+    };
+    let start = start.min(rows.len().saturating_sub(viewport));
+
+    for (offset, row) in rows[start..].iter().take(viewport).enumerate() {
+        Paragraph::new(row.line.clone()).render(
+            Rect {
+                x: inner.x,
+                y: inner.y + offset as u16,
+                width: inner.width,
+                height: 1,
+            },
+            buf,
+        );
+    }
 }
 
 fn render_tool_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
@@ -911,5 +867,36 @@ mod tests {
             })
             .unwrap();
         assert_eq!(terminal.backend().buffer().content(), before.content());
+    }
+
+    #[test]
+    fn mcp_view_server_list_scrolls_to_selected_server() {
+        // More servers than the pane can hold: the highlighted one must be
+        // scrolled into view rather than clipped off the bottom.
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        let mut state = McpViewState::new();
+        state.open(
+            (0..20)
+                .map(|i| make_server(&format!("server-{i:02}"), McpViewStatus::Connected, None))
+                .collect(),
+        );
+        state.selected_server = 19;
+        terminal
+            .draw(|frame| {
+                render_mcp_view(&state, frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .clone()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            content.contains("server-19"),
+            "selected server must scroll into view: {content:?}"
+        );
     }
 }

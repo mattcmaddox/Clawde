@@ -26,6 +26,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use std::cell::Cell;
 
+use crate::input_layout::{split_at_display_col, WrappedInput};
 use crate::overlays::{centered_rect, CLAWDE_PANEL_BG};
 
 const BORDER_FG: Color = Color::Rgb(120, 120, 170);
@@ -56,6 +57,8 @@ pub struct AskUserDialogState {
     pub scroll_offset: usize,
     /// Custom text the user is typing (if they choose not to pick an option).
     pub custom_text: String,
+    /// Insert-point byte cursor inside `custom_text` (supports mid-string edits).
+    pub custom_cursor: usize,
     /// Whether cursor is in the custom-text input row.
     pub in_custom_input: bool,
     /// Pending reply channel sender — set when the dialog opens, consumed on submit.
@@ -79,6 +82,7 @@ impl AskUserDialogState {
         self.selected_idx = 0;
         self.scroll_offset = 0;
         self.custom_text.clear();
+        self.custom_cursor = 0;
         self.in_custom_input = self.options.is_none();
         self.reply_tx = Some(reply_tx);
         self.visible = true;
@@ -95,10 +99,13 @@ impl AskUserDialogState {
         }
         if self.selected_idx == 0 {
             self.selected_idx = n; // wrap to custom row
-            self.in_custom_input = true;
+            self.focus_custom_row();
         } else {
             self.selected_idx -= 1;
             self.in_custom_input = self.selected_idx >= self.options_len();
+            if self.in_custom_input {
+                self.custom_cursor = self.custom_text.len();
+            }
         }
         self.ensure_visible();
     }
@@ -115,6 +122,9 @@ impl AskUserDialogState {
         } else {
             self.selected_idx += 1;
             self.in_custom_input = self.selected_idx >= self.options_len();
+            if self.in_custom_input {
+                self.custom_cursor = self.custom_text.len();
+            }
         }
         self.ensure_visible();
     }
@@ -143,22 +153,76 @@ impl AskUserDialogState {
         }
     }
 
-    /// Append a character to the custom-text input.
+    /// Focus the custom write-in row, placing the cursor at the end of any text
+    /// already typed there.
+    fn focus_custom_row(&mut self) {
+        self.in_custom_input = true;
+        self.custom_cursor = self.custom_text.len();
+    }
+
+    /// Insert a character at the cursor in the custom-text input.
     ///
     /// Any printable character auto-switches to the custom row regardless of
     /// where the selection currently is — so the user can just start typing
     /// without having to navigate down with Tab/↓ first.
     pub fn push_char(&mut self, c: char) {
-        self.custom_text.push(c);
+        self.custom_text.insert(self.custom_cursor, c);
+        self.custom_cursor += c.len_utf8();
         self.in_custom_input = true;
         self.selected_idx = self.options_len();
     }
 
-    /// Backspace in the custom-text input.
+    /// Backspace in the custom-text input (delete the character before the
+    /// cursor).
     pub fn pop_char(&mut self) {
-        if self.in_custom_input || self.options.is_none() {
-            self.custom_text.pop();
+        if (self.in_custom_input || self.options.is_none()) && self.custom_cursor > 0 {
+            let prev = self.custom_text[..self.custom_cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.custom_text.remove(prev);
+            self.custom_cursor = prev;
         }
+    }
+
+    /// Delete the character at the cursor (forward delete).
+    pub fn delete_char(&mut self) {
+        if self.custom_cursor < self.custom_text.len() {
+            self.custom_text.remove(self.custom_cursor);
+        }
+    }
+
+    /// Move the cursor one character to the left.
+    pub fn move_cursor_left(&mut self) {
+        if self.custom_cursor > 0 {
+            self.custom_cursor = self.custom_text[..self.custom_cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    /// Move the cursor one character to the right.
+    pub fn move_cursor_right(&mut self) {
+        if self.custom_cursor < self.custom_text.len() {
+            self.custom_cursor = self.custom_text[self.custom_cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.custom_cursor + i)
+                .unwrap_or(self.custom_text.len());
+        }
+    }
+
+    /// Move the cursor to the start of the custom-text input.
+    pub fn move_cursor_home(&mut self) {
+        self.custom_cursor = 0;
+    }
+
+    /// Move the cursor to the end of the custom-text input.
+    pub fn move_cursor_end(&mut self) {
+        self.custom_cursor = self.custom_text.len();
     }
 
     /// Confirm the current selection and send the answer.
@@ -224,6 +288,16 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
     }
 
     // ---- size estimate ----
+    // The write-in row wraps and grows a line per overflow, so its layout is
+    // needed for both the height estimate and the render below. The text sits
+    // inside the border (2 cols) after the two-column selection prefix.
+    let width = 58u16.min(area.width.saturating_sub(4));
+    let custom_layout = WrappedInput::layout(
+        &state.custom_text,
+        state.custom_cursor,
+        width.saturating_sub(4) as usize,
+    );
+    let custom_lines = custom_layout.height();
     let question_lines = word_wrap(&state.question, 52).len() as u16;
     let options_count = state.options.as_ref().map(|v| v.len() as u16).unwrap_or(0);
     // Cap visible options to viewport; if options exceed it, show scroll indicators.
@@ -233,10 +307,9 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
         state.options_len() > state.scroll_offset + AskUserDialogState::VISIBLE_OPTION_ROWS;
     let scroll_indicators = (has_scroll_up as u16) + (has_scroll_down as u16);
     let options_lines = visible_options + scroll_indicators + 1; // +1 for spacer after options
-    let height = (5 + question_lines + options_lines + 3)
+    let height = (5 + question_lines + options_lines + custom_lines + 2)
         .min(area.height.saturating_sub(2))
         .max(10);
-    let width = 58u16.min(area.width.saturating_sub(4));
     let modal_area = centered_rect(width, height, area);
     state.last_rect.set(modal_area);
 
@@ -326,7 +399,8 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
     let ind0 = (state.scroll_offset > 0) as usize
         + (opts_len0 > state.scroll_offset + AskUserDialogState::VISIBLE_OPTION_ROWS) as usize;
     let vis0 = opts_len0.min(AskUserDialogState::VISIBLE_OPTION_ROWS);
-    let question_cap = (inner.y + inner.height).saturating_sub((ind0 + vis0 + 5) as u16);
+    let question_cap =
+        (inner.y + inner.height).saturating_sub((ind0 + vis0 + custom_lines as usize + 4) as u16);
 
     row += 1; // top padding
     let mut clipped = false;
@@ -438,33 +512,67 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
         row += 1; // spacer before custom row
     }
 
-    // Custom input row
-    if row < inner.y + inner.height - 1 {
-        let is_sel = state.in_custom_input || state.options.is_none();
-        let prefix = if is_sel { "❯ " } else { "  " };
-        let cursor = if is_sel { "█" } else { "" };
-        let style_bg = if is_sel { SELECTED_BG } else { CLAWDE_PANEL_BG };
-        let mut spans = vec![Span::styled(
-            prefix,
-            Style::default()
-                .fg(if is_sel { SELECTED_FG } else { HINT_FG })
-                .bg(style_bg),
-        )];
-        if state.custom_text.is_empty() && !is_sel && state.options.is_some() {
-            // Not yet active: show a subtle prompt so user knows they can type
-            spans.push(Span::styled(
-                "type to fill custom answer…",
-                Style::default().fg(HINT_FG).bg(style_bg),
-            ));
-        } else {
-            let display_text = format!("{}{}", state.custom_text, cursor);
-            spans.push(Span::styled(
-                display_text,
-                Style::default().fg(INPUT_FG).bg(style_bg),
-            ));
+    // Custom input row — word-wrapped across as many rows as the answer needs;
+    // the dialog grows to fit (see the height estimate above).
+    let is_sel = state.in_custom_input || state.options.is_none();
+    let style_bg = if is_sel { SELECTED_BG } else { CLAWDE_PANEL_BG };
+    let prefix = if is_sel { "❯ " } else { "  " };
+    let show_placeholder = state.custom_text.is_empty() && !is_sel && state.options.is_some();
+    if show_placeholder {
+        if row < inner.y + inner.height - 1 {
+            write_line!(
+                row,
+                Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(HINT_FG).bg(style_bg),),
+                    Span::styled(
+                        "type to fill custom answer…",
+                        Style::default().fg(HINT_FG).bg(style_bg),
+                    ),
+                ])
+            );
+            row += 1;
         }
-        write_line!(row, Line::from(spans));
-        row += 1;
+    } else {
+        for (i, line_text) in custom_layout.lines.iter().enumerate() {
+            if row >= inner.y + inner.height - 1 {
+                break;
+            }
+            let lead = if i == 0 { prefix } else { "  " };
+            let mut spans = vec![Span::styled(
+                lead,
+                Style::default()
+                    .fg(if is_sel { SELECTED_FG } else { HINT_FG })
+                    .bg(style_bg),
+            )];
+            if is_sel && i == custom_layout.cursor_row {
+                // Split the line at the cursor so the insertion point is drawn
+                // as a solid block within the wrapped text.
+                let (before, after) = split_at_display_col(line_text, custom_layout.cursor_col);
+                if !before.is_empty() {
+                    spans.push(Span::styled(
+                        before,
+                        Style::default().fg(INPUT_FG).bg(style_bg),
+                    ));
+                }
+                spans.push(Span::styled(
+                    "█",
+                    Style::default().fg(INPUT_FG).bg(style_bg),
+                ));
+                if !after.is_empty() {
+                    spans.push(Span::styled(
+                        after,
+                        Style::default().fg(INPUT_FG).bg(style_bg),
+                    ));
+                }
+            } else {
+                spans.push(Span::styled(
+                    line_text.clone(),
+                    Style::default().fg(INPUT_FG).bg(style_bg),
+                ));
+            }
+            write_line!(row, Line::from(spans));
+            row += 1;
+        }
     }
 
     // Hint row
@@ -558,5 +666,95 @@ mod overflow_tests {
         );
         // The question is clipped with an ellipsis marker, not silently cut.
         assert!(text.contains('\u{2026}'), "clipped question lacks ellipsis");
+    }
+
+    fn render_rows(state: &AskUserDialogState, area: Rect) -> Vec<String> {
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_ask_user_dialog(state, area, &mut buf);
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn write_in_wraps_and_grows_the_dialog() {
+        let mut state = AskUserDialogState::new();
+        state.visible = true;
+        state.question = "Pick one or type your own".to_string();
+        state.options = Some(vec!["one".to_string(), "two".to_string()]);
+        state.custom_text =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron"
+                .to_string();
+        state.custom_cursor = state.custom_text.len();
+        state.in_custom_input = true;
+
+        let area = Rect::new(0, 0, 60, 40);
+        let rows = render_rows(&state, area);
+        let first = rows
+            .iter()
+            .position(|r| r.contains("alpha"))
+            .expect("first word on screen");
+        let last = rows
+            .iter()
+            .position(|r| r.contains("omicron"))
+            .expect("wrapped tail on screen");
+        assert!(
+            last > first,
+            "a long write-in must wrap onto a later row, not clip"
+        );
+        assert!(
+            rows[last].contains('\u{2588}'),
+            "the block cursor should sit on the final wrapped row"
+        );
+    }
+
+    #[test]
+    fn wrapped_input_maps_cursor_into_wrapped_layout() {
+        let text = "alpha beta gamma delta epsilon zeta";
+        let start = WrappedInput::layout(text, 0, 12);
+        assert!(start.lines.len() > 1, "narrow width must wrap");
+        assert_eq!((start.cursor_row, start.cursor_col), (0, 0));
+
+        let end = WrappedInput::layout(text, text.len(), 12);
+        assert_eq!(end.cursor_row, end.lines.len() - 1);
+        assert_eq!(
+            end.cursor_col,
+            end.lines.last().unwrap().chars().count(),
+            "cursor at end maps to the last row's full width"
+        );
+    }
+
+    #[test]
+    fn write_in_cursor_edits_at_insertion_point() {
+        let mut s = AskUserDialogState::new();
+        s.visible = true;
+        s.options = None;
+        for c in "helo".chars() {
+            s.push_char(c);
+        }
+        s.move_cursor_left(); // between 'l' and 'o'
+        s.push_char('l'); // -> "hello"
+        assert_eq!(s.custom_text, "hello");
+        assert_eq!(s.custom_cursor, 4);
+
+        s.move_cursor_home();
+        s.push_char('>'); // -> ">hello"
+        assert_eq!(s.custom_text, ">hello");
+
+        s.move_cursor_end();
+        s.delete_char(); // at the end: no-op
+        assert_eq!(s.custom_text, ">hello");
+
+        s.move_cursor_home();
+        s.delete_char(); // delete the leading '>'
+        assert_eq!(s.custom_text, "hello");
+
+        s.move_cursor_end();
+        s.pop_char();
+        assert_eq!(s.custom_text, "hell");
     }
 }

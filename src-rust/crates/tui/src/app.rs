@@ -7317,6 +7317,39 @@ impl App {
                 KeyCode::Backspace => {
                     self.ask_user_dialog.pop_char();
                 }
+                // Mid-string cursor editing in the write-in row: only active
+                // once the user is typing a custom answer (or when there are
+                // no options, so the row is the only field).
+                KeyCode::Delete
+                    if self.ask_user_dialog.in_custom_input
+                        || self.ask_user_dialog.options.is_none() =>
+                {
+                    self.ask_user_dialog.delete_char();
+                }
+                KeyCode::Left
+                    if self.ask_user_dialog.in_custom_input
+                        || self.ask_user_dialog.options.is_none() =>
+                {
+                    self.ask_user_dialog.move_cursor_left();
+                }
+                KeyCode::Right
+                    if self.ask_user_dialog.in_custom_input
+                        || self.ask_user_dialog.options.is_none() =>
+                {
+                    self.ask_user_dialog.move_cursor_right();
+                }
+                KeyCode::Home
+                    if self.ask_user_dialog.in_custom_input
+                        || self.ask_user_dialog.options.is_none() =>
+                {
+                    self.ask_user_dialog.move_cursor_home();
+                }
+                KeyCode::End
+                    if self.ask_user_dialog.in_custom_input
+                        || self.ask_user_dialog.options.is_none() =>
+                {
+                    self.ask_user_dialog.move_cursor_end();
+                }
                 _ => {}
             }
             return false;
@@ -7464,6 +7497,21 @@ impl App {
                 }
                 KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                     self.key_input_dialog.backspace();
+                }
+                KeyCode::Delete => {
+                    self.key_input_dialog.delete_char();
+                }
+                KeyCode::Left => {
+                    self.key_input_dialog.move_cursor_left();
+                }
+                KeyCode::Right => {
+                    self.key_input_dialog.move_cursor_right();
+                }
+                KeyCode::Home => {
+                    self.key_input_dialog.move_cursor_home();
+                }
+                KeyCode::End => {
+                    self.key_input_dialog.move_cursor_end();
                 }
                 KeyCode::Char('v')
                     if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -7629,6 +7677,21 @@ impl App {
                 }
                 KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                     self.custom_provider_dialog.backspace();
+                }
+                KeyCode::Delete => {
+                    self.custom_provider_dialog.delete_char();
+                }
+                KeyCode::Left => {
+                    self.custom_provider_dialog.move_cursor_left();
+                }
+                KeyCode::Right => {
+                    self.custom_provider_dialog.move_cursor_right();
+                }
+                KeyCode::Home => {
+                    self.custom_provider_dialog.move_cursor_home();
+                }
+                KeyCode::End => {
+                    self.custom_provider_dialog.move_cursor_end();
                 }
                 KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
                     let c = self.shift_normalize(c, key.modifiers);
@@ -9184,11 +9247,23 @@ impl App {
                     return false;
                 }
                 KeyCode::Left => {
-                    self.elicitation.cycle_enum_prev();
+                    self.elicitation.arrow_left();
                     return false;
                 }
                 KeyCode::Right => {
-                    self.elicitation.cycle_enum_next();
+                    self.elicitation.arrow_right();
+                    return false;
+                }
+                KeyCode::Delete => {
+                    self.elicitation.delete_char();
+                    return false;
+                }
+                KeyCode::Home => {
+                    self.elicitation.move_cursor_home();
+                    return false;
+                }
+                KeyCode::End => {
+                    self.elicitation.move_cursor_end();
                     return false;
                 }
                 KeyCode::Char(' ') => {
