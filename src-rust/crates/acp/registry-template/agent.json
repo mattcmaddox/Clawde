@@ -1,7 +1,7 @@
 {
   "id": "clawde",
   "name": "Clawde",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Open-source, multi-provider terminal coding agent built in Rust. Multi-provider routing (Anthropic, OpenAI, Google, Groq, Ollama, OpenAI-compatible, …), full MCP support, plugin system, Rustail companion, chat forking, memory consolidation. No telemetry.",
   "repository": "https://github.com/mattcmaddox/Clawde",
   "website": "https://github.com/mattcmaddox/Clawde",
@@ -13,12 +13,12 @@
   "distribution": {
     "binary": {
       "linux-aarch64": {
-        "archive": "https://github.com/mattcmaddox/Clawde/releases/download/v0.3.6/clawde-linux-aarch64.tar.gz",
+        "archive": "https://github.com/mattcmaddox/Clawde/releases/download/v0.3.7/clawde-linux-aarch64.tar.gz",
         "cmd": "./clawde",
         "args": ["acp"]
       },
       "linux-x86_64": {
-        "archive": "https://github.com/mattcmaddox/Clawde/releases/download/v0.3.6/clawde-linux-x86_64.tar.gz",
+        "archive": "https://github.com/mattcmaddox/Clawde/releases/download/v0.3.7/clawde-linux-x86_64.tar.gz",
         "cmd": "./clawde",
         "args": ["acp"]
       }
