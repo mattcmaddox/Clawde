@@ -379,14 +379,18 @@ release() {
         echo ":: Stamping $version across all sources (was $cargo_ver) ..."
         python3 "$REPO_ROOT/scripts/bump-version.py" "$version"
         if (( ! no_commit )); then
-            # Stage ONLY the files bump-version.py stamps. `git add -A` here
+            # Stage ONLY the files bump-version.py stamps, and ask the script
+            # which ones those are — the surface list lives there, not here, so
+            # a new stamped file needs no edit in this script. `git add -A`
             # would sweep unrelated uncommitted work (this repo runs parallel
             # agents in the same checkout) into the release commit.
-            git -C "$REPO_ROOT" add \
-                src-rust/Cargo.toml \
-                src-rust/Cargo.lock \
-                npm/package.json \
-                README.md
+            local stamped=()
+            mapfile -t stamped < <(python3 "$REPO_ROOT/scripts/bump-version.py" --list-paths)
+            if (( ${#stamped[@]} == 0 )); then
+                echo "error: bump-version.py --list-paths returned no paths" >&2
+                exit 1
+            fi
+            git -C "$REPO_ROOT" add "${stamped[@]}"
             git -C "$REPO_ROOT" commit -m "chore(release): stamp $version"
             git -C "$REPO_ROOT" push origin main
             echo ":: Version bump committed and pushed."

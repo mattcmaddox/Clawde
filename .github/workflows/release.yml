@@ -80,9 +80,14 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src-rust/Cargo.toml src-rust/Cargo.lock npm/package.json \
-            README.md docs/index.md docs/installation.md \
-            src-rust/crates/acp/registry-template/agent.json
+          # Ask bump-version.py which files it owns instead of repeating the
+          # list here; the script is the single source of truth for its surface.
+          mapfile -t stamped < <(python3 scripts/bump-version.py --list-paths)
+          if (( ${#stamped[@]} == 0 )); then
+            echo "::error::bump-version.py --list-paths returned no paths"
+            exit 1
+          fi
+          git add "${stamped[@]}"
           # Only commit if there are changes
           if git diff --cached --quiet; then
             echo "No version-stamp changes to commit (already at v$VERSION?)"
