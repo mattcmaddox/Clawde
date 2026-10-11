@@ -6,11 +6,19 @@
 //! server that lets integration tests drive the *real* `OpenAiCompatProvider`
 //! HTTP + SSE parsing against controlled success, pre-first-byte failure, and
 //! mid-stream truncation responses — no network, no provider keys.
+//!
+//! The four injection modes the plan names are supported: **failures**
+//! (`Json` with an error status), **stream interruptions** (`SseTruncated`),
+//! **quota** (`Quota`, a 429/402 with a `Retry-After` header), and
+//! **latency** ([`MockServer::with_latency`], a per-connection delay before the
+//! first byte). **Tool side effects** are scripted with the `sse_tool_call_*`
+//! frame builders below.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// One scripted response, served once to the next inbound connection.
 #[derive(Clone, Debug)]
@@ -31,6 +39,15 @@ pub enum ScriptedResponse {
     /// been parsed into stream events — the deterministic stand-in for a
     /// provider dropping the connection mid-stream.
     SseTruncated { frames: Vec<String> },
+    /// A rate-limit / quota rejection carrying an optional `Retry-After`
+    /// header — the shape the recovery kernel classifies (`429` → RateLimit,
+    /// `402` → QuotaExhausted). `retry_after_secs` is the header value a real
+    /// upstream sends for a metered window; `None` omits it.
+    Quota {
+        status: u16,
+        retry_after_secs: Option<u64>,
+        body: String,
+    },
 }
 
 /// A minimal record of one inbound request, for asserting dispatch order.
@@ -55,6 +72,17 @@ impl MockServer {
     /// gets a 500 so a test that unexpectedly over-dispatches fails loudly
     /// instead of hanging.
     pub fn new(responses: Vec<ScriptedResponse>) -> Self {
+        Self::start(responses, None)
+    }
+
+    /// Like [`Self::new`], but sleeps `latency` after reading each request and
+    /// before writing the response — the deterministic stand-in for a slow or
+    /// temporarily unresponsive upstream (first-byte / stream-stall handling).
+    pub fn with_latency(responses: Vec<ScriptedResponse>, latency: Duration) -> Self {
+        Self::start(responses, Some(latency))
+    }
+
+    fn start(responses: Vec<ScriptedResponse>, latency: Option<Duration>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let base_url = format!(
             "http://127.0.0.1:{}",
@@ -73,6 +101,9 @@ impl MockServer {
                 let record = read_request(&mut stream);
                 if let Some(record) = record {
                     requests_clone.lock().unwrap().push(record);
+                }
+                if let Some(delay) = latency {
+                    std::thread::sleep(delay);
                 }
                 let response = queue_clone.lock().unwrap().pop_front().unwrap_or_else(|| {
                     ScriptedResponse::Json {
@@ -189,6 +220,31 @@ fn write_response(stream: &mut TcpStream, response: &ScriptedResponse) {
             );
             (head, body.into_bytes())
         }
+        ScriptedResponse::Quota {
+            status,
+            retry_after_secs,
+            body,
+        } => {
+            let reason = if *status == 402 {
+                "Payment Required"
+            } else {
+                "Too Many Requests"
+            };
+            let retry_after = match retry_after_secs {
+                Some(secs) => format!("retry-after: {secs}\r\n"),
+                None => String::new(),
+            };
+            let head = format!(
+                "HTTP/1.1 {status} {reason}\r\n\
+                 content-type: application/json\r\n\
+                 {retry_after}\
+                 content-length: {}\r\n\
+                 connection: close\r\n\
+                 \r\n",
+                body.len()
+            );
+            (head, body.as_bytes().to_vec())
+        }
     };
 
     let _ = stream.write_all(head.as_bytes());
@@ -243,4 +299,55 @@ pub fn sse_done() -> String {
 /// A complete single-chunk text completion stream.
 pub fn text_stream(model: &str, text: &str) -> Vec<String> {
     vec![sse_first_delta(model, text), sse_finish(), sse_done()]
+}
+
+// ---------------------------------------------------------------------------
+// Tool side-effect frames
+// ---------------------------------------------------------------------------
+//
+// A tool-call turn streams as an opening delta (id + function name), one or
+// more argument fragments, then a `tool_calls` finish — the OpenAI-compatible
+// shape the provider decodes back into a `ToolUse` block, which the loop then
+// executes. This is the "tool side effect" injection mode: the test controls
+// exactly which tool the model calls and with what arguments.
+
+/// First tool-call delta: opens a function call with its `id` and `name`.
+pub fn sse_tool_call_open(model: &str, id: &str, name: &str) -> String {
+    sse_frame(serde_json::json!({
+        "id": "chatcmpl-mock",
+        "model": model,
+        "choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": id,
+            "type": "function",
+            "function": {"name": name, "arguments": ""},
+        }]}}],
+    }))
+}
+
+/// A delta appending a fragment of the tool-call JSON arguments.
+pub fn sse_tool_call_args(args_fragment: &str) -> String {
+    sse_frame(serde_json::json!({
+        "choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "function": {"arguments": args_fragment},
+        }]}}],
+    }))
+}
+
+/// Terminal frame for a tool-call stream (`finish_reason: tool_calls`).
+pub fn sse_tool_finish() -> String {
+    sse_frame(serde_json::json!({
+        "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+    }))
+}
+
+/// A complete tool-call stream: opens `name`, streams `args_json`, finishes.
+pub fn tool_call_stream(model: &str, id: &str, name: &str, args_json: &str) -> Vec<String> {
+    vec![
+        sse_tool_call_open(model, id, name),
+        sse_tool_call_args(args_json),
+        sse_tool_finish(),
+        sse_done(),
+    ]
 }

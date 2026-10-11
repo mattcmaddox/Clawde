@@ -20,7 +20,8 @@ use clawde_core::types::Message;
 use futures::{Stream, StreamExt};
 
 use common::mock_provider::{
-    sse_done, sse_finish, sse_first_delta, text_stream, MockServer, RequestRecord, ScriptedResponse,
+    sse_done, sse_finish, sse_first_delta, text_stream, tool_call_stream, MockServer,
+    RequestRecord, ScriptedResponse,
 };
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;
@@ -681,5 +682,154 @@ async fn tool_buffered_mid_stream_truncation_switches_without_leak() {
         second.len(),
         1,
         "fallback upstream contacted after the mid-stream failure"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 injection modes: quota, latency, tool side effects
+// ---------------------------------------------------------------------------
+//
+// These target the `OpenAiCompatProvider` directly rather than the FreeProvider
+// composite: the composite wraps an exhausted chain in a `ServerError` string,
+// which would hide the typed `RecoveryClass` and the `retry_after` hint the
+// recovery kernel actually schedules from.
+
+/// One mock-backed OpenAI-compatible provider (no chain).
+fn mock_provider(server: &MockServer) -> OpenAiCompatProvider {
+    OpenAiCompatProvider::new("groq", "groq", server.base_url.clone())
+        .with_api_key("fake-key-groq-1234567890".to_string())
+}
+
+/// Quota injection: a 429 carrying `Retry-After` classifies as `RateLimited`
+/// and preserves the hint the recovery kernel schedules a cooldown from.
+#[tokio::test]
+async fn quota_response_with_retry_after_classifies_and_carries_the_hint() {
+    let server = MockServer::new(vec![ScriptedResponse::Quota {
+        status: 429,
+        retry_after_secs: Some(7),
+        body: r#"{"error":{"message":"rate limit","type":"rate_limit_exceeded"}}"#.to_string(),
+    }]);
+    let provider = mock_provider(&server);
+
+    // A pre-first-byte rejection returns `Err` directly; if the provider ever
+    // starts returning an empty stream instead, accept that shape too.
+    let error = match provider.create_message_stream(request()).await {
+        Ok(stream) => {
+            let (events, error) = collect(stream).await;
+            assert!(events.is_empty(), "a quota rejection commits no output");
+            error
+        }
+        Err(error) => Some(error),
+    };
+
+    match error {
+        Some(ProviderError::RateLimited { retry_after, .. }) => {
+            assert_eq!(
+                retry_after,
+                Some(7),
+                "Retry-After must survive classification"
+            );
+        }
+        other => panic!("expected RateLimited carrying retry_after, got {other:?}"),
+    }
+}
+
+/// A 402 quota rejection is the account-level shape and classifies as
+/// `QuotaExhausted` (the catalog's stated account-wide exhaustion signal).
+#[tokio::test]
+async fn account_quota_402_classifies_as_quota_exhausted() {
+    let server = MockServer::new(vec![ScriptedResponse::Quota {
+        status: 402,
+        retry_after_secs: None,
+        body: r#"{"error":{"message":"payment required","type":"payment_required"}}"#.to_string(),
+    }]);
+    let provider = mock_provider(&server);
+
+    let error = match provider.create_message_stream(request()).await {
+        Ok(stream) => collect(stream).await.1,
+        Err(error) => Some(error),
+    };
+
+    match error {
+        Some(err) => assert_eq!(
+            err.recovery_class(),
+            clawde_api::provider_error::RecoveryClass::QuotaExhausted
+        ),
+        None => panic!("expected a quota error"),
+    }
+}
+
+/// Latency injection: a slow upstream still streams, and the delay is actually
+/// honored (the stand-in for first-byte / stream-stall handling).
+#[tokio::test]
+async fn latency_injection_is_honored_and_still_streams() {
+    let server = MockServer::with_latency(
+        vec![ScriptedResponse::SseStream {
+            frames: text_stream("mock-model", "slow hello"),
+        }],
+        std::time::Duration::from_millis(150),
+    );
+    let provider = mock_provider(&server);
+
+    let started = std::time::Instant::now();
+    let (events, error) = collect(
+        provider
+            .create_message_stream(request())
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(text(&events), "slow hello");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(150),
+        "the injected latency must be honored (elapsed {:?})",
+        started.elapsed()
+    );
+}
+
+/// Tool side-effect injection: a scripted tool-call turn decodes to a `ToolUse`
+/// block naming the scripted tool, and the arguments arrive as JSON deltas that
+/// concatenate to the exact scripted arguments.
+#[tokio::test]
+async fn tool_side_effect_stream_decodes_to_a_tool_use_block() {
+    let frames = tool_call_stream("mock-model", "call_1", "Bash", r#"{"command":"echo hi"}"#);
+    let server = MockServer::new(vec![ScriptedResponse::SseStream { frames }]);
+    let provider = mock_provider(&server);
+
+    let (events, error) = collect(
+        provider
+            .create_message_stream(tool_request())
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    assert!(error.is_none(), "{error:?}");
+    let name = events
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::ContentBlockStart {
+                content_block: clawde_core::types::ContentBlock::ToolUse { name, .. },
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        })
+        .expect("a scripted tool call must decode to a ToolUse block");
+    assert_eq!(name, "Bash");
+
+    let args: String = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::InputJsonDelta { partial_json, .. } => Some(partial_json.as_str()),
+            _ => None,
+        })
+        .collect();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&args).expect("concatenated tool args parse");
+    assert_eq!(
+        parsed.get("command").and_then(|v| v.as_str()),
+        Some("echo hi")
     );
 }
