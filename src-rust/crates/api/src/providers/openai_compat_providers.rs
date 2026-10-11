@@ -29,7 +29,6 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "venice" => Some(venice()),
         "qwen" | "alibaba" => Some(qwen()),
         "openrouter" => Some(openrouter()),
-        "sambanova" => Some(sambanova()),
         "nvidia" => Some(nvidia()),
         "siliconflow" => Some(siliconflow()),
         "moonshot" | "moonshotai" => Some(moonshot()),
@@ -307,17 +306,6 @@ pub fn openrouter() -> OpenAiCompatProvider {
         include_usage_in_stream: true,
         ..Default::default()
     })
-}
-
-/// SambaNova — fast inference cloud.  Reads `SAMBANOVA_API_KEY`.
-pub fn sambanova() -> OpenAiCompatProvider {
-    let key = std::env::var("SAMBANOVA_API_KEY").unwrap_or_default();
-    OpenAiCompatProvider::new(
-        ProviderId::SAMBANOVA,
-        "SambaNova",
-        "https://api.sambanova.ai/v1",
-    )
-    .with_api_key(key)
 }
 
 /// Nvidia NIM — enterprise AI inference.  Reads `NVIDIA_API_KEY`.

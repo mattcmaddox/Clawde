@@ -196,13 +196,13 @@ pub fn task_preference_ids(task: TaskType) -> &'static [&'static str] {
             "nvidia",
         ],
         // Strong reasoning first (Gemini), then the 70B-class fast models.
-        TaskType::Reasoning => &["google", "groq", "sambanova", "nvidia", "openrouter", "zai"],
+        TaskType::Reasoning => &["google", "groq", "nvidia", "openrouter", "zai"],
         // Design-before-implementation: comprehensive, structured output.
         TaskType::Planning => &["google", "groq", "openrouter", "cline", "zai"],
         // Fastest, cheapest tokens — a check needs speed, not depth.
         TaskType::Verification => &["groq", "cloudflare", "opencode-zen", "zai", "cerebras"],
         // Cheapest available — a typo fix shouldn't burn a strong model.
-        TaskType::SimpleEdit => &["zai", "opencode-zen", "sambanova", "nvidia"],
+        TaskType::SimpleEdit => &["zai", "opencode-zen", "nvidia"],
         // Tool-calling only: any capable upstream, fast ones first.
         TaskType::Search => &[
             "cloudflare",

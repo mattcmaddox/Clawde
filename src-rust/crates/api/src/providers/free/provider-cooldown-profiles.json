@@ -33,14 +33,6 @@
       "respects_retry_after": false,
       "notes": "Free preview tier: 200 requests/hour (matches local_quota_for in catalog.rs). Poolside's rate-limit docs are access-gated, so limit_scope is UNVERIFIED and left at the per-key default — deliberate, because the damaging error is a wrongly-shared bucket. Verify with scripts/probes/limit-scope-probe.py before changing it."
     },
-    "sambanova": {
-      "rate_limit_cooldown_secs": 60,
-      "server_error_cooldown_secs": 30,
-      "max_cooldown_secs": 300,
-      "respects_retry_after": true,
-      "limit_scope": "per-model",
-      "notes": "Free tier is PER-MODEL: 20 RPM / 20 RPD / 200K TPD for each model individually (DeepSeek-V3.1, Meta-Llama-3.3-70B-Instruct, gpt-oss-120b each get their own 20 RPM). Docs page: 'SambaNova model rate limits'. Note the TPD is per-model on the free tier, while Developer tier is capped at 20M tokens/day ACROSS all models. Headers: x-ratelimit-limit-requests, -remaining-requests, -reset-requests, and -day variants."
-    },
     "zai": {
       "rate_limit_cooldown_secs": 60,
       "server_error_cooldown_secs": 30,

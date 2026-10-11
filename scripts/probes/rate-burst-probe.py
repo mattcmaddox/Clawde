@@ -40,7 +40,6 @@ BASE_URLS = {
     "nvidia": "https://integrate.api.nvidia.com/v1",
     "cerebras": "https://api.cerebras.ai/v1",
     "groq": "https://api.groq.com/openai/v1",
-    "sambanova": "https://api.sambanova.ai/v1",
 }
 
 

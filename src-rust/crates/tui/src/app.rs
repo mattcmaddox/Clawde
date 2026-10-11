@@ -280,13 +280,6 @@ fn provider_picker_items() -> Vec<SelectItem> {
             badge: Some("FREE".into()),
         },
         SelectItem {
-            id: "sambanova".into(),
-            title: "SambaNova".into(),
-            description: "Fast hosted inference — free tier".into(),
-            category: "Free".into(),
-            badge: Some("FREE".into()),
-        },
-        SelectItem {
             id: "cline".into(),
             title: "Cline".into(),
             description: "Free rotating model pool via API key".into(),
@@ -17113,9 +17106,9 @@ mod tests {
                 "openai/gpt-oss-120b".to_string(),
             ),
             (
-                "sambanova".to_string(),
-                "SambaNova".to_string(),
-                "Meta-Llama-3.3-70B-Instruct".to_string(),
+                "zai".to_string(),
+                "Z.AI".to_string(),
+                "glm-4.7-flash".to_string(),
             ),
         ];
         // Guard the fixture's premise against the live catalog. This test is
@@ -17143,13 +17136,13 @@ mod tests {
             .collect();
         // Auto first, then one entry per model family (model-first, not
         // provider-first). gpt-oss-120b (cerebras, groq) collapses into one
-        // entry; sambanova's llama-3.3-70b follows in catalog order.
+        // entry; zai's glm-4.7-flash follows in catalog order.
         assert_eq!(
             ids,
             vec![
                 "free/auto",
                 "free/family/gpt-oss-120b",
-                "free/family/llama-3.3-70b",
+                "free/family/glm-4.7-flash",
             ]
         );
     }
@@ -17195,16 +17188,17 @@ mod tests {
                 // gpt-oss-120b is hosted by nvidia + groq and matches the
                 // catalog family exactly → round-robin family route.
                 ("free/family/gpt-oss-120b", "gpt-oss-120b", false),
-                ("", "llama-3.3-70b", true),
-                // Single host → precise provider pin.
+                // No catalog entry carries a `llama-3.3-70b` family any more
+                // (its only host was retired), so groq's llama model matches
+                // no slug and falls through to Other with a precise pin.
+                ("", "Other free models", true),
+                // gpt-oss-20b matches no catalog family slug → Other, pinned.
+                ("free/nvidia/openai/gpt-oss-20b", "gpt-oss-20b", false),
                 (
                     "free/groq/llama-3.3-70b-versatile",
                     "llama-3.3-70b-versatile",
                     false
                 ),
-                ("", "Other free models", true),
-                // gpt-oss-20b matches no catalog family slug → Other, pinned.
-                ("free/nvidia/openai/gpt-oss-20b", "gpt-oss-20b", false),
             ]
         );
     }
@@ -17261,9 +17255,9 @@ mod tests {
         let mut app = make_app();
         app.free_model_defaults = vec![
             (
-                "sambanova".to_string(),
-                "SambaNova".to_string(),
-                "Meta-Llama-3.3-70B-Instruct".to_string(),
+                "zai".to_string(),
+                "Z.AI".to_string(),
+                "glm-4.7-flash".to_string(),
             ),
             (
                 "groq".to_string(),
@@ -17272,14 +17266,14 @@ mod tests {
             ),
         ];
         app.handle_keybinding_action("openFreeModelPopup");
-        // Rows: auto, gpt-oss-120b, llama-3.3-70b (catalog order). Current
+        // Rows: auto, gpt-oss-120b, glm-4.7-flash (catalog order). Current
         // (free/auto) is preselected, so two downs land on llama-3.3-70b.
         // Confirm with Enter.
         app.free_model_popup.select_next();
         app.free_model_popup.select_next();
         app.confirm_free_model_popup();
         assert!(!app.free_model_popup.visible);
-        assert_eq!(app.model_name, "free/family/llama-3.3-70b");
+        assert_eq!(app.model_name, "free/family/glm-4.7-flash");
     }
 
     #[test]
@@ -17313,9 +17307,9 @@ mod tests {
         let mut app = make_app();
         app.free_model_defaults = vec![
             (
-                "sambanova".to_string(),
-                "SambaNova".to_string(),
-                "Meta-Llama-3.3-70B-Instruct".to_string(),
+                "zai".to_string(),
+                "Z.AI".to_string(),
+                "glm-4.7-flash".to_string(),
             ),
             (
                 "groq".to_string(),
@@ -17323,9 +17317,9 @@ mod tests {
                 "gpt-oss-120b".to_string(),
             ),
         ];
-        app.model_name = "free/family/llama-3.3-70b".to_string();
+        app.model_name = "free/family/glm-4.7-flash".to_string();
         app.handle_keybinding_action("openFreeModelPopup");
-        // Rows: auto, gpt-oss-120b, llama-3.3-70b — current (last row) means
+        // Rows: auto, gpt-oss-120b, glm-4.7-flash — current (last row) means
         // two prevs wraps to auto.
         app.free_model_popup.select_prev();
         app.free_model_popup.select_prev();
@@ -17730,7 +17724,7 @@ mod tests {
         );
 
         // Upstream pins whose provider id `infer_provider_from_model` does not
-        // recognise (nvidia, cloudflare, sambanova, cline, zai, …) must still
+        // recognise (nvidia, cloudflare, cline, zai, …) must still
         // route through free mode rather than leaving the user stuck on ollama
         // with a broken model string.
         app.config.provider = Some("ollama".to_string());

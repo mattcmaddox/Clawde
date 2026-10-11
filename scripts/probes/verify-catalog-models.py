@@ -37,7 +37,6 @@ CASES = {
     "cerebras": ("https://api.cerebras.ai/v1", "gpt-oss-120b", {}, "first"),
     "google": ("https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", {}, "first"),
     "groq": ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b", {}, "first"),
-    "sambanova": ("https://api.sambanova.ai/v1", "Meta-Llama-3.3-70B-Instruct", {}, "first"),
     "cline": (
         "https://api.cline.bot/api/v1",
         "cline-free/deepseek-v4.1-flash",

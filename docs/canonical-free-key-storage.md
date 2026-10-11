@@ -101,7 +101,6 @@ ensures no regressions.
 | google | API key |
 | cloudflare | Composite key (ACCOUNT_ID:TOKEN) |
 | groq | API key |
-| sambanova | API key |
 | cline | API key |
 | opencode-zen | API key (shared with opencode-go) |
 | opencode-go | Alias for opencode-zen, not a catalog entry |

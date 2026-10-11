@@ -304,7 +304,7 @@ mod tests {
         // the state was rebuilt empty on every startup while the docs claimed
         // otherwise.
         let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = ids(&["groq", "sambanova", "cerebras"]);
+        let home = ids(&["groq", "zai", "cerebras"]);
 
         let mut st = ToolDialectState::new(3).with_persistence(home.clone(), true);
         st.record(0, true);
@@ -366,7 +366,7 @@ mod tests {
         stored.record(1, false);
         write_tally(&stored);
 
-        let loaded = ToolDialectState::new(2).with_persistence(ids(&["groq", "sambanova"]), true);
+        let loaded = ToolDialectState::new(2).with_persistence(ids(&["groq", "zai"]), true);
         assert!(
             !loaded.is_prose_prone(1),
             "an unattributable tally must not condemn a lane"
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn persist_false_neither_reads_nor_writes_the_tally() {
         let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = ids(&["groq", "sambanova"]);
+        let home = ids(&["groq", "zai"]);
 
         // Seed disk with a verdict that would suppress a demotion.
         let mut stored = ToolDialectState::new(2).with_persistence(home.clone(), true);

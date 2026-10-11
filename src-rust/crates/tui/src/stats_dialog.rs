@@ -1605,7 +1605,7 @@ mod tests {
             serde_json::json!({
                 "disabled_upstreams": [
                     "nvidia", "cerebras", "google", "cloudflare",
-                    "groq", "sambanova", "cline", "opencode-zen",
+                    "groq", "cline", "opencode-zen",
                     "zai", "openrouter", "poolside"
                 ]
             }),

@@ -115,7 +115,6 @@ fn known_provider_ids() -> Vec<&'static str> {
         P::CLOUDFLARE,
         P::VENICE,
         P::SAP,
-        P::SAMBANOVA,
         P::NVIDIA,
         P::SILICONFLOW,
         P::MOONSHOT,
@@ -1189,7 +1188,7 @@ impl SlashCommand for LimitsCommand {
          Makes a lightweight GET request to each configured provider's\n\
          models endpoint and parses X-RateLimit-* response headers.\n\
          Upstreams whose models endpoint doesn't check auth (nvidia,\n\
-         openrouter, sambanova, cloudflare, poolside) get a 1-token\n\
+         openrouter, cloudflare, poolside) get a 1-token\n\
          chat/completions confirmation first.\n\
          \n\
          Most free-tier providers (including Gemini) don't expose rate-limit\n\

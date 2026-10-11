@@ -221,7 +221,7 @@ explicitly punt on it.
 ### F1. Dispatch-time quota awareness is intentionally bounded (RESOLVED)
 The chain now consults fresh server observations before dispatch and keeps
 local sliding-window estimates for the small set of explicit catalog limits:
-Groq 1K requests/day, Cerebras 5 RPM/30K TPM, and SambaNova 20 RPM/200K TPD.
+Groq 1K requests/day, Cerebras 5 RPM/30K TPM, and Poolside 200 requests/hour.
 Providers with ranges, model-specific limits, or non-token units such as
 Cloudflare neurons/day remain neutral until authoritative response metadata is
 available. The estimate is a soft ordering signal, not a hard eligibility gate,
@@ -493,7 +493,7 @@ All inconclusive for a stated reason, not a guess:
 | NVIDIA | Catalog default is EOL (below). With a live model (`openai/gpt-oss-20b`) the drain completed 150 requests without a single 429, so the free-tier ceiling is above that. |
 | Cloudflare | No 429 after 400 requests on `@cf/meta/llama-3.2-3b-instruct`, nor after 150 on the catalog probe model `@cf/qwen/qwen3-30b-a3b-fp8`. The documented 300 RPM text-generation ceiling was not reached. |
 | Cline | HTTP 402 `insufficient_credits`, balance `-$0.00`. |
-| Google, OpenRouter, Cerebras, SambaNova, Poolside | Fewer than 2 stored keys, so there is nothing to compare. |
+| Google, OpenRouter, Cerebras, Poolside | Fewer than 2 stored keys, so there is nothing to compare. |
 
 The probe reports INCONCLUSIVE rather than a verdict whenever the key was never
 actually seen to return 429, or when the comparison model turned out to be
@@ -647,7 +647,6 @@ upstream using the real key, base url and headers, and reports the status. A
 | cerebras | 402 | **NO-CREDITS** — see below |
 | google | 200 | OK |
 | groq | 200 | OK |
-| sambanova | 429 | OK (rate-limited = exists) |
 | cline | 429 | OK — the `cline-free/` + `X-CLIENT-TYPE` fix works |
 | opencode-zen | 200 | OK |
 | zai | 429 | OK (rate-limited = exists) |

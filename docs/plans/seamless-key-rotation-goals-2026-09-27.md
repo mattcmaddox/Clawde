@@ -42,7 +42,7 @@ breaks the user-visible promise this session was making.
 
 The free chain's ordinary fallback **changes the model**: pin
 `nvidia/nemotron-...`, watch it fail, and the chain moves to groq's default,
-then sambanova's. That is the right behaviour when a model is genuinely
+then the next upstream's. That is the right behaviour when a model is genuinely
 unavailable, and it is the wrong behaviour here.
 
 The user asked for one model and holds several NVIDIA accounts precisely to get

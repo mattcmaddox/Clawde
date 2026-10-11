@@ -44,7 +44,7 @@ run the agent loop, execute tools, manage sessions, or expose the TUI.
   strings to `Auto` / `Pinned { start_idx, pinned_model }` / family routes.
 - **Free catalog** (order = fallback priority; `FREE_CATALOG` in
   `crates/api/src/providers/free/catalog.rs`): GitHub Copilot, Poolside,
-  NVIDIA NIM, Cerebras, Google Gemini, Cloudflare, Groq, SambaNova, Cline,
+  NVIDIA NIM, Cerebras, Google Gemini, Cloudflare, Groq, Cline,
   OpenCode Zen, Z.AI, OpenRouter.
 - **Key rotation** — `KeyRotatingProvider` wraps any upstream with 2+ keys;
   exhaustion/cooldown state lives in the `KeyRing` and is exposed via

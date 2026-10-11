@@ -5593,7 +5593,7 @@ mod free_mode_progress_tests {
     fn a_long_turn_error_wraps_instead_of_running_off_the_pane() {
         let text = "free-mode upstreams exhausted: nvidia [rate_limited], poolside \
                     [rate_limited], groq [rate_limited], cerebras [rate_limited], \
-                    ... and 4 more, sambanova [rate_limited]"
+                    ... and 4 more, zai [rate_limited]"
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
@@ -5622,7 +5622,7 @@ mod free_mode_progress_tests {
         // Nothing is dropped at the far end of the message.
         let joined = rendered.join(" ");
         assert!(
-            joined.contains("sambanova [rate_limited]"),
+            joined.contains("zai [rate_limited]"),
             "the tail of the message must survive wrapping, got: {joined}"
         );
     }

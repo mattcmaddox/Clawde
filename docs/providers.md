@@ -147,7 +147,7 @@ observations are stored privately in `capacity-state/free.json`, separate from
 `auth.json` and key cooldown state. For providers without usable headers, Free
 Mode also keeps a conservative local sliding-window estimate only where an
 explicit catalog limit is known: Groq (1K requests/day), Cerebras (5 RPM / 30K
-TPM), and SambaNova (20 RPM / 200K TPD). Dispatches count estimated input
+TPM), and Poolside (200 requests/hour). Dispatches count estimated input
 usage and successful completions add known output usage; each window resets on
 its own schedule. Providers with ambiguous limits remain neutral, and fresh
 server metadata always takes precedence over the local estimate.
@@ -201,9 +201,9 @@ upstreams best suited to that task first, then the remaining upstreams in
 catalog order. The built-in preferences are:
 
 - **code generation** → OpenRouter (DeepSeek), Cerebras, Hugging Face, …
-- **reasoning** → Gemini, Groq, SambaNova, …
+- **reasoning** → Gemini, Groq, NVIDIA, …
 - **verification** → Groq, Cloudflare, OpenCode Zen, … (fastest tokens)
-- **simple edit** → Z.AI, OpenCode Zen, SambaNova, … (cheapest)
+- **simple edit** → Z.AI, OpenCode Zen, NVIDIA, … (cheapest)
 
 Override the per-task preference lists in `settings.json` — a task with an
 override uses it verbatim; tasks without one keep their built-in defaults:
@@ -228,7 +228,7 @@ override uses it verbatim; tasks without one keep their built-in defaults:
 
 Upstream ids must match the free catalog (e.g. `groq`, `cerebras`,
 `google`, `openrouter`, `zai`, `opencode-zen`, `cloudflare`,
-`sambanova`, `nvidia`, `cline`, `poolside`).
+`nvidia`, `cline`, `poolside`).
 
 ### Router behaviour (audit spec Phase 2)
 

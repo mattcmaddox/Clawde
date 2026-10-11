@@ -810,7 +810,6 @@ pub mod config {
             "github-copilot" => &["GITHUB_TOKEN"],
             "groq" => &["GROQ_API_KEY"],
             "cerebras" => &["CEREBRAS_API_KEY"],
-            "sambanova" => &["SAMBANOVA_API_KEY"],
             "deepseek" => &["DEEPSEEK_API_KEY"],
             "openrouter" => &["OPENROUTER_API_KEY"],
             "togetherai" | "together-ai" => &["TOGETHER_API_KEY"],
@@ -8204,7 +8203,6 @@ pub mod cost {
         "google",
         "cloudflare",
         "groq",
-        "sambanova",
         "cline",
         "opencode-zen",
         "opencode-go",
@@ -10404,7 +10402,7 @@ mod tests {
             cost::ModelPricing::FREE
         );
         assert_eq!(
-            cost::ModelPricing::for_model("sambanova/Meta-Llama-3.3-70B-Instruct"),
+            cost::ModelPricing::for_model("groq/openai/gpt-oss-120b"),
             cost::ModelPricing::FREE
         );
         assert_eq!(

@@ -52,7 +52,6 @@ impl ProviderId {
     pub const CLOUDFLARE: &'static str = "cloudflare";
     pub const VENICE: &'static str = "venice";
     pub const SAP: &'static str = "sap";
-    pub const SAMBANOVA: &'static str = "sambanova";
     pub const NVIDIA: &'static str = "nvidia";
     pub const SILICONFLOW: &'static str = "siliconflow";
     pub const MOONSHOT: &'static str = "moonshotai";
@@ -150,7 +149,6 @@ impl ProviderId {
                 | Self::CLOUDFLARE
                 | Self::VENICE
                 | Self::SAP
-                | Self::SAMBANOVA
                 | Self::NVIDIA
                 | Self::SILICONFLOW
                 | Self::MOONSHOT

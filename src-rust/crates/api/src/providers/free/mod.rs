@@ -2287,7 +2287,7 @@ pub fn first_free_upstream_key(
 ///
 /// Uses GET (not HEAD): several upstreams (nvidia, cline) reject
 /// HEAD with 405. For upstreams whose models endpoint doesn't check auth
-/// (nvidia, openrouter, sambanova, cline), the key is confirmed
+/// (nvidia, openrouter, cline), the key is confirmed
 /// with the same minimal `chat/completions` probe as [`validate_upstream_key`]
 /// so a dead key is reported as invalid instead of returning empty headers —
 /// and the rate-limit headers are read from the **chat response**, since those
@@ -2321,7 +2321,6 @@ pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, 
         "google" => "https://generativelanguage.googleapis.com/v1beta/models",
         "groq" => "https://api.groq.com/openai/v1/models",
         "openrouter" => "https://openrouter.ai/api/v1/models",
-        "sambanova" => "https://api.sambanova.ai/v1/models",
         "opencode-zen" => "https://api.opencode.ai/v1/models",
         "zai" => "https://open.bigmodel.cn/api/paas/v4/models",
         "cline" => "https://api.cline.bot/api/v1/ai/cline/recommended-models",
@@ -2426,7 +2425,7 @@ fn models_endpoint_validates_auth(upstream_id: &str) -> bool {
     // Cline's upstream chat outages even though the key itself is fine.)
     !matches!(
         upstream_id,
-        "nvidia" | "openrouter" | "sambanova" | "cloudflare" | "poolside"
+        "nvidia" | "openrouter" | "cloudflare" | "poolside"
     )
 }
 
@@ -2547,7 +2546,6 @@ fn chat_probe_for(upstream_id: &str) -> Option<(String, &'static str)> {
     let (base_url, default_model) = match upstream_id {
         "nvidia" => ("https://integrate.api.nvidia.com/v1", "openai/gpt-oss-120b"),
         "openrouter" => ("https://openrouter.ai/api/v1", "openrouter/free"),
-        "sambanova" => ("https://api.sambanova.ai/v1", "Meta-Llama-3.3-70B-Instruct"),
         "poolside" => ("https://inference.poolside.ai/v1", "poolside/laguna-s-2.1"),
         // Only the auth-lax upstreams reach this probe — every caller gates
         // on `!models_endpoint_validates_auth`. cloudflare is handled by its
@@ -2713,7 +2711,6 @@ pub fn probe_upstream_key(upstream_id: &str, key: &str) -> UpstreamKeyProbe {
         "google" => "https://generativelanguage.googleapis.com/v1beta/models",
         "groq" => "https://api.groq.com/openai/v1/models",
         "openrouter" => "https://openrouter.ai/api/v1/models",
-        "sambanova" => "https://api.sambanova.ai/v1/models",
         "opencode-zen" => "https://api.opencode.ai/v1/models",
         "zai" => "https://open.bigmodel.cn/api/paas/v4/models",
         "cline" => "https://api.cline.bot/api/v1/ai/cline/recommended-models",
@@ -3001,8 +2998,8 @@ enum Route {
     /// given `model_family` (in catalog order, each with its own default
     /// model), then fall through to the remaining entries. This is the
     /// `free/family/<slug>` selection from the model-first picker view —
-    /// e.g. `free/family/llama-3.3-70b` round-robins across Hugging Face,
-    /// NVIDIA and SambaNova before trying other model families.
+    /// e.g. `free/family/gpt-oss-120b` round-robins across NVIDIA, Cerebras
+    /// and Groq before trying other model families.
     Family { model_family: &'static str },
     /// Strict pin: try ONLY the exact (idx, model) pair. No fallback,
     /// no task-based reordering. Used by `--tool-model` when the user
@@ -3291,7 +3288,7 @@ mod cache_tests {
     /// account-scoped chat probe before the models-GET block is reached.
     #[test]
     fn auth_lax_probe_shortcut_has_a_chat_confirm_for_every_id() {
-        for id in ["nvidia", "poolside", "openrouter", "sambanova"] {
+        for id in ["nvidia", "poolside", "openrouter"] {
             assert!(
                 !models_endpoint_validates_auth(id),
                 "{id} is expected to be auth-lax"
@@ -3795,18 +3792,16 @@ mod cooldown_profile_audit {
     /// (checked 2026-09-27). Each of these docs keys its limits table by model
     /// id with distinct values per row, so a rate limit on one model leaves
     /// the key usable for the others.
-    const VERIFIED_PER_MODEL: [&str; 5] = [
+    const VERIFIED_PER_MODEL: [&str; 4] = [
         "cerebras",   // "vary based on the model"; limits table keyed by model id
         "groq",       // free-plan table keyed by MODEL ID
         "google",     // "Limits vary depending on the specific model being used"
-        "sambanova",  // 20 RPM / 20 RPD / 200K TPD granted per model
         "openrouter", // "different rate limits for different models" (RPM only)
     ];
 
-    /// Guards the regression that motivated this audit: cerebras and sambanova
-    /// were both unlabelled, so a one-model rate limit benched the key for
-    /// every model on those upstreams. cerebras runs 1-5 free-tier RPM and
-    /// sambanova 20, so both fire in normal use.
+    /// Guards the regression that motivated this audit: cerebras was
+    /// unlabelled, so a one-model rate limit benched the key for every model.
+    /// cerebras runs 1-5 free-tier RPM, so it fires in normal use.
     #[test]
     fn verified_per_model_upstreams_are_labelled() {
         let profiles = ProviderProfiles::load();

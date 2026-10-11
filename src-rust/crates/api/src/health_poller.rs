@@ -3,7 +3,7 @@
 // Probes each configured free-upstream key via the existing
 // `probe_upstream_key()` helper (GET `/v1/models`, 5s timeout; for
 // upstreams whose models endpoint doesn't check auth — nvidia,
-// huggingface, openrouter, sambanova, cline — a 1-token
+// huggingface, openrouter, cline — a 1-token
 // `chat/completions` confirmation probe) and logs the results so dead
 // keys are surfaced before the first user request hits them.
 //

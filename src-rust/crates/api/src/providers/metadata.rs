@@ -217,11 +217,6 @@ pub const ALL_PROVIDERS: &[ProviderMetadata] = &[
         key_url: "perplexity.ai/settings/api",
     },
     ProviderMetadata {
-        id: "sambanova",
-        env_var: "SAMBANOVA_API_KEY",
-        key_url: "cloud.sambanova.ai",
-    },
-    ProviderMetadata {
         id: "sap-ai-core",
         env_var: "AICORE_SERVICE_KEY",
         key_url: "the provider's website",

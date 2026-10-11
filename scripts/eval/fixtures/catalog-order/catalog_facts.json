@@ -1,6 +1,6 @@
 {
   "source": "src-rust/crates/api/src/providers/free/catalog.rs",
-  "source_sha256": "480ec2672dfc0c6444b07bcbe38421b35e6e2e7bb72a185ed18f7de9538a3c78",
+  "source_sha256": "fbeb13ef7b2d9e5a6b17a4efe99eca49d755c78ae946fed940e9bfcb1a52978d",
   "upstreams": [
     {
       "id": "github-copilot",
@@ -38,11 +38,6 @@
       "default_model": "openai/gpt-oss-120b"
     },
     {
-      "id": "sambanova",
-      "title": "SambaNova",
-      "default_model": "Meta-Llama-3.3-70B-Instruct"
-    },
-    {
       "id": "cline",
       "title": "Cline",
       "default_model": "cline-free/deepseek-v4.1-flash"
@@ -71,7 +66,6 @@
     "google",
     "cloudflare",
     "groq",
-    "sambanova",
     "cline",
     "opencode-zen",
     "zai",

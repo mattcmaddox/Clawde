@@ -41,7 +41,6 @@ MODELS = {
     # Both verified live 2026-09-27. NOTE the catalog default gpt-oss-120b is
     # EOL (HTTP 410 since 2026-09-03), so it cannot be used to probe.
     "nvidia": ("openai/gpt-oss-20b", "nvidia/nemotron-3.5-lightning-30b-a3b"),  # no ratelimit headers at all
-    "sambanova": ("Meta-Llama-3.3-70B-Instruct", "DeepSeek-V3.1"),
     "cline": ("moonshotai/kimi-k3", "spacexai/grok-4.7"),
     # CLOUDFLARE_PROBE_MODEL from catalog.rs — the model clawde actually probes.
     "cloudflare": (
@@ -56,7 +55,6 @@ BASE_URLS = {
     "cline": "https://api.cline.bot/api/v1",
     "groq": "https://api.groq.com/openai/v1",
     "nvidia": "https://integrate.api.nvidia.com/v1",
-    "sambanova": "https://api.sambanova.ai/v1",
     "cerebras": "https://api.cerebras.ai/v1",
     "openrouter": "https://openrouter.ai/api/v1",
 }

@@ -158,7 +158,6 @@ impl AuthStore {
                 | "opencode-zen"
                 | "opencode-go"
                 | "zai"
-                | "sambanova"
         )
     }
 
@@ -853,7 +852,6 @@ impl AuthStore {
             "zai" => "ZAI_API_KEY",
             "opencode-zen" | "opencode-go" => "OPENCODE_API_KEY",
             "crof" => "CROF_API_KEY",
-            "sambanova" => "SAMBANOVA_API_KEY",
             "poolside" => "POOLSIDE_API_KEY",
             // qwen adapter reads DASHSCOPE_API_KEY (Alibaba's DashScope is the
             // backing service), not QWEN_API_KEY.

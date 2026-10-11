@@ -124,7 +124,7 @@ Use known capacity information before dispatch without misclassifying stale or m
 - Fresh observations softly demote utilization tiers at 60%, 80%, and 95%; stable ordering preserves the existing route order within a tier.
 - `Retry-After` and provider reset headers are normalized to delta/Unix timing metadata; a known reset expires the observation before the general TTL.
 - Observations persist privately under `capacity-state/free.json` when Free Mode persistence is enabled and expire after 15 minutes.
-- Explicit catalog limits enable a conservative local sliding-window estimate for providers without usable headers. Current declarations are limited to Groq (1K requests/day), Cerebras (5 RPM/30K TPM), and SambaNova (20 RPM/200K TPD); ambiguous or provider-specific units remain neutral.
+- Explicit catalog limits enable a conservative local sliding-window estimate for providers without usable headers. Current declarations are limited to Groq (1K requests/day), Cerebras (5 RPM/30K TPM), and Poolside (200 requests/hour); ambiguous or provider-specific units remain neutral.
 - Local request accounting happens at dispatch, adds known output usage at completion, resets at each declared window, and never overrides a fresh server-derived observation.
 - Explicit pinned routes are preserved; capacity ordering applies to automatic and family routes.
 - `/keys health`, `/routing`, and the `/stats` live key-health view show fresh capacity signals only when available, with `headers` versus `local` provenance and known reset timing; missing or expired state stays quiet.

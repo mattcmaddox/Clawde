@@ -1122,12 +1122,6 @@ impl ProviderRegistry {
         {
             self.register(Arc::new(p::qwen()));
         }
-        if std::env::var("SAMBANOVA_API_KEY")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        {
-            self.register(Arc::new(p::sambanova()));
-        }
         if std::env::var("MINIMAX_API_KEY")
             .map(|v| !v.is_empty())
             .unwrap_or(false)
@@ -1393,7 +1387,7 @@ mod tests {
             serde_json::json!({
                 "disabled_upstreams": [
                     "huggingface", "nvidia", "cerebras", "google", "cloudflare",
-                    "sambanova", "cline", "cohere", "opencode-zen",
+                    "cline", "cohere", "opencode-zen",
                     "zai", "openrouter", "github-copilot"
                 ]
             }),

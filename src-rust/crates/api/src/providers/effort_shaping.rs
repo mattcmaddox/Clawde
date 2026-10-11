@@ -143,7 +143,6 @@ pub fn is_openaiish_provider(provider_id: &str) -> bool {
             | "nvidia"
             | "cloudflare"
             | "siliconflow"
-            | "sambanova"
             | "moonshot"
             | "zhipu"
             | "zai"
@@ -868,7 +867,7 @@ mod tests {
         let mut o = serde_json::Map::new();
         shape_provider_thinking(
             &mut o,
-            "sambanova",
+            "siliconflow",
             "meta-llama/llama-3.3-70b-instruct",
             Some(EffortLevel::High),
             None,

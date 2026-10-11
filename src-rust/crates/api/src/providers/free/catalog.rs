@@ -57,17 +57,6 @@ pub(crate) fn local_quota_for(id: &str) -> Option<LocalQuota> {
                 window_secs: 60,
             }),
         )),
-        // Profile metadata: 20 RPM and 200K tokens/day.
-        "sambanova" => Some(LocalQuota::windows(
-            Some(LocalQuotaWindow {
-                limit: 20,
-                window_secs: 60,
-            }),
-            Some(LocalQuotaWindow {
-                limit: 200_000,
-                window_secs: 24 * 60 * 60,
-            }),
-        )),
         // Poolside free tier: 200 requests/hour.
         "poolside" => Some(LocalQuota::requests(200, 60 * 60)),
         _ => None,
@@ -267,22 +256,6 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: None,
         context_window: 128_000,
         fallback_models: &[],
-    },
-    FreeUpstream {
-        id: "sambanova",
-        title: "SambaNova",
-        key_url: "cloud.sambanova.ai",
-        default_model: "Meta-Llama-3.3-70B-Instruct",
-        model_family: "llama-3.3-70b",
-        note: "Llama 3.3 70B · DeepSeek V3",
-        tool_calling: true,
-        vision: false,
-        thinking: false,
-        max_tokens_cap: Some(8_192),
-        context_window: 128_000,
-        fallback_models: &[],
-        specialty: "strong generalist",
-        usage: "free tier · 8K",
     },
     // Tier 3: Decent fallbacks
     FreeUpstream {

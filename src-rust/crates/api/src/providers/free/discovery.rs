@@ -93,9 +93,6 @@ pub fn discovery_for(upstream_id: &str) -> FreeModelDiscovery {
         "opencode-zen" => FreeModelDiscovery::OpenCodeZenFreeModels {
             base_url: "https://opencode.ai/zen/v1",
         },
-        "sambanova" => FreeModelDiscovery::OpenAiModelList {
-            base_url: "https://api.sambanova.ai/v1",
-        },
         "zai" => FreeModelDiscovery::OpenAiModelList {
             base_url: "https://api.z.ai/api/coding/paas/v4",
         },
@@ -880,14 +877,13 @@ fn select_nvidia_catalog_free_models(entries: &[(String, bool)], wire_ids: &[&st
 
 /// Curated known-free model ids per upstream, in preference order, checked
 /// before the models.dev cross-reference. models.dev is missing entirely for
-/// sambanova and cloudflare and stale for groq (its free pick can be a
+/// cloudflare and stale for groq (its free pick can be a
 /// non-chat model like `allam-2-7b`), cerebras, and cohere. These entries
 /// are the providers' own free-tier designations; only ids actually present
 /// in the live list are eligible, so a removed model never gets fabricated.
 const KNOWN_FREE_MODELS: &[(&str, &[&str])] = &[
     ("groq", &["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]),
     ("cerebras", &["gpt-oss-120b"]),
-    ("sambanova", &["Meta-Llama-3.3-70B-Instruct"]),
     ("cloudflare", &[super::catalog::CLOUDFLARE_PROBE_MODEL]),
     // Poolside: free-in-Preview, flagship coding model is laguna-s-2.1.
     (
@@ -905,8 +901,11 @@ const KNOWN_FREE_MODELS: &[(&str, &[&str])] = &[
 /// give monthly token credits rather than per-model free access, so the
 /// Alt+J/K popup should show every model the API returns.
 ///
-/// - SambaNova: Developer tier (~600M tokens/month, all models)
-const CREDIT_BASED_FREE: &[&str] = &["sambanova"];
+/// Nothing currently uses this: SambaNova's Developer tier was the last
+/// credit-based free tier in the catalog and it is retired. Kept as the
+/// documented hook for the next upstream that grants monthly credits rather
+/// than per-model free access.
+const CREDIT_BASED_FREE: &[&str] = &[];
 
 /// Shared selection rule for live model lists: prefer the curated
 /// known-free allowlist when it matches, then the models.dev auto-detected
@@ -1043,8 +1042,8 @@ fn select_available_models_from(
             }
         }
     }
-    // For credit-based free tiers (SambaNova Developer), ALL models on the
-    // live list are usable within the monthly allowance.
+    // For credit-based free tiers, ALL models on the live list are usable
+    // within the monthly allowance (none in the catalog today).
     // Append every remaining live model so the Alt+J/K popup shows the full
     // catalog, not just the curated picks.
     if CREDIT_BASED_FREE.contains(&upstream_id) {
@@ -1593,28 +1592,6 @@ mod tests {
         assert!(
             select_available_models_from("cloudflare", &available, &HashMap::new(), &[]).is_empty()
         );
-    }
-
-    #[test]
-    fn credit_based_providers_include_full_live_list() {
-        // SambaNova has a credit-based free tier where ALL models are usable.
-        // The full list must include every live model, not just the curated
-        // allowlist pick.
-        let available: Vec<&str> = vec![
-            "Meta-Llama-3.3-70B-Instruct",
-            "DeepSeek-V3-0324",
-            "Qwen3-32B",
-        ];
-        let list = select_available_models_from("sambanova", &available, &HashMap::new(), &[]);
-        // Allowlisted model leads the full list.
-        assert_eq!(
-            list.first().map(String::as_str),
-            Some("Meta-Llama-3.3-70B-Instruct")
-        );
-        // All live models are present.
-        assert_eq!(list.len(), 3);
-        assert!(list.contains(&"DeepSeek-V3-0324".to_string()));
-        assert!(list.contains(&"Qwen3-32B".to_string()));
     }
 
     #[test]
