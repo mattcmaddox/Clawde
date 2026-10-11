@@ -110,9 +110,9 @@ pub use providers::OpenAiProvider;
 // Phase 3 re-exports — model registry.
 pub use effort_support::{model_is_reasoning, supported_efforts, variant_ladder};
 pub use model_registry::{
-    effective_model_for_config, CostBreakdown, CostTier, CostTierCondition, ExperimentalMode,
-    InterleavedReasoning, Modality, ModelCapability, ModelEntry, ModelRegistry, ModelStatus,
-    ProviderEntry, ProviderOverride,
+    effective_model_for_config, free_mode_effective_model, CostBreakdown, CostTier,
+    CostTierCondition, ExperimentalMode, InterleavedReasoning, Modality, ModelCapability,
+    ModelEntry, ModelRegistry, ModelStatus, ProviderEntry, ProviderOverride,
 };
 pub use variants::{
     variant_efforts, OPENAI_NONE_EFFORT_RELEASE_DATE, OPENAI_XHIGH_EFFORT_RELEASE_DATE,
@@ -194,6 +194,7 @@ pub fn stream_idle_timeout() -> Duration {
 
 // Composite "Free" provider — stacks many free-tier upstreams behind one
 // `free/auto` model id.
+pub use providers::free::resolve_free_model;
 pub use providers::{FreeEntry, FreeProvider, FreeUpstream, FREE_CATALOG};
 
 // Phase 4 re-exports — concrete message transformers.

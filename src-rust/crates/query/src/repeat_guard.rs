@@ -9,7 +9,8 @@
 /// - Per-chain tracking: `(tool_name, canonical_args)` → count
 /// - Args are deep-key-sorted before comparison so `{a:1,b:2}` == `{b:2,a:1}`
 /// - Thresholds default to [3, 5, 8]: first is gentle, later are detailed
-/// - Advisory only: never vetoes calls, just enriches context
+/// - Legacy call-only reminders remain advisory; result-aware tracking warns
+///   on the third unchanged result and requests a pause on the fourth.
 /// - Reset on user messages (repetition across user input is not a loop)
 ///
 /// Default consecutive-repeat counts that trigger a reminder.
@@ -32,6 +33,10 @@ pub(crate) struct RepeatCallDetector {
     last_chain: Option<Chain>,
     thresholds: Vec<u32>,
     args_preview_chars: usize,
+    /// Result fingerprints stay separate from reminder text and tool-call ids.
+    results: std::collections::HashMap<String, u64>,
+    unchanged_counts: std::collections::HashMap<String, u32>,
+    pause_requested: bool,
 }
 
 impl RepeatCallDetector {
@@ -40,6 +45,9 @@ impl RepeatCallDetector {
             last_chain: None,
             thresholds: DEFAULT_THRESHOLDS.to_vec(),
             args_preview_chars: DEFAULT_ARGS_PREVIEW_CHARS,
+            results: std::collections::HashMap::new(),
+            unchanged_counts: std::collections::HashMap::new(),
+            pause_requested: false,
         }
     }
 
@@ -89,10 +97,64 @@ impl RepeatCallDetector {
         }
     }
 
-    /// Reset the chain. Call when a user message arrives — repetition
-    /// across user input is not a loop.
+    /// Record the raw result before notices are appended. Changed results and
+    /// successful writes invalidate repetition evidence; alternating calls are
+    /// still tracked by canonical arguments, not just by the last call.
+    pub fn observe_result(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        content: &str,
+        is_error: bool,
+        made_write: bool,
+    ) -> Option<String> {
+        use std::hash::{Hash, Hasher};
+
+        if made_write && !is_error {
+            self.reset();
+            return None;
+        }
+        let key = format!("{}:{}", tool_name, canonicalize_args(args));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        content.hash(&mut hasher);
+        is_error.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        if self.results.get(&key) != Some(&fingerprint) {
+            // New evidence anywhere in the sequence invalidates the old run.
+            self.unchanged_counts.clear();
+            self.last_chain = None;
+            self.pause_requested = false;
+        }
+        self.results.insert(key.clone(), fingerprint);
+        let legacy_reminder = self.observe(tool_name, args);
+        let count = self.unchanged_counts.entry(key).or_default();
+        *count += 1;
+        if *count == DEFAULT_THRESHOLDS[0] {
+            Some(format!(
+                "Possible tool loop: {tool_name} returned the same result three times without a state change. Try a different approach, or ask the user how to proceed."
+            ))
+        } else if *count == DEFAULT_THRESHOLDS[0] + 1 {
+            self.pause_requested = true;
+            Some(format!(
+                "Tool loop paused: {tool_name} returned the same result four times without a state change. Choose a different approach before continuing."
+            ))
+        } else {
+            // Keep the existing later reminder rungs for callers that inspect
+            // results without acting on the pause request.
+            legacy_reminder
+        }
+    }
+
+    pub fn pause_requested(&self) -> bool {
+        self.pause_requested
+    }
+
+    /// Reset on genuine user input or progress, not autonomous continuation.
     pub fn reset(&mut self) {
         self.last_chain = None;
+        self.results.clear();
+        self.unchanged_counts.clear();
+        self.pause_requested = false;
     }
 }
 
@@ -134,10 +196,11 @@ fn truncate_args(canonical: &str, max_chars: usize) -> String {
     if canonical.len() <= max_chars {
         canonical.to_string()
     } else {
+        let cut = canonical.floor_char_boundary(max_chars);
         format!(
-            "{}… (+{} more chars)",
-            &canonical[..max_chars],
-            canonical.len() - max_chars
+            "{}… (+{} more bytes)",
+            &canonical[..cut],
+            canonical.len() - cut
         )
     }
 }
@@ -146,6 +209,88 @@ fn truncate_args(canonical: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unchanged_results_warn_then_pause() {
+        let mut detector = RepeatCallDetector::new();
+        let args = json!({"command": "cargo test"});
+        for _ in 0..2 {
+            assert!(detector
+                .observe_result("Bash", &args, "failed", true, false)
+                .is_none());
+        }
+        assert!(detector
+            .observe_result("Bash", &args, "failed", true, false)
+            .unwrap()
+            .contains("Possible tool loop"));
+        assert!(!detector.pause_requested());
+        assert!(detector
+            .observe_result("Bash", &args, "failed", true, false)
+            .unwrap()
+            .contains("Tool loop paused"));
+        assert!(detector.pause_requested());
+    }
+
+    #[test]
+    fn changed_results_and_writes_reset_repetition() {
+        let mut detector = RepeatCallDetector::new();
+        let args = json!({"command": "cargo test"});
+        for _ in 0..3 {
+            detector.observe_result("Bash", &args, "failed", true, false);
+        }
+        assert!(detector
+            .observe_result("Bash", &args, "different failure", true, false)
+            .is_none());
+        assert!(!detector.pause_requested());
+        detector.observe_result("Bash", &args, "different failure", true, false);
+        detector.observe_result(
+            "Edit",
+            &json!({"file_path": "foo.rs"}),
+            "written",
+            false,
+            true,
+        );
+        assert!(detector
+            .observe_result("Bash", &args, "different failure", true, false)
+            .is_none());
+        assert!(!detector.pause_requested());
+    }
+
+    #[test]
+    fn alternating_calls_with_unchanged_results_are_detected() {
+        let mut detector = RepeatCallDetector::new();
+        let a = json!({"path": "a"});
+        let b = json!({"path": "b"});
+        detector.observe_result("Read", &a, "a", false, false);
+        detector.observe_result("Read", &b, "b", false, false);
+        for _ in 0..2 {
+            detector.observe_result("Read", &a, "a", false, false);
+            detector.observe_result("Read", &b, "b", false, false);
+        }
+        assert!(detector
+            .observe_result("Read", &a, "a", false, false)
+            .is_some());
+        assert!(!detector.pause_requested());
+        detector.observe_result("Read", &a, "a", false, false);
+        assert!(detector.pause_requested());
+    }
+
+    #[test]
+    fn failed_write_does_not_reset_repetition() {
+        let mut detector = RepeatCallDetector::new();
+        for _ in 0..4 {
+            detector.observe_result("Edit", &json!({}), "permission denied", true, true);
+        }
+        assert!(detector.pause_requested());
+        detector.reset();
+        assert!(!detector.pause_requested());
+    }
+
+    #[test]
+    fn argument_preview_preserves_unicode_boundaries() {
+        let args = "é".repeat(300);
+        assert!(truncate_args(&args, 501).starts_with(&"é".repeat(250)));
+    }
 
     #[test]
     fn no_reminder_below_threshold() {
@@ -255,6 +400,6 @@ mod tests {
         }
         let reminder = det.observe("tool", &big_input).unwrap();
         assert!(reminder.contains("…"));
-        assert!(reminder.contains("more chars"));
+        assert!(reminder.contains("more bytes"));
     }
 }

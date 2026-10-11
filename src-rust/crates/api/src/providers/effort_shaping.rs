@@ -41,6 +41,45 @@ pub fn deepseek_reasoning_effort_for_level(level: EffortLevel) -> &'static str {
     }
 }
 
+/// Z.AI `reasoning_effort` tier for GLM-5.2 (the full ladder). Z.AI's API
+/// accepts the whole ladder on 5.2 and resolves the overlaps itself:
+/// `none`/`minimal` stop thinking, `low`/`medium` are treated as `high`, and
+/// `xhigh` as `max`.
+fn zai_reasoning_effort_for_level(level: EffortLevel) -> &'static str {
+    match level {
+        EffortLevel::None => "none",
+        EffortLevel::Minimal => "minimal",
+        EffortLevel::Low => "low",
+        EffortLevel::Medium => "medium",
+        EffortLevel::High => "high",
+        EffortLevel::XHigh | EffortLevel::Max | EffortLevel::Ultracode => "max",
+    }
+}
+
+/// Z.AI `reasoning_effort` tier for GLM-5.3 / GLM-5.3-FLASH, which accept
+/// only `max`, `high` and `low` — "any other input will result in an error".
+/// Mirrors Z.AI's own Coding Plan mapping (`none`/`minimal`/`low` → `low`,
+/// `medium`/`high` → `high`, `xhigh`/`max` → `max`).
+fn zai_53_reasoning_effort_for_level(level: EffortLevel) -> &'static str {
+    match level {
+        EffortLevel::None | EffortLevel::Minimal | EffortLevel::Low => "low",
+        EffortLevel::Medium | EffortLevel::High => "high",
+        EffortLevel::XHigh | EffortLevel::Max | EffortLevel::Ultracode => "max",
+    }
+}
+
+/// `(major, minor)` of a `glm-<major>.<minor>[-variant]` model id. `None` when
+/// the id carries no explicit minor version (`glm-5-turbo`) or is not a GLM id
+/// at all — both of which are older than every version gate below, so callers
+/// can compare with `>=` and get the conservative answer.
+fn glm_version(model_id: &str) -> Option<(u32, u32)> {
+    let rest = model_id.split("glm-").nth(1)?;
+    let version = rest.split('-').next()?;
+    let (major, minor) = version.split_once('.')?;
+    let minor: String = minor.chars().take_while(char::is_ascii_digit).collect();
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
 /// Google `thinkingLevel` for an effort override. Google's thinkingLevel has
 /// no "none" — it floors at "low"; "minimal" is a real gemini-3 level, so
 /// it passes through. `None` (no override) means the provider default which
@@ -245,16 +284,47 @@ pub fn shape_provider_thinking(
     }
 
     // Z.AI / Zhipu: GLM models expose thinking via `thinking.type` with
-    // `clear_thinking` for preserved thinking across coding turns.
+    // `clear_thinking` for preserved thinking across coding turns, plus
+    // `reasoning_effort` on GLM-5.2 and above. Two version gates matter
+    // (docs.z.ai/guides/capabilities/thinking):
+    //
+    //   - GLM-5.3 / GLM-5.3-FLASH no longer support disabling thinking ("an
+    //     error will occur if the thinking.type parameter in the API request
+    //     is set to disabled") and accept only `max|high|low` for
+    //     `reasoning_effort`. An explicit off therefore still sends
+    //     `type: enabled` — the only legal shape — with the lowest legal tier.
+    //   - GLM-5.2 accepts `type: disabled` and the full effort ladder;
+    //     GLM-4.6 and earlier have no `reasoning_effort` at all.
+    //
+    // Sending `disabled` to 5.3 was a live 400: this arm wrote it for every
+    // one of these models regardless of version.
     if provider_id == "zai" || provider_id == "zhipu" {
-        let enabled = effort_level != Some(EffortLevel::None);
+        let version = glm_version(model_id);
+        let forced_thinking = matches!(version, Some(v) if v >= (5, 3));
+        let supports_effort = matches!(version, Some(v) if v >= (5, 2));
+        let off = effort_level == Some(EffortLevel::None) && !forced_thinking;
         options.insert(
             "thinking".to_string(),
             serde_json::json!({
-                "type": if enabled { "enabled" } else { "disabled" },
+                "type": if off { "disabled" } else { "enabled" },
                 "clear_thinking": false,
             }),
         );
+        // `reasoning_effort` is stated by the request's effort override, never
+        // alongside a disabled block (there `type` is the whole signal).
+        options.remove("reasoningEffort");
+        if supports_effort && !off {
+            if let Some(level) = effort_level {
+                options.insert(
+                    "reasoningEffort".to_string(),
+                    serde_json::json!(if forced_thinking {
+                        zai_53_reasoning_effort_for_level(level)
+                    } else {
+                        zai_reasoning_effort_for_level(level)
+                    }),
+                );
+            }
+        }
     }
 
     // Poolside: binary thinking toggle via chat_template_kwargs. Thinking is
@@ -372,6 +442,12 @@ pub fn inspect_thinking(
     last_route: Option<&FreeLastRoute>,
 ) -> ThinkingInspection {
     let model = model_id.to_ascii_lowercase();
+    // Dispatch caps before shaping. Use that same budget for both the wire
+    // preview and usage diagnostics, including when only a catalog cap exists.
+    let effective_max_tokens = match (max_tokens, upstream.and_then(|entry| entry.max_tokens_cap)) {
+        (Some(requested), Some(cap)) => Some(requested.min(cap)),
+        (requested, cap) => requested.or(cap),
+    };
     let mut options = serde_json::Map::new();
     shape_provider_thinking(
         &mut options,
@@ -379,17 +455,13 @@ pub fn inspect_thinking(
         &model,
         effort_level,
         thinking_budget,
-        max_tokens,
+        effective_max_tokens,
     );
 
     let mut warnings = Vec::new();
 
     // Ladder quirks that hold regardless of the wire param.
     if effort_level == Some(EffortLevel::Low) {
-        warnings.push(
-            "Low disables thinking; Minimal enables a 1,024-token budget — use Minimal for cheap thinking"
-                .to_string(),
-        );
         warnings.push("Low forces temperature 0.0".to_string());
     }
     if let Some(upstream) = upstream {
@@ -428,7 +500,7 @@ pub fn inspect_thinking(
                 let raw = thinking_budget
                     .or_else(|| effort_level.and_then(|l| l.thinking_budget_tokens()))
                     .unwrap_or(budget as u32);
-                if let Some(mt) = max_tokens {
+                if let Some(mt) = effective_max_tokens {
                     if raw >= mt {
                         warnings.push(format!(
                             "budget {raw} clamped below max_tokens {mt} (Gemini requires budget < maxOutputTokens)"
@@ -465,6 +537,16 @@ pub fn inspect_thinking(
                 wire_param = Some(format!(
                     "thinking.type: enabled · reasoningEffort: {effort}"
                 ));
+            }
+            // GLM-5.3+ cannot disable thinking, so an explicit off is honored
+            // only as far as the API allows: thinking stays on at the low tier.
+            if effort_level == Some(EffortLevel::None)
+                && matches!(glm_version(&model), Some(v) if v >= (5, 3))
+            {
+                warnings.push(
+                    "GLM-5.3 no longer supports disabling thinking — request sends type: enabled"
+                        .to_string(),
+                );
             }
         }
     } else if options.get("enable_thinking").and_then(|v| v.as_bool()) == Some(true) {
@@ -518,7 +600,7 @@ pub fn inspect_thinking(
     let last_response = last_route.map(|route| {
         let mut flags = Vec::new();
         if route.usage.reasoning_tokens > 0 {
-            if let Some(mt) = max_tokens {
+            if let Some(mt) = effective_max_tokens {
                 let mt = mt as u64;
                 if route.usage.reasoning_tokens >= mt.saturating_mul(9) / 10
                     && route.usage.output_tokens == 0
@@ -796,6 +878,123 @@ mod tests {
     }
 
     #[test]
+    fn shape_zai_53_never_disables_and_tiers_the_effort() {
+        // GLM-5.3 / GLM-5.3-FLASH error on `type: disabled` and accept only
+        // max|high|low, so an explicit off must stay enabled — and take the
+        // mildest legal tier, because leaving the tier unset means the model's
+        // own default (`max`, deep inference).
+        let mut o = serde_json::Map::new();
+        shape_provider_thinking(
+            &mut o,
+            "zai",
+            "glm-5.3",
+            Some(EffortLevel::None),
+            None,
+            None,
+        );
+        assert_eq!(o["thinking"]["type"], serde_json::json!("enabled"));
+        assert_eq!(o["reasoningEffort"], serde_json::json!("low"));
+
+        let mut o = serde_json::Map::new();
+        shape_provider_thinking(
+            &mut o,
+            "zhipu",
+            "glm-5.3-flash",
+            Some(EffortLevel::Minimal),
+            None,
+            None,
+        );
+        assert_eq!(o["reasoningEffort"], serde_json::json!("low"));
+
+        let mut o = serde_json::Map::new();
+        shape_provider_thinking(
+            &mut o,
+            "zai",
+            "glm-5.3-flash",
+            Some(EffortLevel::High),
+            None,
+            None,
+        );
+        assert_eq!(o["reasoningEffort"], serde_json::json!("high"));
+
+        let mut o = serde_json::Map::new();
+        shape_provider_thinking(
+            &mut o,
+            "zai",
+            "glm-5.3",
+            Some(EffortLevel::Ultracode),
+            None,
+            None,
+        );
+        assert_eq!(o["reasoningEffort"], serde_json::json!("max"));
+    }
+
+    #[test]
+    fn shape_zai_52_tiers_the_full_ladder_and_still_disables() {
+        let mut o = serde_json::Map::new();
+        shape_provider_thinking(
+            &mut o,
+            "zai",
+            "glm-5.2",
+            Some(EffortLevel::Medium),
+            None,
+            None,
+        );
+        assert_eq!(o["thinking"]["type"], serde_json::json!("enabled"));
+        assert_eq!(o["reasoningEffort"], serde_json::json!("medium"));
+
+        let mut o = serde_json::Map::new();
+        shape_provider_thinking(&mut o, "zai", "glm-5.2", Some(EffortLevel::Max), None, None);
+        assert_eq!(o["reasoningEffort"], serde_json::json!("max"));
+
+        let mut o = serde_json::Map::new();
+        shape_provider_thinking(
+            &mut o,
+            "zai",
+            "glm-5.2",
+            Some(EffortLevel::None),
+            None,
+            None,
+        );
+        assert_eq!(o["thinking"]["type"], serde_json::json!("disabled"));
+        assert!(o.get("reasoningEffort").is_none());
+    }
+
+    #[test]
+    fn shape_zai_below_52_gets_no_reasoning_effort() {
+        // `reasoning_effort` is GLM-5.2 and above only; GLM-4.x and the
+        // unversioned `glm-5-turbo` take the toggle alone.
+        for model in ["glm-4.7-flash", "glm-4.6", "glm-5-turbo"] {
+            let mut o = serde_json::Map::new();
+            shape_provider_thinking(&mut o, "zai", model, Some(EffortLevel::High), None, None);
+            assert_eq!(
+                o["thinking"]["type"],
+                serde_json::json!("enabled"),
+                "{model}"
+            );
+            assert!(o.get("reasoningEffort").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn inspect_zai_53_off_reports_forced_thinking() {
+        let insp = inspect_thinking(
+            "zai",
+            "glm-5.3",
+            Some(EffortLevel::None),
+            None,
+            Some(8_192),
+            None,
+            None,
+        );
+        assert_eq!(insp.mode, ThinkingMode::Enabled);
+        assert!(insp
+            .warnings
+            .iter()
+            .any(|w| w.contains("no longer supports disabling")));
+    }
+
+    #[test]
     fn shape_zai_and_poolside_toggles() {
         let mut o = serde_json::Map::new();
         shape_provider_thinking(
@@ -878,6 +1077,30 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("clamped below max_tokens")));
+    }
+
+    #[test]
+    fn inspector_shapes_against_upstream_cap_before_reporting_budget() {
+        let upstream = crate::providers::free::catalog_entry("google").unwrap();
+        let cap = upstream.max_tokens_cap.unwrap();
+        let inspection = inspect_thinking(
+            "google",
+            "gemini-2.5-flash",
+            Some(EffortLevel::XHigh),
+            None,
+            Some(32_768),
+            Some(upstream),
+            None,
+        );
+        assert_eq!(inspection.effective_budget, Some(cap - 1));
+        assert!(inspection
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("clamped to upstream cap")));
+        assert!(inspection
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("clamped below max_tokens")));
     }
 
     #[test]
@@ -1039,10 +1262,11 @@ mod tests {
             None,
             None,
         );
-        assert!(insp
+        assert_eq!(insp.mode, ThinkingMode::Enabled);
+        assert!(!insp
             .warnings
             .iter()
-            .any(|w| w.contains("Low disables thinking; Minimal enables")));
+            .any(|warning| warning.contains("disables thinking")));
         assert!(insp.warnings.iter().any(|w| w.contains("temperature 0.0")));
     }
 

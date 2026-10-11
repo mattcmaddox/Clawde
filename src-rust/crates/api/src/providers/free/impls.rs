@@ -428,73 +428,35 @@ impl FreeProvider {
     }
 
     /// Decide how to route a user-facing model id into the chain.
+    ///
+    /// The *matching* is [`classify_pin`] (shared with [`resolve_free_model`],
+    /// which answers the same question for a caller that only has a config
+    /// string); this method adds what needs a chain — the index to pin first and
+    /// the canonical wire model for a bare tail.
     fn resolve_route(&self, model: &str) -> Route {
-        let trimmed = model.trim();
-        if trimmed.is_empty() || trimmed == "free" || trimmed == "auto" || trimmed == "free/auto" {
-            return Route::Auto;
-        }
-
-        // Legacy alias: `zen/...` was the old Free-mode pin prefix.
-        let normalized: String = if let Some(rest) = trimmed.strip_prefix("zen/") {
-            format!("opencode-zen/{}", rest)
-        } else {
-            trimmed.to_string()
-        };
-
-        // Model-first family route: `free/family/<slug>` or `family/<slug>`.
-        // Resolve the slug against the catalog so an unknown family falls
-        // back to Auto rather than silently routing nowhere. We store the
-        // catalog's own `&'static str` family slug, never a borrow of the
-        // local `normalized` buffer.
-        if let Some(rest) = normalized
-            .strip_prefix("free/family/")
-            .or_else(|| normalized.strip_prefix("family/"))
-        {
-            // Backward-compatible alias for the historical OpenCode Zen
-            // MiniMax family. The Zen free pool is now dynamic, so the alias
-            // resolves to the current catalog family rather than pinning a
-            // paid/stale model ID.
-            let family = if rest == "minimax-m2.5" {
-                "opencode-zen-free"
-            } else {
-                rest
-            };
-            if let Some(entry) = FREE_CATALOG
-                .iter()
-                .find(|entry| entry.model_family == family)
-            {
-                return Route::Family {
-                    model_family: entry.model_family,
+        match classify_pin(model) {
+            // A pin the catalog cannot serve is walked like `auto`: the string
+            // names no upstream, so there is nothing to try first.
+            PinKind::Auto | PinKind::Unknown => Route::Auto,
+            PinKind::Family(model_family) => Route::Family { model_family },
+            PinKind::Upstream { id, model: pinned } => {
+                let Some(idx) = self.chain.iter().position(|e| e.upstream.id == id) else {
+                    // In the catalog, but this session has no key for it, so
+                    // there is no entry to pin first. The rest of the chain is
+                    // still tried — the pin simply cannot be honoured now.
+                    return Route::Auto;
                 };
-            }
-            return Route::Auto;
-        }
-
-        // Explicit provider pin: `free/<provider>/<model>` (produced by the
-        // Alt+J/K popup for a model hosted by exactly one upstream) routes
-        // like a bare `<provider>/<model>` pin — try that upstream first,
-        // then fall through the rest of the chain. `free/auto` and
-        // `free/family/...` were handled above.
-        let normalized: String = if let Some(rest) = normalized.strip_prefix("free/") {
-            rest.to_string()
-        } else {
-            normalized
-        };
-
-        // Find a chain entry whose id is a prefix.
-        for (idx, entry) in self.chain.iter().enumerate() {
-            let prefix = format!("{}/", entry.upstream.id);
-            if let Some(rest) = normalized.strip_prefix(&prefix) {
+                let entry = &self.chain[idx];
                 // OpenRouter is unusual: its model ids are themselves
                 // `vendor/model` strings (e.g. `meta-llama/llama-3-8b:free`)
                 // and the free-pool router model is literally `openrouter/free`.
                 // Pass the post-prefix portion through; for OpenRouter's
                 // built-in free router we restore the full id.
-                let pinned_model = if entry.upstream.id == "openrouter"
-                    && (rest == "free" || rest == "auto" || rest.is_empty())
+                let pinned_model = if id == ProviderId::OPENROUTER
+                    && (pinned == "free" || pinned == "auto" || pinned.is_empty())
                 {
                     "openrouter/free".to_string()
-                } else if !rest.contains('/') {
+                } else if !pinned.contains('/') {
                     // Aggregator upstreams expose vendor-prefixed wire ids
                     // (poolside wants `poolside/laguna-s-2.1`, cline wants
                     // `deepseek/deepseek-v4-flash`, groq wants
@@ -511,21 +473,18 @@ impl FreeProvider {
                         .chain(std::iter::once(entry.upstream.default_model))
                         .chain(entry.upstream.fallback_models.iter().copied());
                     known
-                        .find(|m| m.rsplit('/').next() == Some(rest))
-                        .unwrap_or(rest)
+                        .find(|m| m.rsplit('/').next() == Some(pinned))
+                        .unwrap_or(pinned)
                         .to_string()
                 } else {
-                    rest.to_string()
+                    pinned.to_string()
                 };
-                return Route::Pinned {
+                Route::Pinned {
                     start_idx: idx,
                     pinned_model,
-                };
+                }
             }
         }
-
-        // No prefix matched — treat as a raw model id for the first upstream.
-        Route::Auto
     }
 
     fn circuit_breaker_enabled(&self) -> bool {
@@ -657,6 +616,32 @@ impl FreeProvider {
                         u8::from(dialect.is_prose_prone(*idx))
                     }
                 });
+            }
+            // §6.6 routing hint: for a raised reasoning turn, prefer upstreams
+            // whose output cap can hold the level's thinking budget plus the
+            // answer reserve, and whose default model supports thinking. A
+            // raised turn clamped down to a small cap (Poolside's 8_192) is
+            // exactly spec §2.3's budget-eaten empty reply, so the hint steers
+            // the turn toward a larger-cap reasoner. Auto route only (a pinned
+            // or family route is an explicit user choice the hint must not
+            // reorder), stable, and ordering-only: it never drops a lane and
+            // never blocks fallback.
+            if matches!(route, Route::Auto) {
+                let needed = request
+                    .and_then(|r| r.effort_level)
+                    .and_then(|level| level.thinking_budget_tokens())
+                    .map(|thinking| {
+                        thinking.saturating_add(
+                            crate::providers::reasoning_depth::MIN_OUTPUT_RESERVE_TOKENS,
+                        )
+                    });
+                if let Some(needed) = needed {
+                    plan.sort_by_key(|(idx, _)| {
+                        let up = self.chain[*idx].upstream;
+                        let cap_ok = up.max_tokens_cap.is_none_or(|cap| cap >= needed);
+                        u8::from(!(up.thinking && cap_ok))
+                    });
+                }
             }
             let capacity = self.capacity.lock().unwrap();
             plan.sort_by_key(|(idx, _)| {
@@ -5755,6 +5740,33 @@ mod tests {
         }
     }
 
+    /// The router and the label agree about a retired upstream: `resolve_route`
+    /// walks the chain for a pin the catalog cannot serve, and
+    /// `resolve_free_model` resolves the *label* to `free/auto` for exactly the
+    /// same strings — so a session can never be labelled (or priced) as a model
+    /// the turn did not run on.
+    #[test]
+    fn retired_pin_routes_auto_and_resolves_to_auto() {
+        let provider = FreeProvider::new(vec![entry("groq", true), entry("cerebras", true)]);
+
+        // Mistral was retired from the free catalog on 2026-10-05; the stored
+        // model of a session created before that still names it.
+        let retired = "mistral/mistral-small-latest";
+        assert!(matches!(provider.resolve_route(retired), Route::Auto));
+        assert_eq!(
+            crate::providers::free::resolve_free_model(retired),
+            "free/auto"
+        );
+
+        // A live upstream is pinned by both, unchanged.
+        let live = "groq/gpt-oss-120b";
+        assert!(matches!(
+            provider.resolve_route(live),
+            Route::Pinned { start_idx: 0, .. }
+        ));
+        assert_eq!(crate::providers::free::resolve_free_model(live), live);
+    }
+
     #[test]
     fn nvidia_plan_includes_20b_fallback_after_120b() {
         // Sequential explicitly — this test is about fallback-row adjacency
@@ -6005,6 +6017,50 @@ mod tests {
         assert_eq!(plan[0].1, "gpt-oss-120b");
         assert_eq!(plan[1].0, 0);
         assert_eq!(plan[1].1, "Meta-Llama-3.3-70B-Instruct");
+    }
+
+    #[test]
+    fn routing_hint_prefers_cap_adequate_reasoner_for_raised_turns() {
+        // §6.6 routing hint: nvidia caps at 8_192, github-copilot at 16_384. A
+        // High raise needs 10_000 thinking + 2_048 reserve = 12_048, so only
+        // copilot can hold it. The Reasoning preference list puts nvidia ahead
+        // of copilot (copilot is in the rest group), so the hint is what flips
+        // them — and it is ordering-only.
+        let provider =
+            FreeProvider::new(vec![entry("nvidia", true), entry("github-copilot", true)]);
+        let mut request = dummy_request("free/auto");
+        request.messages = vec![Message::user("explain how the scheduler works")];
+
+        // Distinct upstream indices in plan order (each entry contributes its
+        // primary + fallback model rows, so compare the upstream order).
+        let upstream_order = |plan: &[(usize, String)]| -> Vec<usize> {
+            let mut seen: Vec<usize> = Vec::new();
+            for (idx, _) in plan {
+                if !seen.contains(idx) {
+                    seen.push(*idx);
+                }
+            }
+            seen
+        };
+
+        // No effort: task preference leads with nvidia.
+        let plain = provider.attempt_plan(&Route::Auto, Some(&request));
+        assert_eq!(
+            upstream_order(&plain),
+            vec![0, 1],
+            "nvidia leads on task preference alone"
+        );
+        let plain_rows = plain.len();
+
+        // High effort: the cap-inadequate nvidia is demoted behind copilot.
+        request.effort_level = Some(EffortLevel::High);
+        let raised = provider.attempt_plan(&Route::Auto, Some(&request));
+        assert_eq!(
+            upstream_order(&raised),
+            vec![1, 0],
+            "copilot (16_384 cap) leads the raised turn"
+        );
+        assert_eq!(raised.len(), plain_rows, "the hint never drops a lane");
     }
 
     #[test]

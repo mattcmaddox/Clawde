@@ -4,6 +4,7 @@
 //! cacheable (static) sections are placed before `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`;
 //! volatile, session-specific sections follow it.
 
+use crate::effort::EffortLevel;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -192,6 +193,55 @@ impl SystemPromptPrefix {
 // Build options
 // ---------------------------------------------------------------------------
 
+/// How strongly the system prompt pushes the model to reason before acting.
+///
+/// Strength follows the session's effective effort so the prompt, the thinking
+/// budget, and the TUI's effort display all describe the same session: the
+/// `medium` default carries the baseline, the high rungs add the explicit
+/// alternatives/risks/self-check statements, and an explicit `none` drops the
+/// block (that user asked for direct answers).
+///
+/// The block lives in the cacheable prefix, so its strength must be *sticky
+/// for a task*: re-deriving it per turn (from a per-turn auto-raise, say)
+/// would invalidate the provider's prompt cache every turn. Auto-raise settles
+/// this once per task and holds it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReasoningGuidance {
+    /// No block — effort `none`.
+    Off,
+    /// Think before acting on non-trivial work, ask on real ambiguity, check
+    /// the answer. The default for `medium` and the rungs below it.
+    #[default]
+    Baseline,
+    /// Baseline plus named alternatives, risks, and a closing self-check, for
+    /// `high` and above.
+    Careful,
+}
+
+impl ReasoningGuidance {
+    /// The guidance block for this strength, in order. Empty when the block is
+    /// omitted; `Careful` is the baseline section plus its extra paragraph, so
+    /// the two strengths cannot drift apart.
+    pub fn parts(self) -> &'static [&'static str] {
+        match self {
+            Self::Off => &[],
+            Self::Baseline => &[REASONING_GUIDANCE_CORE],
+            Self::Careful => &[REASONING_GUIDANCE_CORE, REASONING_GUIDANCE_CAREFUL_EXTRA],
+        }
+    }
+
+    /// The guidance strength for an effective effort level.
+    pub fn for_effort(level: EffortLevel) -> Self {
+        match level {
+            EffortLevel::None => Self::Off,
+            EffortLevel::Minimal | EffortLevel::Low | EffortLevel::Medium => Self::Baseline,
+            EffortLevel::High | EffortLevel::XHigh | EffortLevel::Max | EffortLevel::Ultracode => {
+                Self::Careful
+            }
+        }
+    }
+}
+
 /// All options controlling what goes into the assembled system prompt.
 #[derive(Debug, Clone, Default)]
 pub struct SystemPromptOptions {
@@ -245,6 +295,11 @@ pub struct SystemPromptOptions {
     /// end of useful final responses. The client parses and strips the block
     /// before rendering it to the user.
     pub ranked_followups: bool,
+    /// Strength of the reasoning-behavior block (`## Reasoning before acting`),
+    /// derived from the session's effective effort. Defaults to
+    /// [`ReasoningGuidance::Baseline`], which is what the `medium` default
+    /// carries.
+    pub reasoning_guidance: ReasoningGuidance,
 }
 
 // ---------------------------------------------------------------------------
@@ -277,17 +332,28 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         prefix.attribution_text().to_string(),
         // 2. Core capabilities
         CORE_CAPABILITIES.to_string(),
-        // 3. Tool use guidelines (per-tool blocks are conditional on the enabled set)
-        build_tool_use_guidelines(opts.enabled_tools.as_deref()),
-        // 4. Executing actions with care
-        ACTIONS_SECTION.to_string(),
-        // 5. Safety guidelines
-        SAFETY_GUIDELINES.to_string(),
-        // 6. Cyber-risk instruction (owned by safeguards — do not edit)
-        CYBER_RISK_INSTRUCTION.to_string(),
     ];
 
-    // 7. Output style (cacheable when non-Default; its content is stable)
+    // 3. Reasoning guidance (cacheable: fixed for the task's effort level)
+    parts.extend(
+        opts.reasoning_guidance
+            .parts()
+            .iter()
+            .map(|part| part.to_string()),
+    );
+
+    parts.extend([
+        // 4. Tool use guidelines (per-tool blocks are conditional on the enabled set)
+        build_tool_use_guidelines(opts.enabled_tools.as_deref()),
+        // 5. Executing actions with care
+        ACTIONS_SECTION.to_string(),
+        // 6. Safety guidelines
+        SAFETY_GUIDELINES.to_string(),
+        // 7. Cyber-risk instruction (owned by safeguards — do not edit)
+        CYBER_RISK_INSTRUCTION.to_string(),
+    ]);
+
+    // 8. Output style (cacheable when non-Default; its content is stable)
     if let Some(style_text) = opts
         .custom_output_style_prompt
         .as_deref()
@@ -297,12 +363,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         parts.push(format!("\n## Output Style\n{}", style_text));
     }
 
-    // 8. Coordinator mode (cacheable: content is constant)
+    // 9. Coordinator mode (cacheable: content is constant)
     if opts.coordinator_mode {
         parts.push(COORDINATOR_SYSTEM_PROMPT.to_string());
     }
 
-    // 9. Custom system prompt addition (appended to cacheable block)
+    // 10. Custom system prompt addition (appended to cacheable block)
     if let Some(custom) = &opts.custom_system_prompt {
         parts.push(format!(
             "\n<custom_instructions>\n{}\n</custom_instructions>",
@@ -324,12 +390,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // DYNAMIC / UNCACHEABLE sections (after the boundary)                //
     // ------------------------------------------------------------------ //
 
-    // 10. Environment info (platform, OS version, shell, date)
+    // 11. Environment info (platform, OS version, shell, date)
     if !opts.skip_env_info {
         parts.push(build_env_info_section(opts.working_directory.as_deref()));
     }
 
-    // 11. Working directory (legacy XML tag kept for caching compat)
+    // 12. Working directory (legacy XML tag kept for caching compat)
     if let Some(cwd) = &opts.working_directory {
         parts.push(format!(
             "\n<working_directory>{}</working_directory>",
@@ -337,17 +403,17 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         ));
     }
 
-    // 12. Memory injection (from memdir)
+    // 13. Memory injection (from memdir)
     if !opts.memory_content.is_empty() {
         parts.push(format!("\n<memory>\n{}\n</memory>", opts.memory_content));
     }
 
-    // 13. Active goal addendum (dynamic — changes each session)
+    // 14. Active goal addendum (dynamic — changes each session)
     if let Some(goal_text) = &opts.active_goal_addendum {
         parts.push(goal_text.clone());
     }
 
-    // 14. Structured working memory (dynamic — changes as the task progresses).
+    // 15. Structured working memory (dynamic — changes as the task progresses).
     // Keep this explicit and bounded at the caller so it remains useful rather
     // than becoming a second unstructured transcript.
     if let Some(task_context) = &opts.task_context {
@@ -359,12 +425,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         }
     }
 
-    // 15. Appended system prompt (--append-system-prompt)
+    // 16. Appended system prompt (--append-system-prompt)
     if let Some(append) = &opts.append_system_prompt {
         parts.push(format!("\n{}", append));
     }
 
-    // 15. Network-blocked hint (ollama isolated / offline mode).
+    // 17. Network-blocked hint (ollama isolated / offline mode).
     // Injected so the model knows WebSearch/WebFetch will be denied and
     // doesn't waste turns attempting them.
     if opts.network_blocked {
@@ -376,7 +442,7 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         );
     }
 
-    // 17. Tool-retry and output-deadline hints.
+    // 18. Tool-retry and output-deadline hints.
     // When a tool call fails (malformed JSON, permission denied, etc.), the
     // error is returned as a tool_result. The model MUST retry the failed
     // tool call with corrected arguments — do not abandon the task.
@@ -642,6 +708,39 @@ fn build_tool_use_guidelines(enabled: Option<&[String]>) -> String {
     lines.join("\n")
 }
 
+/// Baseline reasoning guidance — the `medium` default. Deliberately narrow:
+/// it asks for reasoning on non-trivial work without turning every turn into a
+/// ceremony, and it is a prompt instruction, not an enforced gate.
+const REASONING_GUIDANCE_CORE: &str = r#"
+## Reasoning before acting
+
+Work from the goal, not from the surface request. On a non-trivial task —
+multi-file work, a code change beyond a trivial edit, debugging, design, or
+anything touching code you have not read yet — think through what "done" means,
+which approach you are taking and what the alternatives were, what could go
+wrong, and which existing patterns in this codebase to follow. On trivial work
+(a single-file read, a formatting tweak, an obvious mechanical fix) skip the
+ceremony and just do it.
+
+Ask instead of guessing when a requirement is underspecified or conflicts with
+another, when two designs differ materially, or when the change is wide-reaching
+or hard to reverse. Do not ask about mechanical or obvious choices — make the
+call and proceed.
+
+State the reasoning, not just the result: when a decision involved a real
+trade-off, say briefly what you chose and why. Before presenting an answer,
+check it against the stated problem — does it solve what was asked, are the edge
+cases handled, does it follow the conventions of the code it touches?"#;
+
+/// What `High` and above add to the baseline: the explicit alternatives, risks,
+/// and closing self-check, stated in the response rather than kept implicit.
+const REASONING_GUIDANCE_CAREFUL_EXTRA: &str = r#"
+
+On a task this complex, additionally: name the one or two alternatives you
+considered before starting, list the risks and failure modes you are accounting
+for, and close by stating which requirements of the original request you
+verified, and how."#;
+
 const ACTIONS_SECTION: &str = r#"
 ## Executing actions with care
 
@@ -692,6 +791,63 @@ mod tests {
 
     fn default_opts() -> SystemPromptOptions {
         SystemPromptOptions::default()
+    }
+
+    #[test]
+    fn reasoning_guidance_strength_follows_the_effort_ladder() {
+        assert_eq!(
+            ReasoningGuidance::for_effort(EffortLevel::None),
+            ReasoningGuidance::Off
+        );
+        for level in [EffortLevel::Minimal, EffortLevel::Low, EffortLevel::Medium] {
+            assert_eq!(
+                ReasoningGuidance::for_effort(level),
+                ReasoningGuidance::Baseline,
+                "{level:?}"
+            );
+        }
+        for level in [
+            EffortLevel::High,
+            EffortLevel::XHigh,
+            EffortLevel::Max,
+            EffortLevel::Ultracode,
+        ] {
+            assert_eq!(
+                ReasoningGuidance::for_effort(level),
+                ReasoningGuidance::Careful,
+                "{level:?}"
+            );
+        }
+        // The `medium` default carries the baseline, which is what the prompt
+        // assembly uses when the caller sets no effort at all.
+        assert_eq!(ReasoningGuidance::default(), ReasoningGuidance::Baseline);
+    }
+
+    #[test]
+    fn default_prompt_carries_the_baseline_reasoning_guidance() {
+        let prompt = build_system_prompt(&default_opts());
+        assert!(prompt.contains("## Reasoning before acting"), "{prompt}");
+        assert!(prompt.contains("Ask instead of guessing"));
+        // `medium` is the baseline: the high-effort addendum stays out.
+        assert!(!prompt.contains("name the one or two alternatives"));
+    }
+
+    #[test]
+    fn reasoning_guidance_drops_at_off_and_extends_at_careful() {
+        let off = build_system_prompt(&SystemPromptOptions {
+            reasoning_guidance: ReasoningGuidance::Off,
+            ..Default::default()
+        });
+        assert!(!off.contains("## Reasoning before acting"));
+
+        let careful = build_system_prompt(&SystemPromptOptions {
+            reasoning_guidance: ReasoningGuidance::Careful,
+            ..Default::default()
+        });
+        assert!(careful.contains("## Reasoning before acting"));
+        assert!(careful.contains("name the one or two alternatives"));
+        // Careful is baseline + extra, never a replacement for it.
+        assert!(careful.contains("Ask instead of guessing"));
     }
 
     #[test]

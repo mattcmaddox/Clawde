@@ -56,6 +56,16 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         // model doesn't waste turns attempting WebSearch/WebFetch. This is
         // session-scoped; the caller refreshes the snapshot before each turn.
         network_blocked: config.network_blocked,
+        // Reasoning-behavior guidance strength follows the session's effort:
+        // `none` drops the block, the `medium` default carries the baseline,
+        // and `high` and above get the stronger variant. The block sits in the
+        // cacheable prefix, so this must be stable for the whole task —
+        // anything that raises effort (`/effort`, or the Phase 2 auto-raise)
+        // has to settle before the prompt is built and hold for the task.
+        reasoning_guidance: config
+            .effort_level
+            .map(clawde_core::system_prompt::ReasoningGuidance::for_effort)
+            .unwrap_or_default(),
         ..Default::default()
     };
 

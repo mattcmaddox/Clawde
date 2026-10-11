@@ -1165,9 +1165,12 @@ Enter plan mode (read-only). In plan mode the model can read files and reason ab
 
 ```
 /plan
+/plan <description>
 ```
 
-To exit plan mode, use `/plan off` or the `/exit-plan` internal action.
+For a non-trivial task the model interviews you before presenting the plan: it reads the files the task touches, states a short plan with its open questions, and asks about the genuinely ambiguous items through `AskUserQuestion` before waiting for your confirmation. Read-only lookups and mechanical edits skip that interview.
+
+To exit plan mode, use `/plan exit`, or the plan toggle / permission-mode cycle.
 
 ---
 

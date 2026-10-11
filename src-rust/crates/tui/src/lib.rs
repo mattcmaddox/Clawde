@@ -1201,6 +1201,60 @@ mod tests {
     }
 
     #[test]
+    fn footer_shows_the_effective_effort_and_why_it_was_raised() {
+        use crate::model_picker::EffortLevel;
+        use clawde_api::providers::reasoning_depth::RaiseReason;
+
+        let backend = TestBackend::new(140, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.has_credentials = true;
+        app.model_name = "anthropic/claude-opus-4-5".to_string();
+        // The user's own setting is Medium; this turn was raised to XHigh.
+        app.effort_level = EffortLevel::Medium;
+        app.effective_effort = Some(EffortLevel::XHigh);
+        app.auto_raise_reason = Some(RaiseReason::MultiFileCode);
+
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(
+            rendered.contains(EffortLevel::XHigh.label()),
+            "the footer must show the level the turn actually uses: {rendered}"
+        );
+        assert!(
+            rendered.contains("auto·multi-file"),
+            "a raised turn must say why: {rendered}"
+        );
+
+        // A turn without a raise shows the user's own level and no marker.
+        app.effective_effort = Some(EffortLevel::Medium);
+        app.auto_raise_reason = None;
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains(EffortLevel::Medium.label()));
+        assert!(!rendered.contains("auto·"));
+    }
+
+    #[test]
     fn test_render_app_hides_generic_thinking_status_row() {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();

@@ -116,7 +116,9 @@ impl SlashCommand for PlanCommand {
            /plan <description> — enter plan mode for the given task\n\
            /plan exit         — leave plan mode and resume normal execution\n\n\
          Plan mode restricts the model to read-only operations. The model must\n\
-         create a detailed plan and receive approval before it can act."
+         create a detailed plan and receive approval before it can act, and for\n\
+         a non-trivial task it interviews you about the plan's open questions\n\
+         before presenting it for approval."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -209,10 +211,19 @@ impl SlashCommand for PlanCommand {
                  commands or write any files until the plan has been reviewed \
                  and approved.\n\
                  \n\
-                 Use EnterPlanMode to enter the planning state, then work \
+                 Start by gathering the context you need: read the files the task \
+                 touches and the patterns they follow. Then present the plan \
+                 together with its open questions, and ask about the genuinely \
+                 ambiguous ones — requirements that conflict or are \
+                 underspecified, a change that is wide-reaching or hard to \
+                 reverse, several designs with materially different tradeoffs — \
+                 one question at a time. Do not ask about mechanical or obvious \
+                 choices, and wait for confirmation before changing anything.\n\
+                 \n\
+                 Use EnterPlanMode to announce the planning state, then work \
                  through the analysis. When you have a complete plan, present \
-                 it for review. Use the plan file at {} to record the plan \
-                 if needed.\n\
+                 it in your response for review. Do not write the plan file \
+                 at {} yourself while plan mode is active.\n\
                  \n\
                  Use /plan open to edit the plan file in your editor, \
                  /plan to view the current plan, and /plan exit when approved.",

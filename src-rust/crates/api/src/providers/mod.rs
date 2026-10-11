@@ -7,6 +7,8 @@ pub use effort_shaping::{
     openai_compat_reasoning_model, openai_reasoning_effort_for_level, openai_reasoning_model,
 };
 
+pub mod reasoning_depth;
+
 pub(crate) mod message_normalization;
 pub(crate) mod request_options;
 

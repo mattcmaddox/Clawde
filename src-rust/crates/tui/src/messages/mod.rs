@@ -44,6 +44,11 @@ pub struct RenderContext<'a> {
     pub tool_names: &'a HashMap<String, String>,
     /// Set of thinking block content hashes that are expanded per-block.
     pub expanded_thinking: &'a std::collections::HashSet<u64>,
+    /// Set of thinking block content hashes the user explicitly collapsed.
+    /// Short thinking blocks render expanded by default (the point of seeing
+    /// reasoning at all), so an explicit collapse needs its own state rather
+    /// than the absence of an entry in `expanded_thinking`.
+    pub collapsed_thinking: &'a std::collections::HashSet<u64>,
     /// Index of the currently highlighted followup (for keyboard nav).
     pub followup_selected: Option<usize>,
 }
@@ -54,6 +59,8 @@ static EMPTY_TOOL_NAMES: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 static EMPTY_EXPANDED_THINKING: std::sync::LazyLock<std::collections::HashSet<u64>> =
     std::sync::LazyLock::new(std::collections::HashSet::new);
+static EMPTY_COLLAPSED_THINKING: std::sync::LazyLock<std::collections::HashSet<u64>> =
+    std::sync::LazyLock::new(std::collections::HashSet::new);
 
 impl Default for RenderContext<'static> {
     fn default() -> Self {
@@ -63,6 +70,7 @@ impl Default for RenderContext<'static> {
             show_thinking: false,
             tool_names: &EMPTY_TOOL_NAMES,
             expanded_thinking: &EMPTY_EXPANDED_THINKING,
+            collapsed_thinking: &EMPTY_COLLAPSED_THINKING,
             followup_selected: None,
         }
     }
@@ -742,6 +750,51 @@ pub fn parse_lsp_diagnostics(text: &str) -> Option<(usize, usize)> {
 /// summaries, and grouped parallel tool-use runs. Shared by the transcript
 /// renderer and the Ctrl+O expand/collapse-all toggle so both address blocks
 /// by the same key.
+/// A thinking block this short renders expanded by default: seeing the
+/// reasoning is the point, and a handful of lines is a fair price for it.
+/// Longer blocks start collapsed so they don't push the answer off screen —
+/// one Ctrl+O (or a click on the header) opens them.
+pub const SHORT_THINKING_MAX_CHARS: usize = 600;
+pub const SHORT_THINKING_MAX_LINES: usize = 8;
+
+/// Whether a thinking block renders expanded by default.
+pub fn thinking_block_expanded_by_default(text: &str) -> bool {
+    text.chars().count() <= SHORT_THINKING_MAX_CHARS
+        && text.lines().count() <= SHORT_THINKING_MAX_LINES
+}
+
+/// Hashes of the collapsible blocks in `msg` that render expanded by default —
+/// the short-thinking-block subset of [`expandable_block_hashes`]. A toggle
+/// (Ctrl+O, header click) consults this so it knows which way each block
+/// currently points.
+pub fn expandable_block_defaults(msg: &Message) -> Vec<u64> {
+    msg.content_blocks()
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { thinking, .. }
+                if thinking_block_expanded_by_default(&thinking) =>
+            {
+                Some(thinking_block_hash(&thinking))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a thinking block renders expanded: the session-wide "show all
+/// thinking" flag wins, then an explicit per-block override (expand or
+/// collapse), then the block's own default. The two override sets are kept
+/// mutually exclusive by every writer, so their order here is convention.
+pub fn thinking_block_is_expanded(ctx: &RenderContext, text: &str, hash: u64) -> bool {
+    if ctx.show_thinking || ctx.expanded_thinking.contains(&hash) {
+        return true;
+    }
+    if ctx.collapsed_thinking.contains(&hash) {
+        return false;
+    }
+    thinking_block_expanded_by_default(text)
+}
+
 pub fn expandable_block_hashes(msg: &Message) -> Vec<u64> {
     let mut hashes = Vec::new();
     for block in msg.content_blocks() {
@@ -860,7 +913,7 @@ pub fn render_transcript_assistant_message_tagged(
             ContentBlock::Thinking { thinking, .. } => {
                 flush_text(&mut pending_text, &mut out, ctx.width);
                 let thinking_hash = thinking_block_hash(&thinking);
-                let expanded = ctx.show_thinking || ctx.expanded_thinking.contains(&thinking_hash);
+                let expanded = thinking_block_is_expanded(ctx, &thinking, thinking_hash);
                 let block_lines = render_transcript_reasoning_block(&thinking, expanded, ctx.width);
                 for (i, line) in block_lines.into_iter().enumerate() {
                     // Tag only the header line (index 0) with the hash so it's clickable.
@@ -1886,7 +1939,7 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 // Compute a stable hash of the thinking content for per-block expansion tracking
                 let thinking_hash = thinking_block_hash(&thinking);
-                let expanded = ctx.show_thinking || ctx.expanded_thinking.contains(&thinking_hash);
+                let expanded = thinking_block_is_expanded(ctx, &thinking, thinking_hash);
                 lines.extend(prefix_message_lines(
                     render_thinking_block(&thinking, expanded),
                     &msg.role,
@@ -2696,6 +2749,97 @@ mod tests {
         // ToolResult now shows output directly (no "Result" header)
         assert!(rendered.contains("file contents"));
         assert!(rendered.contains("hello"));
+    }
+
+    #[test]
+    fn short_thinking_blocks_render_expanded_by_default() {
+        let short = "A brief thought about the change.";
+        let long = "z".repeat(SHORT_THINKING_MAX_CHARS + 1);
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::Thinking {
+                thinking: short.to_string(),
+                signature: "sig1".to_string(),
+            },
+            ContentBlock::Thinking {
+                thinking: long.clone(),
+                signature: "sig2".to_string(),
+            },
+        ]);
+
+        let ctx = RenderContext::default();
+        let tagged = render_transcript_assistant_message_tagged(&msg, &ctx);
+        let combined: String = tagged
+            .iter()
+            .map(|(l, _)| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("▼ Thinking: A brief thought"),
+            "a short thinking block renders expanded without a toggle: {combined}"
+        );
+        assert!(
+            combined.contains(short),
+            "a short thinking block shows its body: {combined}"
+        );
+        assert!(
+            combined.contains("▶ Thinking: z"),
+            "a long thinking block starts collapsed: {combined}"
+        );
+        assert!(
+            !combined.contains(&long),
+            "a collapsed long block hides its body: {combined}"
+        );
+        assert!(
+            combined.contains("ctrl+o to expand"),
+            "the collapsed long block keeps its expand hint: {combined}"
+        );
+
+        // An explicit collapse hides the short block's body too.
+        let collapsed = std::collections::HashSet::from([thinking_block_hash(short)]);
+        let ctx = RenderContext {
+            collapsed_thinking: &collapsed,
+            ..RenderContext::default()
+        };
+        let tagged = render_transcript_assistant_message_tagged(&msg, &ctx);
+        let combined: String = tagged
+            .iter()
+            .map(|(l, _)| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !combined.contains(&format!("▼ Thinking: {}", short)),
+            "explicit collapse must flip the short block to collapsed: {combined}"
+        );
+        assert!(combined.contains("▶ Thinking: A brief thought"));
+    }
+
+    #[test]
+    fn expandable_block_defaults_lists_only_short_thinking_blocks() {
+        let short = "short";
+        let long = "z".repeat(SHORT_THINKING_MAX_CHARS + 1);
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::Thinking {
+                thinking: short.to_string(),
+                signature: "sig1".to_string(),
+            },
+            ContentBlock::Thinking {
+                thinking: long.clone(),
+                signature: "sig2".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "tu-1".to_string(),
+                name: "Bash".to_string(),
+                input: serde_json::json!({ "command": "ls" }),
+                thought_signature: None,
+            },
+        ]);
+
+        let defaults = expandable_block_defaults(&msg);
+        assert_eq!(defaults, vec![thinking_block_hash(short)]);
+        // Every default is also an expandable block, so Ctrl+O covers it.
+        for hash in defaults {
+            assert!(expandable_block_hashes(&msg).contains(&hash));
+        }
     }
 
     #[test]

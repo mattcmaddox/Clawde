@@ -4361,7 +4361,19 @@ mod tests {
         let mut ctx = make_ctx();
         let cmd = find_command("plan").unwrap();
         let result = cmd.execute("refactor the auth module", &mut ctx).await;
-        assert!(matches!(result, CommandResult::UserMessage(_)));
+        // The injected instruction carries the interview steps (spec §6.4):
+        // gather context, surface the open questions, wait for confirmation.
+        match result {
+            CommandResult::UserMessage(msg) => {
+                assert!(msg.contains("gathering the context you need"), "{msg}");
+                assert!(msg.contains("genuinely ambiguous ones"), "{msg}");
+                assert!(
+                    msg.contains("wait for confirmation before changing anything"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected UserMessage, got {:?}", other),
+        }
     }
 
     // ---- /compact tests ----------------------------------------------------

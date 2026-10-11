@@ -291,24 +291,32 @@ pub(crate) async fn execute_tool_batch(
             });
         }
 
+        // Compare raw results, not the model-facing text after adding notices.
+        // Append to the existing result: a tool_use must have exactly one reply.
+        let reminder = if batch_cancelled {
+            None
+        } else {
+            repeat_detector.observe_result(
+                &p.name,
+                &p.input,
+                &result.content,
+                result.is_error,
+                is_write_tool(&p.name),
+            )
+        };
+        let mut content = result.content;
+        if let Some(reminder) = reminder {
+            if let Some(tx) = ctx.event_tx {
+                let _ = tx.send(QueryEvent::Status(reminder.clone()));
+            }
+            content.push_str(&format!("\n[SYSTEM NOTICE: {reminder}]"));
+        }
         result_blocks.push(clawde_core::types::ContentBlock::ToolResult {
             tool_use_id: p.id.clone(),
-            content: clawde_core::types::ToolResultContent::Text(result.content),
+            content: clawde_core::types::ToolResultContent::Text(content),
             // Canonical wire form: omit is_error on success.
             is_error: if result.is_error { Some(true) } else { None },
         });
-        // Repeat-tool-reminder: detect consecutive identical tool calls and
-        // inject a warning to break loops.
-        if let Some(reminder) = repeat_detector.observe(&p.name, &p.input) {
-            result_blocks.push(clawde_core::types::ContentBlock::ToolResult {
-                tool_use_id: p.id.clone(),
-                content: clawde_core::types::ToolResultContent::Text(format!(
-                    "[SYSTEM NOTICE: {}]",
-                    reminder
-                )),
-                is_error: Some(false),
-            });
-        }
     }
 
     (result_blocks, batch_cancelled)
@@ -533,6 +541,56 @@ mod tests {
             }
         }
         assert!(saw_tool_end, "ToolEnd event missing");
+    }
+
+    #[tokio::test]
+    async fn unchanged_results_surface_notices_without_duplicate_replies() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeTool {
+            name: "ok_tool",
+            result: ToolResult::success("unchanged"),
+        })];
+        let tool_ctx = test_ctx();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let exec_ctx = exec_ctx(&tools, &tool_ctx, &tx);
+        let mut state = TurnToolState::default();
+        let mut detector = RepeatCallDetector::new();
+
+        for count in 1..=4 {
+            let id = format!("t{count}");
+            let (blocks, cancelled) = execute_tool_batch(
+                &exec_ctx,
+                &[prepared(&id, "ok_tool", None)],
+                &mut state,
+                &mut detector,
+            )
+            .await;
+            assert!(!cancelled);
+            assert_eq!(blocks.len(), 1, "one reply per tool_use, including notices");
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = &blocks[0]
+            else {
+                panic!("expected tool result");
+            };
+            assert_eq!(tool_use_id, &id);
+            assert_eq!(*is_error, None);
+            let clawde_core::types::ToolResultContent::Text(text) = content else {
+                panic!("expected text result");
+            };
+            assert_eq!(text.contains("SYSTEM NOTICE"), count >= 3);
+            assert_eq!(detector.pause_requested(), count == 4);
+        }
+        let statuses: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                QueryEvent::Status(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses[0].contains("Possible tool loop"));
+        assert!(statuses[1].contains("Tool loop paused"));
     }
 
     #[tokio::test]

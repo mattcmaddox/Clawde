@@ -87,25 +87,22 @@ fn project_key(project_root: &Path) -> String {
 }
 
 /// Find the project root for `cwd`: the nearest ancestor directory that
-/// contains a `.clawde/settings.json(c)` and is *not* the global config dir.
+/// contains a `.clawde/settings.json(c)`. Returns `None` when there is no
+/// project-level settings file above `cwd`.
 ///
-/// Returns `None` when there is no project-level settings file above `cwd`.
-/// This mirrors the walk in `Settings::find_project_settings` so trust
-/// approvals are keyed by the same directory the project config came from.
+/// Delegates the walk to [`Settings::project_settings_path`] so trust
+/// approvals are keyed by exactly the directory the project config came from —
+/// including its exclusion of the user-level settings file, which is what keeps
+/// the user's own `~/.clawde/settings.json` from being treated as a project
+/// root (and its servers from being re-gated as `Project`) when the home is
+/// redirected.
 pub fn project_root_for(cwd: &Path) -> Option<PathBuf> {
-    let global = Settings::config_dir();
-    let mut dir = cwd;
-    loop {
-        let clawde = dir.join(".clawde");
-        if clawde != global {
-            for name in ["settings.json", "settings.jsonc"] {
-                if clawde.join(name).exists() {
-                    return Some(dir.to_path_buf());
-                }
-            }
-        }
-        dir = dir.parent()?;
-    }
+    // `<root>/.clawde/settings.json(c)` → `<root>`.
+    Settings::project_settings_path(cwd).and_then(|file| {
+        file.parent()
+            .and_then(|clawde| clawde.parent())
+            .map(Path::to_path_buf)
+    })
 }
 
 /// Per-user allowlist of approved project MCP servers.

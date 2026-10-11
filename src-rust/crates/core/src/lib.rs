@@ -3637,6 +3637,9 @@ pub mod config {
         /// 3. **XDG** — `$XDG_CONFIG_HOME/clawde` when `$XDG_CONFIG_HOME` is set
         ///    (and absolute, per the spec), otherwise `~/.config/clawde`. Fresh
         ///    installs land here.
+        ///
+        /// Steps 2-3 live in [`Self::user_config_dir`]; this function is that
+        /// directory plus the explicit `$CLAWDE_HOME` override.
         pub fn config_dir() -> PathBuf {
             // 1. Explicit override wins, used verbatim.
             if let Some(explicit) = std::env::var_os("CLAWDE_HOME") {
@@ -3644,11 +3647,25 @@ pub mod config {
                     return PathBuf::from(explicit);
                 }
             }
+            Self::user_config_dir()
+        }
 
+        /// The **user-level** clawde directory, ignoring every redirect — both
+        /// `$CLAWDE_HOME` and the cargo-test scratch home.
+        ///
+        /// [`Self::config_dir`] is this directory in a normal process, and
+        /// something else entirely when the home has been redirected. Callers
+        /// that must recognise *the user's own settings file* — rather than
+        /// "whichever file is the effective global one" — need the
+        /// distinction: the project-settings walk climbs from `cwd` to the
+        /// filesystem root, so on any path under `$HOME` it arrives at
+        /// `~/.clawde`, which is the user-level config dir and can never be a
+        /// project's.
+        pub fn user_config_dir() -> PathBuf {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
             // 2. An existing `~/.clawde` is used verbatim.
-            let new_dir = home.join(".clawde");
+            let new_dir = home.join(crate::constants::CONFIG_DIR_NAME);
             if new_dir.is_dir() {
                 return new_dir;
             }
@@ -4179,88 +4196,83 @@ pub mod config {
             merged
         }
 
+        /// The nearest ancestor `.clawde/settings.json(c)` above `cwd` — the
+        /// project-level settings file, if the project has one.
+        ///
+        /// Never returns the user-level settings file. The walk starts at `cwd`
+        /// and climbs to the filesystem root, so from any path under `$HOME` it
+        /// arrives at the home directory itself — and `~/.clawde` holds the
+        /// *user-level* settings, not a project's. Excluding it by equality
+        /// with [`Self::global_settings_path`] is not enough: once the home is
+        /// redirected (`$CLAWDE_HOME`, or the cargo-test scratch home) the
+        /// effective global path points elsewhere, and the real
+        /// `~/.clawde/settings.json` — the developer's model, keys, hooks —
+        /// would load as a project layer that *outranks* the configured global
+        /// settings. So the exclusion is by identity
+        /// ([`Self::user_config_dir`]).
+        ///
+        /// `None` means no project file exists above `cwd`. The nearest
+        /// candidate that exists wins: a file that exists but does not parse is
+        /// the caller's to reject, and no deeper file shadows it.
+        pub fn project_settings_path(cwd: &std::path::Path) -> Option<PathBuf> {
+            let global_path = Self::global_settings_path();
+            let user_level = Self::user_config_dir();
+            let mut dir = cwd;
+            loop {
+                let clawde = dir.join(crate::constants::CONFIG_DIR_NAME);
+                // Try .json first, then .jsonc.
+                for name in ["settings.json", "settings.jsonc"] {
+                    let candidate = clawde.join(name);
+                    if candidate.exists()
+                        && candidate != global_path
+                        && candidate != user_level.join(name)
+                    {
+                        return Some(candidate);
+                    }
+                }
+                dir = dir.parent()?;
+            }
+        }
+
+        /// SECURITY: tag every server a repository declares as project-origin
+        /// so it is gated behind explicit approval before launching. `origin`
+        /// is `#[serde(skip)]`, so a settings file can never set it itself —
+        /// the loader always assigns it.
+        fn tag_project_mcp_origins(settings: &mut Self) {
+            for server in &mut settings.config.mcp_servers {
+                server.origin = McpServerOrigin::Project;
+            }
+            for ps in settings.projects.values_mut() {
+                for server in &mut ps.mcp_servers {
+                    server.origin = McpServerOrigin::Project;
+                }
+            }
+        }
+
         /// Walk up from `cwd` looking for `.clawde/settings.json` or
         /// `.clawde/settings.jsonc`.
         async fn find_project_settings(cwd: &std::path::Path) -> Option<Self> {
-            let global_path = Self::global_settings_path();
-            let mut dir = cwd;
-            loop {
-                // Try .json first, then .jsonc.
-                for name in &["settings.json", "settings.jsonc"] {
-                    let candidate = dir.join(".clawde").join(name);
-                    if candidate.exists() && candidate != global_path {
-                        if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
-                            let stripped = strip_jsonc_comments(&content);
-                            if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
-                                // SECURITY: tag every server defined by this
-                                // repository as project-origin so it gets gated
-                                // behind explicit approval before launching.
-                                // `origin` is `#[serde(skip)]`, so the file can
-                                // never set it itself — we always assign here.
-                                for server in &mut s.config.mcp_servers {
-                                    server.origin = McpServerOrigin::Project;
-                                }
-                                for ps in s.projects.values_mut() {
-                                    for server in &mut ps.mcp_servers {
-                                        server.origin = McpServerOrigin::Project;
-                                    }
-                                }
-                                return Some(s);
-                            }
-                        }
-                        // Found a file but couldn't parse — stop here, don't go up.
-                        return None;
-                    }
-                }
-                match dir.parent() {
-                    Some(parent) => dir = parent,
-                    None => break,
-                }
-            }
-            None
+            let path = Self::project_settings_path(cwd)?;
+            let content = tokio::fs::read_to_string(&path).await.ok()?;
+            let stripped = strip_jsonc_comments(&content);
+            let mut s = serde_json::from_str::<Self>(&stripped).ok()?;
+            Self::tag_project_mcp_origins(&mut s);
+            Some(s)
         }
 
         /// Load project-level settings for `cwd` (synchronous twin of
-        /// [`Self::find_project_settings`]). Walks up from `cwd` looking for
-        /// `.clawde/settings.json` / `.clawde/settings.jsonc`. Returns `None`
-        /// when no project file exists or the nearest candidate fails to parse.
+        /// [`Self::find_project_settings`]). Returns `None` when no project file
+        /// exists or the nearest candidate fails to parse.
         ///
         /// Used by the TUI settings screen to tag per-entry origin (global vs
         /// project) so the user can see *where* an effective value comes from.
         pub fn load_project_settings_sync(cwd: &std::path::Path) -> Option<Self> {
-            let global_path = Self::global_settings_path();
-            let mut dir = cwd;
-            loop {
-                for name in &["settings.json", "settings.jsonc"] {
-                    let candidate = dir.join(".clawde").join(name);
-                    if candidate.exists() && candidate != global_path {
-                        if let Ok(content) = std::fs::read_to_string(&candidate) {
-                            let stripped = strip_jsonc_comments(&content);
-                            if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
-                                // SECURITY: mirror find_project_settings — tag
-                                // every server defined by this repository as
-                                // project-origin so it is gated behind approval.
-                                for server in &mut s.config.mcp_servers {
-                                    server.origin = McpServerOrigin::Project;
-                                }
-                                for ps in s.projects.values_mut() {
-                                    for server in &mut ps.mcp_servers {
-                                        server.origin = McpServerOrigin::Project;
-                                    }
-                                }
-                                return Some(s);
-                            }
-                        }
-                        // Found a file but couldn't parse — stop here, don't go up.
-                        return None;
-                    }
-                }
-                match dir.parent() {
-                    Some(parent) => dir = parent,
-                    None => break,
-                }
-            }
-            None
+            let path = Self::project_settings_path(cwd)?;
+            let content = std::fs::read_to_string(&path).ok()?;
+            let stripped = strip_jsonc_comments(&content);
+            let mut s = serde_json::from_str::<Self>(&stripped).ok()?;
+            Self::tag_project_mcp_origins(&mut s);
+            Some(s)
         }
 
         /// Effective settings for `cwd` — global merged with project, project
@@ -9382,6 +9394,158 @@ mod tests {
             McpServerOrigin::Project,
             "project-defined server must be tagged Project origin and cannot forge User"
         );
+    }
+
+    /// A redirected home (`$CLAWDE_HOME`, or the cargo-test scratch home) must
+    /// not turn the *user-level* settings file into a project layer.
+    ///
+    /// The project walk climbs from `cwd` to the filesystem root, so from any
+    /// path under `$HOME` it reaches `~/.clawde/settings.json` — the user-level
+    /// file. It used to be accepted as a project layer whenever the effective
+    /// global path pointed elsewhere, so a scratch/test run read the
+    /// developer's real model, keys and hooks, and that layer *outranked* the
+    /// configured global settings (observed 2026-10-11: a stale
+    /// `mistral/mistral-small-latest` from a retired upstream surfaced in the
+    /// footer of a run whose own settings file was empty).
+    ///
+    /// `$HOME` only governs `dirs::home_dir()` on Unix, so this is Linux/macOS
+    /// only (same reason as the `crate::paths` resolver tests).
+    #[cfg(unix)]
+    #[test]
+    fn redirected_home_never_loads_the_user_level_settings_as_a_project() {
+        use crate::config::Settings;
+
+        /// Restores the saved home-resolution env vars on drop, so a panicking
+        /// assertion cannot leave the harness pointed at a deleted temp dir.
+        struct HomeEnvGuard {
+            saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        }
+        impl Drop for HomeEnvGuard {
+            fn drop(&mut self) {
+                for (k, v) in &self.saved {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+
+        let _lock = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home_env_keys = ["CLAWDE_HOME", "HOME", "XDG_CONFIG_HOME"];
+        let _restore = HomeEnvGuard {
+            saved: home_env_keys
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect(),
+        };
+        for key in home_env_keys {
+            std::env::remove_var(key);
+        }
+
+        // The tree has to hang off a directory that is outside the real home:
+        // `$TMPDIR` lives *under* `$HOME` on some dev boxes, and every
+        // `.clawde/settings.json` above `cwd` is a candidate, so an unrelated
+        // real one on the walk would decide these assertions for us.
+        let root = std::path::Path::new("/tmp");
+        if !root.is_dir() {
+            eprintln!("skipping: /tmp is unavailable, so no home-independent tree can be built");
+            return;
+        }
+        let home = tempfile::Builder::new()
+            .prefix("clawde-redirect-home-")
+            .tempdir_in(root)
+            .unwrap();
+        let scratch = tempfile::Builder::new()
+            .prefix("clawde-redirect-scratch-")
+            .tempdir_in(root)
+            .unwrap();
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("CLAWDE_HOME", scratch.path());
+
+        // The user-level settings file, carrying a model the free catalog no
+        // longer has.
+        let user_dir = home.path().join(".clawde");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let user_settings = user_dir.join("settings.json");
+        std::fs::write(
+            &user_settings,
+            r#"{"config":{"model":"mistral/mistral-small-latest"}}"#,
+        )
+        .unwrap();
+
+        // A real project under the home dir, as every dev checkout is.
+        let project = home.path().join("work").join("repo");
+        std::fs::create_dir_all(project.join(".clawde")).unwrap();
+        std::fs::write(
+            project.join(".clawde").join("settings.json"),
+            r#"{"config":{"verbose":true}}"#,
+        )
+        .unwrap();
+
+        // The nearest project file wins...
+        assert_eq!(
+            Settings::project_settings_path(&project),
+            Some(project.join(".clawde").join("settings.json"))
+        );
+        // ...and with no project file of its own the walk reports none rather
+        // than reaching for the user-level file one level up.
+        let from_work = Settings::project_settings_path(&home.path().join("work"));
+        assert_ne!(
+            from_work.as_deref(),
+            Some(user_settings.as_path()),
+            "the user-level settings file must never be returned as a project file"
+        );
+        assert_eq!(from_work, None);
+
+        // No merge path may carry the user-level model in as a project value,
+        // while the real project file still applies.
+        let loaded = Settings::load_project_settings_sync(&project).expect("project file found");
+        assert_eq!(
+            loaded.config.model, None,
+            "the user-level model must not leak in as a project value"
+        );
+        assert!(
+            loaded.config.verbose,
+            "the project's own values still apply"
+        );
+
+        // With only the user-level file above `cwd`, there is no project layer
+        // at all — the model must not appear through either merge path.
+        let work = home.path().join("work");
+        let leaked = Settings::load_project_settings_sync(&work);
+        assert_eq!(
+            leaked.and_then(|s| s.config.model),
+            None,
+            "the user-level model must not load as a project layer"
+        );
+        assert_eq!(Settings::load_effective_sync(&work).config.model, None);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let merged = runtime.block_on(Settings::load_hierarchical(&project));
+        assert_eq!(
+            merged.config.model, None,
+            "the user-level model must not leak in as a project value"
+        );
+        assert!(
+            merged.config.verbose,
+            "the project's own values still apply"
+        );
+        let merged_work = runtime.block_on(Settings::load_hierarchical(&work));
+        assert_eq!(merged_work.config.model, None);
+
+        // MCP trust keys a project by its own root — never by the home dir,
+        // which would re-gate the user's own global servers as `Project`.
+        assert_eq!(
+            crate::mcp_trust::project_root_for(&project),
+            Some(project.clone())
+        );
+        assert_eq!(crate::mcp_trust::project_root_for(&work), None);
     }
 
     /// Synchronous variants of the hierarchical load used by the TUI settings

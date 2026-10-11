@@ -250,11 +250,22 @@ clawde --permission-mode plan
 ```
 
 When in plan mode:
-- Write and execute operations require explicit permission.
+- Writes and command execution are denied until you leave plan mode — the permission manager allows read-only tools only.
 - The model can read files, search, and reason freely.
-- Exiting plan mode (via `ExitPlanModeTool`) returns to the normal permission model.
+- Leaving plan mode returns to the normal permission model.
 
-The `EnterPlanModeTool` and `ExitPlanModeTool` internal tools manage transitions. A `plan_mode_exit` attachment is injected into the conversation when the mode changes to guide the model's next steps.
+### The plan-mode interview
+
+For a non-trivial task — design, code work, debugging/architecture, or a verification run, the same definition the adaptive reasoning depth uses — the model interviews you before proposing anything:
+
+1. It reads the files the task touches and the patterns they follow.
+2. It presents a short plan together with its open questions.
+3. It asks about the genuinely ambiguous items — requirements that conflict or are underspecified, a wide-reaching or hard-to-reverse change, several designs with materially different tradeoffs — through `AskUserQuestion`, one question at a time.
+4. It waits for your confirmation. Writes stay denied until you confirm and leave plan mode.
+
+Read-only lookups and mechanical edits skip the interview, so a quick question in plan mode stays an ordinary turn. A non-interactive run (`--print`, CI, gateway) never gets it, since there is no one to answer; `/plan <description>` injects the same procedure as turn instructions.
+
+The `EnterPlanModeTool` and `ExitPlanModeTool` internal tools let the model announce the transition. The mode itself belongs to the session — `/plan`, `--permission-mode plan`, or the plan toggle — and the permission manager is what enforces it.
 
 ---
 
@@ -312,6 +323,23 @@ CLAWDE_GOALS=0 clawde
 ```
 
 Set `CLAWDE_GOALS=0` in the environment to completely disable goal-related commands and the `GoalCompleteTool`. Useful in environments where autonomous multi-turn execution is undesirable.
+
+---
+
+## Tool-loop safeguards
+
+Clawde compares tool calls by name and canonical JSON arguments, and compares
+raw results before adding system notices. If a call returns the same result
+three times without an intervening state change, Clawde displays a possible-loop
+warning and tells the model to vary its approach. A fourth unchanged result
+ends the current query with a visible pause message rather than spending more
+turns on the same call.
+
+A successful write or a changed tool result clears the repetition evidence.
+Failed writes do not. Autonomous continuation messages retain that evidence;
+new user instructions start a fresh run. These checks also catch alternating
+calls whose results remain unchanged. Existing goal, verification, and plan
+budgets remain separate safeguards and may stop a run earlier.
 
 ---
 

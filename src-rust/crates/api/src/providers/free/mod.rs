@@ -16,13 +16,17 @@
 // compatible endpoint" idea, ported into clawde's native provider
 // trait.
 //
-// Routing:
+// Routing (see `classify_pin`, the shared classifier, and
+// `FreeProvider::resolve_route`, which layers per-entry detail on it):
 //   * `free` / `free/auto` / `auto`  →  try each configured upstream
 //     in catalog order, using that upstream's `default_model`.
 //   * `<upstream_id>/<rest>`         →  pin that upstream, then
 //     fall through to the rest of the chain on transient errors.
-//   * anything else                  →  passed through verbatim
-//     to the first upstream in the chain.
+//   * `free/family/<slug>` (and the
+//     legacy `family/<slug>`)        →  every upstream hosting that family,
+//     in catalog order.
+//   * anything else                  →  walk the whole chain: a string the
+//     catalog cannot serve is ignored rather than passed through.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -73,7 +77,7 @@ mod impls;
 mod modelsdev;
 mod task_classifier;
 pub use modelsdev::{fetch_best_free_models_from_modelsdev, modelsdev_free_model_ids};
-pub use task_classifier::{classify_request, task_preference_ids, TaskType};
+pub use task_classifier::{classify_request, classify_text, task_preference_ids, TaskType};
 
 /// Select the first configured vision-capable free upstream in catalog order.
 ///
@@ -345,6 +349,16 @@ fn shape_thinking_for_upstream(req: &mut ProviderRequest, entry: &FreeEntry) {
     // max_tokens is already clamped to the entry's cap by every dispatch
     // site before this runs, so Google's thinkingBudget clamp sees the
     // effective output budget.
+    //
+    // NOTE: the level itself is passed through unchanged. The adaptive raise
+    // (spec §6.2) is bounded in the query layer against the request's output
+    // budget, but this function cannot re-bound it per upstream: it sees an
+    // effort level with no record of whether the raise or the user chose it, so
+    // stepping a level down here would silently overrule an explicit
+    // `/effort` for whichever upstream the chain happened to land on. The §6.6
+    // routing hint (a cap-adequate ordering preference in
+    // `attempt_plan_inner`) steers a raised turn toward a larger-cap upstream
+    // before dispatch, so this function never has to re-bound the level.
     shape_provider_thinking(
         options,
         entry.upstream.id,
@@ -2776,6 +2790,201 @@ pub struct FreeProvider {
     /// Production shares one store via [`Self::share_liveness`] so the TUI can
     /// read it; a freshly constructed provider starts empty.
     liveness: Arc<Mutex<Vec<LivenessRecord>>>,
+}
+
+/// How [`FREE_CATALOG`] can serve a user-facing free-mode model string.
+///
+/// This is the classification behind [`FreeProvider::resolve_route`], split out
+/// so a caller can ask what free mode will do with a pin without building a
+/// provider (see [`resolve_free_model`]).
+#[derive(Debug, PartialEq, Eq)]
+enum PinKind<'a> {
+    /// `""` / `auto` / `free` / `free/auto`: walk the whole chain in priority
+    /// order. The pin names no specific route, but it is a valid label — the
+    /// router and the label already agree.
+    Auto,
+    /// A catalog upstream, pinned first with its own wire model, then the rest
+    /// of the chain on a transient failure.
+    Upstream { id: &'static str, model: &'a str },
+    /// Every upstream that declares this model family, in catalog order.
+    Family(&'static str),
+    /// Names no catalog upstream or family, so the router ignores the string and
+    /// walks the whole chain. Indistinguishable from [`Self::Auto`] to the
+    /// router; distinguishable to a label, which must not keep naming it.
+    Unknown,
+}
+
+/// Classify a free-mode model pin against [`FREE_CATALOG`].
+///
+/// Mirrors the string handling in [`FreeProvider::resolve_route`] exactly —
+/// sentinels first, then the model-first family forms (`free/family/<slug>`,
+/// the legacy `family/<slug>`, and the legacy `zen/<model>` alias), then a
+/// `<upstream>/<model>` pin. The provider adds the per-entry detail (which chain
+/// index, the canonical wire model) on top; the *matching* lives here so the two
+/// can never disagree about what a route is.
+fn classify_pin(model: &str) -> PinKind<'_> {
+    let trimmed = model.trim();
+    if matches!(trimmed, "" | "free" | "auto" | "free/auto") {
+        return PinKind::Auto;
+    }
+
+    // Legacy alias: `zen/<model>` was the old Free-mode pin prefix and now means
+    // the OpenCode Zen upstream. Kept as an id override rather than a rewritten
+    // string so the returned model tail still borrows from `model`.
+    let zen = trimmed.strip_prefix("zen/");
+    let pin = zen.unwrap_or(trimmed);
+
+    // Model-first family route. The `zen/` alias yields an `opencode-zen/<…>`
+    // pin, which can carry neither family prefix, so it skips this branch —
+    // which is exactly what `resolve_route` did by normalizing the alias into
+    // the string before looking for a family.
+    if zen.is_none() {
+        if let Some(slug) = pin
+            .strip_prefix("free/family/")
+            .or_else(|| pin.strip_prefix("family/"))
+        {
+            // Historical alias for the OpenCode Zen MiniMax family: the Zen free
+            // pool is dynamic, so it resolves to the current catalog family
+            // rather than pinning a paid/stale model id.
+            let slug = if slug == "minimax-m2.5" {
+                "opencode-zen-free"
+            } else {
+                slug
+            };
+            return match FREE_CATALOG.iter().find(|entry| entry.model_family == slug) {
+                Some(entry) => PinKind::Family(entry.model_family),
+                // A family no upstream declares is not a route.
+                None => PinKind::Unknown,
+            };
+        }
+    }
+
+    let (id, tail) = match zen {
+        // `zen/<model>`: the remainder is the OpenCode Zen wire model, verbatim.
+        Some(rest) => (ProviderId::OPENCODE_ZEN, rest),
+        None => {
+            // Explicit provider pin: `free/<upstream>/<model>` or
+            // `<upstream>/<model>`. A bare upstream id (`groq`) is not a pin —
+            // `resolve_route` only ever matched `<id>/` prefixes.
+            let body = pin.strip_prefix("free/").unwrap_or(pin);
+            match body.split_once('/') {
+                Some(pair) => pair,
+                None => return PinKind::Unknown,
+            }
+        }
+    };
+
+    match FREE_CATALOG.iter().find(|entry| entry.id == id) {
+        Some(entry) => PinKind::Upstream {
+            id: entry.id,
+            model: tail,
+        },
+        None => PinKind::Unknown,
+    }
+}
+
+/// Whether `model` names a specific free-catalog route — an upstream pin or a
+/// model family.
+///
+/// `false` means the free provider walks the whole chain and ignores the string
+/// (the sentinels `""` / `auto` / `free` / `free/auto` included: they name no
+/// specific route, but they are valid labels as they stand).
+fn catalog_serves_pin(model: &str) -> bool {
+    matches!(
+        classify_pin(model),
+        PinKind::Upstream { .. } | PinKind::Family(_)
+    )
+}
+
+/// The model free mode will actually serve for the pin `model`.
+///
+/// A pin outlives the upstream it names. [`FREE_CATALOG`] is the authority on
+/// what free mode can route, and when an upstream is retired the stored `model`
+/// keeps naming it while [`FreeProvider::resolve_route`] has already downgraded
+/// the request to [`Route::Auto`]. Keeping the retired id in the label is not
+/// cosmetic: the id is also absent from the free-upstream list cost accounting
+/// prices against, so a free session was billed at Sonnet rates for traffic the
+/// chain served for nothing, and the id was persisted into every new session.
+///
+/// Returns the servable pin unchanged (sentinels normalized to the canonical
+/// `free/auto`) and `free/auto` for a pin the catalog cannot serve.
+pub fn resolve_free_model(pinned: &str) -> String {
+    let trimmed = pinned.trim();
+    if catalog_serves_pin(trimmed) {
+        trimmed.to_string()
+    } else {
+        clawde_core::constants::DEFAULT_MODEL.to_string()
+    }
+}
+
+#[cfg(test)]
+mod free_pin_resolution {
+    use super::*;
+
+    /// Every shape the model picker writes survives resolution: a pin to each
+    /// catalog upstream (bare and `free/`-prefixed) and each catalog family.
+    #[test]
+    fn every_catalog_route_survives_resolution() {
+        for entry in FREE_CATALOG {
+            for pin in [
+                format!("{}/{}", entry.id, entry.default_model),
+                format!("free/{}/{}", entry.id, entry.default_model),
+            ] {
+                assert!(
+                    catalog_serves_pin(&pin),
+                    "`{pin}` names catalog upstream `{}`",
+                    entry.id
+                );
+                assert_eq!(resolve_free_model(&pin), pin);
+            }
+            let family = format!("free/family/{}", entry.model_family);
+            assert!(
+                catalog_serves_pin(&family),
+                "`{family}` names catalog family `{}`",
+                entry.model_family
+            );
+            assert_eq!(resolve_free_model(&family), family);
+        }
+    }
+
+    /// The legacy `zen/` alias and its canonical spelling both stay pinned.
+    #[test]
+    fn legacy_zen_pins_still_resolve() {
+        for pin in ["zen/llama-3.3-70b", "opencode-zen/llama-3.3-70b"] {
+            assert_eq!(resolve_free_model(pin), pin);
+        }
+    }
+
+    /// A pin to an upstream the catalog no longer has is not a route. Free mode
+    /// walks the chain instead, so the label must say `free/auto` rather than
+    /// keep naming an upstream the request never used. Same for a family no
+    /// upstream declares, and for a bare id — `resolve_route` only ever matched
+    /// `<id>/` prefixes.
+    #[test]
+    fn retired_upstream_pin_resolves_to_auto() {
+        let retired = "mistral/mistral-small-latest";
+        assert!(!catalog_serves_pin(retired));
+        assert_eq!(resolve_free_model(retired), "free/auto");
+        assert_eq!(
+            resolve_free_model("free/family/retired-family"),
+            "free/auto"
+        );
+        assert_eq!(resolve_free_model("mistral"), "free/auto");
+    }
+
+    /// The sentinels name no specific route but are valid labels as they stand;
+    /// they normalize to the one canonical spelling so a session records the
+    /// same id regardless of how the user spelled auto.
+    #[test]
+    fn auto_sentinels_normalize_to_free_auto() {
+        for sentinel in ["", " ", "free", "auto", "free/auto", " free/auto "] {
+            assert_eq!(
+                resolve_free_model(sentinel),
+                "free/auto",
+                "sentinel {sentinel:?}"
+            );
+        }
+    }
 }
 
 #[derive(Debug)]

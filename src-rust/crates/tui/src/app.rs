@@ -1930,6 +1930,19 @@ pub struct App {
     // ---- Thinking block expansion state ----------------------------------
     /// Set of thinking block content hashes that are expanded.
     pub thinking_expanded: std::collections::HashSet<u64>,
+    /// Effort the current turn actually uses, as reported by the query loop
+    /// (`QueryEvent::EffortResolved`). May be higher than `effort_level`, which
+    /// holds the user's own setting; `None` means "no override" and the footer
+    /// falls back to `effort_level`.
+    pub effective_effort: Option<EffortLevel>,
+    /// Why this turn's effort was raised above `effort_level`, when the
+    /// adaptive reasoning-depth classifier raised it.
+    pub auto_raise_reason: Option<clawde_api::providers::reasoning_depth::RaiseReason>,
+    /// Set of thinking block content hashes the user explicitly collapsed.
+    /// Short thinking blocks render expanded by default, so "collapsed" needs
+    /// its own state: absence from `thinking_expanded` no longer means hidden.
+    /// The two sets are kept mutually exclusive by [`Self::set_block_expanded`].
+    pub thinking_collapsed: std::collections::HashSet<u64>,
     /// The message pane area from the last render frame (used for mouse hit testing).
     pub last_msg_area: Cell<ratatui::layout::Rect>,
     /// The frame region that supports text selection.
@@ -2199,7 +2212,12 @@ impl App {
     }
 
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
-        let model_name = config.effective_model().to_string();
+        // Free mode resolves through the catalog: a pin whose upstream has been
+        // retired is already ignored by the router, so the footer must label the
+        // session with what will actually serve it (and the cost tracker must
+        // price it that way) rather than with the dead id.
+        let model_name = clawde_api::free_mode_effective_model(&config)
+            .unwrap_or_else(|| config.effective_model().to_string());
         // Price this session from its effective model before any usage is
         // recorded. An unset model is an unknown model, and an unknown model
         // now prices at $0 (see `ModelPricing::default_pricing`), so this call
@@ -2537,6 +2555,9 @@ impl App {
             agent_type_badge: None,
             active_goal_badge: None,
             thinking_expanded: std::collections::HashSet::new(),
+            thinking_collapsed: std::collections::HashSet::new(),
+            effective_effort: None,
+            auto_raise_reason: None,
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
             last_input_area: Cell::new(ratatui::layout::Rect::default()),
@@ -4409,7 +4430,7 @@ impl App {
             model_id,
             Some(effort),
             None,
-            None,
+            Some(self.config.effective_max_tokens()),
             upstream,
             last_route.as_ref(),
         ))
@@ -4450,18 +4471,23 @@ impl App {
         &self,
     ) -> Option<clawde_api::providers::effort_shaping::ThinkingInspection> {
         let provider = self.config.selected_provider_id();
+        let effort = self.effective_effort.unwrap_or(self.effort_level);
         // `free/auto` is a routing alias, not a real provider — resolve it to
         // the first configured upstream so the inspector shows the wire param
         // the auto chain would actually send (mirrors the popup's resolution).
         if provider == "free" && self.model_name == "free/auto" {
             let (upstream_id, _, model) = self.free_model_defaults.first()?;
-            return self.inspection_for_model_id(upstream_id, model, self.effort_level);
+            return self.inspection_for_model_id(upstream_id, model, effort);
         }
         let model_id = self
             .model_name
             .strip_prefix(&format!("{}/", provider))
             .unwrap_or(&self.model_name);
-        self.inspection_for_model_id(provider, model_id, self.effort_level)
+        if provider == "free" {
+            let (upstream_id, model) = self.free_model_id_pair(&self.model_name)?;
+            return self.inspection_for_model_id(&upstream_id, &model, effort);
+        }
+        self.inspection_for_model_id(provider, model_id, effort)
     }
 
     /// Compute a read-only thinking inspection for the effort level currently
@@ -4510,6 +4536,8 @@ impl App {
         let next = ((cur as i64) + i64::from(delta)).clamp(0, levels.len() as i64 - 1) as usize;
         if next != cur {
             self.effort_level = levels[next];
+            self.effective_effort = None;
+            self.auto_raise_reason = None;
             // Flag the change so the CLI runtime syncs it into `current_effort`
             // (the value that actually drives queries) and the persisted
             // session — same bridge the effort picker's Enter uses. Without
@@ -4645,6 +4673,8 @@ impl App {
 
     /// Update the active model name (also updates config + cost tracker).
     pub fn set_model(&mut self, model: String) {
+        self.effective_effort = None;
+        self.auto_raise_reason = None;
         let old_provider = self.config.selected_provider_id().to_string();
         let old_model = self.model_name.clone();
         let inferred_provider = Self::infer_provider_from_model(&model);
@@ -5263,6 +5293,27 @@ impl App {
             self.close_secondary_views();
             self.open_keys_dialog();
             return true;
+        }
+
+        if cmd == "plan" && !args.trim().is_empty() {
+            match args.trim() {
+                // Opening the user's editor must not alter tool permissions.
+                "open" => return false,
+                "exit" => self.plan_mode = false,
+                _ => self.plan_mode = true,
+            }
+            self.config.permission_mode = if self.plan_mode {
+                clawde_core::config::PermissionMode::Plan
+            } else {
+                clawde_core::config::PermissionMode::Default
+            };
+            self.status_message = Some(if self.plan_mode {
+                "Plan mode ON — Clawde will plan before acting.".to_string()
+            } else {
+                "Plan mode OFF.".to_string()
+            });
+            // The command layer still supplies the task/interview instructions.
+            return false;
         }
 
         self.intercept_slash_command(cmd)
@@ -6257,6 +6308,33 @@ impl App {
         self.followup_row_map.borrow_mut().clear();
     }
 
+    /// Whether the collapsible block `hash` renders expanded right now: an
+    /// explicit toggle wins, else the block's own default. Mirrors
+    /// `messages::thinking_block_is_expanded` for the renderer's benefit.
+    pub fn block_renders_expanded(&self, hash: u64) -> bool {
+        if self.thinking_expanded.contains(&hash) {
+            return true;
+        }
+        if self.thinking_collapsed.contains(&hash) {
+            return false;
+        }
+        self.messages
+            .iter()
+            .any(|message| crate::messages::expandable_block_defaults(message).contains(&hash))
+    }
+
+    /// Record an explicit expand/collapse, keeping the two override sets
+    /// mutually exclusive so `block_renders_expanded` stays unambiguous.
+    pub fn set_block_expanded(&mut self, hash: u64, expanded: bool) {
+        if expanded {
+            self.thinking_collapsed.remove(&hash);
+            self.thinking_expanded.insert(hash);
+        } else {
+            self.thinking_expanded.remove(&hash);
+            self.thinking_collapsed.insert(hash);
+        }
+    }
+
     /// Check current token usage and push token warning notifications as
     /// appropriate.  Call this after updating `token_count`.
     #[allow(dead_code)]
@@ -6992,6 +7070,8 @@ impl App {
                     // `ultracode` keyword: it sets the effort to the top level.
                     let chosen = self.effort_picker.current();
                     self.effort_level = chosen;
+                    self.effective_effort = None;
+                    self.auto_raise_reason = None;
                     self.effort_picker.close();
                     self.status_message = Some(format!(
                         "Effort set to {} {}.",
@@ -8503,6 +8583,8 @@ impl App {
                         // from the picker does NOT clear it.
                         if let Some(e) = effort {
                             self.effort_level = e;
+                            self.effective_effort = None;
+                            self.auto_raise_reason = None;
                             // Same runtime-sync bridge as the effort picker /
                             // Alt+H/L: without the flag the CLI never learns
                             // about the inline effort selection.
@@ -11381,9 +11463,9 @@ impl App {
             }
             "toggleThinkingExpand" => {
                 // Ctrl+O: expand or collapse every collapsible block at once
-                // (thinking blocks + grouped parallel tool calls). Uses the
-                // same helpers as the transcript renderer so per-block click
-                // expansion and this toggle share the same key set.
+                // (thinking blocks + grouped parallel tool calls). The decision
+                // is on what is *rendered* — short thinking blocks start
+                // expanded, so an unset hash does not mean "hidden".
                 let hashes: Vec<u64> = self
                     .messages
                     .iter()
@@ -11392,15 +11474,25 @@ impl App {
                 if hashes.is_empty() {
                     self.status_message = Some("Nothing to expand.".to_string());
                 } else {
-                    let all_expanded = hashes.iter().all(|h| self.thinking_expanded.contains(h));
+                    // Compute defaults once, rather than rescanning the whole
+                    // transcript for every block in the expand-all action.
+                    let defaults: std::collections::HashSet<_> = self
+                        .messages
+                        .iter()
+                        .flat_map(crate::messages::expandable_block_defaults)
+                        .collect();
+                    let all_expanded = hashes.iter().all(|hash| {
+                        self.thinking_expanded.contains(hash)
+                            || (!self.thinking_collapsed.contains(hash) && defaults.contains(hash))
+                    });
                     if all_expanded {
                         for h in &hashes {
-                            self.thinking_expanded.remove(h);
+                            self.set_block_expanded(*h, false);
                         }
                         self.status_message = Some("Collapsed all thinking blocks.".to_string());
                     } else {
-                        for h in hashes {
-                            self.thinking_expanded.insert(h);
+                        for h in &hashes {
+                            self.set_block_expanded(*h, true);
                         }
                         self.status_message = Some("Expanded all thinking blocks.".to_string());
                     }
@@ -12988,12 +13080,17 @@ impl App {
                 }
 
                 // Check for click on a thinking block header (takes priority over text selection).
-                if let Some(&hash) = self.thinking_row_map.borrow().get(&mouse_event.row) {
-                    if self.thinking_expanded.contains(&hash) {
-                        self.thinking_expanded.remove(&hash);
-                    } else {
-                        self.thinking_expanded.insert(hash);
-                    }
+                let clicked_thinking_hash = self
+                    .thinking_row_map
+                    .borrow()
+                    .get(&mouse_event.row)
+                    .copied();
+                if let Some(hash) = clicked_thinking_hash {
+                    // Toggle what is *shown*, not set membership: a short block
+                    // is expanded by default, so a click has to be able to
+                    // collapse it.
+                    let expanded = self.block_renders_expanded(hash);
+                    self.set_block_expanded(hash, !expanded);
                     self.invalidate_transcript();
                     return;
                 }
@@ -13382,6 +13479,15 @@ impl App {
                 // Verify event was produced). Clear the in-flight spinner so a
                 // failed round can never leave `verifying…` stuck on screen.
                 self.is_verifying = false;
+            }
+
+            QueryEvent::EffortResolved { level, raised } => {
+                // The level this turn actually uses, which the adaptive
+                // reasoning-depth classifier may have raised above the user's
+                // own setting. Sent every turn, so an unraised turn clears the
+                // footer's auto marker instead of leaving it lit.
+                self.effective_effort = level;
+                self.auto_raise_reason = raised;
             }
 
             QueryEvent::UpstreamContinuation { upstream_id, .. } => {
@@ -14780,6 +14886,35 @@ mod tests {
         assert!(report.contains("Run tests"), "{report}");
         assert!(report.contains("3 / 2 / 1"), "{report}");
         assert!(report.contains("Data:"), "{report}");
+    }
+
+    #[test]
+    fn current_inspector_uses_effective_effort_and_pinned_upstream() {
+        let mut app = make_app();
+        app.config.provider = Some("free".to_string());
+        app.model_name = "free/google/gemini-3-flash-preview".to_string();
+        app.effort_level = EffortLevel::Low;
+        app.effective_effort = Some(EffortLevel::High);
+        let inspection = app.current_inspector().unwrap();
+        assert_eq!(inspection.provider_id, "google");
+        assert_eq!(
+            inspection.wire_param.as_deref(),
+            Some("thinkingLevel: high")
+        );
+    }
+
+    #[test]
+    fn selecting_effort_clears_stale_auto_raise() {
+        let mut app = make_app();
+        app.effective_effort = Some(EffortLevel::XHigh);
+        app.auto_raise_reason = Some(clawde_api::providers::reasoning_depth::RaiseReason::TaskKind);
+        app.effort_picker.open(
+            EffortLevel::Low,
+            vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+        );
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.effective_effort, None);
+        assert_eq!(app.auto_raise_reason, None);
     }
 
     #[test]
@@ -16661,6 +16796,30 @@ mod tests {
     }
 
     #[test]
+    fn plan_command_arguments_set_mode_instead_of_toggling() {
+        use clawde_core::config::PermissionMode;
+        let mut app = make_app();
+        assert!(!app.intercept_slash_command_with_args("plan", "exit"));
+        assert!(!app.plan_mode);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+        for _ in 0..2 {
+            assert!(!app.intercept_slash_command_with_args("plan", "refactor the parser"));
+            assert!(app.plan_mode);
+            assert_eq!(app.config.permission_mode, PermissionMode::Plan);
+        }
+        assert!(!app.intercept_slash_command_with_args("plan", "open"));
+        assert!(app.plan_mode);
+        assert!(!app.intercept_slash_command_with_args("plan", "exit"));
+        assert!(!app.plan_mode);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+        assert!(!app.intercept_slash_command_with_args("plan", "open"));
+        assert!(!app.plan_mode);
+        // Bare /plan retains its intentional toggle behavior.
+        assert!(!app.intercept_slash_command_with_args("plan", ""));
+        assert!(app.plan_mode);
+    }
+
+    #[test]
     fn test_clear_slash_command_clears_messages() {
         let mut app = make_app();
         app.add_message(Role::User, "hello".to_string());
@@ -17257,6 +17416,32 @@ mod tests {
     }
 
     #[test]
+    fn effort_resolved_event_sets_and_clears_the_auto_raise_marker() {
+        use clawde_api::providers::reasoning_depth::RaiseReason;
+
+        let mut app = make_app();
+        assert!(app.effective_effort.is_none());
+        assert!(app.auto_raise_reason.is_none());
+
+        // A raised turn: the footer needs both the level and the reason.
+        app.handle_query_event(QueryEvent::EffortResolved {
+            level: Some(EffortLevel::XHigh),
+            raised: Some(RaiseReason::MultiFileCode),
+        });
+        assert_eq!(app.effective_effort, Some(EffortLevel::XHigh));
+        assert_eq!(app.auto_raise_reason, Some(RaiseReason::MultiFileCode));
+
+        // A later unraised turn clears the marker rather than leaving a stale
+        // "auto" badge lit next to a level the user chose.
+        app.handle_query_event(QueryEvent::EffortResolved {
+            level: Some(EffortLevel::Medium),
+            raised: None,
+        });
+        assert_eq!(app.effective_effort, Some(EffortLevel::Medium));
+        assert_eq!(app.auto_raise_reason, None);
+    }
+
+    #[test]
     fn test_toggle_thinking_expand_expands_and_collapses_all() {
         let mut app = make_app();
 
@@ -17264,7 +17449,57 @@ mod tests {
         assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
         assert!(app.thinking_expanded.is_empty());
 
-        // Two thinking blocks in one assistant message.
+        // One short block (starts expanded) and one long block (starts
+        // collapsed), so the first press has work in both directions.
+        let long = "y".repeat(crate::messages::SHORT_THINKING_MAX_CHARS + 1);
+        app.messages.push(Message::assistant_blocks(vec![
+            ContentBlock::Thinking {
+                thinking: "first reasoning".to_string(),
+                signature: "sig1".to_string(),
+            },
+            ContentBlock::Thinking {
+                thinking: long.clone(),
+                signature: "sig2".to_string(),
+            },
+        ]));
+        let h1 = crate::messages::thinking_block_hash("first reasoning");
+        let h2 = crate::messages::thinking_block_hash(&long);
+        assert!(
+            app.block_renders_expanded(h1),
+            "short blocks start expanded"
+        );
+        assert!(
+            !app.block_renders_expanded(h2),
+            "long blocks start collapsed"
+        );
+
+        // First press: not everything is expanded → expand everything.
+        assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
+        assert!(app.block_renders_expanded(h1));
+        assert!(app.block_renders_expanded(h2));
+
+        // Second press: everything is expanded → collapse everything, including
+        // the short block that started open.
+        assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
+        assert!(!app.block_renders_expanded(h1));
+        assert!(!app.block_renders_expanded(h2));
+        assert!(
+            app.thinking_collapsed.contains(&h1),
+            "collapsing a default-expanded block must be recorded"
+        );
+
+        // Third press brings everything back.
+        assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
+        assert!(app.block_renders_expanded(h1));
+        assert!(app.block_renders_expanded(h2));
+        assert!(app.thinking_collapsed.is_empty());
+    }
+
+    #[test]
+    fn test_collapsing_all_short_blocks_needs_one_press_from_default() {
+        // With only short blocks, everything is already visible — so the first
+        // Ctrl+O press collapses rather than appearing to do nothing.
+        let mut app = make_app();
         app.messages.push(Message::assistant_blocks(vec![
             ContentBlock::Thinking {
                 thinking: "first reasoning".to_string(),
@@ -17277,15 +17512,38 @@ mod tests {
         ]));
         let h1 = crate::messages::thinking_block_hash("first reasoning");
         let h2 = crate::messages::thinking_block_hash("second reasoning");
+        assert!(app.block_renders_expanded(h1) && app.block_renders_expanded(h2));
 
-        // First press expands every block.
         assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
-        assert!(app.thinking_expanded.contains(&h1));
-        assert!(app.thinking_expanded.contains(&h2));
+        assert!(!app.block_renders_expanded(h1));
+        assert!(!app.block_renders_expanded(h2));
 
-        // Second press collapses everything again.
         assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
-        assert!(app.thinking_expanded.is_empty());
+        assert!(app.block_renders_expanded(h1) && app.block_renders_expanded(h2));
+    }
+
+    #[test]
+    fn test_collapsed_thinking_overrides_the_short_block_default() {
+        let mut app = make_app();
+        app.messages
+            .push(Message::assistant_blocks(vec![ContentBlock::Thinking {
+                thinking: "short thought".to_string(),
+                signature: "sig1".to_string(),
+            }]));
+        let hash = crate::messages::thinking_block_hash("short thought");
+        assert!(app.block_renders_expanded(hash));
+
+        // Explicit state wins in both directions, and the two sets stay
+        // mutually exclusive so the renderer never sees both.
+        app.set_block_expanded(hash, false);
+        assert!(!app.block_renders_expanded(hash));
+        assert!(!app.thinking_expanded.contains(&hash));
+        assert!(app.thinking_collapsed.contains(&hash));
+
+        app.set_block_expanded(hash, true);
+        assert!(app.block_renders_expanded(hash));
+        assert!(app.thinking_expanded.contains(&hash));
+        assert!(!app.thinking_collapsed.contains(&hash));
     }
 
     #[test]

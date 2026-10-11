@@ -2103,6 +2103,7 @@ fn build_all_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         show_thinking: false,
         tool_names: &tool_names,
         expanded_thinking: &app.thinking_expanded,
+        collapsed_thinking: &app.thinking_collapsed,
         followup_selected: app.followup_selected,
     };
     let turns = build_transcript_turns(app);
@@ -2249,6 +2250,7 @@ fn render_streaming_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         show_thinking: false,
         tool_names: &tool_names,
         expanded_thinking: &app.thinking_expanded,
+        collapsed_thinking: &app.thinking_collapsed,
         followup_selected: app.followup_selected,
     };
     let turns = build_transcript_turns(app);
@@ -3362,15 +3364,23 @@ fn render_input(
                 ));
             }
             // Effort level indicator (thinking level) — shown for all providers.
+            // The level displayed is the one this turn actually uses, so an
+            // adaptive raise (spec §6.2) is visible rather than hidden behind
+            // the user's static setting; a raise is labelled with its reason.
             let effort_color = p.effort;
+            let shown_effort = app.effective_effort.unwrap_or(app.effort_level);
             spans.push(Span::styled(
-                format!(
-                    " · {} {}",
-                    app.effort_level.symbol(),
-                    app.effort_level.label()
-                ),
+                format!(" · {} {}", shown_effort.symbol(), shown_effort.label()),
                 Style::default().fg(effort_color),
             ));
+            if let Some(reason) = app.auto_raise_reason {
+                spans.push(Span::styled(
+                    format!(" (auto·{})", reason.label()),
+                    Style::default()
+                        .fg(effort_color)
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
             // Persistent thinking-inspector warning marker: when the current
             // model+effort has a clamp / ignored-param / ladder quirk, surface
             // it subtly here (the popup/pickers carry the detail).

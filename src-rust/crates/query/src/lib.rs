@@ -24,11 +24,13 @@ pub mod coordinator;
 pub mod correction_detector;
 pub mod cron_scheduler;
 pub mod decide;
+pub(crate) mod degeneration;
 pub mod diagnostics;
 pub mod drift;
 pub mod goal_loop;
 pub mod live_smoke;
 pub mod managed_orchestrator;
+pub mod plan_interview;
 pub mod relevant_context;
 pub(crate) mod repeat_guard;
 pub mod sanitize;
@@ -38,6 +40,7 @@ pub mod session_title;
 pub mod skill_prefetch;
 pub(crate) mod state_emission;
 pub mod task_state;
+pub(crate) mod thinking_failure;
 pub(crate) mod tool_exec;
 pub mod tool_use_tracker;
 pub mod verify;
@@ -595,6 +598,16 @@ pub enum QueryEvent {
     /// Carries no content — consumers render a brief activity note so the seam
     /// between the two halves of an answer is visible rather than silent.
     UpstreamContinuation { upstream_id: String, model: String },
+    /// The effort this turn will actually use, and — when the adaptive
+    /// reasoning-depth classifier (spec §6.2) raised it above the user's own
+    /// setting — why. Emitted once per turn before the first model call, so an
+    /// interactive client can show the effective level instead of the static
+    /// picker value. `raised` is `None` on a turn that was not raised, which
+    /// also clears a stale indicator from an earlier turn.
+    EffortResolved {
+        level: Option<clawde_core::effort::EffortLevel>,
+        raised: Option<clawde_api::providers::reasoning_depth::RaiseReason>,
+    },
 }
 
 /// One cycle of the continuous server-info poll. `model` is the model the
@@ -1456,31 +1469,149 @@ fn extract_prose_tool_calls(
 
 /// Resolve the effective effort level for a turn.
 ///
-/// Ultracode is a keyword-activated effort: if the most recent user message
-/// contains the `ultracode` keyword (whole-word, case-insensitive), the effort
-/// for this turn is raised to [`EffortLevel::Ultracode`] — the model's top
-/// reasoning plus the ultracode operating procedure (injected as a system
-/// addendum by the loop). Otherwise the configured `config_effort` is used
-/// unchanged. Checking only the *last* user message keeps the mode scoped to the
-/// turn that asked for it (a later plain turn deactivates it automatically).
+/// Three inputs, in precedence order:
+///
+/// 1. **Explicit user intent wins outright.** An explicit `none` is returned
+///    unchanged (nothing below may re-enable reasoning), and the `ultracode`
+///    keyword in the most recent user message raises the turn to
+///    [`EffortLevel::Ultracode`] — the model's top reasoning plus the ultracode
+///    operating procedure (injected as a system addendum by the loop). Checking
+///    only the *last* user message keeps the keyword scoped to the turn that
+///    asked for it (a later plain turn deactivates it automatically).
+/// 2. **Adaptive reasoning depth** ([`clawde_api::providers::reasoning_depth`],
+///    spec §6.2): a rule-based raise for turns that need more reasoning, applied
+///    only when the user expressed **no** effort preference at all. It only ever
+///    raises, never above `XHigh`, and never into a thinking budget the output
+///    cap cannot carry.
+/// 3. Otherwise the configured `config_effort` is used unchanged — including
+///    `None`, which means "no override; use the provider/model default".
+///
+/// The loop resolves this once at task start and retains the result through
+/// tool rounds, retries, compaction, and autonomous continuations. A genuine
+/// queued user instruction starts a new resolution. This keeps numeric
+/// thinking budgets and cacheable reasoning guidance stable.
 ///
 /// [`EffortLevel::Ultracode`]: clawde_core::effort::EffortLevel::Ultracode
 fn effective_effort_for_turn(
     config_effort: Option<clawde_core::effort::EffortLevel>,
     messages: &[Message],
-) -> Option<clawde_core::effort::EffortLevel> {
+    max_tokens: u32,
+) -> (
+    Option<clawde_core::effort::EffortLevel>,
+    Option<clawde_api::providers::reasoning_depth::RaiseReason>,
+) {
+    use clawde_api::providers::reasoning_depth;
+
     // An explicit off override must win over keyword activation as well as the
     // persisted/provider defaults; otherwise a prompt containing "ultracode"
     // would silently re-enable reasoning after `/thinking off`.
     if config_effort == Some(clawde_core::effort::EffortLevel::None) {
-        return config_effort;
+        return (config_effort, None);
     }
-    if let Some(last_user) = messages.iter().rev().find(|m| m.role == Role::User) {
-        if clawde_core::effort::text_triggers_ultracode(&last_user.get_all_text()) {
-            return Some(clawde_core::effort::EffortLevel::Ultracode);
+    if clawde_core::effort::text_triggers_ultracode(&task_statement(messages)) {
+        // Only user-authored task text can activate a workflow; tool output
+        // is untrusted and must neither enable nor disable it.
+        return (Some(clawde_core::effort::EffortLevel::Ultracode), None);
+    }
+
+    // An effort the user resolved for themselves — `/effort`, `--effort`,
+    // `ing`, `settings.json defaultEffort`, or a resumed session's saved effort
+    // — is a hard override, so the adaptive raise is not consulted at all. The
+    // raise exists to fill in the unconfigured case, not to second-guess a
+    // deliberate choice (spec §6.2: "the user's explicit setting always wins").
+    if config_effort.is_some() {
+        return (config_effort, None);
+    }
+
+    let signals = depth_signals_for_turn(messages);
+    let decision = reasoning_depth::decide(config_effort, &signals, max_tokens);
+    match decision.reason {
+        // Raised: report the level and why.
+        Some(reason) => (decision.level, Some(reason)),
+        // Not raised: return the caller's own value untouched, so `None` keeps
+        // meaning "no override" rather than silently becoming `medium`.
+        None => (config_effort, None),
+    }
+}
+
+/// The reasoning-depth signals for this turn (spec §6.2).
+///
+/// Four of the five signal groups come from the task statement; the fifth
+/// (previous failure) comes from the transcript since that statement. Explicit
+/// user signals (`/effort`, `--effort`, `defaultEffort`, `ing`, the `ultracode`
+/// keyword) are resolved by the caller and never appear here.
+fn depth_signals_for_turn(
+    messages: &[Message],
+) -> clawde_api::providers::reasoning_depth::DepthSignals {
+    let mut signals = clawde_api::providers::reasoning_depth::DepthSignals::from_prompt(
+        &task_statement(messages),
+    );
+    signals.retry_after_failure = turn_has_failed_attempt(messages);
+    signals
+}
+
+/// Index of the current task's statement in the transcript.
+///
+/// The boundary is the newest user turn that carries actual user text, not
+/// simply "the newest user message": tool results arrive as user-role turns too,
+/// so role alone would pick a tool result on every continuation turn.
+fn task_start_index(messages: &[Message]) -> Option<usize> {
+    messages
+        .iter()
+        .rposition(|m| m.role == Role::User && message_has_user_text(m))
+}
+
+/// The current task's statement, empty when the transcript has none yet.
+///
+/// Reading the statement (rather than whatever arrived last) keeps a task's
+/// signals stable for the whole task: the reasoning-depth raise and the Plan
+/// Mode interview both read this, and the guidance they drive sits in the
+/// cacheable prefix.
+fn task_statement(messages: &[Message]) -> String {
+    task_start_index(messages)
+        .map(|start| messages[start].get_all_text())
+        .unwrap_or_default()
+}
+
+/// Whether an attempt in the *current task* already failed: a tool error since
+/// the task statement.
+///
+/// Scoped to the task so a failure from an earlier, unrelated task cannot keep
+/// raising the level of the next one. The boundary is the newest user turn that
+/// carries actual user text, not simply "the newest user message": tool results
+/// arrive as user-role turns too, so role alone would stop the scan at the very
+/// first tool result. Only the deterministic signal is read — a model saying
+/// "I'm not sure" is prose, not evidence.
+fn turn_has_failed_attempt(messages: &[Message]) -> bool {
+    let Some(task_start) = task_start_index(messages) else {
+        return false;
+    };
+    messages[task_start + 1..].iter().any(|m| {
+        m.content_blocks().iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult {
+                    is_error: Some(true),
+                    ..
+                }
+            )
+        })
+    })
+}
+
+/// Whether a message carries user-authored text (as opposed to tool results,
+/// which are also user-role messages).
+fn message_has_user_text(message: &Message) -> bool {
+    match &message.content {
+        clawde_core::types::MessageContent::Text(text) => !text.trim().is_empty(),
+        clawde_core::types::MessageContent::Blocks(blocks) => {
+            blocks.iter().any(|block| match block {
+                ContentBlock::Text { text } => !text.trim().is_empty(),
+                ContentBlock::UserCommand { .. } => true,
+                _ => false,
+            })
         }
     }
-    config_effort
 }
 
 /// Whether a tool name writes files — drives the verify loop's
@@ -2580,6 +2711,24 @@ async fn run_query_loop_inner(
         }
     }
 
+    // Resolve once before tools, compaction, or synthetic continuations can
+    // change the transcript. A numeric thinking budget is explicit intent too.
+    //
+    // The raise is bounded by the budget THIS request asks for, never by the
+    // serving provider's output cap. Folding the free catalog's smallest
+    // `max_tokens_cap` (8_192) in here put the bound below the 12_048 the
+    // cheapest raise rung needs, so the adaptive raise could never fire on the
+    // default provider. Per-upstream clamps belong at dispatch, where they are
+    // applied to `max_tokens` and to Google's numeric `thinkingBudget`.
+    // Explicit effort settings are never reduced by this check.
+    let depth_budget = config.max_tokens;
+    let mut resolved_effort = if config.thinking_budget.is_some() && config.effort_level.is_none() {
+        (None, None)
+    } else {
+        effective_effort_for_turn(config.effort_level, messages, depth_budget)
+    };
+    let mut interview_signals = depth_signals_for_turn(messages);
+
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
     // Execute-and-verify (audit spec Phase 1): tracks whether the run has
@@ -2632,6 +2781,21 @@ async fn run_query_loop_inner(
     // Repeat-tool-reminder guard: detects consecutive identical tool calls
     // and injects escalating reminders to break infinite loops.
     let mut repeat_detector = repeat_guard::RepeatCallDetector::new();
+    // Degeneration guards (spec `docs/plans/reasoning-improvements-spec.md`
+    // §6.5 #1/#3/#4). The thresholds and the pure detectors live in
+    // `degeneration.rs`; these locals are the per-run state they need. Stall
+    // narration is capped like the prose-tool nudge so a model that cannot
+    // self-report cannot keep the loop alive; the rabbit-hole narration fires
+    // at most once per no-progress episode; the divergence baseline advances
+    // only when a narration fires, so a steady state is not re-flagged.
+    let mut stall_tracker = degeneration::StallTracker::new();
+    let mut stall_narrations_used: u32 = 0;
+    let mut rabbit_hole_narrated = false;
+    let mut divergence_tracker = degeneration::DivergenceTracker::new();
+    let mut last_divergence_bucket: u32 = 0;
+    // The baseline is the state as the run opens, not the state at the first
+    // re-anchor milestone — the opening turns' own drift must be measurable.
+    divergence_tracker.prime(&task_state);
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
@@ -2642,6 +2806,13 @@ async fn run_query_loop_inner(
     // One bounded model fallback is allowed after the primary model repeatedly
     // exhausts its output budget; otherwise surface the partial response.
     let mut max_tokens_fallback_used = false;
+    // §6.6 thinking-failure handling: a degenerate terminal turn (thinking-only
+    // or budget-eaten, no visible answer, no tool calls) is retried once before
+    // the loop falls back to the placeholder. `max_tokens_boost` raises the
+    // retry's output budget on a budget-eaten turn so the retry can actually
+    // answer; both reset once a visible answer is produced.
+    let mut degenerate_retries: u32 = 0;
+    let mut max_tokens_boost: u32 = 0;
     // Active model — may switch to fallback on overloaded errors.
     // Agent model override takes priority over the session model when set.
     let mut effective_model = if let Some(ref agent) = config.agent_definition {
@@ -3030,6 +3201,25 @@ async fn run_query_loop_inner(
                         usage: $usage,
                     };
                 }
+                // A cleared no-progress streak means progress resumed, so a
+                // later rabbit hole gets its own narration.
+                if no_progress_streak == 0 {
+                    rabbit_hole_narrated = false;
+                }
+                // Stall guard (spec §6.5 #1): a turn with negligible output, no
+                // tool calls, and no writes. The narration is applied below,
+                // where it can override the stop decision; the surface signal
+                // is user-facing and goes out here.
+                let stall_signal =
+                    stall_tracker.observe($usage.output_tokens, tool_count, wrote_files);
+                if let degeneration::StallSignal::Surface(streak) = stall_signal {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(QueryEvent::Status(degeneration::stall_surface_message(
+                                streak,
+                            )));
+                    }
+                }
                 // Announce a slow round up front so the TUI can show a
                 // spinner instead of a silent wait during the checks.
                 if continuation_policy.will_run_checks(&turn_ctx) {
@@ -3278,6 +3468,32 @@ async fn run_query_loop_inner(
                         message: recovery_message,
                     };
                 }
+                // Degeneration narration (spec §6.5 #1 and #4): a stalled turn,
+                // or a no-progress streak one turn short of the loop's stop,
+                // gets one bounded continuation whose message asks the model
+                // for a progress/rationale update instead of ending the run
+                // silently. Deliberately after the continuation policy and
+                // after the deterministic-gate recovery, and skipped on the
+                // degradation turn: narration is added to a decision, never a
+                // replacement for a stop the plan or the gate already made
+                // (those return above).
+                if !degradation_turn {
+                    if let degeneration::StallSignal::Narrate(streak) = stall_signal {
+                        if stall_narrations_used < degeneration::STALL_NARRATE_CAP {
+                            stall_narrations_used += 1;
+                            decision = crate::continuation::ContinuationDecision::Continue {
+                                message: degeneration::stall_narration(streak),
+                            };
+                        }
+                    } else if degeneration::rabbit_hole_due(no_progress_streak)
+                        && !rabbit_hole_narrated
+                    {
+                        rabbit_hole_narrated = true;
+                        decision = crate::continuation::ContinuationDecision::Continue {
+                            message: degeneration::rabbit_hole_narration(no_progress_streak),
+                        };
+                    }
+                }
                 // A declined gate-open review is already included in the
                 // bounded plan evidence above and was emitted as a status
                 // event before persistence.
@@ -3331,9 +3547,8 @@ async fn run_query_loop_inner(
                         // per-turn counters are cleared with the other turn
                         // state below.
                         turn_state.clear_turn();
-                        // Reset repeat-tool-reminder: a user message changes the
-                        // context; repetition across it is not a loop.
-                        repeat_detector.reset();
+                        // Autonomous continuations are not new user direction:
+                        // preserve unchanged-result evidence across them.
                         turn_snapshot = if let Some(ref snap) = shadow_snap {
                             snap.track().await
                         } else {
@@ -3344,6 +3559,8 @@ async fn run_query_loop_inner(
                         turn = 0;
                         max_tokens_recovery_count = 0;
                         max_tokens_fallback_used = false;
+                        degenerate_retries = 0;
+                        max_tokens_boost = 0;
                         retries_left = 2;
                         request_retries = 0;
                         last_recovery_error = None;
@@ -3369,9 +3586,85 @@ async fn run_query_loop_inner(
             }};
         }
 
+        // §6.6 thinking-failure guard, shared by the provider and Anthropic
+        // terminal paths so an empty or thinking-only completion is handled
+        // identically on both. A terminal turn with no visible answer and no
+        // tool call is a degenerate completion, not a reply: retry it once with
+        // a nudge (raising the output budget when reasoning ate it) and surface
+        // the outcome. The exhausted case falls through so the caller can show
+        // a visible placeholder instead of a blank message. A visible answer
+        // never reaches the else-branch; the retry budget is cleared at the
+        // continuation boundary (see the `continue` arm of `continue_or_end!`),
+        // which is the only way a run proceeds past a completed visible turn.
+        macro_rules! degenerate_turn_retry {
+            ($assistant_msg:expr, $usage:expr, $provider:expr, $model:expr, $max_tokens:expr) => {{
+                if !degradation_turn {
+                    let (visible, thinking) = thinking_failure::content_shape(&$assistant_msg);
+                    if !visible {
+                        if let Some(failure) = thinking_failure::classify(
+                            visible,
+                            !$assistant_msg.get_tool_use_blocks().is_empty(),
+                            thinking,
+                            $usage.reasoning_tokens,
+                            $max_tokens,
+                        ) {
+                            let can_retry =
+                                degenerate_retries < thinking_failure::DEGENERATE_RETRY_LIMIT;
+                            if can_retry {
+                                degenerate_retries += 1;
+                                if matches!(failure, thinking_failure::ThinkingFailure::BudgetEaten)
+                                {
+                                    max_tokens_boost = max_tokens_boost
+                                        .saturating_add(thinking_failure::BUDGET_EATEN_BOOST_TOKENS)
+                                        .min(thinking_failure::MAX_BUDGET_EATEN_BOOST_TOKENS);
+                                }
+                            }
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::Status(
+                                    failure.surface_message($provider, $model, !can_retry),
+                                ));
+                            }
+                            if can_retry {
+                                messages.push(Message::user(failure.retry_nudge()));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }};
+        }
+
         // Check for cancellation
         if cancel_token.is_cancelled() {
             return QueryOutcome::Cancelled;
+        }
+
+        // Stop after completing and recording every result in the batch. Both
+        // request paths pass this boundary, so no fifth unchanged call is sent.
+        if repeat_detector.pause_requested() {
+            let text = "Tool loop paused after four unchanged results. Choose a different approach before continuing.";
+            let message = Message::assistant(text);
+            messages.push(message.clone());
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::Stream(
+                    AnthropicStreamEvent::ContentBlockDelta {
+                        index: 0,
+                        delta: clawde_api::streaming::ContentDelta::TextDelta {
+                            text: text.to_string(),
+                        },
+                    },
+                ));
+                let _ = tx.send(QueryEvent::TurnComplete {
+                    stop_reason: "end_turn".to_string(),
+                    turn,
+                    usage: None,
+                    observability: None,
+                });
+            }
+            return QueryOutcome::EndTurn {
+                message,
+                usage: UsageInfo::default(),
+            };
         }
 
         // Auto-context-refresh: check for external file modifications
@@ -3416,6 +3709,12 @@ async fn run_query_loop_inner(
                     active_task_id = clawde_core::spec::Spec::task_id_from_accepted_message(&text);
                 }
                 messages.push(Message::user(text));
+                interview_signals = depth_signals_for_turn(messages);
+                if config.thinking_budget.is_none() || config.effort_level.is_some() {
+                    resolved_effort =
+                        effective_effort_for_turn(config.effort_level, messages, depth_budget);
+                }
+                repeat_detector.reset();
             }
         }
 
@@ -3545,6 +3844,17 @@ async fn run_query_loop_inner(
             }
         }
 
+        // Divergence guard (spec §6.5 #3). Evaluated on the goal re-anchor's
+        // own cadence — the restatement backbone the spec names — and gated by
+        // the tracker so a steady elevated drift score is narrated once, not
+        // once per milestone. Request-only, like the pins below: the transcript
+        // stays free of harness chatter.
+        let mut divergence_pin = None;
+        if bucket > last_divergence_bucket {
+            last_divergence_bucket = bucket;
+            divergence_pin = divergence_tracker.observe(&task_state);
+        }
+
         // Step-budget warning. Fired once per window, as soon as the remaining
         // turns drop to `BUDGET_WARNING_TURNS`, so the model can land the work in
         // flight rather than discovering the limit mid-edit. Request-only, like
@@ -3594,6 +3904,9 @@ async fn run_query_loop_inner(
         if let Some(ref reanchor) = goal_reanchor_pin {
             api_messages.push(ApiMessage::from(&Message::user(reanchor.clone())));
         }
+        if let Some(ref drift) = divergence_pin {
+            api_messages.push(ApiMessage::from(&Message::user(drift.clone())));
+        }
         // Most urgent instruction goes last, where attention is strongest.
         if let Some(ref budget) = step_budget_pin {
             api_messages.push(ApiMessage::from(&Message::user(budget.clone())));
@@ -3614,15 +3927,28 @@ async fn run_query_loop_inner(
         // so an ultracode turn gets the model's top reasoning (via the budget /
         // provider mapping below) plus the ultracode procedure addendum injected
         // into the system prompt.
-        let effective_effort_level =
-            effective_effort_for_turn(config.effort_level, messages.as_slice());
+        let (effective_effort_level, effort_raise) = resolved_effort;
+        // Tell interactive clients the effort this turn actually uses, and
+        // whether it was raised — sent every turn so a stale "auto" indicator
+        // from an earlier turn cannot outlive the turn it described.
+        if let Some(ref tx) = event_tx {
+            let _ = tx.send(QueryEvent::EffortResolved {
+                level: effective_effort_level,
+                raised: effort_raise,
+            });
+        }
 
         // Verification nudge: if there are incomplete todos for this session
         // and the conversation has more than 2 turns, append a reminder.
+        let assembled_prompt_config;
         let system = {
             // Build a (possibly patched) config for system-prompt assembly.
             // Agent prompt prefix and todo nudge are both applied here.
             let mut patched = config.clone();
+            // The turn's *effective* effort drives the reasoning-guidance
+            // strength, so the prompt and the thinking budget can never
+            // disagree about how hard this turn is thinking.
+            patched.effort_level = effective_effort_level;
             if !config.disable_task_context {
                 patched.task_context = Some(task_context.clone());
             }
@@ -3780,14 +4106,41 @@ async fn run_query_loop_inner(
                 }
             }
 
-            build_system_prompt(&patched)
+            // Plan Mode interview for THIS turn (spec §6.4). Plan mode already
+            // denies every write at the permission manager, so the missing piece
+            // is what the model should do instead: gather context, present the
+            // plan with its open questions, ask about the genuinely ambiguous
+            // ones, then wait for confirmation. Gated to non-trivial tasks (§9
+            // Q4 — always-on interviewing destroys the benefit of planning) and
+            // skipped in a non-interactive run, where no answer can arrive.
+            // `tool_ctx.config.permission_mode` is the session's live mode as the
+            // permission manager sees it, not a snapshot taken at startup.
+            if let Some(block) = crate::plan_interview::guidance_for_turn(
+                tool_ctx.config.permission_mode == clawde_core::config::PermissionMode::Plan,
+                tool_ctx.non_interactive,
+                &interview_signals,
+            ) {
+                patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
+                    Some(existing) => format!("{existing}\n\n{block}"),
+                    None => block.to_string(),
+                });
+            }
+
+            let system = build_system_prompt(&patched);
+            assembled_prompt_config = patched;
+            system
         };
 
         let mut system_for_provider = system.clone(); // used by non-Anthropic dispatch below
-        let mut req_builder = CreateMessageRequest::builder(&effective_model, config.max_tokens)
-            .messages(api_messages)
-            .system(system)
-            .tools(api_tools);
+                                                      // A budget-eaten retry (§6.6) grants extra output budget; the Anthropic
+                                                      // request honors it the same way the provider path does.
+        let mut req_builder = CreateMessageRequest::builder(
+            &effective_model,
+            config.max_tokens.saturating_add(max_tokens_boost),
+        )
+        .messages(api_messages)
+        .system(system)
+        .tools(api_tools);
 
         // Resolve effective thinking budget:
         //   1. Explicit `thinking_budget` in config takes precedence.
@@ -4252,17 +4605,20 @@ async fn run_query_loop_inner(
                         && !tools.is_empty()
                         && !degradation_turn
                     {
-                        let mut patched_sys = config.clone();
+                        let mut patched_sys = assembled_prompt_config.clone();
                         patched_sys.enabled_tools = Some(vec![]);
                         if !config.disable_task_context {
                             patched_sys.task_context = Some(task_state.render());
                         }
                         system_for_provider = build_system_prompt(&patched_sys);
                     }
+                    // A budget-eaten retry grants extra output budget (bounded
+                    // by `max_tokens_boost`); the provider cap still clamps it.
+                    let requested_max_tokens = config.max_tokens.saturating_add(max_tokens_boost);
                     let effective_max_tokens = provider
                         .max_tokens_cap_for(&model_id_str)
-                        .map(|cap| config.max_tokens.min(cap))
-                        .unwrap_or(config.max_tokens);
+                        .map(|cap| requested_max_tokens.min(cap))
+                        .unwrap_or(requested_max_tokens);
                     // Max-steps degradation (issue #230): dispatch the final
                     // summary turn with no tools so the provider can only emit
                     // text (opencode's `toolChoice:"none"` equivalent).
@@ -4314,6 +4670,9 @@ async fn run_query_loop_inner(
                     }
                     if let Some(ref reanchor) = goal_reanchor_pin {
                         provider_messages.push(Message::user(reanchor.clone()));
+                    }
+                    if let Some(ref drift) = divergence_pin {
+                        provider_messages.push(Message::user(drift.clone()));
                     }
                     // Mirrors the Anthropic-shaped request above: the budget
                     // warning is the last thing the model reads.
@@ -4742,6 +5101,13 @@ async fn run_query_loop_inner(
                                                     if u.cache_creation_input_tokens > 0 {
                                                         usage.cache_creation_input_tokens =
                                                             u.cache_creation_input_tokens;
+                                                    }
+                                                    // Reasoning tokens drive the §6.6
+                                                    // thinking-failure classifier; without
+                                                    // this the free-tier budget-eaten detect
+                                                    // never fired (the field stayed 0).
+                                                    if u.reasoning_tokens > 0 {
+                                                        usage.reasoning_tokens = u.reasoning_tokens;
                                                     }
                                                 }
                                             }
@@ -5258,11 +5624,17 @@ async fn run_query_loop_inner(
                     // look like a silent halt. Fire the placeholder whenever
                     // there is no visible text and no tool call — this covers
                     // both the truly-empty case and the thinking-only case.
-                    let has_visible_output = content_blocks.iter().any(|b| match b {
-                        ContentBlock::Text { text } => !text.trim().is_empty(),
-                        ContentBlock::ToolUse { .. } => true,
-                        _ => false,
-                    });
+                    // §6.6 thinking-failure guard (shared macro): retry a
+                    // degenerate terminal turn once, then fall through to the
+                    // placeholder below so the user never sees a blank turn.
+                    degenerate_turn_retry!(
+                        assistant_msg,
+                        usage,
+                        actual_upstream_id.as_deref().unwrap_or(&provider_id_str),
+                        actual_model.as_str(),
+                        effective_max_tokens
+                    );
+                    let (has_visible_output, _) = thinking_failure::content_shape(&assistant_msg);
                     if !has_visible_output {
                         // Attribute the placeholder to the upstream that
                         // actually served (and failed) the turn — free/auto
@@ -5629,6 +6001,46 @@ async fn run_query_loop_inner(
                     debug!("PostModelTurn hook injecting error message");
                     messages.push(err_msg);
                 }
+            }
+        }
+
+        // §6.6 thinking-failure guard, UX-first (mirror of the provider path's
+        // `degenerate_turn_retry!`): the Anthropic terminal path must not be the
+        // one path that silently swallows an empty or thinking-only completion.
+        degenerate_turn_retry!(
+            assistant_msg,
+            usage,
+            "anthropic",
+            effective_model.as_str(),
+            config.max_tokens.saturating_add(max_tokens_boost)
+        );
+        // Retry exhausted (or no failure at all): if the turn still has no
+        // visible answer, inject a placeholder so the user sees why it ended
+        // instead of a blank assistant message.
+        if !thinking_failure::content_shape(&assistant_msg).0 {
+            let placeholder = format!(
+                "(no response from anthropic/{} — model ended the turn with stop_reason \"{}\")",
+                effective_model, stop
+            );
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::Stream(
+                    AnthropicStreamEvent::ContentBlockDelta {
+                        index: 0,
+                        delta: clawde_api::streaming::ContentDelta::TextDelta {
+                            text: placeholder.clone(),
+                        },
+                    },
+                ));
+            }
+            if let clawde_core::types::MessageContent::Blocks(ref mut blocks) =
+                assistant_msg.content
+            {
+                blocks.push(ContentBlock::Text {
+                    text: placeholder.clone(),
+                });
+            }
+            if let Some(last) = messages.last_mut() {
+                *last = assistant_msg.clone();
             }
         }
 
@@ -6848,10 +7260,15 @@ mod tests {
     }
 
     // Tests that touch process-global env vars (e.g. the free-upstream API-key
-    // fallbacks read by `first_free_upstream_key`) must serialize on this
-    // guard — the same pattern as `crates/core/src/paths.rs::ENV_LOCK` — so
-    // they don't race under `cargo test --workspace`'s parallel runner.
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+    // fallbacks read by `first_free_upstream_key`, or `CLAWDE_HOME` for the
+    // goal store) must serialize on this ONE guard, or they race under `cargo
+    // test --workspace`'s parallel runner. Several tests here used to declare a
+    // function-local `static ENV_LOCK`, which does not serialize against
+    // anything — a `CLAWDE_HOME` write in one test then hid another test's goal
+    // store. A tokio mutex lets async tests hold it with `.lock().await`; sync
+    // tests use `.blocking_lock()` (never called from inside a runtime, so no
+    // panic). Same pattern as `crates/cli/src/main.rs::ENV_LOCK`.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn active_plan_context_is_bound_to_approved_progress() {
@@ -8357,6 +8774,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_tool_loop_pauses_on_fourth_result_and_surfaces_output() {
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: recorded.clone(),
+            always_end_turn: false,
+            write_path: None,
+            write_content: None,
+            write_emitted: Arc::new(AtomicBool::new(false)),
+            keep_tool_use_after_write: false,
+            alternate_tool_then_end: false,
+            write_on_requests: None,
+            scripted_write_contents: None,
+        });
+        let (outcome, events) = drive_loop_with_observability(provider, noop_tools()).await;
+        let QueryOutcome::EndTurn { message, .. } = outcome else {
+            panic!("repeat guard must end the loop");
+        };
+        assert!(message.get_all_text().contains("Tool loop paused"));
+        assert_eq!(recorded.lock().unwrap().len(), 4, "no fifth unchanged call");
+        let notices: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                QueryEvent::Status(text)
+                    if text.contains("tool loop") || text.contains("Tool loop") =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 2);
+        assert!(notices[0].contains("Possible tool loop"));
+        assert!(notices[1].contains("Tool loop paused"));
+        assert!(events.iter().any(|event| matches!(event, QueryEvent::TurnComplete { stop_reason, .. } if stop_reason == "end_turn")));
+    }
+
+    #[tokio::test]
     async fn turn_complete_reports_provider_observability() {
         let recorded = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(RecordingProvider {
@@ -8774,7 +9229,7 @@ mod tests {
 
     #[test]
     fn free_catalog_pin_redirect_routes_keyed_upstreams() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = ENV_LOCK.blocking_lock();
         // `first_free_upstream_key` falls back to env vars, so the negative
         // assertions below must not be contaminated by a developer's exported
         // `GROQ_API_KEY` / `HF_TOKEN`.
@@ -8941,21 +9396,53 @@ mod tests {
         );
     }
 
-    // ---- ultracode activation (effort) ----------------------------------
+    // ---- effort resolution (ultracode keyword + adaptive depth) ----------
+
+    /// A cap wide enough that no raise trips the output reserve.
+    const WIDE_CAP: u32 = 32_768;
 
     #[test]
     fn ultracode_keyword_raises_effort_to_ultracode() {
         use clawde_core::effort::EffortLevel;
         let msgs = vec![Message::user("please ultracode this refactor")];
-        // Even with no configured effort, the keyword forces Ultracode.
+        // Even with no configured effort, the keyword forces Ultracode. It is
+        // user intent, so it carries no "auto-raise" marker.
         assert_eq!(
-            effective_effort_for_turn(None, &msgs),
-            Some(EffortLevel::Ultracode)
+            effective_effort_for_turn(None, &msgs, WIDE_CAP),
+            (Some(EffortLevel::Ultracode), None)
         );
         // ...and it overrides a lower configured effort for the turn.
         assert_eq!(
-            effective_effort_for_turn(Some(EffortLevel::Low), &msgs),
-            Some(EffortLevel::Ultracode)
+            effective_effort_for_turn(Some(EffortLevel::Low), &msgs, WIDE_CAP),
+            (Some(EffortLevel::Ultracode), None)
+        );
+    }
+
+    #[test]
+    fn tool_results_cannot_activate_or_deactivate_ultracode() {
+        use clawde_core::effort::EffortLevel;
+        let result = |text: &str| {
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: clawde_core::types::ToolResultContent::Text(text.to_string()),
+                is_error: None,
+            }])
+        };
+        let ordinary = vec![
+            Message::user("find all references to foo"),
+            result("ultracode"),
+        ];
+        assert_eq!(
+            effective_effort_for_turn(None, &ordinary, WIDE_CAP),
+            (None, None)
+        );
+        let activated = vec![
+            Message::user("ultracode refactor the parser"),
+            result("found parser"),
+        ];
+        assert_eq!(
+            effective_effort_for_turn(None, &activated, WIDE_CAP),
+            (Some(EffortLevel::Ultracode), None)
         );
     }
 
@@ -8963,20 +9450,540 @@ mod tests {
     fn explicit_off_beats_ultracode_keyword() {
         let msgs = vec![Message::user("ultracode this task")];
         assert_eq!(
-            effective_effort_for_turn(Some(clawde_core::effort::EffortLevel::None), &msgs),
-            Some(clawde_core::effort::EffortLevel::None)
+            effective_effort_for_turn(
+                Some(clawde_core::effort::EffortLevel::None),
+                &msgs,
+                WIDE_CAP
+            ),
+            (Some(clawde_core::effort::EffortLevel::None), None)
         );
     }
 
     #[test]
-    fn no_keyword_keeps_configured_effort() {
+    fn non_raising_prompt_keeps_the_configured_effort() {
         use clawde_core::effort::EffortLevel;
-        let msgs = vec![Message::user("please refactor this module")];
-        assert_eq!(effective_effort_for_turn(None, &msgs), None);
+        // A search-style task is not enough on its own, so the configured value
+        // — including "no override" — passes through untouched.
+        let msgs = vec![Message::user("find all references to foo")];
         assert_eq!(
-            effective_effort_for_turn(Some(EffortLevel::High), &msgs),
-            Some(EffortLevel::High)
+            effective_effort_for_turn(None, &msgs, WIDE_CAP),
+            (None, None)
         );
+        assert_eq!(
+            effective_effort_for_turn(Some(EffortLevel::High), &msgs, WIDE_CAP),
+            (Some(EffortLevel::High), None)
+        );
+    }
+
+    #[test]
+    fn adaptive_depth_raises_code_work_but_never_above_the_user() {
+        use clawde_api::providers::reasoning_depth::RaiseReason;
+        use clawde_core::effort::EffortLevel;
+        // Code work raises the floor to High even with nothing configured.
+        let msgs = vec![Message::user("refactor the parser module")];
+        assert_eq!(
+            effective_effort_for_turn(None, &msgs, WIDE_CAP),
+            (Some(EffortLevel::High), Some(RaiseReason::TaskKind))
+        );
+        // An explicit level above the target is left alone, with no "auto"
+        // marker — the raise only ever goes up.
+        assert_eq!(
+            effective_effort_for_turn(Some(EffortLevel::Max), &msgs, WIDE_CAP),
+            (Some(EffortLevel::Max), None)
+        );
+        // A cap that cannot carry the raised thinking budget forfeits the raise.
+        assert_eq!(effective_effort_for_turn(None, &msgs, 4_096), (None, None));
+    }
+
+    /// Every request the recording provider received for one turn, with the mock
+    /// registered under `provider_id` so the loop resolves its budget the way
+    /// that provider would.
+    async fn requests_for_turn(
+        provider_id: &str,
+        task: &str,
+        max_tokens: u32,
+    ) -> Vec<clawde_api::ProviderRequest> {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn clawde_api::LlmProvider> = Arc::new(SystemPromptProvider {
+            id: clawde_core::provider_id::ProviderId::new(provider_id),
+            prompts: Arc::new(StdMutex::new(Vec::new())),
+            requests: requests.clone(),
+            tool_rounds: 0,
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.config.provider = Some(provider_id.to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.max_tokens = max_tokens;
+        config.provider_registry = Some(Arc::new(registry));
+
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let cost = clawde_core::cost::CostTracker::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut messages = vec![Message::user(task)];
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &config,
+                cost,
+                None,
+                cancel,
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "turn must complete: {outcome:?}"
+        );
+
+        let captured = requests.lock().unwrap().clone();
+        captured
+    }
+
+    /// The free chain's raise is bounded by the budget the request asks for, not
+    /// by the smallest `max_tokens_cap` in `FREE_CATALOG`.
+    ///
+    /// Folding that minimum (8_192) in made every raise rung unreachable — the
+    /// cheapest one needs 12_048 — so the adaptive raise was dead on the default
+    /// provider. The per-upstream clamp still applies to the wire `max_tokens`
+    /// (and to Google's numeric `thinkingBudget`) at dispatch.
+    #[tokio::test]
+    async fn free_chain_raise_is_bounded_by_the_requested_budget() {
+        use clawde_core::effort::EffortLevel;
+        // Two named files are a strong signal: the raise reaches the ceiling, and
+        // the default request budget carries it.
+        let requests = requests_for_turn(
+            "free",
+            "refactor src/a.rs and src/b.rs to share the parser",
+            clawde_core::constants::DEFAULT_MAX_TOKENS,
+        )
+        .await;
+        assert_eq!(
+            requests.first().and_then(|request| request.effort_level),
+            Some(EffortLevel::XHigh),
+            "the free chain must carry the raised effort"
+        );
+
+        // A budget that cannot carry the raised thinking still forfeits the
+        // raise: the answer must keep at least `MIN_OUTPUT_RESERVE_TOKENS`.
+        let requests = requests_for_turn(
+            "free",
+            "refactor src/a.rs and src/b.rs to share the parser",
+            4_096,
+        )
+        .await;
+        assert_eq!(
+            requests.first().and_then(|request| request.effort_level),
+            None
+        );
+    }
+
+    #[test]
+    fn an_explicit_effort_is_never_raised() {
+        use clawde_core::effort::EffortLevel;
+        // Every signal that would otherwise raise — multi-file, retry, design
+        // work — leaves a deliberate choice alone. This is the CLI precedence
+        // contract (see `headless_effort_precedence_flows_into_provider_request`).
+        let msgs = vec![
+            Message::user("refactor src/a.rs and src/b.rs to share the parser"),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-1".to_string(),
+                content: clawde_core::types::ToolResultContent::Text("exit 1".to_string()),
+                is_error: Some(true),
+            }]),
+        ];
+        assert_eq!(
+            effective_effort_for_turn(Some(EffortLevel::Low), &msgs, WIDE_CAP),
+            (Some(EffortLevel::Low), None)
+        );
+        assert_eq!(
+            effective_effort_for_turn(Some(EffortLevel::Medium), &msgs, WIDE_CAP),
+            (Some(EffortLevel::Medium), None)
+        );
+    }
+
+    #[test]
+    fn failed_attempt_in_the_task_raises_after_a_retry() {
+        use clawde_api::providers::reasoning_depth::RaiseReason;
+        use clawde_core::effort::EffortLevel;
+        let msgs = vec![
+            Message::user("update the parser and its tests"),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-1".to_string(),
+                content: clawde_core::types::ToolResultContent::Text("exit 1".to_string()),
+                is_error: Some(true),
+            }]),
+        ];
+        // Failure is the dominant signal, and it reaches the ceiling.
+        assert_eq!(
+            effective_effort_for_turn(None, &msgs, WIDE_CAP),
+            (
+                Some(EffortLevel::XHigh),
+                Some(RaiseReason::RetryAfterFailure)
+            )
+        );
+
+        // A failure from an earlier task must not raise the next one.
+        let msgs = vec![
+            Message::user("update the parser"),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-1".to_string(),
+                content: clawde_core::types::ToolResultContent::Text("exit 1".to_string()),
+                is_error: Some(true),
+            }]),
+            Message::user("find all references to foo"),
+        ];
+        assert_eq!(
+            effective_effort_for_turn(None, &msgs, WIDE_CAP),
+            (None, None)
+        );
+    }
+
+    // ---- Plan Mode interview (spec §6.4) ----------------------------------
+
+    /// A minimal provider double that records the rendered system prompt of every
+    /// request and ends the turn immediately. The recording provider above only
+    /// captures whether tools were present; the interview is a *prompt* contract,
+    /// so it needs the text the model actually receives.
+    struct SystemPromptProvider {
+        id: clawde_core::provider_id::ProviderId,
+        prompts: Arc<StdMutex<Vec<String>>>,
+        requests: Arc<StdMutex<Vec<clawde_api::ProviderRequest>>>,
+        tool_rounds: usize,
+    }
+
+    /// The system prompt as plain text, whichever shape the provider received.
+    fn system_prompt_text(prompt: Option<&clawde_api::SystemPrompt>) -> String {
+        match prompt {
+            Some(clawde_api::SystemPrompt::Text(text)) => text.clone(),
+            Some(clawde_api::SystemPrompt::Blocks(blocks)) => blocks
+                .iter()
+                .map(|block| block.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => String::new(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl clawde_api::LlmProvider for SystemPromptProvider {
+        fn id(&self) -> &clawde_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "system-prompt-mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
+            unimplemented!("these tests only use create_message_stream")
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: clawde_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            clawde_api::ProviderError,
+        > {
+            use clawde_api::provider_types::StopReason;
+            use clawde_api::StreamEvent;
+
+            self.prompts
+                .lock()
+                .unwrap()
+                .push(system_prompt_text(request.system_prompt.as_ref()));
+
+            self.requests.lock().unwrap().push(request);
+            let request_count = self.requests.lock().unwrap().len();
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            if request_count <= self.tool_rounds {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::MessageStart {
+                        id: msg_id,
+                        model: "mock-model".to_string(),
+                        usage: UsageInfo::default(),
+                    }),
+                    Ok(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        content_block: ContentBlock::ToolUse {
+                            id: format!("t{request_count}"),
+                            name: "missing_tool".to_string(),
+                            // Distinct args per round: guards that key on a
+                            // repeated call (`repeat_guard`, the no-progress
+                            // detector) must not cut a multi-round turn short
+                            // before the test has driven it far enough.
+                            input: serde_json::json!({"round": request_count}),
+                            thought_signature: None,
+                        },
+                    }),
+                    Ok(StreamEvent::InputJsonDelta {
+                        index: 0,
+                        partial_json: format!(r#"{{"round":{request_count}}}"#),
+                    }),
+                    Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::ToolUse),
+                        usage: Some(UsageInfo::default()),
+                    }),
+                    Ok(StreamEvent::MessageStop),
+                ])));
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::MessageStart {
+                    id: msg_id,
+                    model: "mock-model".to_string(),
+                    usage: UsageInfo::default(),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "Here is the plan.".to_string(),
+                }),
+                Ok(StreamEvent::MessageDelta {
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Some(UsageInfo::default()),
+                }),
+                Ok(StreamEvent::MessageStop),
+            ])))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> clawde_api::ProviderCapabilities {
+            clawde_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: clawde_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    /// Run one turn through the real loop with the session's plan mode and
+    /// interactivity set, and return the system prompt each request carried.
+    async fn system_prompts_for_turn(
+        task: &str,
+        plan_mode: bool,
+        non_interactive: bool,
+    ) -> Vec<String> {
+        let prompts = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn clawde_api::LlmProvider> = Arc::new(SystemPromptProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            prompts: prompts.clone(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            tool_rounds: 0,
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.non_interactive = non_interactive;
+        ctx.config.provider = Some("mockprov".to_string());
+        ctx.config.permission_mode = if plan_mode {
+            clawde_core::config::PermissionMode::Plan
+        } else {
+            clawde_core::config::PermissionMode::Default
+        };
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(Arc::new(registry));
+
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let cost = clawde_core::cost::CostTracker::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut messages = vec![Message::user(task)];
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &config,
+                cost,
+                None,
+                cancel,
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "turn must complete: {outcome:?}"
+        );
+
+        let captured = prompts.lock().unwrap().clone();
+        assert!(
+            !captured.is_empty(),
+            "the provider must have seen a request"
+        );
+        captured
+    }
+
+    #[tokio::test]
+    async fn effort_and_interview_stay_stable_through_failed_tool_rounds() {
+        use clawde_core::effort::EffortLevel;
+        for budget in [None, Some(2_000)] {
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let provider = Arc::new(SystemPromptProvider {
+                id: clawde_core::ProviderId::new("mockprov"),
+                prompts: Arc::new(StdMutex::new(Vec::new())),
+                requests: requests.clone(),
+                tool_rounds: 2,
+            });
+            let mut registry = clawde_api::ProviderRegistry::new();
+            registry.register(provider);
+            let mut ctx = deny_all_context();
+            ctx.config.provider = Some("mockprov".to_string());
+            ctx.config.permission_mode = clawde_core::config::PermissionMode::Plan;
+            ctx.non_interactive = false;
+            let mut config = make_config(None, None);
+            config.max_tokens = WIDE_CAP;
+            config.thinking_budget = budget;
+            config.model = "mock-model".to_string();
+            config.provider_registry = Some(Arc::new(registry));
+            let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+                api_key: "test-key".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut messages = vec![Message::user("refactor the parser module")];
+            let outcome = run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await;
+            assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+            let captured = requests.lock().unwrap();
+            assert_eq!(captured.len(), 3);
+            let expected = budget.is_none().then_some(EffortLevel::High);
+            for request in captured.iter() {
+                assert_eq!(
+                    request.effort_level, expected,
+                    "failure must not invalidate the task's effort cache"
+                );
+                assert!(system_prompt_text(request.system_prompt.as_ref())
+                    .contains("## Plan Mode interview"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_interview_reaches_the_request() {
+        let prompts = system_prompts_for_turn("refactor the parser module", true, false).await;
+        assert!(
+            prompts.iter().all(|p| p.contains("## Plan Mode interview")),
+            "plan mode + a non-trivial task must interview: {prompts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_interview_is_gated_off_outside_its_case() {
+        // Plan mode off: ordinary task, ordinary turn.
+        let prompts = system_prompts_for_turn("refactor the parser module", false, false).await;
+        assert!(
+            prompts
+                .iter()
+                .all(|p| !p.contains("## Plan Mode interview")),
+            "no interview without plan mode: {prompts:?}"
+        );
+
+        // A read-only lookup in plan mode is not interrogated.
+        let prompts =
+            system_prompts_for_turn("find all references to resolve_route", true, false).await;
+        assert!(
+            prompts
+                .iter()
+                .all(|p| !p.contains("## Plan Mode interview")),
+            "a search is a trivial task: {prompts:?}"
+        );
+
+        // A run that cannot surface a question must not be told to ask one.
+        let prompts = system_prompts_for_turn("refactor the parser module", true, true).await;
+        assert!(
+            prompts
+                .iter()
+                .all(|p| !p.contains("## Plan Mode interview")),
+            "a non-interactive run cannot interview: {prompts:?}"
+        );
+    }
+
+    /// A continuation turn (the last user-role message is a tool result) still
+    /// reads the task's own signals, so the interview survives the tool round
+    /// instead of keying off whatever the tool happened to return.
+    #[test]
+    fn task_statement_ignores_tool_result_turns() {
+        let msgs = vec![
+            Message::user("refactor the parser module"),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-1".to_string(),
+                content: clawde_core::types::ToolResultContent::Text(
+                    "search results for src/parser.rs".to_string(),
+                ),
+                is_error: None,
+            }]),
+        ];
+        assert_eq!(task_statement(&msgs), "refactor the parser module");
+        assert!(depth_signals_for_turn(&msgs).non_trivial());
+
+        // No user text at all yet (e.g. a resumed transcript of tool traffic):
+        // an empty statement, not a guessed one.
+        let tool_only = vec![Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tu-1".to_string(),
+            content: clawde_core::types::ToolResultContent::Text("exit 1".to_string()),
+            is_error: Some(true),
+        }])];
+        assert_eq!(task_statement(&tool_only), "");
     }
 
     #[test]
@@ -8986,9 +9993,12 @@ mod tests {
         let msgs = vec![
             Message::user("ultracode kick things off"),
             Message::assistant("working on it"),
-            Message::user("now just tidy up the docs"),
+            Message::user("find all references to foo"),
         ];
-        assert_eq!(effective_effort_for_turn(None, &msgs), None);
+        assert_eq!(
+            effective_effort_for_turn(None, &msgs, WIDE_CAP),
+            (None, None)
+        );
     }
 
     #[test]
@@ -8999,8 +10009,8 @@ mod tests {
         // assembled system prompt.
         let msgs = vec![Message::user("ultracode audit the query loop")];
         assert_eq!(
-            effective_effort_for_turn(None, &msgs),
-            Some(EffortLevel::Ultracode)
+            effective_effort_for_turn(None, &msgs, WIDE_CAP),
+            (Some(EffortLevel::Ultracode), None)
         );
         let addendum = clawde_core::effort::ultracode_system_prompt_addendum();
         let opts = clawde_core::system_prompt::SystemPromptOptions {
@@ -9014,8 +10024,12 @@ mod tests {
 
         // Absent path: no keyword -> configured effort stays, no ultracode text.
         assert_eq!(
-            effective_effort_for_turn(None, &[Message::user("hi there")]),
-            None
+            effective_effort_for_turn(
+                None,
+                &[Message::user("find all references to foo")],
+                WIDE_CAP
+            ),
+            (None, None)
         );
         let plain = clawde_core::system_prompt::build_system_prompt(
             &clawde_core::system_prompt::SystemPromptOptions {
@@ -10756,7 +11770,6 @@ mod tests {
     /// turn cap, and the Status event is surfaced.
     #[tokio::test]
     async fn no_progress_detector_stops_repeated_tool_loop_before_cap() {
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _g = ENV_LOCK.lock().await;
         let home = tempfile::tempdir().expect("goal home");
         let _old = std::env::var_os("CLAWDE_HOME");
@@ -10845,6 +11858,729 @@ mod tests {
         assert!(
             statuses.iter().any(|s| s.contains("No progress detected")),
             "expected a no-progress Status event, got: {statuses:?}"
+        );
+        // Rabbit-hole narration (spec §6.5 #4) lands one turn before the stop,
+        // as a user message on the history the loop mutates: the model gets one
+        // chance to change approach before the no-progress stop owns the turn.
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.get_all_text().contains("rabbit hole")),
+            "the loop must narrate the rabbit hole before stopping it"
+        );
+    }
+
+    /// Whole-loop wiring for the stall guard (spec §6.5 #1): a Goal-mode loop
+    /// whose model answers every turn with a negligible amount of text is asked
+    /// for a progress update, and then surfaced to the user, instead of ending
+    /// silently. The goal policy stops a stalled goal at the same three-turn
+    /// bar, so this also pins the ordering: narration runs *after* the policy
+    /// and adds a turn to its stop rather than replacing it.
+    #[tokio::test]
+    async fn stall_guard_narrates_then_surfaces_in_a_goal_loop() {
+        let _g = ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().expect("goal home");
+        let _old = std::env::var_os("CLAWDE_HOME");
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let store = clawde_core::GoalStore::open_default().expect("goal store");
+        store
+            .set_goal("stall-test", "finish the feature", None, 0)
+            .expect("set goal");
+
+        // Every request answers with the same short text and no tool calls, so
+        // every loop turn is a stalled turn.
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn clawde_api::LlmProvider> = Arc::new(SystemPromptProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            prompts: Arc::new(StdMutex::new(Vec::new())),
+            requests: requests.clone(),
+            tool_rounds: 0,
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("test client");
+        let mut ctx = deny_all_context();
+        ctx.session_id = "stall-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_turns: 12,
+            provider_registry: Some(Arc::new(registry)),
+            continuation: crate::continuation::ContinuationMode::Goal,
+            ..Default::default()
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut messages = vec![Message::user("start")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        match _old {
+            Some(v) => std::env::set_var("CLAWDE_HOME", v),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "the stalled loop must end with EndTurn"
+        );
+
+        // The narration is a user message for the next request, which is where
+        // the model can actually read it.
+        let narration_requests = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.get_all_text().contains("Progress check"))
+            })
+            .count();
+        assert_eq!(
+            narration_requests, 1,
+            "exactly one turn should carry the stall narration"
+        );
+
+        let statuses: Vec<String> = {
+            let mut out = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                if let QueryEvent::Status(s) = event {
+                    out.push(s);
+                }
+            }
+            out
+        };
+        assert!(
+            statuses
+                .iter()
+                .any(|s| s.contains("No progress for 4 consecutive turns")),
+            "the stall must be surfaced to the user, got: {statuses:?}"
+        );
+    }
+
+    /// Scripted reply shapes for the §6.6 thinking-failure tests.
+    #[derive(Clone)]
+    enum ReplyShape {
+        /// Thinking blocks, no text, but not budget-eaten.
+        ThinkingOnly { reasoning_tokens: u64 },
+        /// Reasoning consumed almost the whole output budget.
+        BudgetEaten { reasoning_tokens: u64 },
+        /// A normal visible answer.
+        Text(String),
+    }
+
+    /// A provider double that replays a scripted sequence of reply shapes, so a
+    /// test can drive the §6.6 degenerate-turn retry (a thinking-only or
+    /// budget-eaten turn followed by a real answer).
+    struct SequenceProvider {
+        id: clawde_core::provider_id::ProviderId,
+        requests: Arc<StdMutex<Vec<clawde_api::ProviderRequest>>>,
+        shapes: Vec<ReplyShape>,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl clawde_api::LlmProvider for SequenceProvider {
+        fn id(&self) -> &clawde_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "sequence-mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
+            unimplemented!("these tests only use create_message_stream")
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: clawde_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            clawde_api::ProviderError,
+        > {
+            use clawde_api::provider_types::StopReason;
+            use clawde_api::StreamEvent;
+
+            self.requests.lock().unwrap().push(request);
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as usize;
+            let shape = self
+                .shapes
+                .get(n)
+                .or_else(|| self.shapes.last())
+                .cloned()
+                .expect("at least one shape");
+            let msg_id = uuid::Uuid::new_v4().to_string();
+
+            let mut events = vec![Ok(StreamEvent::MessageStart {
+                id: msg_id,
+                model: "mock-model".to_string(),
+                usage: UsageInfo::default(),
+            })];
+            match shape {
+                ReplyShape::Text(text) => {
+                    events.push(Ok(StreamEvent::TextDelta { index: 0, text }));
+                    events.push(Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::EndTurn),
+                        usage: Some(UsageInfo::default()),
+                    }));
+                }
+                ReplyShape::ThinkingOnly { reasoning_tokens }
+                | ReplyShape::BudgetEaten { reasoning_tokens } => {
+                    events.push(Ok(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        content_block: ContentBlock::Thinking {
+                            thinking: "deep thoughts".to_string(),
+                            signature: String::new(),
+                        },
+                    }));
+                    events.push(Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::EndTurn),
+                        usage: Some(UsageInfo {
+                            reasoning_tokens,
+                            ..UsageInfo::default()
+                        }),
+                    }));
+                }
+            }
+            events.push(Ok(StreamEvent::MessageStop));
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> clawde_api::ProviderCapabilities {
+            clawde_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: false,
+                thinking: true,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: clawde_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    /// Run one turn through the real loop against a scripted sequence provider,
+    /// returning the recorded requests, the final outcome and the status lines.
+    async fn run_sequence_turn(
+        shapes: Vec<ReplyShape>,
+        max_tokens: u32,
+        prompt: &str,
+    ) -> (Vec<clawde_api::ProviderRequest>, QueryOutcome, Vec<String>) {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn clawde_api::LlmProvider> = Arc::new(SequenceProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            requests: requests.clone(),
+            shapes,
+            calls: std::sync::atomic::AtomicU32::new(0),
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("test client");
+        let mut ctx = deny_all_context();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_tokens,
+            max_turns: 4,
+            provider_registry: Some(Arc::new(registry)),
+            ..Default::default()
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut messages = vec![Message::user(prompt)];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let statuses: Vec<String> = {
+            let mut out = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                if let QueryEvent::Status(s) = event {
+                    out.push(s);
+                }
+            }
+            out
+        };
+        let requests = requests.lock().unwrap().clone();
+        (requests, outcome, statuses)
+    }
+
+    /// §6.6: a thinking-only terminal turn is retried once (with a nudge) and
+    /// surfaced to the user, rather than silently becoming the placeholder.
+    #[tokio::test]
+    async fn thinking_only_turn_retries_once_before_the_placeholder() {
+        let _g = ENV_LOCK.lock().await;
+        let (requests, outcome, statuses) = run_sequence_turn(
+            vec![
+                ReplyShape::ThinkingOnly {
+                    reasoning_tokens: 50,
+                },
+                ReplyShape::Text("the real answer".to_string()),
+            ],
+            4_096,
+            "explain the design",
+        )
+        .await;
+
+        assert_eq!(
+            requests.len(),
+            2,
+            "a thinking-only turn is retried exactly once"
+        );
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|m| m.get_all_text().contains("only reasoning")),
+            "the retry must carry the nudge the model can read"
+        );
+        assert!(
+            statuses.iter().any(|s| s.contains("thinking-only")),
+            "the failure must be surfaced, got: {statuses:?}"
+        );
+        match outcome {
+            QueryOutcome::EndTurn { message, .. } => {
+                assert_eq!(message.get_all_text(), "the real answer");
+            }
+            other => panic!("expected EndTurn with the real answer, got {other:?}"),
+        }
+    }
+
+    /// §6.6: a budget-eaten turn is retried with a raised output budget (the
+    /// only lever that can recover it) and surfaced.
+    #[tokio::test]
+    async fn budget_eaten_turn_retries_with_a_higher_output_budget() {
+        let _g = ENV_LOCK.lock().await;
+        let (requests, outcome, statuses) = run_sequence_turn(
+            vec![
+                ReplyShape::BudgetEaten {
+                    reasoning_tokens: 1_900,
+                },
+                ReplyShape::Text("recovered".to_string()),
+            ],
+            2_000,
+            "explain the design",
+        )
+        .await;
+
+        assert_eq!(requests.len(), 2, "a budget-eaten turn is retried once");
+        assert_eq!(
+            requests[0].max_tokens, 2_000,
+            "the first attempt uses the configured budget"
+        );
+        assert_eq!(
+            requests[1].max_tokens,
+            2_000 + crate::thinking_failure::BUDGET_EATEN_BOOST_TOKENS,
+            "the retry grants the budget-eaten boost"
+        );
+        assert!(
+            statuses.iter().any(|s| s.contains("budget")),
+            "the budget-eaten failure must be surfaced, got: {statuses:?}"
+        );
+        match outcome {
+            QueryOutcome::EndTurn { message, .. } => {
+                assert_eq!(message.get_all_text(), "recovered");
+            }
+            other => panic!("expected EndTurn with the recovered answer, got {other:?}"),
+        }
+    }
+
+    /// A minimal Anthropic `POST /v1/messages` SSE mock: serves one scripted
+    /// `text/event-stream` body per inbound connection, in order. Lets a test
+    /// drive the *Anthropic* terminal path (which uses the real client) without
+    /// any network.
+    fn anthropic_sse_mock(bodies: Vec<String>) -> (String, Arc<StdMutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let base = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        );
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen_thread = seen.clone();
+        let expected = bodies.len();
+        std::thread::spawn(move || {
+            for (i, mut stream) in listener.incoming().take(expected + 2).flatten().enumerate() {
+                let mut buf = [0u8; 16_384];
+                let _ = stream.read(&mut buf);
+                seen_thread
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).to_string());
+                let body = bodies.get(i).cloned().unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, seen)
+    }
+
+    /// A complete Anthropic SSE body from `(event, data)` frames.
+    fn anthropic_sse_body(frames: &[(&str, &str)]) -> String {
+        frames
+            .iter()
+            .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+            .collect()
+    }
+
+    /// §6.6 on the Anthropic path (the other terminal path): a thinking-only
+    /// completion is retried once and the real answer is served — the Anthropic
+    /// path must not silently swallow it the way it used to.
+    #[tokio::test]
+    async fn anthropic_path_retries_thinking_only_then_answers() {
+        let _g = ENV_LOCK.lock().await;
+        const START: &str = r#"{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#;
+        let thinking_only = anthropic_sse_body(&[
+            ("message_start", START),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        let answer = anthropic_sse_body(&[
+            ("message_start", START),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"the real answer"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        let (base, seen) = anthropic_sse_mock(vec![thinking_only, answer]);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            api_base: base,
+            ..Default::default()
+        })
+        .expect("test client");
+        let mut ctx = deny_all_context();
+        ctx.config.provider = Some("anthropic".to_string());
+        let config = QueryConfig {
+            model: "claude-test".to_string(),
+            max_turns: 4,
+            provider_registry: None,
+            ..Default::default()
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut messages = vec![Message::user("explain the design")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "a thinking-only Anthropic turn is retried exactly once"
+        );
+        let statuses: Vec<String> = {
+            let mut out = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                if let QueryEvent::Status(s) = event {
+                    out.push(s);
+                }
+            }
+            out
+        };
+        assert!(
+            statuses.iter().any(|s| s.contains("thinking-only")),
+            "the failure must be surfaced, got: {statuses:?}"
+        );
+        match outcome {
+            QueryOutcome::EndTurn { message, .. } => {
+                assert_eq!(message.get_all_text(), "the real answer");
+            }
+            other => panic!("expected EndTurn with the real answer, got {other:?}"),
+        }
+    }
+
+    /// §6.6 UX-first, exhausted case on the Anthropic path: after the single
+    /// retry, a still-empty turn gets a *visible* placeholder instead of a
+    /// blank assistant message.
+    #[tokio::test]
+    async fn anthropic_path_placeholder_after_retry_exhausted() {
+        let _g = ENV_LOCK.lock().await;
+        const START: &str = r#"{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#;
+        let thinking_only = || {
+            anthropic_sse_body(&[
+                ("message_start", START),
+                (
+                    "content_block_start",
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+                ),
+                (
+                    "content_block_stop",
+                    r#"{"type":"content_block_stop","index":0}"#,
+                ),
+                (
+                    "message_delta",
+                    r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}"#,
+                ),
+                ("message_stop", r#"{"type":"message_stop"}"#),
+            ])
+        };
+        let (base, seen) = anthropic_sse_mock(vec![thinking_only(), thinking_only()]);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            api_base: base,
+            ..Default::default()
+        })
+        .expect("test client");
+        let mut ctx = deny_all_context();
+        ctx.config.provider = Some("anthropic".to_string());
+        let config = QueryConfig {
+            model: "claude-test".to_string(),
+            max_turns: 4,
+            provider_registry: None,
+            ..Default::default()
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut messages = vec![Message::user("explain the design")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the retry is bounded to one; no third dispatch"
+        );
+        let statuses: Vec<String> = {
+            let mut out = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                if let QueryEvent::Status(s) = event {
+                    out.push(s);
+                }
+            }
+            out
+        };
+        assert!(
+            statuses.iter().any(|s| s.contains("still no answer")),
+            "the exhausted failure must be surfaced, got: {statuses:?}"
+        );
+        match outcome {
+            QueryOutcome::EndTurn { message, .. } => {
+                assert!(
+                    message
+                        .get_all_text()
+                        .contains("no response from anthropic"),
+                    "a visible placeholder must replace the blank turn, got: {:?}",
+                    message.get_all_text()
+                );
+            }
+            other => panic!("expected EndTurn with the placeholder, got {other:?}"),
+        }
+    }
+
+    /// Whole-loop wiring for the divergence guard (spec §6.5 #3): once the run
+    /// has grown past the session's own strong-drift baseline, the refocus pin
+    /// rides the next request — and only one narration goes out.
+    #[tokio::test]
+    async fn divergence_pin_reaches_the_model_once() {
+        let _g = ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().expect("goal home");
+        let _old = std::env::var_os("CLAWDE_HOME");
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let store = clawde_core::GoalStore::open_default().expect("goal store");
+        store
+            .set_goal("drift-test", "finish the feature", None, 0)
+            .expect("set goal");
+
+        // Six tool rounds in the first logical turn: enough prepared calls to
+        // advance the goal re-anchor milestone the divergence check rides.
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn clawde_api::LlmProvider> = Arc::new(SystemPromptProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            prompts: Arc::new(StdMutex::new(Vec::new())),
+            requests: requests.clone(),
+            tool_rounds: 6,
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("test client");
+        let mut ctx = deny_all_context();
+        ctx.session_id = "drift-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_turns: 12,
+            provider_registry: Some(Arc::new(registry)),
+            continuation: crate::continuation::ContinuationMode::Goal,
+            ..Default::default()
+        };
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Three user turns that grew the scope past the ledger's own bar.
+        let mut messages = vec![
+            Message::user("Refactor the parser"),
+            Message::user("Also add a config reader"),
+            Message::user("And then a settings exporter"),
+            Message::user("Also add a JSON writer"),
+            Message::user("And then a CLI flag"),
+        ];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        match _old {
+            Some(v) => std::env::set_var("CLAWDE_HOME", v),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        let drift_pins = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.get_all_text().contains("[Drift check]"))
+            })
+            .count();
+        assert_eq!(
+            drift_pins, 1,
+            "the refocus pin must reach exactly one request"
         );
     }
 

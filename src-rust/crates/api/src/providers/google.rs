@@ -14,6 +14,7 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use clawde_core::effort::EffortLevel;
 use clawde_core::provider_id::ProviderId;
 use clawde_core::types::{
     ContentBlock, Message, MessageContent, Role, ToolResultContent, UsageInfo,
@@ -30,7 +31,12 @@ use crate::provider_types::{
     StopReason, StreamEvent, SystemPrompt, SystemPromptStyle,
 };
 
+use super::effort_shaping::shape_provider_thinking;
 use super::request_options::merge_google_options;
+
+/// Thinking budget assumed when a request asks for thinking without naming
+/// one — `ThinkingConfig::adaptive()` and friends carry `budget_tokens: 0`.
+const DEFAULT_THINKING_BUDGET: u32 = 8192;
 
 // ---------------------------------------------------------------------------
 // GoogleProvider
@@ -56,6 +62,39 @@ impl GoogleProvider {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// The `thinkingConfig` this request should carry, shaped by the shared
+    /// provider-thinking shaper (the single source of truth for the
+    /// per-version mapping). `None` when the shaper writes nothing, which
+    /// leaves the provider default in place.
+    fn thinking_config_for(request: &ProviderRequest) -> Option<Value> {
+        let model = request.model.to_ascii_lowercase();
+        let mut scratch = serde_json::Map::new();
+        shape_provider_thinking(
+            &mut scratch,
+            "google",
+            &model,
+            // Gemini 2.5's arm only shapes when it has a level to work from;
+            // an explicit budget is this request's own signal, so supply the
+            // ladder default as that arm's fallback. 3.x passes the effort
+            // through unchanged, where `None` is the shaper's documented
+            // default level.
+            request
+                .effort_level
+                .or_else(|| model.contains("2.5").then_some(EffortLevel::Medium)),
+            // A zero budget means "no budget stated" (adaptive thinking), so
+            // fall back to the historic default rather than asking for a
+            // zero-token budget.
+            request
+                .thinking
+                .as_ref()
+                .map(|t| t.budget_tokens)
+                .filter(|budget| *budget > 0)
+                .or(Some(DEFAULT_THINKING_BUDGET)),
+            Some(request.max_tokens),
+        );
+        scratch.remove("thinkingConfig")
+    }
 
     /// Returns true if the model supports thinking config (Gemini 2.5+ / 3.0+).
     fn supports_thinking(model: &str) -> bool {
@@ -463,20 +502,20 @@ impl GoogleProvider {
             gen_config.insert("topK".to_string(), json!(top_k));
         }
 
-        // Thinking config for supported models.
-        if Self::supports_thinking(&request.model) && request.thinking.is_some() {
-            let budget = request
-                .thinking
-                .as_ref()
-                .map(|t| t.budget_tokens)
-                .unwrap_or(8192);
-            gen_config.insert(
-                "thinkingConfig".to_string(),
-                json!({
-                    "includeThoughts": true,
-                    "thinkingBudget": budget
-                }),
-            );
+        // Thinking config for supported models. The 2.5-vs-3.x split (numeric
+        // `thinkingBudget` on 2.5, `thinkingLevel` on 3.x) comes from the
+        // shared shaper, so this path can never disagree with the query
+        // layer's `build_provider_options` or the free chain. Building the
+        // config here by hand sent `thinkingBudget` to Gemini 3.x, which
+        // Google documents as deprecated there with intermittent
+        // `400 INVALID_ARGUMENT`.
+        if request.model.contains("gemini")
+            && Self::supports_thinking(&request.model)
+            && request.thinking.is_some()
+        {
+            if let Some(config) = Self::thinking_config_for(request) {
+                gen_config.insert("thinkingConfig".to_string(), config);
+            }
         }
 
         // ---- Assemble body ----
@@ -1133,6 +1172,7 @@ fn thought_signature_from_part(part: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_types::ThinkingConfig;
     use clawde_core::types::Message;
     use serde_json::json;
 
@@ -1152,6 +1192,52 @@ mod tests {
             provider_options: json!({}),
             strict_route: false,
         }
+    }
+
+    #[test]
+    fn build_request_body_never_sends_thinking_budget_to_gemini_3() {
+        let provider = GoogleProvider::new("test".to_string());
+        let mut request = test_request(vec![Message::user_blocks(vec![ContentBlock::Text {
+            text: "hi".to_string(),
+        }])]);
+        request.thinking = Some(ThinkingConfig::enabled(19_000));
+        request.effort_level = Some(EffortLevel::High);
+
+        let body = provider.build_request_body(&request);
+        let config = &body["generationConfig"]["thinkingConfig"];
+        assert!(
+            config.get("thinkingBudget").is_none(),
+            "thinkingBudget is deprecated on Gemini 3 and can 400: {config}"
+        );
+        assert_eq!(config["thinkingLevel"], json!("high"));
+        assert_eq!(config["includeThoughts"], json!(true));
+    }
+
+    #[test]
+    fn build_request_body_keeps_the_numeric_budget_on_gemini_25() {
+        let provider = GoogleProvider::new("test".to_string());
+        let mut request = test_request(vec![Message::user_blocks(vec![ContentBlock::Text {
+            text: "hi".to_string(),
+        }])]);
+        request.model = "gemini-2.5-flash".to_string();
+        request.max_tokens = 4096;
+        request.thinking = Some(ThinkingConfig::enabled(19_000));
+
+        // No effort override: the request's own budget is the signal, and the
+        // shared shaper clamps it below maxOutputTokens as Gemini requires.
+        let body = provider.build_request_body(&request);
+        let config = &body["generationConfig"]["thinkingConfig"];
+        assert_eq!(config["includeThoughts"], json!(true));
+        assert_eq!(config["thinkingBudget"], json!(4095));
+
+        // Adaptive thinking (budget 0) falls back to the default budget.
+        request.max_tokens = 20_000;
+        request.thinking = Some(ThinkingConfig::adaptive());
+        let body = provider.build_request_body(&request);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            json!(8192)
+        );
     }
 
     #[test]

@@ -1861,7 +1861,8 @@ pub fn effective_model_for_config(
     registry: &ModelRegistry,
 ) -> String {
     if config.model.is_some() {
-        return config.effective_model().to_string();
+        return free_mode_effective_model(config)
+            .unwrap_or_else(|| config.effective_model().to_string());
     }
 
     if let Some(provider_id) = config.provider.as_deref() {
@@ -1871,6 +1872,30 @@ pub fn effective_model_for_config(
     }
 
     config.effective_model().to_string()
+}
+
+/// The model free mode will serve for `config`, or `None` when free mode is not
+/// the provider that will serve the request.
+///
+/// The dispatcher takes an explicit `provider` verbatim and only consults the
+/// model's `provider/` prefix when none is set, so `Some` here means the free
+/// composite owns the request and the catalog decides what it can route.
+///
+/// A `provider/model` pin outlives the upstream it names, and free mode already
+/// ignores a pin the catalog cannot serve (the chain is walked instead). This
+/// resolves the *label* the same way — via
+/// [`crate::providers::free::resolve_free_model`] — so the model shown in the
+/// footer, recorded in the session and used for cost pricing is the model the
+/// request actually ran on. Without it a retired pin (e.g.
+/// `mistral/mistral-small-latest`, retired 2026-10-05) kept being displayed and
+/// billed as a paid model while free upstreams served the turn.
+pub fn free_mode_effective_model(config: &clawde_core::config::Config) -> Option<String> {
+    if config.provider.as_deref() != Some(ProviderId::FREE) {
+        return None;
+    }
+    Some(crate::providers::free::resolve_free_model(
+        config.effective_model(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,6 +1912,42 @@ mod tests {
         // Empty would mean the embed or parser broke.
         assert!(!reg.is_empty(), "bundled snapshot must populate registry");
         assert!(reg.provider_count() > 0, "providers must be populated");
+    }
+
+    /// A free-mode pin whose upstream has been retired resolves to `free/auto`:
+    /// the free provider already walks the chain for exactly that pin, so the
+    /// value a session displays, stores and prices must not keep naming it.
+    #[test]
+    fn free_mode_retired_pin_resolves_to_auto() {
+        let registry = ModelRegistry::new();
+        let mut config = clawde_core::config::Config {
+            provider: Some("free".to_string()),
+            model: Some("mistral/mistral-small-latest".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(effective_model_for_config(&config, &registry), "free/auto");
+        assert_eq!(
+            free_mode_effective_model(&config).as_deref(),
+            Some("free/auto")
+        );
+
+        // A pin to a configured upstream is left exactly as written.
+        config.model = Some("groq/llama-3.3-70b-versatile".to_string());
+        assert_eq!(
+            effective_model_for_config(&config, &registry),
+            "groq/llama-3.3-70b-versatile"
+        );
+
+        // Free mode is not the provider here, so nothing is reconciled: a bare
+        // id is authoritative by design (self-hosted endpoints), and a
+        // `provider/model` prefix selects the provider.
+        config.provider = Some("ollama".to_string());
+        config.model = Some("deepseek-coder:latest".to_string());
+        assert_eq!(free_mode_effective_model(&config), None);
+        assert_eq!(
+            effective_model_for_config(&config, &registry),
+            "deepseek-coder:latest"
+        );
     }
 
     #[test]

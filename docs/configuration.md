@@ -75,6 +75,8 @@ The `config` object holds runtime behaviour options.
 | `provider` | string \| null | `"free"` | Active provider (`free` = Free Mode router across your configured free upstreams). See the [Providers](#providers) section. |
 | `defaultEffort` | string \| null | null | Persisted thinking-effort default: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultracode`. Applies whenever no session or CLI override exists. Manage with `/config set|get|unset default-effort`. |
 
+A `model` set while `provider` is `free` is resolved against the free catalog: `free/auto`, `<upstream>/<model>` and `free/family/<slug>` route as written, and a pin naming an upstream the catalog no longer has resolves to `free/auto` — the same walk-the-whole-chain route the free provider already takes for it, so the session is not labelled, stored or priced as an upstream that never served the turn.
+
 ### Reasoning and effort
 
 Thinking depth is controlled by a single canonical effort level. Per-turn resolution, highest wins:
@@ -100,9 +102,43 @@ Each provider translates the level to its native thinking parameters:
 | Google Gemini 3.x | `thinkingConfig.thinkingLevel` (`minimal` … `high`) + `includeThoughts` |
 | DeepSeek V4 | `thinking.type: enabled\|disabled` + `reasoning_effort: high \| max` |
 | Qwen3 (OpenAI-compatible hosts) | `reasoning_effort` |
-| Other models (Llama, GLM, gpt-oss, …) | no thinking parameters — the level only tunes temperature/prompt behaviour |
+| Z.AI / Zhipu GLM-5.2+ | `thinking.type: enabled\|disabled` + `reasoning_effort` (`max \| high \| low` on 5.3, full ladder on 5.2) |
+| Z.AI GLM-5.3 / 5.3-FLASH | thinking is always on — the API rejects `type: disabled`, so an explicit `none` sends no thinking block and the mildest effort tier |
+| Other models (Llama, gpt-oss, …) | no thinking parameters — the level only tunes temperature/prompt behaviour |
 
 In Free Mode the router applies the override per upstream at dispatch time, so `/effort high` correctly turns on Gemini thinking when the chain lands on `free/google/…` and emits `reasoning_effort` for a DeepSeek or Qwen3 model elsewhere — each upstream only ever sees parameters its model family accepts.
+
+#### Adaptive reasoning depth
+
+When **no** effort is configured — no `/effort`, no `--effort`, no
+`config.defaultEffort`, no resumed-session effort — Clawde picks one for the
+task from signals it already has: the task type (the same classifier the free
+router uses), how long the request is, how many files it names, and whether an
+attempt in this task already failed. The choice stays fixed through tool rounds,
+retries, compaction, and autonomous continuations so the thinking budget and
+cacheable guidance do not change mid-task. An explicit `--thinking` budget also
+suppresses automatic effort selection.
+
+- It only ever **raises**: code work starts at `high`, and a multi-file change,
+design task, or retry after a failure reaches `xhigh`. Nothing above `xhigh` is
+ever chosen automatically; `ultracode` stays keyword/CLI-gated.
+- An explicit setting always wins. `/effort low` means low, whatever the turn
+looks like.
+- A raise is skipped when the output budget cannot carry the extra thinking:
+at least 2,048 tokens of answer must survive the level's own thinking budget.
+The check uses the budget this request asks for, so a raise is not forfeited
+just because the free chain might land on a small-cap upstream — the
+per-upstream clamp is applied at dispatch, to `max_tokens` and to Gemini's
+numeric `thinkingBudget`. Reasoning-aware upstream selection is still pending.
+Explicit effort settings are not reduced by this check.
+- The footer shows the level in effect, with `(auto·<reason>)` when it was
+raised (`task type`, `request size`, `multi-file`, `retry after failure`).
+
+The effective level also selects how strongly the system prompt asks for
+reasoning: `none` omits the `## Reasoning before acting` block entirely,
+`medium` and below get the baseline version, and `high` and above add the
+explicit alternatives/risks/self-check paragraphs. The prompt, the thinking
+budget, and the footer therefore always describe the same turn.
 
 ### Ollama remote GPU and offline tool mode
 

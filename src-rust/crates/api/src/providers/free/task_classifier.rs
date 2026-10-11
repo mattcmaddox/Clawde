@@ -80,8 +80,16 @@ pub fn classify_request(request: &ProviderRequest) -> TaskType {
     if last_user_message_is_tool_result(request) {
         return TaskType::CodeEdit;
     }
-    let text = last_user_text(request).to_lowercase();
+    classify_text(&last_user_text(request))
+}
 
+/// The keyword rules of [`classify_request`], over the task text alone.
+///
+/// Extracted so callers that hold only the user's text — the adaptive
+/// reasoning-depth classifier (`providers::reasoning_depth`) — reuse the same
+/// rules rather than growing a second, drifting classifier.
+pub fn classify_text(text: &str) -> TaskType {
+    let text = text.to_lowercase();
     if contains_any(
         &text,
         &[

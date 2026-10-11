@@ -216,6 +216,24 @@ exist; use them and do not route around them:
   read the developer's live tally (21 structured groq samples) and fail, and
   how the followup tests rewrote the real `~/.clawde/followups.md`.
 
+The **project-settings walk** is the second way out of a redirected home, and
+it is easy to miss because nothing calls `config_dir()`: the walk climbs from
+`cwd` to the filesystem root looking for `<ancestor>/.clawde/settings.json`, so
+from any path under `$HOME` it reaches the home directory itself — and
+`~/.clawde` is the *user-level* config dir, never a project. Excluding a
+candidate by comparing it with `global_settings_path()` is not enough, because
+the whole point of a redirect is that this path is somewhere else: the real
+`~/.clawde/settings.json` then loads as a project layer that **outranks** the
+configured global settings (observed 2026-10-11 — a scratch-home TUI run from
+`~/clawde/src-rust` displayed and priced a `mistral/mistral-small-latest` model
+left in the developer's live settings by an upstream retired on 2026-10-05, and
+the same walk re-tagged their global MCP servers as `Project`). The walk lives
+in `Settings::project_settings_path` (`crates/core/src/lib.rs`), which excludes
+the user-level file by identity (`Settings::user_config_dir()`, the
+unredirected `config_dir()`); `mcp_trust::project_root_for` delegates to it so
+trust approvals are keyed by the same directory the project config came from.
+Regression test: `core::tests::redirected_home_never_loads_the_user_level_settings_as_a_project`.
+
 Both scratch directories are self-cleaning: `Settings::test_scratch_dir()`
 (`crates/core/src/lib.rs`) creates the `prefix-<pid>` directory, registers it
 for removal at process exit through `libc::atexit`, and reaps siblings in
@@ -529,7 +547,7 @@ fetching a model list.
    2+ keys → `KeyRotatingProvider`, else if 1 usable key (via
    `first_free_upstream_key`) → single provider, else skip.
 
-2. **`resolve_route()`** (free/impls.rs) — Maps model ID to Route. `"free"`/`"auto"`/`"free/auto"`/`""` → Auto (try all in order). `"groq/model"` → Pinned (try pinned first, then rest). Legacy `"zen/"` → normalized to `"opencode-zen/"`. OpenRouter special: `"openrouter/free"` restores full model ID.
+2. **`resolve_route()`** (free/impls.rs) — Maps model ID to Route. `"free"`/`"auto"`/`"free/auto"`/`""` → Auto (try all in order). `"groq/model"` → Pinned (try pinned first, then rest). Legacy `"zen/"` → normalized to `"opencode-zen/"`. OpenRouter special: `"openrouter/free"` restores full model ID. The string matching is `classify_pin` (free/mod.rs) and `resolve_route` adds only what needs a chain (the index to pin first, the canonical wire model for a bare tail), so the label side cannot drift from the routing side: `resolve_free_model` — which the footer label, the session's stored model and cost pricing all resolve through (`free_mode_effective_model`, api/model_registry.rs) — answers a pin the catalog no longer has (a retired upstream) with `free/auto`, exactly what the router does with it.
 
 3. **`attempt_plan()`** (free/impls.rs) — Builds ordered `[(idx, model)]` list. Auto = all upstreams with their `default_model`. Pinned = pinned first, then all others in catalog order with defaults.
 
