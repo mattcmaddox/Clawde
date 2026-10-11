@@ -422,5 +422,119 @@ class TarRoundTripTests(unittest.TestCase):
         self.assertIn(run_id, name)
 
 
+class PassAt1Tests(unittest.TestCase):
+    def test_all_pass(self) -> None:
+        records = [_record("t1", "groq", repeat=0), _record("t1", "groq", repeat=1)]
+        self.assertEqual(best_of_n.pass_at_1(records), 1.0)
+
+    def test_half_pass(self) -> None:
+        records = [
+            _record("t1", "groq", repeat=0),
+            _record("t1", "groq", repeat=1, verify_pass=False),
+        ]
+        self.assertEqual(best_of_n.pass_at_1(records), 0.5)
+
+    def test_unevaluable_is_excluded_not_a_failure(self) -> None:
+        records = [
+            _record("t1", "groq", repeat=0),
+            _record("t1", "groq", repeat=1, run_error="provider flake"),
+        ]
+        self.assertEqual(best_of_n.pass_at_1(records), 1.0)
+
+    def test_empty_is_none_not_zero(self) -> None:
+        self.assertIsNone(best_of_n.pass_at_1([]))
+        self.assertIsNone(best_of_n.pass_at_1([_record("t1", "groq", run_error="x")]))
+
+
+class PassPowerKTests(unittest.TestCase):
+    def test_all_k_pass_is_one(self) -> None:
+        records = [_record("t1", "groq", repeat=i) for i in range(3)]
+        self.assertEqual(best_of_n.pass_power_k(records, 3), 1.0)
+
+    def test_any_failure_in_the_k_is_zero(self) -> None:
+        records = [
+            _record("t1", "groq", repeat=0),
+            _record("t1", "groq", repeat=1),
+            _record("t1", "groq", repeat=2, verify_pass=False),
+        ]
+        self.assertEqual(best_of_n.pass_power_k(records, 3), 0.0)
+
+    def test_fewer_than_k_attempts_is_excluded(self) -> None:
+        # Only 2 evaluable attempts but k=3: the task is dropped from the
+        # denominator, not scored as a failure.
+        records = [_record("t1", "groq", repeat=0), _record("t1", "groq", repeat=1)]
+        self.assertIsNone(best_of_n.pass_power_k(records, 3))
+
+    def test_partial_tasks_average(self) -> None:
+        records = [
+            _record("t1", "groq", repeat=0),
+            _record("t1", "groq", repeat=1),
+            _record("t2", "groq", repeat=0),
+            _record("t2", "groq", repeat=1, verify_pass=False),
+        ]
+        self.assertEqual(best_of_n.pass_power_k(records, 2), 0.5)
+
+    def test_k_below_one_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            best_of_n.pass_power_k([], 0)
+
+
+class ComparePoliciesTests(unittest.TestCase):
+    def test_baseline_is_the_best_fixed_policy(self) -> None:
+        records = [
+            # groq: 2/2 pass on t1, 2/2 on t2 -> pass^2 = 1.0
+            _record("t1", "groq", repeat=0),
+            _record("t1", "groq", repeat=1),
+            _record("t2", "groq", repeat=0),
+            _record("t2", "groq", repeat=1),
+            # cerebras: t1 all pass, t2 one fail -> pass^2 = 0.5
+            _record("t1", "cerebras", repeat=0),
+            _record("t1", "cerebras", repeat=1),
+            _record("t2", "cerebras", repeat=0),
+            _record("t2", "cerebras", repeat=1, verify_pass=False),
+        ]
+        comparison = best_of_n.compare_policies(records, 2, adaptive=set(), min_samples=4)
+        self.assertEqual(comparison["baseline"]["policy"], "groq")
+        self.assertEqual(comparison["baseline"]["pass^k"], 1.0)
+
+    def test_adaptive_beats_baseline_when_reliability_is_higher(self) -> None:
+        records = [
+            # fixed groq: one task fails its second run -> pass^2 = 0.5
+            _record("t1", "groq", repeat=0),
+            _record("t1", "groq", repeat=1),
+            _record("t2", "groq", repeat=0),
+            _record("t2", "groq", repeat=1, verify_pass=False),
+            # adaptive free/auto: both tasks pass both runs -> pass^2 = 1.0
+            _record("t1", "routed", repeat=0, policy="free/auto"),
+            _record("t1", "routed", repeat=1, policy="free/auto"),
+            _record("t2", "routed", repeat=0, policy="free/auto"),
+            _record("t2", "routed", repeat=1, policy="free/auto"),
+        ]
+        comparison = best_of_n.compare_policies(records, 2, adaptive={"free/auto"}, min_samples=2)
+        self.assertEqual(comparison["baseline"]["policy"], "groq")
+        adaptive = comparison["policies"]["free/auto"]
+        self.assertTrue(adaptive["beats_baseline"])
+        self.assertEqual(adaptive["delta_pass^k"], 0.5)
+
+    def test_adaptive_below_min_samples_is_not_ranked(self) -> None:
+        records = [
+            _record("t1", "groq", repeat=0),
+            _record("t1", "groq", repeat=1),
+            # only one adaptive attempt
+            _record("t1", "routed", repeat=0, policy="free/auto"),
+        ]
+        comparison = best_of_n.compare_policies(records, 2, adaptive={"free/auto"}, min_samples=6)
+        adaptive = comparison["policies"]["free/auto"]
+        self.assertFalse(adaptive["sufficient_data"])
+        self.assertIsNone(adaptive["beats_baseline"])
+        self.assertIsNone(adaptive["delta_pass^k"])
+
+    def test_policy_label_falls_back_to_upstream(self) -> None:
+        records = [_record("t1", "groq", repeat=0)]
+        comparison = best_of_n.compare_policies(records, 1, adaptive=set())
+        self.assertIn("groq", comparison["policies"])
+        self.assertFalse(comparison["policies"]["groq"]["adaptive"])
+
+
 if __name__ == "__main__":
     unittest.main()

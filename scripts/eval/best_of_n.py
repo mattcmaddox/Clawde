@@ -823,6 +823,12 @@ def build_report(
                 f"per-task winners differ on {sum(1 for t in per_task.values() if len(t['passing_upstreams']) > 1)}/{len(per_task)} tasks"
                 if per_task else "no data"
             ),
+            # Phase 6 reliability: pass@1 and repeated-run pass^k, plus every
+            # adaptive policy ranked against the best fixed-provider baseline.
+            "pass_at_1": pass_at_1(records),
+            "reliability_k": repeats,
+            "pass_power_k": pass_power_k(records, repeats),
+            "policies": compare_policies(records, repeats),
         },
     }
     return report
@@ -847,6 +853,168 @@ def print_report_summary(report: dict) -> None:
     print(f"\n  single-attempt rates: {agg['single_attempt_pass_rate']}")
     print(f"  best-of-N rate: {agg['best_of_n_pass_rate']}  uplift: {agg['uplift']}  [{agg['diversity']}]")
     print(f"  unevaluable: {agg['unevaluable']}  pin-excluded: {agg['pin_excluded']}")
+
+
+# ---------------------------------------------------------------------------
+# Reliability metrics (Phase 6): pass@1, pass^k, policy comparison
+# ---------------------------------------------------------------------------
+
+# A policy with fewer evaluable attempts than this is reported but never ranked
+# or accepted — the plan's "minimum-sample gate" before a routing decision is
+# trusted. Kept here (not in a router) because it gates *measurement* first.
+MIN_POLICY_SAMPLES = 6
+
+# The policy label that marks an adaptive (routing) attempt. Fixed-baseline
+# attempts carry only their `upstream` id; a run that exercises an adaptive
+# route labels the record `policy: "free/auto"` so it is compared, not baselined.
+ADAPTIVE_POLICY = "free/auto"
+
+
+def _attempt_passed(record: dict) -> bool:
+    """A clean pass: verify green AND no out-of-scope edits (see build_report)."""
+    return bool(record.get("verify_pass")) and not record.get("scope_violations")
+
+
+def _policy_of(record: dict) -> str:
+    """The routing policy label: `policy` when present, else the upstream id."""
+    return record.get("policy") or record.get("upstream") or "unknown"
+
+
+def _evaluable(records: list[dict], policy: str | None = None) -> list[dict]:
+    """Evaluable records (no `run_error`), optionally for one policy label.
+
+    Unevaluable attempts are excluded, never scored as failures — the same
+    rule `build_report` applies to pass rates.
+    """
+    return [
+        r
+        for r in records
+        if not r.get("run_error") and (policy is None or _policy_of(r) == policy)
+    ]
+
+
+def pass_at_1(records: list[dict], policy: str | None = None) -> float | None:
+    """Fraction of evaluable attempts that pass, optionally for one policy.
+
+    `None` when there is nothing evaluable to score (never `0.0`).
+    """
+    evaluable = _evaluable(records, policy)
+    if not evaluable:
+        return None
+    return round(sum(1 for r in evaluable if _attempt_passed(r)) / len(evaluable), 3)
+
+
+def pass_power_k(records: list[dict], k: int, policy: str | None = None) -> float | None:
+    """Repeated-run reliability: fraction of tasks whose first `k` attempts pass.
+
+    This is the reliability reading — *all* k runs succeed — not the code-gen
+    `pass@k` (at least one of k succeeds). A task with fewer than `k` evaluable
+    attempts is excluded from the denominator, never scored as a failure.
+    """
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    per_task: dict[str, list[dict]] = {}
+    for record in _evaluable(records, policy):
+        per_task.setdefault(record["task"], []).append(record)
+    scores: list[int] = []
+    for task_records in per_task.values():
+        chosen = sorted(task_records, key=lambda r: r.get("repeat", 0))[:k]
+        if len(chosen) < k:
+            continue
+        scores.append(1 if all(_attempt_passed(r) for r in chosen) else 0)
+    if not scores:
+        return None
+    return round(sum(scores) / len(scores), 3)
+
+
+def compare_policies(
+    records: list[dict],
+    k: int,
+    *,
+    adaptive: set[str] | None = None,
+    min_samples: int = MIN_POLICY_SAMPLES,
+) -> dict:
+    """Per-policy pass@1 / pass^k, ranked against the best fixed baseline.
+
+    `adaptive` names the routing-candidate policies; every other policy is a
+    fixed-provider baseline candidate. The baseline is the fixed policy with the
+    highest pass^k (ties broken by pass@1, then sample count). An adaptive
+    policy with fewer than `min_samples` evaluable attempts is reported with
+    `sufficient_data: False` and `beats_baseline: None`, so an under-powered
+    policy can never be accepted on noise.
+    """
+    adaptive = adaptive if adaptive is not None else {ADAPTIVE_POLICY}
+    metrics: dict[str, dict] = {}
+    for policy in sorted({_policy_of(r) for r in records}):
+        evaluable = _evaluable(records, policy)
+        metrics[policy] = {
+            "pass@1": pass_at_1(records, policy),
+            "pass^k": pass_power_k(records, k, policy),
+            "samples": len(evaluable),
+            "sufficient_data": len(evaluable) >= min_samples,
+            "adaptive": policy in adaptive,
+        }
+
+    fixed = {
+        p: m
+        for p, m in metrics.items()
+        if not m["adaptive"] and m["sufficient_data"] and m["pass^k"] is not None
+    }
+    baseline_policy = None
+    if fixed:
+        baseline_policy = max(
+            fixed,
+            key=lambda p: (fixed[p]["pass^k"], fixed[p]["pass@1"] or 0.0, fixed[p]["samples"]),
+        )
+    baseline = None
+    if baseline_policy is not None:
+        base = fixed[baseline_policy]
+        baseline = {
+            "policy": baseline_policy,
+            "pass@1": base["pass@1"],
+            "pass^k": base["pass^k"],
+            "samples": base["samples"],
+        }
+
+    for metric in metrics.values():
+        if not metric["adaptive"]:
+            continue
+        if baseline is not None and metric["sufficient_data"] and metric["pass^k"] is not None:
+            metric["delta_pass^k"] = round(metric["pass^k"] - baseline["pass^k"], 3)
+            metric["beats_baseline"] = metric["pass^k"] > baseline["pass^k"]
+        else:
+            metric["delta_pass^k"] = None
+            metric["beats_baseline"] = None
+
+    return {"k": k, "min_samples": min_samples, "baseline": baseline, "policies": metrics}
+
+
+def print_reliability_summary(report: dict) -> None:
+    """Compact stdout block for the aggregate reliability metrics."""
+    agg = report.get("aggregate", {})
+    k = agg.get("pass_power_k")
+    print(f"\n  pass@1: {agg.get('pass_at_1')}  pass^{agg.get('reliability_k')}: {k}")
+    comparison = agg.get("policies") or {}
+    baseline = comparison.get("baseline")
+    if baseline:
+        print(
+            f"  fixed baseline: {baseline['policy']} "
+            f"(pass@1 {baseline['pass@1']}, pass^{comparison['k']} {baseline['pass^k']}, "
+            f"n={baseline['samples']})"
+        )
+    for policy, metric in comparison.get("policies", {}).items():
+        if not metric.get("adaptive"):
+            continue
+        if metric["beats_baseline"] is None:
+            verdict = "insufficient data — not ranked"
+        elif metric["beats_baseline"]:
+            verdict = "beats baseline"
+        else:
+            verdict = "does not beat baseline"
+        print(
+            f"  adaptive {policy}: pass@1 {metric['pass@1']}, "
+            f"pass^{comparison['k']} {metric['pass^k']}, n={metric['samples']} → {verdict}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1064,6 +1232,7 @@ def bestofn_mode(args: argparse.Namespace) -> int:
             append_result(Path(args.results), row)
 
     print_report_summary(report)
+    print_reliability_summary(report)
     print(f"\nreport: {out_path}")
     print(f"artifacts: {artifacts}")
     evaluable = [r for r in records if not r.get("run_error")]
