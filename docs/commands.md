@@ -9,11 +9,11 @@ This document is the complete reference for every slash command available in Cla
 1. [Command System Overview](#command-system-overview)
 2. [Session & Navigation](#session--navigation)
 3. [Streaming & Interrupts](#streaming--interrupts)
-4. [Model & Provider](#model--provider) — `/model`, `/models`, `/keys`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
-5. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/autopilot`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
+4. [Model & Provider](#model--provider) — `/model`, `/models`, `/keys`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`, `/routing`, `/compare`
+5. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/autopilot`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`, `/mode`
 6. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/spec`, `/spec-mode`, `/spec-review`, `/security-review`, `/init`, `/search`
 7. [Search & Files](#search--files) — `/files`, `/context`
-8. [Memory & Context](#memory--context) — `/memory`, `/usage`, `/cost`, `/stats`, `/status`, `/insights`
+8. [Memory & Context](#memory--context) — `/memory`, `/usage`, `/cost`, `/stats`, `/status`, `/insights`, `/auto-compact`, `/ctx-viz`
 9. [Agents & Tasks](#agents--tasks) — `/agents`, `/tasks`, `/goal`, `/managed-agents`, `/agent`
 10. [Planning & Review](#planning--review) — `/plan`, `/ultraplan`, `/ultrareview`
 11. [MCP & Integrations](#mcp--integrations) — `/mcp`, `/skills`, `ultracode`, `/plugin`, `/chrome`
@@ -21,7 +21,7 @@ This document is the complete reference for every slash command available in Cla
 13. [Display & Terminal](#display--terminal) — `/theme`, `/output-style`, `/statusline`, `/vim`, `/terminal-setup`, `/caveman`, `/cathead`, `/normal`, `/mobile`, `/color`, `/stickers`
 14. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/health`, `/verify`, `/version`, `/update`
 15. [Export & Sharing](#export--sharing) — `/export`, `/copy`
-16. [Advanced & Internal](#advanced--internal) — `/thinking`, `/connect`, `/fork`, `/effort`, `/summary`, `/brief`, `/sandbox-toggle`, `/think-back`, `/thinkback-play`
+16. [Advanced & Internal](#advanced--internal) — `/thinking`, `/connect`, `/fork`, `/effort`, `/summary`, `/brief`, `/sandbox-toggle`, `/think-back`, `/thinkback-play`, `/remote-control`, `/remote-env`, `/web-setup`
 17. [Self-Hosting & Katban](#self-hosting--katban) — `/katban`
 18. [Command Availability](#command-availability)
 
@@ -187,7 +187,7 @@ The destination must belong to the same git repository (typically a linked `git 
 ---
 
 ### /exit
-**Aliases:** `quit`
+**Aliases:** `quit`, `q`
 
 Exit the Clawde REPL. Equivalent to pressing `Ctrl+D`. Unsaved session state is flushed before exit.
 
@@ -199,7 +199,7 @@ Exit the Clawde REPL. Equivalent to pressing `Ctrl+D`. Unsaved session state is 
 ---
 
 ### /resume
-**Aliases:** `continue`
+**Aliases:** `r`, `continue`
 
 Resume a previous session from the session store. Displays a list of recent sessions with timestamps and summaries. Select one to restore its message history and file state.
 
@@ -211,7 +211,7 @@ Resume a previous session from the session store. Displays a list of recent sess
 ---
 
 ### /session
-**Aliases:** `remote`, `history`
+**Aliases:** `remote`
 
 Manage active and stored sessions. Subcommands allow listing, switching, deleting, and attaching to remote sessions.
 
@@ -250,7 +250,6 @@ Rename the current session. The new name is used in session listings and exports
 ---
 
 ### /rewind
-**Aliases:** `checkpoint`
 
 Rewind the conversation to a previous message. Displays a numbered list of messages; enter a number to truncate history to that point and resume from there.
 
@@ -267,6 +266,20 @@ Summarize and compress the conversation history to reduce context window usage. 
 
 ```
 /compact
+```
+
+---
+
+### /links
+**Aliases:** `link`
+
+List the URLs mentioned in this session and open one in your browser. URLs are harvested from user and assistant message text, most recent first.
+
+```
+/links            — open the most recent URL
+/links list       — print a numbered list (most recent first)
+/links <N>        — open the Nth URL from /links list
+/links last       — same as bare /links
 ```
 
 ---
@@ -474,6 +487,7 @@ and `/models` respectively.
 ---
 
 ### /thinking
+**Aliases:** `think`
 
 Configure or report extended thinking for the current session. Extended thinking lets the model reason through its response before answering — higher quality on hard problems, at the cost of additional tokens.
 
@@ -545,6 +559,38 @@ Toggle fast mode. In fast mode, Clawde switches to the active provider's smaller
 ```
 
 Setting persists to `~/.clawde/ui-settings.json`.
+
+---
+
+### /routing
+**Aliases:** `route`
+
+Show or change the free-mode routing strategy — how the free chain picks which upstream to try first.
+
+```
+/routing              — show the current strategy
+/routing auto         — route by request type, refined by latency (default)
+/routing sequential   — try upstreams in priority order
+/routing random       — randomize upstream order on each request
+/routing latency      — try the lowest-latency upstream first
+/routing task         — route by request type using per-task upstream preferences
+```
+
+`/sr`, `/rr`, `/lr` and `/tr` are top-level shortcuts for `sequential`, `random`, `latency` and `task` respectively. `task` mode is overridable per task type via `providers.free.options.routing.task_preferences`. The setting is persisted to `settings.json` under `providers.free.options.routing`.
+
+---
+
+### /compare
+**Aliases:** `cmp`
+
+Compare the configured free upstreams side by side: task-aware success rate, latency, dispatch history, cooldown state and key health. Requires a live provider registry, so start free mode first.
+
+```
+/compare
+/compare coding
+/compare --task reasoning
+/compare --provider groq
+```
 
 ---
 
@@ -626,6 +672,7 @@ While autopilot is active, the status bar shows `autopilot · N pending`, and de
 ---
 
 ### /hooks
+**Aliases:** `hook`
 
 Manage event hooks. Hooks are shell commands or scripts that execute when lifecycle events fire (e.g., before/after tool calls, on session start/end).
 
@@ -767,6 +814,7 @@ Configure the status line displayed at the bottom of the TUI. Toggle individual 
 ---
 
 ### /vim
+**Aliases:** `vi`
 
 Toggle vim keybinding mode on or off. In vim mode the input field behaves like a vim editor (normal/insert/visual modes). Persisted to config.
 
@@ -799,6 +847,24 @@ Run the terminal capability detection and setup wizard. Checks for true-color su
 ```
 /terminal-setup
 ```
+
+---
+
+### /mode
+**Aliases:** `preset`
+
+Switch the session's mode preset. A mode bundles config knobs (reasoning effort, permission mode, output style) with decision-rule guidance — plan posture, check-in cadence, ask-on-ambiguity — so an entire working posture changes in one command.
+
+```
+/mode                    — show the current mode and list presets
+/mode careful            — plan before writing, ask on design decisions
+/mode fast               — low reasoning effort, minimal check-ins
+/mode walkaway           — auto-approve file edits, minimal narration
+/mode default            — reset to default behavior
+/mode careful --turn     — apply for this turn only, reverting afterwards
+```
+
+Without `--turn` the preset is persisted to `settings.json` and survives restarts; `--turn` applies the knobs for a single turn without saving. Custom modes are JSON files in `~/.clawde/modes/` or a project-local `.clawde/modes/`.
 
 ---
 
@@ -959,6 +1025,7 @@ Analyze context window usage. Shows a breakdown of tokens consumed by system pro
 ## Memory & Context
 
 ### /memory
+**Aliases:** `mnemosyne`, `lethesyne`
 
 Manage memory files: the AGENTS.md instruction files that provide project context, plus the project auto-memory store (`MEMORY.md` index + session summaries) that is injected into the system prompt at session start.
 
@@ -1031,7 +1098,6 @@ Show the current session status. Includes active model, permission mode, thinkin
 ---
 
 ### /insights
-**Aliases:** `ctx-viz`
 
 Generate an analytical report of the current session. Prints a structured breakdown of conversation statistics including turn count, token usage (input/output/total), average tokens per exchange, estimated cost, total tool calls, and the most frequently invoked tool.
 
@@ -1061,6 +1127,36 @@ Tools
 ├─ Total calls         : 34
 └─ Most used           : Bash (18 calls)
 ```
+
+---
+
+### /auto-compact
+**Aliases:** `autocompact`
+
+Toggle automatic context compaction. When enabled, Clawde compacts the conversation as the context window fills instead of waiting for a manual `/compact`.
+
+```
+/auto-compact        — toggle
+/auto-compact on     — enable
+/auto-compact off    — disable
+```
+
+`on`/`enable`/`1`/`true` and `off`/`disable`/`0`/`false` are accepted. The setting is persisted to `settings.json`.
+
+---
+
+### /ctx-viz
+**Aliases:** `context-visualizer`, `ctx`
+
+Open the context-window overlay: tokens used against the window, rate limits, message counts, tool-call statistics and session cost. In headless mode it prints a one-line summary instead.
+
+```
+/ctx-viz
+/ctx
+/context-visualizer
+```
+
+`/context` is a separate, text-only readout of the same window; `/ctx-viz` is the interactive overlay.
 
 ---
 
@@ -1216,6 +1312,7 @@ Documented above under [Configuration & Settings](#configuration--settings).
 ---
 
 ### /skills
+**Aliases:** `skill`
 
 List and manage skills. Skills are bundled prompt-commands that extend Clawde's capabilities without writing code. They appear alongside built-in commands in the registry.
 
@@ -1333,6 +1430,7 @@ Remove credentials. By default removes only the **active** profile for the provi
 ---
 
 ### /accounts
+**Aliases:** `account`
 
 List every stored account across providers. The active profile in each provider is marked with `*`.
 
@@ -1777,6 +1875,52 @@ Replay a previous extended-thinking trace as a formatted, step-numbered walkthro
 /thinkback-play         — replay the most recent thinking trace
 /thinkback-play 2       — replay the second most recent thinking trace
 ```
+
+---
+
+### /remote-control
+**Aliases:** `rc`
+
+Show or manage the remote-control bridge, which lets a web UI drive this interactive session: prompts typed remotely run locally in this session, text and tool events stream back, and tool-permission prompts are answered from the web UI using the same decision path as the local keyboard.
+
+```
+/remote-control          — show bridge status and connection details
+/remote-control status   — same as bare /remote-control
+/remote-control start    — enable the bridge at next startup
+/remote-control stop     — disable it
+```
+
+`status` reports the hostname, the device ID (the first 12 characters of the SHA-256 device fingerprint), the bridge server (`CLAWDE_BRIDGE_URL`, default `https://claude.ai`) and whether a session token is present.
+
+`start` only persists `remoteControlAtStartup`; it takes effect on the next launch. The bridge still will not start without a session token — supplied via `CLAWDE_BRIDGE_TOKEN` or `CLAUDE_BRIDGE_OAUTH_TOKEN`, or reused from the bearer credential. Headless runs never start the bridge.
+
+---
+
+### /remote-env
+
+Show and manage the environment variables in config that are forwarded to remote Clawde sessions.
+
+```
+/remote-env                       — list (same as /remote-env list)
+/remote-env set <KEY> <VALUE>     — set a variable
+/remote-env unset <KEY>           — remove one
+```
+
+Values are persisted to `settings.json` under `env`. Keys containing `KEY`, `TOKEN`, `SECRET` or `PASSWORD` are masked in the listing.
+
+---
+
+### /web-setup
+**Aliases:** `remote-setup`
+
+Run a remote-readiness checklist for the current provider: credentials, SSH agent forwarding, the Clawde config directory, and DNS/port reachability of the provider endpoint. The same check is available on the CLI as `clawde remote-setup`.
+
+```
+/web-setup
+/remote-setup
+```
+
+The SSH-agent line is informational — it is only needed for git over SSH — and does not fail the checklist.
 
 ---
 

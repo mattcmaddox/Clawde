@@ -280,6 +280,9 @@ impl SlashCommand for AccountsCommand {
     fn name(&self) -> &str {
         "accounts"
     }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["account"]
+    }
     fn description(&self) -> &str {
         "List stored Anthropic and Codex accounts"
     }

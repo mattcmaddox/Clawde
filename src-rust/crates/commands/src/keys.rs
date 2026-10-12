@@ -1178,6 +1178,10 @@ impl SlashCommand for LimitsCommand {
         "limits"
     }
 
+    fn aliases(&self) -> Vec<&str> {
+        vec!["limit"]
+    }
+
     fn description(&self) -> &str {
         "Query rate-limit information from configured provider APIs"
     }

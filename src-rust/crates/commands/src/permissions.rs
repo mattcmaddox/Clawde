@@ -26,6 +26,9 @@ impl SlashCommand for PermissionsCommand {
     fn name(&self) -> &str {
         "permissions"
     }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["allowed-tools"]
+    }
     fn description(&self) -> &str {
         "View or change tool permission settings"
     }

@@ -2298,6 +2298,9 @@ impl SlashCommand for HooksCommand {
     fn name(&self) -> &str {
         "hooks"
     }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["hook"]
+    }
     fn description(&self) -> &str {
         "Show configured event hooks"
     }

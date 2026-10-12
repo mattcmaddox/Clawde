@@ -330,6 +330,9 @@ impl SlashCommand for CheckpointsCommand {
     fn name(&self) -> &str {
         "checkpoints"
     }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["checkpoint"]
+    }
     fn description(&self) -> &str {
         "List assistant turns that have recorded file changes"
     }

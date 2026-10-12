@@ -16,7 +16,7 @@ impl SlashCommand for PluginCommand {
         "plugin"
     }
     fn aliases(&self) -> Vec<&str> {
-        vec!["plugins"]
+        vec!["plugins", "marketplace"]
     }
     fn description(&self) -> &str {
         "Manage plugins"
