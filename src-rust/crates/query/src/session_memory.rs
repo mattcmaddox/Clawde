@@ -6,22 +6,29 @@
 // This mirrors TypeScript services/SessionMemory/sessionMemory.ts and
 // services/extractMemories/extractMemories.ts.
 //
+// Transport: one non-streaming completion through any `LlmProvider`. The caller
+// resolves the fast free chain (see
+// `clawde_api::providers::free::fast_free_model`), so extraction runs on the
+// same cheap aux lane as the session titler and synopsizer rather than
+// depending on the session provider's key. This module used to call
+// `AnthropicClient` directly, which made it a silent no-op on the default
+// free-mode setup.
+//
 // Strategy:
-//   1. After sessions with 20+ messages (or on compact), call the API with a
-//      structured extraction prompt.
-//   2. Parse the response into typed ExtractedMemory entries.
-//   3. Append entries under "## Auto-extracted memories" in AGENTS.md
+//   1. After sessions with 20+ messages (or on compact), call the provider with
+//      a structured extraction prompt.
+//   2. [`SessionMemoryExtractor::extract`] gates the turn through
+//      `decide::decide_memory`: a large turn has its tool observations masked
+//      before the transcript is built, a small turn is sent verbatim.
+//   3. Parse the response into typed ExtractedMemory entries.
+//   4. Append entries under "## Auto-extracted memories" in AGENTS.md
 //      (creating the file if it doesn't exist).
-//   4. Track state so we don't re-extract from already-processed messages.
+//   5. Track state so we don't re-extract from already-processed messages.
 
-use clawde_api::{
-    AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler,
-    SystemPrompt,
-};
-use clawde_core::types::{Message, Role};
-use serde_json::Value;
+use crate::session_synopsis::empty_request_defaults;
+use clawde_api::{LlmProvider, ProviderRequest, SystemPrompt};
+use clawde_core::types::{ContentBlock, Message, MessageContent, Role, ToolResultContent};
 use std::path::Path;
-use std::sync::Arc;
 use tokio::fs;
 use tracing::{debug, info, warn};
 
@@ -209,15 +216,30 @@ impl SessionMemoryExtractor {
 
     /// Extract key memories from a conversation.
     ///
-    /// Calls the API with a structured extraction prompt and parses the
-    /// response into `ExtractedMemory` entries.
+    /// Dispatches one non-streaming completion through `provider`. The caller
+    /// resolves a fast free-chain route (see
+    /// `clawde_api::providers::free::fast_free_model`) so extraction never
+    /// depends on the session provider's key — the failure mode that made this
+    /// a no-op on the default free-mode setup.
+    ///
+    /// `tokens_used` and `report_len_chars` feed
+    /// [`crate::decide::decide_memory`]: a turn large enough to summarize has
+    /// its verbose tool observations masked to placeholders before the
+    /// transcript is built, keeping the prompt inside the aux lane's token
+    /// budget; a small turn is sent verbatim.
     pub async fn extract(
         &self,
         messages: &[Message],
         working_dir: &Path,
-        api_client: &clawde_api::AnthropicClient,
+        provider: &dyn LlmProvider,
+        tokens_used: usize,
+        report_len_chars: usize,
     ) -> anyhow::Result<Vec<ExtractedMemory>> {
-        let model_visible: Vec<&Message> = messages
+        let source = match crate::decide::decide_memory(tokens_used, report_len_chars) {
+            crate::decide::MemoryDecision::Summarize => mask_observations(messages),
+            crate::decide::MemoryDecision::Keep => messages.to_vec(),
+        };
+        let model_visible: Vec<&Message> = source
             .iter()
             .filter(|m| m.role == Role::User || m.role == Role::Assistant)
             .collect();
@@ -226,15 +248,18 @@ impl SessionMemoryExtractor {
             return Ok(vec![]);
         }
 
-        // Build a compact transcript for the extraction prompt
+        // Build a compact transcript for the extraction prompt. Tool
+        // observations are included: a fact worth remembering ("the project
+        // uses Rust 2021") is discovered by reading `Cargo.toml`, not from
+        // prose, and a text-only transcript drops exactly that evidence. On a
+        // summarized turn those observations have already been masked above.
         let mut transcript = String::new();
         for msg in &model_visible {
             let role_label = match msg.role {
                 Role::User => "Human",
                 Role::Assistant => "Assistant",
             };
-            let text = msg.get_all_text();
-            if !text.is_empty() {
+            if let Some(text) = render_message(msg) {
                 transcript.push_str(&format!("{}: {}\n\n", role_label, text));
             }
         }
@@ -242,32 +267,28 @@ impl SessionMemoryExtractor {
         let working_dir_str = working_dir.display().to_string();
         let prompt = build_extraction_prompt(&transcript, &working_dir_str);
 
-        let api_msgs = vec![ApiMessage {
-            role: "user".to_string(),
-            content: Value::String(prompt),
-        }];
+        let request = ProviderRequest {
+            model: self.model.clone(),
+            messages: vec![Message::user(prompt)],
+            system_prompt: Some(SystemPrompt::Text(EXTRACTION_SYSTEM_PROMPT.to_string())),
+            max_tokens: self.max_tokens,
+            temperature: Some(0.2),
+            ..empty_request_defaults()
+        };
 
-        let request = CreateMessageRequest::builder(&self.model, self.max_tokens)
-            .messages(api_msgs)
-            .system(SystemPrompt::Text(EXTRACTION_SYSTEM_PROMPT.to_string()))
-            .build();
-
-        let handler: Arc<dyn StreamHandler> = Arc::new(clawde_api::streaming::NullStreamHandler);
-        let mut rx = api_client
-            .create_message_stream(request, handler)
+        let response = provider
+            .create_message(request)
             .await
             .map_err(|e| anyhow::anyhow!("API error: {}", e))?;
 
-        let mut acc = StreamAccumulator::new();
-        while let Some(evt) = rx.recv().await {
-            acc.on_event(&evt);
-            if matches!(evt, AnthropicStreamEvent::MessageStop) {
-                break;
-            }
-        }
-
-        let (response_msg, _usage, _stop) = acc.finish();
-        let response_text = response_msg.get_all_text();
+        let response_text = response
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
 
         if response_text.is_empty() {
             debug!("Session memory extraction produced empty response");
@@ -355,7 +376,6 @@ impl SessionMemoryExtractor {
         &self,
         messages: &[Message],
         _working_dir: &Path,
-        _api_client: &clawde_api::AnthropicClient,
     ) -> anyhow::Result<Vec<ExtractedMemory>> {
         // Only extract if we have enough messages
         if messages.len() < MIN_MESSAGES_TO_EXTRACT_ON_COMPACT {
@@ -421,6 +441,91 @@ impl SessionMemoryExtractor {
 
         facts
     }
+}
+
+// ---------------------------------------------------------------------------
+// Observation masking
+// ---------------------------------------------------------------------------
+
+/// Render one message for the extraction transcript, including tool uses and
+/// tool observations (see the transcript note in [`SessionMemoryExtractor::extract`]).
+/// Returns `None` when the message carries nothing the extractor can use.
+fn render_message(msg: &Message) -> Option<String> {
+    let blocks = match &msg.content {
+        MessageContent::Text(text) => {
+            let trimmed = text.trim();
+            return if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        MessageContent::Blocks(blocks) => blocks,
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } if !text.trim().is_empty() => {
+                parts.push(text.trim().to_string());
+            }
+            ContentBlock::ToolUse { name, input, .. } => {
+                let detail = input
+                    .as_object()
+                    .and_then(|o| o.values().find_map(|v| v.as_str()));
+                match detail {
+                    Some(d) => parts.push(format!("[tool {name}] {d}")),
+                    None => parts.push(format!("[tool {name}]")),
+                }
+            }
+            ContentBlock::ToolResult { content, .. } => match content {
+                ToolResultContent::Text(t) if !t.trim().is_empty() => {
+                    parts.push(format!("[observation] {}", t.trim()));
+                }
+                ToolResultContent::Blocks(inner) => {
+                    let joined: String = inner
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !joined.trim().is_empty() {
+                        parts.push(format!("[observation] {}", joined.trim()));
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+/// Mask verbose tool observations before the transcript is summarized.
+///
+/// Summarizing a large turn is the case where the aux lane's token budget
+/// actually bites, so the observations that dominate it are reduced the same
+/// way the compaction path reduces them: repeated reads collapse to their last
+/// occurrence, duplicated searches dedupe, and oversized results keep only a
+/// head/tail window. The extractor still sees the shape of what happened — the
+/// facts worth remembering are in the prompts and the head of each result —
+/// without the raw file dumps that push the prompt past the budget.
+fn mask_observations(messages: &[Message]) -> Vec<Message> {
+    let mut masked = messages.to_vec();
+    crate::compact::collapse_read_tool_results(&mut masked);
+    crate::compact::collapse_search_results(&mut masked);
+    crate::compact::prune_oversized_tool_results(
+        &mut masked,
+        &crate::compact::ToolResultPrunerConfig::default(),
+    );
+    masked
 }
 
 // ---------------------------------------------------------------------------
@@ -750,5 +855,199 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
         let msgs = vec![msg];
         state.advance_cursor(&msgs);
         assert_eq!(state.last_extracted_message_uuid.as_deref(), Some("uuid-1"));
+    }
+
+    // ---- extract (ported provider path) --------------------------------
+
+    use clawde_api::{LlmProvider, ProviderRequest, ProviderResponse, StopReason};
+    use std::sync::{Arc, Mutex};
+
+    /// Provider stub that records every request and replies with a fixed body —
+    /// drives `extract` without a live model.
+    struct RecordingExtractorProvider {
+        id: clawde_core::provider_id::ProviderId,
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RecordingExtractorProvider {
+        fn id(&self) -> &clawde_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "recording-extractor"
+        }
+        async fn create_message(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, clawde_api::ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(ProviderResponse {
+                id: "recording-extractor".to_string(),
+                model: "recording-extractor".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: self.reply.clone(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: Default::default(),
+                rate_limit: None,
+            })
+        }
+        async fn create_message_stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            clawde_api::ProviderError,
+        > {
+            unimplemented!("session memory extraction uses create_message only")
+        }
+        async fn health_check(
+            &self,
+        ) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderStatus::Healthy)
+        }
+        fn capabilities(&self) -> clawde_api::ProviderCapabilities {
+            clawde_api::ProviderCapabilities {
+                streaming: false,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: clawde_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    fn extractor_provider(
+        requests: &Arc<Mutex<Vec<ProviderRequest>>>,
+        reply: &str,
+    ) -> RecordingExtractorProvider {
+        RecordingExtractorProvider {
+            id: clawde_core::provider_id::ProviderId::new("free"),
+            requests: requests.clone(),
+            reply: reply.to_string(),
+        }
+    }
+
+    fn observation_message(text: &str) -> Message {
+        Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-1".to_string(),
+            content: ToolResultContent::Text(text.to_string()),
+            is_error: None,
+        }])
+    }
+
+    #[tokio::test]
+    async fn extract_dispatches_through_the_provider_and_parses_memories() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = extractor_provider(
+            &requests,
+            "MEMORY: project_fact | 9 | The project runs on the free chain",
+        );
+        let extractor = SessionMemoryExtractor::new("groq/openai/gpt-oss-120b");
+        let messages = make_messages(MIN_MESSAGES_TO_EXTRACT);
+        let dir = tempfile::tempdir().unwrap();
+
+        let memories = extractor
+            .extract(&messages, dir.path(), &provider, 1_000, 50)
+            .await
+            .unwrap();
+
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].category, MemoryCategory::ProjectFact);
+        assert!(memories[0].content.contains("free chain"));
+
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].model, "groq/openai/gpt-oss-120b");
+        assert!(matches!(
+            captured[0].system_prompt.as_ref(),
+            Some(clawde_api::SystemPrompt::Text(t)) if t.contains("memory extraction")
+        ));
+    }
+
+    #[tokio::test]
+    async fn extract_includes_tool_observations_in_the_transcript() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = extractor_provider(&requests, "MEMORY: project_fact | 8 | ok");
+        let extractor = SessionMemoryExtractor::new("free/auto");
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut messages = make_messages(MIN_MESSAGES_TO_EXTRACT);
+        messages.push(observation_message("CARGO_EDITION_2021"));
+
+        extractor
+            .extract(&messages, dir.path(), &provider, 1_000, 50)
+            .await
+            .unwrap();
+
+        let captured = requests.lock().unwrap();
+        let prompt = captured[0].messages[0].get_all_text();
+        assert!(
+            prompt.contains("[observation] CARGO_EDITION_2021"),
+            "tool observation dropped from the transcript: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_masks_duplicate_observations_only_when_summarizing() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = extractor_provider(&requests, "MEMORY: project_fact | 8 | ok");
+        let extractor = SessionMemoryExtractor::new("free/auto");
+        let dir = tempfile::tempdir().unwrap();
+
+        let messages = vec![
+            observation_message("DUPLICATE_OBSERVATION_MARKER"),
+            observation_message("DUPLICATE_OBSERVATION_MARKER"),
+            Message::user("keep going"),
+            Message::assistant("done"),
+        ];
+
+        // Small turn -> Keep -> both observations survive verbatim.
+        extractor
+            .extract(&messages, dir.path(), &provider, 1_000, 50)
+            .await
+            .unwrap();
+        // Large turn -> Summarize -> the duplicate collapses to its last
+        // occurrence only.
+        extractor
+            .extract(
+                &messages,
+                dir.path(),
+                &provider,
+                crate::decide::MEMORY_SUMMARIZE_THRESHOLD + 1,
+                50,
+            )
+            .await
+            .unwrap();
+
+        let captured = requests.lock().unwrap();
+        let keep_prompt = captured[0].messages[0].get_all_text();
+        let summarize_prompt = captured[1].messages[0].get_all_text();
+        assert_eq!(
+            keep_prompt.matches("DUPLICATE_OBSERVATION_MARKER").count(),
+            2,
+            "a kept turn must not mask: {keep_prompt}"
+        );
+        assert_eq!(
+            summarize_prompt
+                .matches("DUPLICATE_OBSERVATION_MARKER")
+                .count(),
+            1,
+            "a summarized turn must mask: {summarize_prompt}"
+        );
+        assert!(summarize_prompt.contains("showing last occurrence only"));
     }
 }

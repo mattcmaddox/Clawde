@@ -370,7 +370,7 @@ If the provider uses an env var (e.g. `FOO_API_KEY`), wire it into the auth-stor
 
 ### 6. Tests
 
-- Add a smoke test in `crates/api/tests/` that exercises request shaping and response parsing against a mocked HTTP body. No live API calls — follow the fixture pattern in `crates/api/tests/ollama_native_chat.rs` and `crates/api/tests/free_recovery.rs` (shared helpers live in `crates/api/tests/common/`, bodies in `crates/api/tests/fixtures/`).
+- Add a smoke test in `crates/api/tests/` that exercises request shaping and response parsing against a mocked HTTP body. **No live API calls** — a mocked body is what keeps `cargo test` deterministic and off shared free-tier capacity (a flaky/quota-exhausted upstream would fail the suite for reasons unrelated to the change). Live provider checks belong at the gate level instead: the pre-commit live eval gate and the `scripts/probes/` tmux rotation probes, never `cargo test`. Follow the fixture pattern in `crates/api/tests/ollama_native_chat.rs` and `crates/api/tests/free_recovery.rs` (shared helpers live in `crates/api/tests/common/`, bodies in `crates/api/tests/fixtures/`).
 - If the provider supports tool calls, add a tool-call round-trip fixture.
 - OpenAI-compatible providers share the transport in `openai_compat_providers.rs`; a new entry there still needs a request-shaping test if it has any base-URL or header quirk.
 

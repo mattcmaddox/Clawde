@@ -97,6 +97,19 @@ impl EnvVarGuard {
             prev,
         }
     }
+
+    /// Hold [`ENV_LOCK`] without mutating anything.
+    ///
+    /// For tests that *read* env-dependent state and assert on it: they must
+    /// serialize with the [`EnvVarGuard::set`] writers, or a parallel writer
+    /// makes the read nondeterministic (see the type doc — unguarded readers
+    /// of the same var must not assert on values another test writes).
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl Drop for EnvVarGuard {

@@ -310,15 +310,24 @@ pub fn decide_adversarial(enabled: bool, diff: &str) -> bool {
 
 /// Token budget above which a turn's context should be summarized for memory.
 ///
-/// Fitted 2026-08-14 to the first recorded `context_tokens_est` distribution
-/// (6-turn baseline series, phase-2 tasks): observed max 1250, p95 1250 —
-/// far below the old 120k guess. Lowered to 10k (≈8x observed max) so the
-/// decision can actually fire on genuinely large contexts while every
-/// measured turn is kept verbatim. Re-fit after more per-turn data lands.
-pub const MEMORY_SUMMARIZE_THRESHOLD: usize = 10_000;
+/// Grounded in the aux-lane budget rather than an n=6 percentile fit: the
+/// memory summarizer runs on the same fast free chain as the session titler
+/// and synopsizer, whose preferred upstream (Groq's free tier) enforces 8,000
+/// tokens per minute — the measured limit, not the advertised 12,000 (see
+/// `openai_compat_providers.rs`). A turn assembled larger than that budget
+/// cannot be handed to the summarizer verbatim without risking a 429 on the
+/// lane, so it is summarized instead; turns at or below the budget are kept
+/// verbatim.
+pub const MEMORY_SUMMARIZE_THRESHOLD: usize = 8_000;
 
 /// Report size (chars) above which the report itself is worth summarizing.
-pub const MEMORY_REPORT_CHARS_THRESHOLD: usize = 4_000;
+///
+/// Aligned with [`clawde_core::memdir::MAX_SESSION_SUMMARY_BYTES`], the cap
+/// memdir applies when it loads a persisted session summary. A report larger
+/// than the read cap would be silently truncated on injection, so it is
+/// summarized to fit instead of written only to be cut. Summaries are
+/// markdown and overwhelmingly ASCII, so the byte cap is a safe char budget.
+pub const MEMORY_REPORT_CHARS_THRESHOLD: usize = clawde_core::memdir::MAX_SESSION_SUMMARY_BYTES;
 
 /// What to do with the turn's context when persisting to memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

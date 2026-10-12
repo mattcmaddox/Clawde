@@ -4484,6 +4484,10 @@ mod tests {
 
     #[test]
     fn chat_probe_prefers_fallback_model_for_capacity_starved_upstreams() {
+        // Reads the `CLAWDE_FREE_BASE_URL_*` override path indirectly, so it
+        // must serialize with the tests that set those vars — otherwise a
+        // parallel writer makes `base` the mock URL (observed flake).
+        let _env = crate::test_support::EnvVarGuard::lock();
         // nvidia has a catalog fallback (20B) — the probe must use it instead
         // of the capacity-starved 120B default, so valid keys aren't marked
         // unhealthy by a 30s+ 503.

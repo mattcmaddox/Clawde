@@ -14,7 +14,6 @@
 
 pub mod agent_tool;
 pub mod auto_dream;
-pub mod away_summary;
 pub mod command_queue;
 pub mod compact;
 pub mod context_analyzer;
@@ -448,6 +447,28 @@ fn free_catalog_pin_redirect(provider_id: &str, auth_store: &clawde_core::AuthSt
         return false;
     }
     clawde_api::providers::free::first_free_upstream_key(auth_store, provider_id).is_some()
+}
+
+/// Choose the provider and model for one-shot background memory work (session
+/// memory extraction).
+///
+/// Prefers the free chain's provider with a fast free model — the same lane the
+/// session titler and synopsizer use — so extraction never spends the session
+/// provider's budget and works on the default free-mode setup. Falls back to the
+/// session's own provider and model when the free chain is not registered, and
+/// yields `None` (no extraction) when neither is available. Generic over the
+/// provider handle purely so the choice is pinned by a test without a provider
+/// stub.
+fn memory_lane<P>(
+    free_provider: Option<P>,
+    session_provider: Option<P>,
+    free_model: &str,
+    session_model: &str,
+) -> Option<(P, String)> {
+    match free_provider {
+        Some(free) => Some((free, free_model.to_string())),
+        None => session_provider.map(|provider| (provider, session_model.to_string())),
+    }
 }
 
 /// Convert a canonical Clawde model ID into the upstream model ID expected by
@@ -6227,7 +6248,7 @@ async fn run_query_loop_inner(
                         crate::session_memory::SessionMemoryExtractor::new(&config.model);
                     if crate::session_memory::SessionMemoryExtractor::should_extract(messages) {
                         if let Ok(extracted) = extractor
-                            .extract_before_compact(messages, &tool_ctx.working_dir, client)
+                            .extract_before_compact(messages, &tool_ctx.working_dir)
                             .await
                         {
                             if !extracted.is_empty() {
@@ -6310,68 +6331,83 @@ async fn run_query_loop_inner(
                     // Asynchronously extract and persist session memories if warranted.
                     // Runs in a detached Tokio task so it doesn't block the query loop.
                     if session_memory::SessionMemoryExtractor::should_extract(messages) {
-                        let model_clone = config.model.clone();
-                        let messages_clone = messages.clone();
-                        let working_dir_clone = tool_ctx.working_dir.clone();
-                        let event_tx_for_memory = event_tx.clone();
-
-                        // Build a fresh client using the same API key.  This avoids
-                        // requiring an Arc in the existing run_query_loop signature.
-                        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-                            if !api_key.is_empty() {
-                                if let Ok(sm_client) = clawde_api::AnthropicClient::new(
-                                    clawde_api::client::ClientConfig {
-                                        api_key,
-                                        ..Default::default()
-                                    },
-                                ) {
-                                    let sm_client = std::sync::Arc::new(sm_client);
-                                    // Tracked so the exit drain can wait for this
-                                    // durable write instead of losing it to
-                                    // runtime teardown (see pending_writes).
-                                    clawde_core::pending_writes::spawn(async move {
-                                        let extractor = session_memory::SessionMemoryExtractor::new(
-                                            &model_clone,
-                                        );
-                                        match extractor
-                                            .extract(
-                                                &messages_clone,
-                                                &working_dir_clone,
-                                                &sm_client,
+                        // Memory extraction runs on the fast free chain the
+                        // titler and synopsizer use — one cheap completion
+                        // against a free upstream, independent of the session
+                        // provider. The previous version built an Anthropic
+                        // client from `ANTHROPIC_API_KEY` and so silently did
+                        // nothing on the default free-mode setup. Falls back to
+                        // the session's own provider when the free chain is not
+                        // registered (e.g. a sub-agent with no free keys).
+                        // The memory lane: the fast free chain when it is
+                        // registered, otherwise the session provider (see
+                        // `memory_lane`).
+                        let free_provider = config.provider_registry.as_ref().and_then(|reg| {
+                            reg.get(&clawde_core::ProviderId::new("free")).cloned()
+                        });
+                        let lane = memory_lane(
+                            free_provider,
+                            compact_provider.clone(),
+                            &clawde_api::providers::free::fast_free_model(
+                                &clawde_core::AuthStore::load(),
+                            ),
+                            &config.model,
+                        );
+                        if let Some((memory_provider, memory_model)) = lane {
+                            let messages_clone = messages.clone();
+                            let working_dir_clone = tool_ctx.working_dir.clone();
+                            let event_tx_for_memory = event_tx.clone();
+                            // The signal `decide_memory` budgets on: the turn's
+                            // assembled context (free providers report
+                            // `input_tokens: 0`, so the estimate is the only
+                            // truthful measurement) and the length of the
+                            // report this turn produced.
+                            let tokens_used = context_tokens as usize;
+                            let report_len_chars = assistant_msg.get_all_text().chars().count();
+                            // Tracked so the exit drain can wait for this
+                            // durable write instead of losing it to runtime
+                            // teardown (see pending_writes).
+                            clawde_core::pending_writes::spawn(async move {
+                                let extractor =
+                                    session_memory::SessionMemoryExtractor::new(&memory_model);
+                                match extractor
+                                    .extract(
+                                        &messages_clone,
+                                        &working_dir_clone,
+                                        memory_provider.as_ref(),
+                                        tokens_used,
+                                        report_len_chars,
+                                    )
+                                    .await
+                                {
+                                    Ok(memories) if !memories.is_empty() => {
+                                        let target =
+                                            working_dir_clone.join(".clawde").join("AGENTS.md");
+                                        if let Err(e) =
+                                            session_memory::SessionMemoryExtractor::persist(
+                                                &memories, &target,
                                             )
                                             .await
                                         {
-                                            Ok(memories) if !memories.is_empty() => {
-                                                let target = working_dir_clone
-                                                    .join(".clawde")
-                                                    .join("AGENTS.md");
-                                                if let Err(e) =
-                                                    session_memory::SessionMemoryExtractor::persist(
-                                                        &memories, &target,
-                                                    )
-                                                    .await
-                                                {
-                                                    tracing::warn!(
-                                                        error = %e,
-                                                        "Failed to persist session memories"
-                                                    );
-                                                } else if let Some(tx) = event_tx_for_memory {
-                                                    let _ = tx.send(QueryEvent::MemoryUpdated(
-                                                        target.display().to_string(),
-                                                    ));
-                                                }
-                                            }
-                                            Ok(_) => {} // no memories extracted
-                                            Err(e) => {
-                                                tracing::debug!(
-                                                    error = %e,
-                                                    "Session memory extraction failed (non-fatal)"
-                                                );
-                                            }
+                                            tracing::warn!(
+                                                error = %e,
+                                                "Failed to persist session memories"
+                                            );
+                                        } else if let Some(tx) = event_tx_for_memory {
+                                            let _ = tx.send(QueryEvent::MemoryUpdated(
+                                                target.display().to_string(),
+                                            ));
                                         }
-                                    });
+                                    }
+                                    Ok(_) => {} // no memories extracted
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            error = %e,
+                                            "Session memory extraction failed (non-fatal)"
+                                        );
+                                    }
                                 }
-                            }
+                            });
                         }
                     }
 
@@ -6471,7 +6507,28 @@ async fn run_query_loop_inner(
                                     "run_in_background": false,
                                     "isolation": null
                                 });
-                                let ctx_for_dream = tool_ctx.clone();
+                                // Consolidation is background memory work, so it
+                                // runs on the fast free chain the titler,
+                                // synopsizer, and extractor use — never spending
+                                // the session provider's budget. The session
+                                // provider is left in place when the free chain
+                                // is not registered, so a paid-only setup still
+                                // consolidates.
+                                let ctx_for_dream = {
+                                    let mut c = tool_ctx.clone();
+                                    let free_registered =
+                                        config.provider_registry.as_ref().is_some_and(|reg| {
+                                            reg.get(&clawde_core::ProviderId::new("free")).is_some()
+                                        });
+                                    if free_registered {
+                                        c.config.provider = Some("free".to_string());
+                                        c.config.model =
+                                            Some(clawde_api::providers::free::fast_free_model(
+                                                &clawde_core::AuthStore::load(),
+                                            ));
+                                    }
+                                    c
+                                };
                                 let event_tx_for_dream = event_tx.clone();
                                 let memory_entrypoint =
                                     task.memory_dir.join(clawde_core::memdir::MEMORY_ENTRYPOINT);
@@ -7185,6 +7242,32 @@ mod tests {
     use super::*;
     use clawde_api::SystemPrompt;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn memory_lane_prefers_the_free_chain_then_falls_back_to_the_session() {
+        // Free chain registered: it wins, with the fast free model, whatever
+        // the session provider is.
+        assert_eq!(
+            memory_lane(
+                Some("free"),
+                Some("session"),
+                "groq/openai/gpt-oss-120b",
+                "claude-opus-4-5",
+            ),
+            Some(("free", "groq/openai/gpt-oss-120b".to_string()))
+        );
+        // No free chain: the session provider and its model are used, so a
+        // paid-only setup still extracts memories.
+        assert_eq!(
+            memory_lane(None, Some("session"), "free/auto", "claude-opus-4-5"),
+            Some(("session", "claude-opus-4-5".to_string()))
+        );
+        // Neither available: no extraction at all.
+        assert_eq!(
+            memory_lane::<&str>(None, None, "free/auto", "claude-opus-4-5"),
+            None
+        );
+    }
 
     #[test]
     fn partial_blocks_keep_text_and_thinking_but_drop_tools() {

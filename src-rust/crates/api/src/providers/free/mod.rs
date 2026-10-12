@@ -2225,6 +2225,24 @@ pub fn all_stored_free_upstream_keys(
     out
 }
 
+/// Preferred fast, cheap model for one-shot auxiliary work: session titling,
+/// the session synopsis, and session-memory extraction.
+///
+/// Prefers a pin into the free chain's Groq upstream (fast, and the aux-lane
+/// budget the memory summarizer is sized against). When Groq has no configured
+/// key, falls back to the free Auto route (`free/auto`), which the composite
+/// provider routes across configured upstreams in catalog order. The string
+/// only matters when the dispatch provider is the free chain; other providers
+/// ignore or resolve it themselves. The pin format is what
+/// `FreeProvider::resolve_route` consumes.
+pub fn fast_free_model(auth_store: &clawde_core::AuthStore) -> String {
+    if first_free_upstream_key(auth_store, "groq").is_some() {
+        "groq/openai/gpt-oss-120b".to_string()
+    } else {
+        "free/auto".to_string()
+    }
+}
+
 /// First usable key for a free-catalog upstream's single-key chain entry.
 ///
 /// Ring-consistent first: if the multi-key store holds any valid slot after

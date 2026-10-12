@@ -3854,19 +3854,11 @@ fn reset_autonomy_for_session(tool_ctx: &mut ToolContext, session_id: &str) {
 /// Model id for the session-exit one-shot summarisers (session title, session
 /// synopsis): a fast, cheap completion is all either needs.
 ///
-/// Prefers a pin into the free chain's Groq upstream. When Groq has no
-/// configured key, falls back to the free Auto route (`free/auto`), which the
-/// composite provider routes across configured upstreams in catalog order. The
-/// string only matters when the selected provider is the free chain; other
-/// providers ignore or resolve it themselves. The pin format is what
-/// `FreeProvider::resolve_route` consumes.
+/// The resolution itself is shared with the query crate's memory extractor —
+/// one definition in `clawde_api::providers::free` so the titler, synopsizer,
+/// and memory lane can never pin different models.
 fn fast_free_model_for_config() -> String {
-    let auth = clawde_core::AuthStore::load();
-    if clawde_api::providers::free::first_free_upstream_key(&auth, "groq").is_some() {
-        "groq/openai/gpt-oss-120b".to_string()
-    } else {
-        "free/auto".to_string()
-    }
+    clawde_api::providers::free::fast_free_model(&clawde_core::AuthStore::load())
 }
 
 /// Resolve the Ollama model this session should release from the remote GPU

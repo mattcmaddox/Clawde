@@ -824,10 +824,17 @@ pub fn load_memory_index(memory_dir: &Path) -> Option<EntrypointTruncation> {
 
 // ---------------------------------------------------------------------------
 // System-prompt memory content builder
-// ---------------------------------------------------------------------------/// Maximum bytes loaded from a single session summary. Kept conservative so
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes loaded from a single session summary. Kept conservative so
 /// the combined memory injection (index + summary) stays within a few percent
 /// of a typical 128K context window (audit spec §18.3 token-budget concern).
-const MAX_SESSION_SUMMARY_BYTES: usize = 4_000;
+///
+/// Public because it is also the write-side budget the memory summarizer
+/// sizes itself against (`query::decide::MEMORY_REPORT_CHARS_THRESHOLD`): a
+/// report kept under the same cap memdir reads back can never be truncated on
+/// injection.
+pub const MAX_SESSION_SUMMARY_BYTES: usize = 4_000;
 
 /// Load the most recently modified session summary from `sessions/`.
 ///
