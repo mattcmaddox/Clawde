@@ -71,9 +71,8 @@ cd "$ROOT" || exit 0
 # reaches a commit reaches every future clone. If gitleaks is not installed,
 # skip with a one-time hint rather than nagging on every commit.
 if [ "${CLAWDE_HOOK_SKIP_GITLEAKS:-0}" = "1" ]; then
-    exit 0
-fi
-if command -v gitleaks >/dev/null 2>&1; then
+    :  # scan skipped; fall through so the remaining checks still run
+elif command -v gitleaks >/dev/null 2>&1; then
     if ! gitleaks protect --staged --config "$ROOT/gitleaks.toml" \
         --no-banner --redact >/dev/null 2>&1; then
         echo "pre-commit: gitleaks found a secret in the staged changes."
