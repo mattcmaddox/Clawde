@@ -946,6 +946,8 @@ List all files currently tracked (read or written) in the active session. Useful
 
 ### /context
 
+**Aliases:** `context-window`
+
 Analyze context window usage. Shows a breakdown of tokens consumed by system prompt, conversation history, file contents, and tool results. Helps identify what to compact or drop.
 
 ```

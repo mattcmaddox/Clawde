@@ -15,6 +15,9 @@ impl SlashCommand for ContextCommand {
     fn name(&self) -> &str {
         "context"
     }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["context-window"]
+    }
     fn description(&self) -> &str {
         "Show context window usage (tokens used / available)"
     }
