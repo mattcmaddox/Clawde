@@ -1656,11 +1656,13 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
 /// run identical behavior instead of drifting (Phase A one-site goal).
 fn run_edited_post_steps(
     tool_calls: &[(String, String, Value)],
+    successful_edits: &[std::path::PathBuf],
+    verify_config: &clawde_core::config::VerifyConfig,
     working_dir: &std::path::Path,
     file_tracker: &mut context_refresh::FileModificationTracker,
     context_files: &mut Vec<std::path::PathBuf>,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
-) {
+) -> Option<String> {
     // D4: real within-turn auto-lint after any write this round.
     let edited_files: Vec<std::path::PathBuf> = tool_calls
         .iter()
@@ -1674,13 +1676,13 @@ fn run_edited_post_steps(
         })
         .collect();
     if !edited_files.is_empty() {
-        let verify_config = clawde_core::config::VerifyConfig {
+        let lint_config = clawde_core::config::VerifyConfig {
             auto_lint: true,
             auto_test: false,
             ..Default::default()
         };
         if let Ok(report) =
-            crate::verify::lint_edited_files(&edited_files, &verify_config, working_dir)
+            crate::verify::lint_edited_files(&edited_files, &lint_config, working_dir)
         {
             // Surface only genuine lint failures. A passing within-turn lint is
             // informational noise and would otherwise collide with the terminal
@@ -1689,6 +1691,41 @@ fn run_edited_post_steps(
             if report.verdict == crate::verify::VerifyVerdict::Fixable {
                 if let Some(tx) = event_tx {
                     let _ = tx.send(QueryEvent::Verify(report));
+                }
+            }
+        }
+    }
+
+    // Optional tests run once per successful edit batch, not once per file.
+    // Keep this separate from per-file lint and end-of-turn whole-project checks.
+    if !successful_edits.is_empty() && verify_config.auto_test_after_edit {
+        match crate::verify::run_tests_after_edit(verify_config, working_dir) {
+            Ok(report) if report.verdict == crate::verify::VerifyVerdict::Fixable => {
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Verify(report.clone()));
+                }
+                let feedback = report
+                    .results
+                    .iter()
+                    .filter(|result| !result.ok && !result.skipped)
+                    .map(|result| format!("[{}]\n{}", result.label, result.output))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                return Some(format!(
+                    "Post-edit tests failed. Fix the failures before finishing, then continue:\n\n{feedback}"
+                ));
+            }
+            Ok(report) if report.verdict == crate::verify::VerifyVerdict::Escalate => {
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status(report.headline));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status(format!(
+                        "Post-edit tests could not run: {error}"
+                    )));
                 }
             }
         }
@@ -1710,6 +1747,37 @@ fn run_edited_post_steps(
             }
         }
     }
+    None
+}
+
+/// Paths from successful file-mutating calls in a tool batch. A missing
+/// `is_error` flag is the canonical successful ToolResult representation.
+fn successful_file_mutator_paths(
+    tool_calls: &[(String, String, Value)],
+    tool_results: &[ContentBlock],
+) -> Vec<std::path::PathBuf> {
+    let successful_ids: std::collections::HashSet<&str> = tool_results
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } if !is_error.unwrap_or(false) => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    tool_calls
+        .iter()
+        .filter(|(id, name, _)| successful_ids.contains(id.as_str()) && is_write_tool(name))
+        .filter_map(|(_, _, input)| {
+            input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from)
+        })
+        .collect()
 }
 
 /// Whether a tool result is itself a deterministic project check. These tools
@@ -5597,6 +5665,8 @@ async fn run_query_loop_inner(
                         if batch_cancelled {
                             return QueryOutcome::Cancelled;
                         }
+                        let successful_edits =
+                            successful_file_mutator_paths(&tool_use_blocks_back, &tool_results);
                         let tool_result_message = Message {
                             role: clawde_core::types::Role::User,
                             content: clawde_core::types::MessageContent::Blocks(tool_results),
@@ -5621,13 +5691,17 @@ async fn run_query_loop_inner(
                         // after edits + context-refresh read tracking) — see
                         // `run_edited_post_steps`. Identical behavior on the
                         // Anthropic path below (Phase A one-site goal).
-                        run_edited_post_steps(
+                        if let Some(feedback) = run_edited_post_steps(
                             &tool_use_blocks_back,
+                            &successful_edits,
+                            &tool_ctx.config.verify,
                             &tool_ctx.working_dir,
                             &mut file_tracker,
                             &mut context_files,
                             event_tx.as_ref(),
-                        );
+                        ) {
+                            messages.push(Message::user(feedback));
+                        }
 
                         continue; // loop for next tool round
                     }
@@ -6722,6 +6796,8 @@ async fn run_query_loop_inner(
                     )
                     .await;
 
+                    let successful_edits =
+                        successful_file_mutator_paths(&tool_calls, &result_blocks);
                     // Append tool results as a user message so the history remains
                     // valid (every tool_use is answered) even on cancellation.
                     let tool_result_message = Message::user_blocks(result_blocks);
@@ -6750,13 +6826,17 @@ async fn run_query_loop_inner(
                     // D4/D5 shared within-turn post-steps (real auto-lint after
                     // edits + context-refresh read tracking) — identical to the
                     // provider path (Phase A one-site goal).
-                    run_edited_post_steps(
+                    if let Some(feedback) = run_edited_post_steps(
                         &tool_calls,
+                        &successful_edits,
+                        &tool_ctx.config.verify,
                         &tool_ctx.working_dir,
                         &mut file_tracker,
                         &mut context_files,
                         event_tx.as_ref(),
-                    );
+                    ) {
+                        messages.push(Message::user(feedback));
+                    }
                     // Preserve runtime evidence for the next provider request.
                     task_state.set_runtime_evidence(
                         task_state.runtime.plan_step.clone(),
@@ -7243,6 +7323,36 @@ mod tests {
     use super::*;
     use clawde_api::SystemPrompt;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn post_edit_test_batch_requires_a_successful_file_mutation() {
+        let call = (
+            "write-1".to_string(),
+            "Write".to_string(),
+            serde_json::json!({"file_path": "src/lib.rs"}),
+        );
+        let successful = ContentBlock::ToolResult {
+            tool_use_id: "write-1".to_string(),
+            content: ToolResultContent::Text("written".to_string()),
+            is_error: None,
+        };
+        let failed = ContentBlock::ToolResult {
+            tool_use_id: "write-1".to_string(),
+            content: ToolResultContent::Text("permission denied".to_string()),
+            is_error: Some(true),
+        };
+        let bash_call = (
+            "bash-1".to_string(),
+            "Bash".to_string(),
+            serde_json::json!({"command": "echo test"}),
+        );
+        assert_eq!(
+            successful_file_mutator_paths(std::slice::from_ref(&call), &[successful]),
+            vec![std::path::PathBuf::from("src/lib.rs")]
+        );
+        assert!(successful_file_mutator_paths(std::slice::from_ref(&call), &[failed]).is_empty());
+        assert!(successful_file_mutator_paths(&[bash_call], &[]).is_empty());
+    }
 
     #[test]
     fn memory_lane_prefers_the_free_chain_then_falls_back_to_the_session() {

@@ -2580,6 +2580,10 @@ pub mod config {
         pub auto_lint: bool,
         /// Run the test suite during verification.
         pub auto_test: bool,
+        /// Run the detected test command once after each successful tool batch
+        /// that edits files. Off by default; the end-of-turn verify pass remains
+        /// the normal place for full project tests.
+        pub auto_test_after_edit: bool,
         /// Skip verification when the turn wrote no files (pure read/search
         /// turns have nothing to verify).
         pub skip_when_no_writes: bool,
@@ -2680,6 +2684,7 @@ pub mod config {
                 sandbox: VerifySandbox::Direct,
                 auto_lint: true,
                 auto_test: true,
+                auto_test_after_edit: false,
                 skip_when_no_writes: true,
                 timeout_secs: 180,
                 container_image: None,
@@ -9138,6 +9143,18 @@ mod tests {
     fn test_hooks_config_default() {
         let cfg = crate::config::Config::default();
         assert!(cfg.hooks.is_empty());
+    }
+
+    #[test]
+    fn verify_config_auto_test_after_edit_defaults_off_and_roundtrips() {
+        let default = crate::config::VerifyConfig::default();
+        assert!(!default.auto_test_after_edit);
+
+        let parsed: crate::config::VerifyConfig =
+            serde_json::from_str(r#"{"auto_test_after_edit": true}"#).expect("parse verify config");
+        assert!(parsed.auto_test_after_edit);
+        let json = serde_json::to_string(&parsed).expect("serialize verify config");
+        assert!(json.contains("\"auto_test_after_edit\":true"), "{json}");
     }
 
     #[test]

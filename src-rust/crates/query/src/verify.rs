@@ -571,45 +571,64 @@ pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<Ver
     })
 }
 
-/// Run verification after each file edit (auto-verify after edit).
-/// This is a lighter version that runs immediately after file changes.
-/// Based on Aider's lint_edited() pattern.
-#[allow(dead_code)]
-pub fn run_verify_after_edit(
+/// Run the detected test command after a successful write batch when the
+/// runtime opt-in is enabled. Whole-project lint remains at the end-of-turn
+/// verification point; this hook deliberately runs tests only, once per batch.
+pub fn run_tests_after_edit(
     config: &VerifyConfig,
     working_dir: &Path,
 ) -> Result<VerifyReport, String> {
-    if !config.auto_test && !config.auto_lint {
+    if !config.enabled || !config.auto_test || !config.auto_test_after_edit {
         return Ok(VerifyReport {
             verdict: VerifyVerdict::Escalate,
             results: Vec::new(),
             attempt: 0,
             max_retries: 1,
-            headline: "No checks configured".to_string(),
+            headline: "Post-edit tests disabled".to_string(),
             sandbox: config.sandbox,
             unavailable: false,
         });
     }
 
-    // Run checks with single retry (lighter than full verify loop)
-    let results = run_checks(config, working_dir)?;
-    let failures: Vec<&CheckResult> = results.iter().filter(|r| !r.ok && !r.skipped).collect();
-
-    let headline = if failures.is_empty() {
-        "All checks passed".to_string()
-    } else {
-        format!("{} check(s) failed", failures.len())
+    let test_config = VerifyConfig {
+        auto_lint: false,
+        ..config.clone()
     };
+    let results = run_checks(&test_config, working_dir)?;
+    let max_retries = config.max_retries.max(1);
+    if results.is_empty() {
+        return Ok(VerifyReport {
+            verdict: VerifyVerdict::Escalate,
+            results,
+            attempt: 0,
+            max_retries,
+            headline: "No test command detected for post-edit verification".to_string(),
+            sandbox: config.sandbox,
+            unavailable: false,
+        });
+    }
 
+    let failures: Vec<&CheckResult> = results.iter().filter(|r| !r.ok && !r.skipped).collect();
+    let skipped = results.iter().any(|r| r.skipped);
+    let verdict = if !failures.is_empty() {
+        VerifyVerdict::Fixable
+    } else if skipped {
+        VerifyVerdict::Escalate
+    } else {
+        VerifyVerdict::Pass
+    };
+    let headline = if !failures.is_empty() {
+        format!("{} post-edit test check(s) failed", failures.len())
+    } else if skipped {
+        "Post-edit tests could not all run".to_string()
+    } else {
+        "Post-edit tests passed".to_string()
+    };
     Ok(VerifyReport {
-        verdict: if failures.is_empty() {
-            VerifyVerdict::Pass
-        } else {
-            VerifyVerdict::Fixable
-        },
+        verdict,
         results,
         attempt: 1,
-        max_retries: 1,
+        max_retries,
         headline,
         sandbox: config.sandbox,
         unavailable: false,
@@ -1006,6 +1025,40 @@ mod tests {
 
     fn passing_check() -> CheckResult {
         CheckResult::pass("test: cargo test")
+    }
+
+    #[test]
+    fn post_edit_test_runner_is_opt_in_and_test_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"post_edit_verify_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "#[cfg(test)] mod tests { #[test] fn smoke() { assert_eq!(2 + 2, 4); } }\n",
+        )
+        .unwrap();
+
+        let mut config = default_config();
+        config.auto_test_after_edit = false;
+        let disabled = run_tests_after_edit(&config, dir.path()).unwrap();
+        assert_eq!(disabled.headline, "Post-edit tests disabled");
+        assert!(disabled.results.is_empty());
+
+        config.auto_test_after_edit = true;
+        let report = run_tests_after_edit(&config, dir.path()).unwrap();
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].label, "test: cargo test --workspace");
+        assert!(
+            report.results[0].ok,
+            "test output: {}",
+            report.results[0].output
+        );
+        assert_eq!(report.verdict, VerifyVerdict::Pass);
+        assert_eq!(report.headline, "Post-edit tests passed");
     }
 
     #[test]
