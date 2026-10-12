@@ -23,7 +23,6 @@ pub const REFRESH_ARROW: &str = "↻"; // U+21BB
 pub const FORK_GLYPH: &str = "⑂"; // U+2442
 pub const DIAMOND_OPEN: &str = "◇"; // U+25C7 - running/pending review
 pub const DIAMOND_FILLED: &str = "◆"; // U+25C6 - completed review
-pub const REFERENCE_MARK: &str = "※"; // U+203B - away summary marker
 pub const FLAG_ICON: &str = "⚑"; // U+2691
 pub const BLOCKQUOTE_BAR: &str = "▎"; // U+258E - blockquote left bar
 pub const HEAVY_HORIZONTAL: &str = "━"; // U+2501

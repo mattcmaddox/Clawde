@@ -1616,7 +1616,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         app.message_row_map.borrow_mut().clear();
         app.thinking_row_map.borrow_mut().clear();
         render_welcome_box(frame, app, content_area);
-        // Startup notices (remote session, +dir, away summary) sit just below
+        // Startup notices (remote session, +dir) sit just below
         // the welcome box on the empty screen.
         let notice_lines = startup_notice_lines(app, content_area.width);
         if !notice_lines.is_empty() && content_area.height > WELCOME_BOX_HEIGHT {

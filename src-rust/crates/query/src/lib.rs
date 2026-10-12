@@ -6256,8 +6256,9 @@ async fn run_query_loop_inner(
                                     count = extracted.len(),
                                     "Extracted memories before auto-compaction"
                                 );
-                                // Persist extracted memories to AGENTS.md
-                                let agents_path = tool_ctx.working_dir.join("AGENTS.md");
+                                // Persist extracted memories to the local, git-ignored .clawde/AGENTS.md
+                                let agents_path =
+                                    tool_ctx.working_dir.join(".clawde").join("AGENTS.md");
                                 if let Err(e) =
                                     crate::session_memory::SessionMemoryExtractor::persist(
                                         &extracted,

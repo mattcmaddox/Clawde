@@ -20,7 +20,6 @@ history_picker = []
 token_budget = []
 message_actions = []
 quick_search = []
-away_summary = []
 hook_prompts = []
 kairos_brief = []
 kairos_channels = []
@@ -54,11 +53,11 @@ ccr_auto_connect = []
 ccr_mirror = []
 ccr_remote_setup = []
 
-# Full dev build — includes all experimental features (36 total)
+# Full dev build — includes all experimental features
 dev_full = [
     "voice",
     "ultraplan", "ultrathink", "history_picker",
-    "token_budget", "message_actions", "quick_search", "away_summary",
+    "token_budget", "message_actions", "quick_search",
     "hook_prompts", "kairos_brief", "kairos_channels", "lodestone",
     "agent_triggers", "agent_triggers_remote",
     "extract_memories", "verification_agent", "builtin_explore_plan_agents",
