@@ -137,6 +137,26 @@ burns ~30% of a core forever. Check with:
 python3 scripts/probes/idle-cpu-probe.py --binary src-rust/target/debug/clawde
 ```
 
+### Board UI / Katban guard
+
+`crates/katban/src/board_server.rs` serves the admin board as one embedded
+HTML+JS document, so no Rust test compiles or runs it. Two rules keep its error
+paths honest:
+
+- **A failed write reports in the page, never in an `alert()`.** Every
+auth-gated write goes through the page's `write()` helper because `request()`
+**throws** on any non-ok response — and drops the session on a 401 — so an
+`if (res.status === 401) … else alert(…)` arm placed after a `request()` call is
+unreachable, and a blocking `alert()` freezes the tab. Failures belong in
+`#notice`/`toast`, and a failed write must leave the user's draft in the box.
+- **Reads are gated the moment a proxy is in front.** On loopback the board's
+reads stay open; with `X-Forwarded-*` present (caddy) the read tier requires the
+admin session like every write, and the login cookie is marked `Secure`.
+
+`scripts/probes/katban-board-ux-probe.py` drives both through a real browser
+(CI, Linux leg; `--require-browser` so a missing browser fails instead of
+skipping). Run it by hand per `docs/katban.md` after touching the board UI.
+
 ### `cargo check` skips test targets
 
 `cargo check --workspace` (and plain `cargo build`) do NOT compile `#[cfg(test)]`

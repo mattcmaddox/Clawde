@@ -10,6 +10,7 @@
 // Board, guest tiers, and auth arrive in later slices.
 
 use anyhow::Context;
+use clawde_katban::doctor::Finding;
 use std::path::{Path, PathBuf};
 
 pub(crate) const USAGE: &str = r#"Usage: clawde katban <command> [OPTIONS]
@@ -28,6 +29,8 @@ Commands:
   board ...                                   Kanban-style task board (cards, links)
   project ...                                 Register a board to a git repo (for running)
   status                                      Overview of sites, boards, caddy config
+  doctor [--caddy-dir DIR] [--fix] [--strict] Diagnose drift vs the installed host
+  caddy reload [--caddy-dir DIR]              Validate the whole Caddyfile, then reload caddy
   help                                        Show this help
 
 Cat Chat is a separate public-facing sandbox:
@@ -74,6 +77,8 @@ pub async fn run_command(args: &[String]) -> anyhow::Result<()> {
         "board" => run_board(&args[1..]).await,
         "project" => run_project(&args[1..]),
         "status" => run_status(),
+        "doctor" => run_doctor(&args[1..]),
+        "caddy" => run_caddy(&args[1..]),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(())
@@ -118,7 +123,7 @@ pub async fn run_catchat_command(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     };
     match command {
-        "serve" => run_catchat_server(&args[1..]).await,
+        "serve" => catchat_serve(&args[1..]).await,
         "expose" => run_catchat_expose(&args[1..]).await,
         "links" => run_link(&args[1..]),
         "unblock" => run_catchat_unblock(&args[1..]),
@@ -487,7 +492,7 @@ async fn site_serve(opts: SiteOpts) -> anyhow::Result<()> {
 
 async fn site_expose(opts: SiteOpts) -> anyhow::Result<()> {
     use clawde_katban::caddy::{
-        katban_bootstrap_instructions, render_config, site_kind, write_atomic, DEFAULT_INCLUDE_NAME,
+        katban_bootstrap_instructions, render_config, site_kind, DEFAULT_INCLUDE_NAME,
     };
     use clawde_katban::config::load;
 
@@ -572,7 +577,9 @@ async fn site_expose(opts: SiteOpts) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    write_atomic(&managed_path, &text)?;
+    for line in apply_managed_include(&managed_path, &text)? {
+        println!("{line}");
+    }
 
     // Katban site exposure only writes the shared Caddy reload units. Cat
     // Chat's service is created exclusively by `clawde catchat expose`.
@@ -808,13 +815,16 @@ async fn board_password(args: Vec<String>) -> anyhow::Result<()> {
 /// regenerates the managed config with the board block intact.
 fn admin_board_block() -> anyhow::Result<Option<(String, u16)>> {
     let store = clawde_katban::admin_auth::load().context("load admin store")?;
-    let Some(subdomain) = store.public_subdomain else {
-        return Ok(None);
-    };
+    Ok(board_block_from(&store))
+}
+
+/// The admin board's caddy block `(subdomain, port)` of a loaded store.
+fn board_block_from(store: &clawde_katban::admin_auth::AdminStore) -> Option<(String, u16)> {
+    let subdomain = store.public_subdomain.clone()?;
     let port = store
         .board_port
         .unwrap_or(clawde_katban::board_server::DEFAULT_BOARD_PORT);
-    Ok(Some((subdomain, port)))
+    Some((subdomain, port))
 }
 
 /// Publish the admin board behind caddy at an https subdomain, mirroring
@@ -824,7 +834,7 @@ fn admin_board_block() -> anyhow::Result<Option<(String, u16)>> {
 async fn board_expose(args: &[String]) -> anyhow::Result<()> {
     use clawde_katban::board_server::DEFAULT_BOARD_PORT;
     use clawde_katban::caddy::{
-        katban_bootstrap_instructions, render_config, write_atomic, DEFAULT_INCLUDE_NAME,
+        katban_bootstrap_instructions, render_config, DEFAULT_INCLUDE_NAME,
     };
 
     let mut subdomain: Option<String> = None;
@@ -971,7 +981,9 @@ async fn board_expose(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    write_atomic(&managed_path, &text)?;
+    for line in apply_managed_include(&managed_path, &text)? {
+        println!("{line}");
+    }
 
     // Reloader units watch the managed file; the board unit is rendered when
     // runner projects are configured (`--run <NAME,...>` / `--run all`).
@@ -1679,6 +1691,41 @@ fn unit_user() -> anyhow::Result<String> {
     )
 }
 
+/// Resolve the binary an always-on unit should pin. Whatever build invoked
+/// the expose is `current_exe()` — if that is a debug build, prefer the
+/// sibling release binary, because a debug path is enormous and is removed by
+/// `cargo clean`, leaving a pinned unit that can no longer start.
+fn resolve_unit_binary() -> (PathBuf, bool) {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from("clawde"));
+    prefer_release_binary(exe)
+}
+
+/// Prefer `.../target/release/clawde` over `.../target/debug/clawde` when the
+/// former exists. Returns the chosen path and whether it is still a debug
+/// build, so the caller can warn instead of silently pinning one.
+fn prefer_release_binary(exe: PathBuf) -> (PathBuf, bool) {
+    let is_debug = exe
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .is_some_and(|name| name == "debug");
+    if is_debug {
+        let release = exe.file_name().and_then(|name| {
+            exe.parent()
+                .and_then(Path::parent)
+                .map(|target| target.join("release").join(name))
+        });
+        if let Some(release) = release {
+            if release.is_file() {
+                return (release, false);
+            }
+        }
+    }
+    (exe, is_debug)
+}
+
 /// Render + write `catchat.service` (Cat Chat's always-on sandbox server)
 /// and the shared caddy reloader units. Returns the directory the files were
 /// written to. The binary path is resolved from the currently running clawde,
@@ -1695,9 +1742,15 @@ fn write_systemd_units(
 ) -> anyhow::Result<PathBuf> {
     let dir = units_dir();
     std::fs::create_dir_all(&dir)?;
-    let binary = std::env::current_exe()?
-        .canonicalize()
-        .unwrap_or_else(|_| std::env::current_exe().unwrap());
+    let (binary, debug_pinned) = resolve_unit_binary();
+    if debug_pinned {
+        eprintln!(
+            "warning: rendering an always-on unit pinned to a debug build ({}); \
+             `cargo clean` or a rebuild removes it — build with `cargo build --release` \
+             and re-run this command",
+            binary.display()
+        );
+    }
     let user = unit_user()?;
     if let Some(port) = catchat_port {
         std::fs::write(
@@ -1711,9 +1764,17 @@ fn write_systemd_units(
             &caddy_dir.join(clawde_katban::caddy::DEFAULT_INCLUDE_NAME),
         ),
     )?;
+    // The watcher runs the *checked* reload (`clawde katban caddy reload`), so
+    // the reload flavour is re-detected when it fires instead of being baked in
+    // here — switching to a socket-scoped admin endpoint later needs no
+    // re-render. It does mean the unit needs this binary to exist, which
+    // `doctor` reports.
     std::fs::write(
         dir.join("katban-reload.service"),
-        clawde_katban::caddy::render_reloader_service_unit("systemctl reload caddy"),
+        clawde_katban::caddy::render_reloader_service_unit(
+            &binary.display().to_string(),
+            caddy_dir,
+        ),
     )?;
     let (projects, board_port) = board;
     if !projects.is_empty() {
@@ -1760,6 +1821,737 @@ fn run_status() -> anyhow::Result<()> {
         println!("               (MISSING — run: clawde katban site expose <name>)");
     }
     Ok(())
+}
+
+const DOCTOR_USAGE: &str = r#"Usage: clawde katban doctor [OPTIONS]
+
+Diagnose drift between the persisted Katban/Cat Chat config and what the host
+actually has installed: the managed caddy include, the Caddyfile import, every
+exposed route's loopback backend, the always-on systemd units (including the
+port each serves and the caddy reload watcher), and whether caddy is running.
+A store that will not parse is reported as a finding.
+
+  --caddy-dir DIR   Managed caddy include dir (default /etc/caddy)
+  --fix             Rewrite the managed include from desired state and reload caddy
+  --strict          Exit non-zero when any error is found
+  help              Show this help
+"#;
+
+const CADDY_USAGE: &str = r#"Usage: clawde katban caddy <command> [OPTIONS]
+
+Katban's view of the host caddy install: the managed include it writes and the
+reload that makes it live.
+
+Commands:
+  reload [--caddy-dir DIR]   Validate the whole Caddyfile with `caddy adapt`,
+                             then reload caddy — refusing to reload a config
+                             that no longer adapts
+  help                       Show this help
+
+This is what the installed `katban-reload.path` watcher runs, so a fragment
+written by anything (a second tool, a hand edit, a partial write) is reported
+instead of being applied and left to fail every later reload. For the read-only
+comparison of the include against desired state, use `clawde katban doctor`.
+"#;
+
+/// `clawde katban caddy` — the reload path, kept separate from `doctor`
+/// (which only reports).
+fn run_caddy(args: &[String]) -> anyhow::Result<()> {
+    let Some(subcommand) = args.first().map(|s| s.as_str()) else {
+        print!("{CADDY_USAGE}");
+        return Ok(());
+    };
+    match subcommand {
+        "reload" => run_caddy_reload(&args[1..]),
+        "help" | "--help" | "-h" => {
+            print!("{CADDY_USAGE}");
+            Ok(())
+        }
+        other => anyhow::bail!("unknown katban caddy command: {other}\n\n{CADDY_USAGE}"),
+    }
+}
+
+/// `clawde katban caddy reload` — validate the whole Caddyfile, then reload.
+///
+/// The order is the point, and it is why the installed `katban-reload.service`
+/// runs *this* rather than a bare `systemctl reload caddy`: caddy keeps the
+/// last-good config when a reload fails, so a fragment that no longer adapts
+/// cannot take the proxy down — but nothing stops that fragment from sitting on
+/// disk, where it keeps every later reload failing until a human notices.
+/// Refusing here means an unhealthy config is never applied, and the journal
+/// says why. A hand edit and a second tool writing the include are covered too;
+/// `expose` is not the only writer.
+///
+/// Exits non-zero on a refusal or a failed reload so the systemd unit records a
+/// failure instead of reporting success.
+fn run_caddy_reload(args: &[String]) -> anyhow::Result<()> {
+    let mut caddy_dir = PathBuf::from("/etc/caddy");
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--caddy-dir" => {
+                index += 1;
+                caddy_dir = PathBuf::from(args.get(index).context("--caddy-dir needs a value")?);
+            }
+            flag if flag.starts_with("--caddy-dir=") => {
+                caddy_dir = PathBuf::from(&flag["--caddy-dir=".len()..]);
+            }
+            "help" | "--help" | "-h" => {
+                print!("{CADDY_USAGE}");
+                return Ok(());
+            }
+            flag => anyhow::bail!("unknown option: {flag}\n\n{CADDY_USAGE}"),
+        }
+        index += 1;
+    }
+
+    let managed_path = caddy_dir.join(clawde_katban::caddy::DEFAULT_INCLUDE_NAME);
+    let caddyfile = caddyfile_for(&managed_path);
+    if !caddyfile.is_file() {
+        anyhow::bail!(
+            "nothing to reload: no Caddyfile at {} — the managed include in {} is not loaded \
+             from here",
+            caddyfile.display(),
+            caddy_dir.display()
+        );
+    }
+
+    match validate_caddyfile(&caddyfile) {
+        Validation::Valid => println!("validated {} with `caddy adapt`", caddyfile.display()),
+        Validation::Skipped => println!(
+            "note: `caddy` is not on PATH — skipped validation; the reload below still decides"
+        ),
+        Validation::Invalid(error) => anyhow::bail!(
+            "refused to reload: {} no longer adapts — caddy keeps serving the last-good config, \
+             and this file will keep every later reload failing until it is fixed\n{error}",
+            caddyfile.display()
+        ),
+    }
+
+    let endpoint = std::fs::read_to_string(&caddyfile)
+        .map(|text| admin_endpoint(&text))
+        .unwrap_or(AdminEndpoint::Unset);
+    let plan = reload_plan(&caddyfile, &endpoint);
+    if let Some(note) = plan.note {
+        println!("{note}");
+    }
+    let (ok, line) = run_reload(&plan.argv);
+    println!("{line}");
+    if !ok {
+        anyhow::bail!("caddy reload failed");
+    }
+    Ok(())
+}
+
+/// Where the bootstrap installs the always-on units. `diagnose` takes the
+/// directory as an argument so the checks stay testable against a scratch one.
+const SYSTEMD_UNITS_DIR: &str = "/etc/systemd/system";
+
+/// Everything `doctor` compares, gathered up front so a store that will not
+/// parse is a finding rather than an abort.
+struct Diagnosis {
+    managed_path: PathBuf,
+    /// Desired managed-include text, or `None` when the persisted state that
+    /// produces it could not be read.
+    desired: Option<String>,
+    /// The managed include as it is on disk, or `None` when it is missing.
+    actual: Option<String>,
+    /// The directory holds a Caddyfile or the managed include. `--fix` refuses
+    /// to write anywhere else, so a typo'd `--caddy-dir` cannot leave a stray
+    /// `katban.conf` behind.
+    can_repair: bool,
+    findings: Vec<Finding>,
+}
+
+impl Diagnosis {
+    fn include_matches(&self) -> bool {
+        matches!((&self.desired, &self.actual), (Some(desired), Some(actual)) if desired == actual)
+    }
+}
+
+/// `clawde katban doctor` — compare the persisted desired state (exposed
+/// sites, Cat Chat links, admin board) against the host: the managed caddy
+/// include, the Caddyfile `import`, every exposed route's loopback backend,
+/// the always-on units, and the caddy reload watcher. Every failure this
+/// session hit (stale include, unit pinned to a deleted binary, unguarded
+/// import, dead port) surfaces here as one line.
+fn run_doctor(args: &[String]) -> anyhow::Result<()> {
+    let mut caddy_dir = PathBuf::from("/etc/caddy");
+    let mut fix = false;
+    let mut strict = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--caddy-dir" => {
+                index += 1;
+                caddy_dir = PathBuf::from(args.get(index).context("--caddy-dir needs a value")?);
+            }
+            flag if flag.starts_with("--caddy-dir=") => {
+                caddy_dir = PathBuf::from(&flag["--caddy-dir=".len()..]);
+            }
+            "--fix" => fix = true,
+            "--strict" => strict = true,
+            "help" | "--help" | "-h" => {
+                print!("{DOCTOR_USAGE}");
+                return Ok(());
+            }
+            flag => anyhow::bail!("unknown option: {flag}\n\n{DOCTOR_USAGE}"),
+        }
+        index += 1;
+    }
+
+    use clawde_katban::doctor::Level;
+
+    let units_dir = Path::new(SYSTEMD_UNITS_DIR);
+    let mut diagnosis = diagnose(&caddy_dir, units_dir, caddy_states());
+    if fix {
+        match (&diagnosis.desired, &diagnosis.actual) {
+            (None, _) => println!(
+                "cannot rewrite the managed include: the persisted state could not be read \
+                 (see the findings below)"
+            ),
+            (Some(_), _) if diagnosis.include_matches() => {
+                println!("managed include already matches desired state — nothing to fix")
+            }
+            (Some(_), _) if !diagnosis.can_repair => println!(
+                "refusing to write {}: no Caddyfile and no managed include in {} — check \
+                 --caddy-dir",
+                diagnosis.managed_path.display(),
+                caddy_dir.display()
+            ),
+            (Some(desired), _) => {
+                // A repair that cannot adapt is rolled back, so report the
+                // failure and keep the findings instead of aborting the run.
+                match apply_managed_include(&diagnosis.managed_path, desired) {
+                    Ok(lines) => {
+                        for line in lines {
+                            println!("{line}");
+                        }
+                    }
+                    Err(error) => println!("fix failed: {error}"),
+                }
+                // Re-diagnose so the report — and the `--strict` decision —
+                // describe the repaired host, not the one just fixed.
+                diagnosis = diagnose(&caddy_dir, units_dir, caddy_states());
+            }
+        }
+    }
+
+    println!("Katban / Cat Chat doctor");
+    println!("managed include: {}", diagnosis.managed_path.display());
+    println!();
+    for finding in &diagnosis.findings {
+        let tag = match finding.level {
+            Level::Ok => "ok   ",
+            Level::Warn => "warn ",
+            Level::Error => "ERROR",
+        };
+        println!("[{tag}] {:<22} {}", finding.subject, finding.message);
+    }
+    let errors = diagnosis
+        .findings
+        .iter()
+        .filter(|f| f.level == Level::Error)
+        .count();
+    let warnings = diagnosis
+        .findings
+        .iter()
+        .filter(|f| f.level == Level::Warn)
+        .count();
+    println!();
+    println!("{errors} error(s), {warnings} warning(s)");
+
+    if strict && errors > 0 {
+        anyhow::bail!("{errors} doctor error(s) (--strict)");
+    }
+    Ok(())
+}
+
+/// The Caddyfile that imports the managed include in `caddy_dir`.
+fn caddyfile_for(managed_path: &Path) -> PathBuf {
+    managed_path
+        .parent()
+        .unwrap_or_else(|| Path::new("/etc/caddy"))
+        .join("Caddyfile")
+}
+
+/// What the Caddyfile's global block says about caddy's admin endpoint.
+///
+/// This is the switch that decides whether a reload can be done without root:
+/// the admin API is unauthenticated (any local process may POST a full config),
+/// so the trusted default stays `systemctl reload caddy` and the rootless path
+/// is used only when the operator scoped the endpoint to a unix socket, where
+/// socket permissions do the access control (spec §10.1a's documented fallback).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdminEndpoint {
+    /// No `admin` directive: caddy's default (TCP `localhost:2019`).
+    Unset,
+    /// `admin off` — no admin API at all; only a service reload works.
+    Off,
+    /// `admin unix/...` — rootless reloads are safe here.
+    Unix(String),
+    /// `admin <host:port>` — the exposed-by-default TCP endpoint.
+    Tcp(String),
+}
+
+/// Parse the global `admin` directive out of a Caddyfile. Pure, so the
+/// decision is unit-testable; `admin` is a global option, so scanning every
+/// line is enough (a site block cannot set it).
+fn admin_endpoint(caddyfile: &str) -> AdminEndpoint {
+    for line in caddyfile.lines() {
+        let code = line.split('#').next().unwrap_or("").trim();
+        let Some(rest) = code.strip_prefix("admin") else {
+            continue;
+        };
+        // `admin` must be its own token — `administration` is not the directive.
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some(value) = rest.split_whitespace().next() else {
+            continue;
+        };
+        return match value {
+            "off" => AdminEndpoint::Off,
+            token if token.starts_with("unix/") => AdminEndpoint::Unix(token.to_string()),
+            token => AdminEndpoint::Tcp(token.to_string()),
+        };
+    }
+    AdminEndpoint::Unset
+}
+
+/// How this host's reload will be performed, plus why.
+struct ReloadPlan {
+    argv: Vec<String>,
+    /// Printed before the outcome when the choice is not the plain default.
+    note: Option<String>,
+}
+
+/// The reload command for this host.
+///
+/// The admin API is used **only** through a unix socket named by this Caddyfile,
+/// because the default TCP endpoint is unauthenticated and host-global: posting
+/// *another* directory's Caddyfile to `localhost:2019` would replace the running
+/// proxy's whole config. A socket path, by contrast, belongs to the install that
+/// names it, so a scratch `--caddy-dir` can only ever fail to connect.
+///
+/// `CLAWDE_CADDY_RELOAD` tunes the choice: `systemd` forces the service reload,
+/// `caddy` asks for the rootless admin-API path (refused, with a note, unless
+/// this Caddyfile scopes the endpoint to a socket), unset auto-detects.
+fn reload_plan(caddyfile: &Path, endpoint: &AdminEndpoint) -> ReloadPlan {
+    let requested = std::env::var("CLAWDE_CADDY_RELOAD").unwrap_or_default();
+    let service = || ReloadPlan {
+        argv: vec!["systemctl".into(), "reload".into(), "caddy".into()],
+        note: None,
+    };
+    match endpoint {
+        AdminEndpoint::Unix(address) => {
+            let mut argv = vec![
+                "caddy".into(),
+                "reload".into(),
+                "--config".into(),
+                caddyfile.display().to_string(),
+            ];
+            argv.push("--address".into());
+            argv.push(address.clone());
+            ReloadPlan { argv, note: None }
+        }
+        other => {
+            let mut plan = service();
+            if requested == "caddy" {
+                let found = match other {
+                    AdminEndpoint::Off => "`admin off`".to_string(),
+                    AdminEndpoint::Tcp(address) => format!("a TCP admin endpoint ({address})"),
+                    _ => "no `admin` directive".to_string(),
+                };
+                plan.note = Some(format!(
+                    "note: CLAWDE_CADDY_RELOAD=caddy needs a socket-scoped admin endpoint \
+                     (`admin unix//...`); this Caddyfile has {found} — the unauthenticated TCP \
+                     admin API is never used, reloading via the service instead"
+                ));
+            }
+            plan
+        }
+    }
+}
+
+/// The outcome of `caddy adapt` over the whole Caddyfile.
+enum Validation {
+    /// The file adapts: the config on disk is loadable.
+    Valid,
+    /// caddy refused it; the string is caddy's own diagnostic.
+    Invalid(String),
+    /// No `caddy` binary to ask — validation is best-effort.
+    Skipped,
+}
+
+/// `caddy adapt` parses and adapts the Caddyfile without starting anything and
+/// without root (measured: ~50 ms). This is what makes a bad fragment
+/// detectable *before* it is persisted.
+fn validate_caddyfile(caddyfile: &Path) -> Validation {
+    match std::process::Command::new("caddy")
+        .arg("adapt")
+        .arg("--config")
+        .arg(caddyfile)
+        .output()
+    {
+        Ok(output) if output.status.success() => Validation::Valid,
+        Ok(output) => {
+            Validation::Invalid(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+        Err(_) => Validation::Skipped,
+    }
+}
+
+/// The most useful line of a failed reload's stderr. caddy logs JSON, where
+/// every line looks alike and only the error is worth showing; systemctl prints
+/// plain text, where the last line carries the verdict.
+fn reload_error_line(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let chosen = lines
+        .iter()
+        .rev()
+        .find(|line| line.contains("\"level\":\"error\"") || line.starts_with("Error"))
+        .or_else(|| lines.last())
+        .copied()
+        .unwrap_or("(no output)");
+    chosen.trim().chars().take(300).collect()
+}
+
+/// Execute a reload command, returning whether it succeeded plus a printable
+/// status line. Output is captured rather than inherited so a reload failure
+/// reads as one line instead of spraying caddy's JSON over the command's own
+/// report. The flag is what lets `caddy reload` exit non-zero for systemd while
+/// `expose` still reports the failure inline.
+fn run_reload(argv: &[String]) -> (bool, String) {
+    let Some((program, args)) = argv.split_first() else {
+        return (false, "warning: no reload command".to_string());
+    };
+    let shown = argv.join(" ");
+    match std::process::Command::new(program).args(args).output() {
+        Ok(output) if output.status.success() => (true, format!("reloaded caddy via `{shown}`")),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let hint = if program == "systemctl" {
+                " — that needs root: the installed katban-reload.path watcher runs it as root, or \
+                 scope caddy's admin endpoint to a unix socket and set CLAWDE_CADDY_RELOAD=caddy"
+            } else {
+                ""
+            };
+            (
+                false,
+                format!(
+                    "warning: `{shown}` failed ({}){hint}: {}",
+                    output.status,
+                    reload_error_line(&stderr)
+                ),
+            )
+        }
+        Err(error) => (false, format!("warning: could not run `{shown}`: {error}")),
+    }
+}
+
+/// Persist the managed include, then make it live: write, validate the whole
+/// Caddyfile, reload — in that order, and roll the write back if caddy can no
+/// longer adapt the result.
+///
+/// The rollback is the point. Caddy itself keeps the last-good config when a
+/// reload fails, so a bad fragment cannot take the proxy down (spec §10.1a) —
+/// but nothing today stops that fragment from being *persisted*, where it keeps
+/// every later reload failing until a human notices. Validating before the
+/// reload and restoring the previous bytes means an unadaptable state is never
+/// left on disk.
+fn apply_managed_include(managed_path: &Path, desired: &str) -> anyhow::Result<Vec<String>> {
+    let previous = std::fs::read_to_string(managed_path).ok();
+    clawde_katban::caddy::write_atomic(managed_path, desired)?;
+    let mut report = vec![format!(
+        "wrote {} from desired state",
+        managed_path.display()
+    )];
+
+    let caddyfile = caddyfile_for(managed_path);
+    if !caddyfile.is_file() {
+        report.push(format!(
+            "note: no Caddyfile at {} — nothing validates or reloads this include yet",
+            caddyfile.display()
+        ));
+        return Ok(report);
+    }
+
+    match validate_caddyfile(&caddyfile) {
+        Validation::Valid => report.push("validated (caddy adapt)".to_string()),
+        Validation::Skipped => report.push(
+            "note: `caddy` is not on PATH — skipped validation (the reload below still decides)"
+                .to_string(),
+        ),
+        Validation::Invalid(error) => {
+            match &previous {
+                Some(text) => {
+                    clawde_katban::caddy::write_atomic(managed_path, text)?;
+                }
+                None => {
+                    std::fs::remove_file(managed_path).ok();
+                }
+            }
+            anyhow::bail!(
+                "refused to keep this change: the Caddyfile no longer adapts\n{error}\n\
+                 (the managed include was restored to its previous contents)"
+            );
+        }
+    }
+
+    let endpoint = std::fs::read_to_string(&caddyfile)
+        .map(|text| admin_endpoint(&text))
+        .unwrap_or(AdminEndpoint::Unset);
+    let plan = reload_plan(&caddyfile, &endpoint);
+    if let Some(note) = plan.note {
+        report.push(note);
+    }
+    let (_, line) = run_reload(&plan.argv);
+    report.push(line);
+    Ok(report)
+}
+
+/// caddy's `LoadState`/`ActiveState`, from one `systemctl show`. `None` when
+/// systemd is absent or has no caddy unit: the reverse proxy may be run some
+/// other way (a container, a snap, another unit name), and guessing would turn
+/// a working host into a false alarm.
+fn caddy_states() -> Option<(String, String)> {
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "show",
+            "caddy.service",
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "--value",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let load_state = lines.next()?.to_string();
+    let active_state = lines.next()?.to_string();
+    Some((load_state, active_state))
+}
+
+/// Gather the facts and grade them. Never fails: unreadable state, a missing
+/// include and an absent Caddyfile are findings, not errors that abort the
+/// report — a corrupted `katban.json` is exactly what doctor must name.
+/// `caddy` is the `(LoadState, ActiveState)` pair of the caddy unit, gathered
+/// by the caller so the checks stay hermetic in tests.
+fn diagnose(caddy_dir: &Path, units_dir: &Path, caddy: Option<(String, String)>) -> Diagnosis {
+    use clawde_katban::board_server::DEFAULT_BOARD_PORT;
+    use clawde_katban::caddy::{site_kind, SiteKind, DEFAULT_INCLUDE_NAME};
+    use clawde_katban::catchat::server::DEFAULT_GUEST_PORT;
+    use clawde_katban::doctor::{
+        check_caddy_service, check_imports, check_listener, check_managed_include,
+        check_reloader_path_unit, check_reloader_service_unit, check_service_unit, check_site,
+        check_unit_port, unit_port_flag, Level, SiteTarget,
+    };
+
+    let managed_path = caddy_dir.join(DEFAULT_INCLUDE_NAME);
+    let actual = std::fs::read_to_string(&managed_path).ok();
+    let mut findings = Vec::new();
+
+    // Persisted state. Outer `None` = the store is unreadable; inner `None` =
+    // the role is not exposed.
+    let sites = match clawde_katban::config::load() {
+        Ok(config) => Some(config.sites),
+        Err(error) => {
+            findings.push(Finding::new(
+                Level::Error,
+                "katban.json",
+                format!("unreadable: {error} — exposed sites cannot be compared until it parses"),
+            ));
+            None
+        }
+    };
+    let guest = match clawde_katban::catchat::links::load() {
+        Ok(store) => Some(guest_block_from(&store)),
+        Err(error) => {
+            findings.push(Finding::new(
+                Level::Error,
+                "catchat links.json",
+                format!("unreadable: {error}"),
+            ));
+            None
+        }
+    };
+    let board = match clawde_katban::admin_auth::load() {
+        Ok(store) => Some(board_block_from(&store)),
+        Err(error) => {
+            findings.push(Finding::new(
+                Level::Error,
+                "admin.json",
+                format!("unreadable: {error}"),
+            ));
+            None
+        }
+    };
+
+    // The desired include needs every part of the state, so one unreadable
+    // store skips the comparison instead of inventing a diff (its own finding
+    // is already reported above).
+    let desired = match (&sites, &guest, &board) {
+        (Some(sites), Some(guest), Some(board)) => {
+            let exposed: Vec<_> = sites
+                .iter()
+                .filter(|site| site.public_subdomain.is_some())
+                .map(|site| (site.clone(), site_kind(site)))
+                .collect();
+            Some(clawde_katban::caddy::render_config(
+                &exposed,
+                guest.as_ref().map(|(host, port)| (host.as_str(), *port)),
+                board.as_ref().map(|(host, port)| (host.as_str(), *port)),
+            ))
+        }
+        _ => None,
+    };
+    if let Some(desired) = &desired {
+        findings.push(check_managed_include(actual.as_deref(), desired));
+    }
+
+    // Whether caddy ever loads the include at all.
+    match std::fs::read_to_string(caddy_dir.join("Caddyfile")) {
+        Ok(caddyfile) => findings.extend(check_imports(&caddyfile, &managed_path)),
+        Err(_) => findings.push(Finding::new(
+            Level::Warn,
+            "caddyfile",
+            format!(
+                "no Caddyfile at {} — the managed include is never loaded",
+                caddy_dir.join("Caddyfile").display()
+            ),
+        )),
+    }
+
+    // Every exposed route's backend: a live site's proxy port, a locked site's
+    // folder, then the two role services.
+    if let Some(sites) = &sites {
+        for site in sites.iter().filter(|site| site.public_subdomain.is_some()) {
+            findings.push(match site_kind(site) {
+                SiteKind::Live { port } => {
+                    check_site(&site.name, SiteTarget::Proxy { port }, port_listening(port))
+                }
+                SiteKind::Static { root } => check_site(
+                    &site.name,
+                    SiteTarget::Static { root: &root },
+                    root.is_dir(),
+                ),
+            });
+        }
+    }
+    if let Some(Some((_, port))) = guest.as_ref() {
+        findings.push(check_listener("cat chat", *port, port_listening(*port)));
+    }
+    if let Some(Some((_, port))) = board.as_ref() {
+        findings.push(check_listener("admin board", *port, port_listening(*port)));
+    }
+
+    // Only expect units for roles that are actually configured: a missing
+    // `katban-board.service` is normal when no board is exposed, and a missing
+    // `catchat.service` is normal when Cat Chat is not. A role whose store is
+    // unreadable is unknown, so it is left alone.
+    let mut unit_names = vec!["katban-reload"];
+    if guest.as_ref().is_some_and(Option::is_some) {
+        unit_names.push("catchat");
+    }
+    if board.as_ref().is_some_and(Option::is_some) {
+        unit_names.push("katban-board");
+    }
+    for name in unit_names {
+        let unit = units_dir.join(format!("{name}.service"));
+        let contents = std::fs::read_to_string(&unit).ok();
+        findings.extend(check_service_unit(name, contents.as_deref()));
+    }
+
+    // The installed unit and its caddy block are rendered at different times
+    // and installed by hand, so they can disagree about the port — a 502 that
+    // nothing else reports. `unit_port_flag` returning `None` means the unit
+    // takes the server's own default.
+    for (role, unit, proxied, default_port) in [
+        (
+            "catchat.service",
+            "catchat",
+            guest
+                .as_ref()
+                .and_then(|guest| guest.as_ref())
+                .map(|(_, port)| *port),
+            DEFAULT_GUEST_PORT,
+        ),
+        (
+            "katban-board.service",
+            "katban-board",
+            board
+                .as_ref()
+                .and_then(|board| board.as_ref())
+                .map(|(_, port)| *port),
+            DEFAULT_BOARD_PORT,
+        ),
+    ] {
+        let Some(proxied) = proxied else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(units_dir.join(format!("{unit}.service"))) else {
+            continue;
+        };
+        findings.push(check_unit_port(
+            role,
+            unit_port_flag(&text).unwrap_or(default_port),
+            proxied,
+        ));
+    }
+
+    // The reload watcher is checked even with nothing exposed: a stale
+    // `PathChanged=` is what makes the next `expose` silently do nothing, and a
+    // watcher that reloads without validating applies whatever is on disk.
+    let reloader = std::fs::read_to_string(units_dir.join("katban-reload.path")).ok();
+    findings.extend(check_reloader_path_unit(reloader.as_deref(), &managed_path));
+    let reloader_service = std::fs::read_to_string(units_dir.join("katban-reload.service")).ok();
+    findings.extend(check_reloader_service_unit(
+        reloader_service.as_deref(),
+        caddy_dir,
+    ));
+
+    // And whether caddy is up at all, when the host has a caddy unit to ask.
+    if let Some((load_state, active_state)) = caddy {
+        findings.extend(check_caddy_service(&load_state, &active_state));
+    }
+
+    // A directory with neither a Caddyfile nor the managed include is not a
+    // caddy dir, and `--fix` must not leave a stray file in it.
+    let can_repair = caddy_dir.join("Caddyfile").is_file() || managed_path.is_file();
+
+    Diagnosis {
+        managed_path,
+        desired,
+        actual,
+        can_repair,
+        findings,
+    }
+}
+
+/// The Cat Chat block `(host, port)` of a loaded store, when Cat Chat has been
+/// exposed.
+fn guest_block_from(store: &clawde_katban::catchat::links::GuestStore) -> Option<(String, u16)> {
+    let host = store.public_subdomain.clone()?;
+    let port = store
+        .guest_port
+        .unwrap_or(clawde_katban::catchat::server::DEFAULT_GUEST_PORT);
+    Some((host, port))
+}
+
+/// Is something accepting connections on loopback at `port`?
+fn port_listening(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250)).is_ok()
 }
 
 const LINK_USAGE: &str = r#"Usage: clawde catchat links <command>
@@ -2012,23 +2804,6 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
     }
 }
 
-async fn run_catchat_server(args: &[String]) -> anyhow::Result<()> {
-    let Some(subcommand) = args.first().map(|s| s.as_str()) else {
-        print!("{GUEST_USAGE}");
-        return Ok(());
-    };
-    match subcommand {
-        "serve" => catchat_serve(&args[1..]).await,
-        "expose" => run_catchat_expose(&args[1..]).await,
-        "unblock" => run_catchat_unblock(&args[1..]),
-        "help" | "--help" | "-h" => {
-            print!("{GUEST_USAGE}");
-            Ok(())
-        }
-        other => anyhow::bail!("unknown guest command: {other}\n\n{GUEST_USAGE}"),
-    }
-}
-
 async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
     use clawde_katban::catchat::server::{GuestServer, DEFAULT_GUEST_PORT};
     use std::sync::Arc;
@@ -2116,9 +2891,7 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
 /// exposed sites + the guest block), emits the reloader units, prints the
 /// one-time bootstrap, and best-effort updates the DuckDNS subdomain.
 async fn run_catchat_expose(args: &[String]) -> anyhow::Result<()> {
-    use clawde_katban::caddy::{
-        bootstrap_instructions, render_config, write_atomic, DEFAULT_INCLUDE_NAME,
-    };
+    use clawde_katban::caddy::{bootstrap_instructions, render_config, DEFAULT_INCLUDE_NAME};
     use clawde_katban::catchat::links::{load, save};
     use clawde_katban::config::load as load_sites;
 
@@ -2213,7 +2986,9 @@ async fn run_catchat_expose(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    write_atomic(&managed_path, &text)?;
+    for line in apply_managed_include(&managed_path, &text)? {
+        println!("{line}");
+    }
 
     // Write Cat Chat's own systemd unit plus the shared Caddy reloader. The
     // service is only emitted from the Cat Chat expose path.
@@ -2358,6 +3133,21 @@ mod tests {
                     caddy_dir.join("katban.conf").display()
                 )),
                 "reloader must watch the managed file in --caddy-dir"
+            );
+            // The watcher runs the checked reload, not a bare service reload,
+            // and validates the include dir it was rendered for.
+            let reload_service = std::fs::read_to_string(units.join("katban-reload.service"))?;
+            assert!(
+                reload_service.contains("katban caddy reload --caddy-dir"),
+                "the watcher must gate the reload: {reload_service}"
+            );
+            assert!(
+                reload_service.contains(&caddy_dir.display().to_string()),
+                "the watcher must validate the include in --caddy-dir: {reload_service}"
+            );
+            assert!(
+                !reload_service.contains("ExecStart=systemctl reload caddy"),
+                "the watcher must not apply an unvalidated config: {reload_service}"
             );
             // No runner project -> no board unit.
             assert!(!units.join("katban-board.service").exists());
@@ -2747,5 +3537,803 @@ mod tests {
             None => std::env::remove_var("CLAWDE_HOME"),
         }
         result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catchat_serve_flags_reach_the_serve_parser() {
+        // Regression: `run_catchat_command` once handed `serve` to a second
+        // dispatcher that stripped the subcommand token and then matched the
+        // next argument (`--port`) as if it were a subcommand, so every
+        // `clawde catchat serve --port N` died with "unknown guest command".
+        // The flag must now reach `catchat_serve`'s option parser instead.
+        let error = run_catchat_command(&["serve".to_string(), "--not-a-real-flag".to_string()])
+            .await
+            .expect_err("an unknown serve flag must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown option"),
+            "serve flags must reach the serve parser, got: {message}"
+        );
+        assert!(
+            !message.contains("unknown guest command"),
+            "the removed double-dispatch must not come back: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catchat_command_dispatch_routes_each_verb() {
+        // Each verb must reach its own parser and surface that parser's
+        // message — never a neighbour's. One table row per verb, so adding a
+        // verb without a routing case shows up in the diff. The regression
+        // this guards is `serve` being handed to a second dispatcher
+        // (`unknown guest command`), so every row names the expected owner.
+        let _guard = crate::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        let result = async {
+            // (arguments, fragment only that verb's own parser produces)
+            let error_cases: &[(&[&str], &str)] = &[
+                (&["frobnicate"], "unknown catchat command"),
+                (&["serve", "--bogus"], "unknown option"),
+                (&["expose", "--bogus"], "unknown option"),
+                (&["unblock"], "unblock needs an IP"),
+            ];
+            for (args, expected) in error_cases {
+                let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+                let message = run_catchat_command(&args)
+                    .await
+                    .expect_err("this verb must reject the arguments")
+                    .to_string();
+                assert!(
+                    message.contains(expected),
+                    "`{}` must be reported by its own parser, got: {message}",
+                    args.join(" ")
+                );
+                assert!(
+                    !message.contains("unknown guest command"),
+                    "the removed double-dispatch came back: {message}"
+                );
+            }
+
+            // Verbs that print their usage and succeed.
+            let ok_cases: &[&[&str]] = &[&[], &["links"], &["help"], &["--help"], &["-h"]];
+            for args in ok_cases {
+                let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+                assert!(
+                    run_catchat_command(&args).await.is_ok(),
+                    "`{}` prints usage and succeeds",
+                    args.join(" ")
+                );
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        result.unwrap();
+    }
+
+    /// A caddy dir and a systemd units dir for `doctor` to read, so its checks
+    /// never touch the developer's host (the caller pins `CLAWDE_HOME`).
+    fn doctor_scratch() -> (tempfile::TempDir, tempfile::TempDir) {
+        let caddy = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        (caddy, units)
+    }
+
+    fn write_sites(home: &Path, sites: serde_json::Value) {
+        std::fs::create_dir_all(home.join("katban")).unwrap();
+        let config = serde_json::json!({ "version": 1, "sites": sites });
+        std::fs::write(home.join("katban/katban.json"), config.to_string()).unwrap();
+    }
+
+    fn finding<'a>(findings: &'a [Finding], subject: &str) -> &'a Finding {
+        findings
+            .iter()
+            .find(|f| f.subject == subject)
+            .unwrap_or_else(|| panic!("no `{subject}` finding in {findings:#?}"))
+    }
+
+    #[tokio::test]
+    async fn doctor_flags_dead_site_routes_and_a_missing_import() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, units) = doctor_scratch();
+        use clawde_katban::doctor::Level;
+
+        // A live site whose backend we own (so it is up) and a locked site
+        // whose folder is gone.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        let missing_root = home.path().join("gone");
+        write_sites(
+            home.path(),
+            serde_json::json!([
+                { "name": "live", "root": "/tmp", "port": live_port,
+                  "publicSubdomain": "live.example.com", "locked": false },
+                { "name": "locked", "root": missing_root.display().to_string(), "port": 8788,
+                  "publicSubdomain": "locked.example.com", "locked": true },
+            ]),
+        );
+        // The one-time bootstrap line was never added.
+        std::fs::write(caddy.path().join("Caddyfile"), "import sites-enabled/*\n").unwrap();
+
+        let diagnosis = diagnose(caddy.path(), units.path(), None);
+        assert!(
+            diagnosis.desired.is_some(),
+            "readable state must render a desired include"
+        );
+        assert_eq!(
+            finding(&diagnosis.findings, "managed caddy include").level,
+            Level::Warn
+        );
+        assert!(finding(&diagnosis.findings, "caddy import")
+            .message
+            .contains("never serves these routes"));
+        assert_eq!(finding(&diagnosis.findings, "site live").level, Level::Ok);
+        let locked = finding(&diagnosis.findings, "site locked");
+        assert_eq!(locked.level, Level::Warn);
+        assert!(locked.message.contains("404"));
+        // Roles that are not configured get no unit expected of them.
+        assert!(!diagnosis
+            .findings
+            .iter()
+            .any(|f| f.subject == "catchat.service"));
+        assert!(!diagnosis
+            .findings
+            .iter()
+            .any(|f| f.subject == "katban-board.service"));
+        assert_eq!(
+            finding(&diagnosis.findings, "katban-reload.service").level,
+            Level::Warn
+        );
+        assert_eq!(
+            finding(&diagnosis.findings, "katban-reload.path").level,
+            Level::Warn
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_flags_a_watcher_that_reloads_without_validating() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, units) = doctor_scratch();
+        use clawde_katban::doctor::Level;
+
+        write_sites(home.path(), serde_json::json!([]));
+        std::fs::write(caddy.path().join("Caddyfile"), "import katban*.conf\n").unwrap();
+        // A watcher installed before the gate existed: it applies whatever is
+        // on disk, so a fragment that stopped adapting fails every later
+        // reload with nothing naming the cause.
+        std::fs::write(
+            units.path().join("katban-reload.service"),
+            "[Service]\nType=oneshot\nExecStart=systemctl reload caddy\n",
+        )
+        .unwrap();
+        let stale = diagnose(caddy.path(), units.path(), None);
+        let gate = finding(&stale.findings, "katban-reload gate");
+        assert_eq!(gate.level, Level::Warn);
+        assert!(gate.message.contains("without validating"), "{gate:?}");
+
+        // A watcher rendered from the current code passes, for this dir.
+        std::fs::write(
+            units.path().join("katban-reload.service"),
+            clawde_katban::caddy::render_reloader_service_unit(
+                "/usr/local/bin/clawde",
+                caddy.path(),
+            ),
+        )
+        .unwrap();
+        let fresh = diagnose(caddy.path(), units.path(), None);
+        assert_eq!(
+            finding(&fresh.findings, "katban-reload gate").level,
+            Level::Ok
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_flags_a_reloader_watching_another_include() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, units) = doctor_scratch();
+        use clawde_katban::doctor::Level;
+
+        write_sites(home.path(), serde_json::json!([]));
+        std::fs::write(caddy.path().join("Caddyfile"), "import katban*.conf\n").unwrap();
+        // Cat Chat is exposed and its backend is up (a listener we own), but
+        // the reload watcher points at the default caddy dir, not this one.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let guest_port = listener.local_addr().unwrap().port();
+        std::fs::create_dir_all(home.path().join("catchat")).unwrap();
+        std::fs::write(
+            home.path().join("catchat/links.json"),
+            serde_json::json!({
+                "version": 1,
+                "publicSubdomain": "chat.example.com",
+                "guestPort": guest_port,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            units.path().join("katban-reload.path"),
+            "[Path]\nPathChanged=/etc/caddy/katban.conf\n",
+        )
+        .unwrap();
+
+        let diagnosis = diagnose(caddy.path(), units.path(), None);
+        let reloader = finding(&diagnosis.findings, "katban-reload.path");
+        assert_eq!(reloader.level, Level::Error);
+        assert!(reloader.message.contains("/etc/caddy/katban.conf"));
+        assert!(reloader
+            .message
+            .contains(&caddy.path().join("katban.conf").display().to_string()));
+        // Cat Chat is exposed, so its unit is expected and its port is checked.
+        assert!(diagnosis
+            .findings
+            .iter()
+            .any(|f| f.subject == "catchat.service"));
+        assert_eq!(
+            finding(&diagnosis.findings, "cat chat listener").level,
+            Level::Ok
+        );
+        // No board is exposed, so no board unit is expected of the host.
+        assert!(!diagnosis
+            .findings
+            .iter()
+            .any(|f| f.subject == "katban-board.service"));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_unreadable_state_instead_of_aborting() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, units) = doctor_scratch();
+        use clawde_katban::doctor::Level;
+
+        std::fs::create_dir_all(home.path().join("katban")).unwrap();
+        std::fs::write(home.path().join("katban/katban.json"), "{ nope").unwrap();
+        std::fs::write(caddy.path().join("Caddyfile"), "import katban*.conf\n").unwrap();
+
+        let diagnosis = diagnose(caddy.path(), units.path(), None);
+        let state = finding(&diagnosis.findings, "katban.json");
+        assert_eq!(state.level, Level::Error);
+        assert!(state.message.contains("unreadable"));
+        assert!(
+            diagnosis.desired.is_none(),
+            "an unreadable store must not invent a desired include"
+        );
+        assert!(!diagnosis
+            .findings
+            .iter()
+            .any(|f| f.subject == "managed caddy include"));
+        // The rest of the host is still reported.
+        assert!(diagnosis
+            .findings
+            .iter()
+            .any(|f| f.subject == "katban-reload.path"));
+    }
+
+    #[tokio::test]
+    async fn doctor_repairs_the_managed_include_then_reports_it_clean() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, units) = doctor_scratch();
+        use clawde_katban::doctor::Level;
+
+        write_sites(home.path(), serde_json::json!([]));
+        std::fs::write(caddy.path().join("Caddyfile"), "import katban*.conf\n").unwrap();
+
+        let before = diagnose(caddy.path(), units.path(), None);
+        assert_eq!(
+            finding(&before.findings, "managed caddy include").level,
+            Level::Warn
+        );
+        assert!(!before.include_matches());
+        assert!(
+            before.can_repair,
+            "this dir has a Caddyfile to write beside"
+        );
+
+        // What `--fix` writes, minus the systemctl hop (which needs root).
+        clawde_katban::caddy::write_atomic(
+            &before.managed_path,
+            before.desired.as_deref().unwrap(),
+        )
+        .unwrap();
+
+        // A fresh diagnosis — what the report and `--strict` now see — must be
+        // clean instead of repeating the repaired drift.
+        let after = diagnose(caddy.path(), units.path(), None);
+        assert!(after.include_matches());
+        assert_eq!(
+            finding(&after.findings, "managed caddy include").level,
+            Level::Ok
+        );
+        assert_eq!(
+            after
+                .findings
+                .iter()
+                .filter(|f| f.level == Level::Error)
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_flags_a_role_unit_serving_another_port_than_caddy_proxies() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, units) = doctor_scratch();
+        use clawde_katban::doctor::Level;
+
+        write_sites(home.path(), serde_json::json!([]));
+        std::fs::write(caddy.path().join("Caddyfile"), "import katban*.conf\n").unwrap();
+        // Cat Chat's caddy block proxies to 8790, its unit serves 9999: the
+        // unit and the block were rendered at different times.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let guest_port = listener.local_addr().unwrap().port();
+        std::fs::create_dir_all(home.path().join("catchat")).unwrap();
+        std::fs::write(
+            home.path().join("catchat/links.json"),
+            serde_json::json!({
+                "version": 1,
+                "publicSubdomain": "chat.example.com",
+                "guestPort": guest_port,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            units.path().join("catchat.service"),
+            "[Service]\nExecStart=clawde catchat serve --port 9999\n",
+        )
+        .unwrap();
+
+        let diagnosis = diagnose(caddy.path(), units.path(), None);
+        let drift = finding(&diagnosis.findings, "catchat.service port");
+        assert_eq!(drift.level, Level::Error);
+        assert!(drift.message.contains("9999"));
+        assert!(drift.message.contains(&guest_port.to_string()));
+        // The unit itself is fine, so only the port disagrees.
+        assert_eq!(
+            finding(&diagnosis.findings, "catchat.service").level,
+            Level::Ok
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_refuses_to_repair_a_directory_that_is_not_caddy() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, units) = doctor_scratch();
+        use clawde_katban::doctor::Level;
+
+        write_sites(home.path(), serde_json::json!([]));
+        // A typo'd --caddy-dir: neither a Caddyfile nor a managed include.
+        let diagnosis = diagnose(caddy.path(), units.path(), None);
+        assert!(!diagnosis.can_repair, "--fix must not write here");
+        assert!(diagnosis.desired.is_some(), "state itself is readable");
+        assert_eq!(finding(&diagnosis.findings, "caddyfile").level, Level::Warn);
+        // A directory that has the include but no Caddyfile is still ours.
+        std::fs::write(
+            diagnosis.managed_path.clone(),
+            diagnosis.desired.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert!(diagnose(caddy.path(), units.path(), None).can_repair);
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_the_caddy_unit_it_can_see() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, units) = doctor_scratch();
+        use clawde_katban::doctor::Level;
+
+        write_sites(home.path(), serde_json::json!([]));
+        std::fs::write(caddy.path().join("Caddyfile"), "import katban*.conf\n").unwrap();
+
+        // A failed caddy unit is the worst case: every route is down.
+        let failed = diagnose(
+            caddy.path(),
+            units.path(),
+            Some(("loaded".into(), "failed".into())),
+        );
+        assert_eq!(
+            finding(&failed.findings, "caddy.service").level,
+            Level::Error
+        );
+
+        // No caddy unit to ask about (another proxy) -> no finding at all.
+        let unknown = diagnose(caddy.path(), units.path(), None);
+        assert!(!unknown
+            .findings
+            .iter()
+            .any(|f| f.subject == "caddy.service"));
+    }
+
+    /// Fake `caddy` and `systemctl` on PATH so the apply/reload path is
+    /// exercised without touching the host: each shim appends its argv to
+    /// `$SHIM_LOG` and exits with `$SHIM_ADAPT_EXIT` (for `adapt`) or
+    /// `$SHIM_RUN_EXIT` (anything else).
+    fn install_shims(dir: &Path) {
+        for program in ["caddy", "systemctl"] {
+            let shim = dir.join(program);
+            std::fs::write(
+                &shim,
+                "#!/bin/sh\n\
+                 printf '%s %s\\n' \"$0\" \"$*\" >> \"$SHIM_LOG\"\n\
+                 if [ \"$1\" = adapt ]; then\n\
+                   if [ \"${SHIM_ADAPT_EXIT:-0}\" != 0 ]; then\n\
+                     echo 'shim: unexpected token, expecting }' >&2\n\
+                   fi\n\
+                   exit \"${SHIM_ADAPT_EXIT:-0}\"\n\
+                 fi\n\
+                 exit \"${SHIM_RUN_EXIT:-0}\"\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+    }
+
+    /// The `PATH` and `SHIM_LOG` values that put the shims in front of the real
+    /// binaries. The caller sets them: the env audit requires a test's
+    /// mutations to be visible in the `ENV_LOCK`-holding test fn, not hidden in
+    /// a helper. The previous `PATH` stays after the shim dir, so commands the
+    /// shims do not stand in for (`id`, `git`, ...) still resolve.
+    fn shim_env(shim_dir: &Path, log: &Path) -> (String, String) {
+        let path = std::env::var("PATH").unwrap_or_default();
+        (
+            format!("{}:{path}", shim_dir.display()),
+            log.display().to_string(),
+        )
+    }
+
+    fn shim_log(log: &Path) -> String {
+        std::fs::read_to_string(log).unwrap_or_default()
+    }
+
+    /// What the installed watcher runs: an unadaptable Caddyfile is refused and
+    /// nothing reaches caddy at all.
+    #[tokio::test]
+    async fn caddy_reload_refuses_a_caddyfile_that_stops_adapting() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let (caddy, shims) = doctor_scratch();
+        let previous_path = std::env::var("PATH").ok();
+        let previous_log = std::env::var("SHIM_LOG").ok();
+        install_shims(shims.path());
+        let (path, log_path) = shim_env(shims.path(), &shims.path().join("log"));
+        std::env::set_var("PATH", path);
+        std::env::set_var("SHIM_LOG", log_path);
+        std::env::set_var("SHIM_ADAPT_EXIT", "1");
+        std::env::set_var("SHIM_RUN_EXIT", "0");
+        std::fs::write(caddy.path().join("Caddyfile"), "import katban*.conf\n").unwrap();
+
+        let error = run_caddy_reload(&[
+            "--caddy-dir".to_string(),
+            caddy.path().display().to_string(),
+        ])
+        .expect_err("an unadaptable Caddyfile must not be applied");
+        let message = error.to_string();
+        assert!(message.contains("refused to reload"), "{message}");
+        assert!(message.contains("no longer adapts"), "{message}");
+        // caddy's own diagnostic reaches the journal, not just a status code.
+        assert!(message.contains("unexpected token"), "{message}");
+
+        // The gate is the point: validation ran, the reload never did.
+        let log = shim_log(&shims.path().join("log"));
+        assert!(log.contains("adapt"), "validation must run: {log}");
+        assert!(!log.contains("reload"), "nothing may reach caddy: {log}");
+
+        std::env::remove_var("SHIM_ADAPT_EXIT");
+        std::env::remove_var("SHIM_RUN_EXIT");
+        match previous_log {
+            Some(value) => std::env::set_var("SHIM_LOG", value),
+            None => std::env::remove_var("SHIM_LOG"),
+        }
+        match previous_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+
+    /// The healthy path: validate first, then reload — in that order.
+    #[tokio::test]
+    async fn caddy_reload_validates_before_it_reloads() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let (caddy, shims) = doctor_scratch();
+        let previous_path = std::env::var("PATH").ok();
+        let previous_log = std::env::var("SHIM_LOG").ok();
+        install_shims(shims.path());
+        let (path, log_path) = shim_env(shims.path(), &shims.path().join("log"));
+        std::env::set_var("PATH", path);
+        std::env::set_var("SHIM_LOG", log_path);
+        std::env::set_var("SHIM_ADAPT_EXIT", "0");
+        std::env::set_var("SHIM_RUN_EXIT", "0");
+        std::fs::write(caddy.path().join("Caddyfile"), "import katban*.conf\n").unwrap();
+
+        run_caddy_reload(&[
+            "--caddy-dir".to_string(),
+            caddy.path().display().to_string(),
+        ])
+        .expect("an adapting Caddyfile is applied");
+
+        let log = shim_log(&shims.path().join("log"));
+        let validated = log.find("adapt").expect("validation must run");
+        let reloaded = log.find("reload").expect("the reload must follow: {log}");
+        assert!(validated < reloaded, "validate before reload: {log}");
+
+        std::env::remove_var("SHIM_ADAPT_EXIT");
+        std::env::remove_var("SHIM_RUN_EXIT");
+        match previous_log {
+            Some(value) => std::env::set_var("SHIM_LOG", value),
+            None => std::env::remove_var("SHIM_LOG"),
+        }
+        match previous_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+
+    #[test]
+    fn caddy_reload_errors_when_there_is_no_caddyfile() {
+        let (caddy, _units) = doctor_scratch();
+        let error = run_caddy_reload(&[
+            "--caddy-dir".to_string(),
+            caddy.path().display().to_string(),
+        ])
+        .expect_err("a dir with no Caddyfile has nothing to reload");
+        assert!(error.to_string().contains("no Caddyfile"), "{error}");
+    }
+
+    #[test]
+    fn caddy_subcommands_reject_unknown_input() {
+        let unknown = run_caddy_reload(&["--bogus".to_string()]).unwrap_err();
+        assert!(unknown.to_string().contains("unknown option"));
+        let incomplete = run_caddy_reload(&["--caddy-dir".to_string()]).unwrap_err();
+        assert!(incomplete.to_string().contains("--caddy-dir needs a value"));
+        assert!(run_caddy_reload(&["--help".to_string()]).is_ok());
+
+        assert!(run_caddy(&[]).is_ok());
+        assert!(run_caddy(&["help".to_string()]).is_ok());
+        let bad = run_caddy(&["rewind".to_string()]).unwrap_err();
+        assert!(bad.to_string().contains("unknown katban caddy command"));
+    }
+
+    #[tokio::test]
+    async fn apply_managed_include_rolls_back_a_config_that_stops_adapting() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, shims) = doctor_scratch();
+        let (path, log_path) = shim_env(shims.path(), &shims.path().join("log"));
+        install_shims(shims.path());
+        std::env::set_var("PATH", path);
+        std::env::set_var("SHIM_LOG", log_path);
+        std::env::set_var("SHIM_ADAPT_EXIT", "1");
+        std::env::set_var("SHIM_RUN_EXIT", "0");
+
+        // The include as it is now; the fragment below would be the change.
+        std::fs::write(caddy.path().join("Caddyfile"), "import katban*.conf\n").unwrap();
+        let managed = caddy.path().join("katban.conf");
+        std::fs::write(&managed, "previous-good\n").unwrap();
+
+        let error = apply_managed_include(&managed, "demo.example.com {\n\trespond \"x\"\n")
+            .expect_err("a config that no longer adapts must not be kept");
+        let message = error.to_string();
+        assert!(message.contains("no longer adapts"), "{message}");
+        // caddy's own diagnostic is surfaced, not swallowed.
+        assert!(message.contains("unexpected token"), "{message}");
+        // The previous bytes are back on disk...
+        assert_eq!(
+            std::fs::read_to_string(&managed).unwrap(),
+            "previous-good\n"
+        );
+        // ...and nothing ever tried to reload the proxy.
+        let log = shim_log(&shims.path().join("log"));
+        assert!(log.contains("adapt"), "validation must run: {log}");
+        assert!(
+            !log.contains("reload"),
+            "no reload after a failed adapt: {log}"
+        );
+
+        std::env::remove_var("SHIM_ADAPT_EXIT");
+        std::env::remove_var("SHIM_RUN_EXIT");
+    }
+
+    #[tokio::test]
+    async fn apply_managed_include_reloads_rootlessly_for_a_unix_socket_admin() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, shims) = doctor_scratch();
+        let log = shims.path().join("log");
+        let (path, log_path) = shim_env(shims.path(), &log);
+        install_shims(shims.path());
+        std::env::set_var("PATH", path);
+        std::env::set_var("SHIM_LOG", log_path);
+        std::env::remove_var("CLAWDE_CADDY_RELOAD");
+
+        let socket = "unix//run/caddy/admin.sock";
+        std::fs::write(
+            caddy.path().join("Caddyfile"),
+            format!("{{\n\tadmin {socket}\n}}\n\nimport katban*.conf\n"),
+        )
+        .unwrap();
+        let managed = caddy.path().join("katban.conf");
+
+        let report = apply_managed_include(&managed, "demo.example.com {\n}\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&managed).unwrap(),
+            "demo.example.com {\n}\n"
+        );
+        assert!(
+            report.iter().any(|line| line.contains("validated")),
+            "{report:?}"
+        );
+        let log = shim_log(&log);
+        assert!(
+            log.contains("caddy reload --config") && log.contains(socket),
+            "a socket-scoped admin endpoint reloads root-free through it: {log}"
+        );
+        assert!(!log.contains("systemctl"), "no service reload here: {log}");
+    }
+
+    #[tokio::test]
+    async fn apply_managed_include_keeps_the_trusted_service_reload_by_default() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let (caddy, shims) = doctor_scratch();
+        let log = shims.path().join("log");
+        let (path, log_path) = shim_env(shims.path(), &log);
+        install_shims(shims.path());
+        std::env::set_var("PATH", path);
+        std::env::set_var("SHIM_LOG", log_path);
+        std::env::remove_var("CLAWDE_CADDY_RELOAD");
+
+        // A plain host: caddy's default TCP admin API is reachable without
+        // root, but the trusted default must stay the service reload.
+        std::fs::write(caddy.path().join("Caddyfile"), "import katban*.conf\n").unwrap();
+        let managed = caddy.path().join("katban.conf");
+        apply_managed_include(&managed, "demo.example.com {\n}\n").unwrap();
+        let default_path = shim_log(&log);
+        assert!(
+            default_path.contains("systemctl reload caddy"),
+            "{default_path}"
+        );
+        assert!(!default_path.contains("caddy reload"), "{default_path}");
+
+        // Asking for the admin API without a socket endpoint is refused, not
+        // obeyed: the TCP admin API would have loaded *this* directory's
+        // Caddyfile into the running proxy.
+        std::fs::write(&log, "").unwrap();
+        std::env::set_var("CLAWDE_CADDY_RELOAD", "caddy");
+        let report = apply_managed_include(&managed, "demo.example.com {\n  # v2\n}\n").unwrap();
+        let forced = shim_log(&log);
+        assert!(forced.contains("systemctl reload caddy"), "{forced}");
+        assert!(!forced.contains("caddy reload"), "{forced}");
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("needs a socket-scoped admin endpoint")),
+            "the refusal is explained: {report:?}"
+        );
+        std::env::remove_var("CLAWDE_CADDY_RELOAD");
+    }
+
+    #[test]
+    fn admin_endpoint_reads_the_global_directive() {
+        assert_eq!(
+            admin_endpoint("import katban*.conf\n"),
+            AdminEndpoint::Unset
+        );
+        assert_eq!(admin_endpoint("admin off\n"), AdminEndpoint::Off);
+        assert_eq!(
+            admin_endpoint("{\n\tadmin unix//run/caddy/admin.sock\n}\n"),
+            AdminEndpoint::Unix("unix//run/caddy/admin.sock".into())
+        );
+        assert_eq!(
+            admin_endpoint("admin localhost:2019\n"),
+            AdminEndpoint::Tcp("localhost:2019".into())
+        );
+        // Not the directive, and not uncommented.
+        assert_eq!(admin_endpoint("administration off\n"), AdminEndpoint::Unset);
+        assert_eq!(admin_endpoint("# admin off\n"), AdminEndpoint::Unset);
+    }
+
+    #[test]
+    fn reload_error_line_prefers_the_error_over_log_noise() {
+        // caddy's stderr is JSON logs; only the error line is useful.
+        let caddy = concat!(
+            "{\"level\":\"info\",\"msg\":\"using config from file\"}\n",
+            "{\"level\":\"error\",\"msg\":\"dial unix /run/x.sock: connection refused\"}\n"
+        );
+        let picked = reload_error_line(caddy);
+        assert!(picked.contains("connection refused"), "{picked}");
+        assert!(!picked.contains("using config"), "{picked}");
+
+        // systemctl prints prose; the verdict is the last line.
+        let systemd = "Failed to reload caddy.service: Interactive authentication required.\nSee system logs and 'systemctl status caddy.service' for details.\n";
+        assert!(reload_error_line(systemd).contains("See system logs"));
+        assert_eq!(reload_error_line("   \n"), "(no output)");
+    }
+
+    #[test]
+    fn reload_plan_picks_the_rootless_path_only_for_a_socket() {
+        let file = Path::new("/etc/caddy/Caddyfile");
+        let service = vec!["systemctl", "reload", "caddy"];
+        for endpoint in [
+            AdminEndpoint::Unset,
+            AdminEndpoint::Off,
+            AdminEndpoint::Tcp("localhost:2019".into()),
+        ] {
+            let plan = reload_plan(file, &endpoint);
+            assert_eq!(plan.argv, service, "{endpoint:?} keeps the service reload");
+            assert!(plan.note.is_none());
+        }
+        assert_eq!(
+            reload_plan(file, &AdminEndpoint::Unix("unix//run/caddy/a.sock".into())).argv,
+            vec![
+                "caddy",
+                "reload",
+                "--config",
+                "/etc/caddy/Caddyfile",
+                "--address",
+                "unix//run/caddy/a.sock"
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_rejects_unknown_and_incomplete_options() {
+        let unknown = run_doctor(&["--bogus".to_string()]).unwrap_err();
+        assert!(unknown.to_string().contains("unknown option"));
+        let incomplete = run_doctor(&["--caddy-dir".to_string()]).unwrap_err();
+        assert!(incomplete.to_string().contains("--caddy-dir needs a value"));
+        assert!(run_doctor(&["--help".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn prefer_release_binary_swaps_a_debug_path_when_release_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let debug = target.join("debug");
+        let release = target.join("release");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::create_dir_all(&release).unwrap();
+        let debug_bin = debug.join("clawde");
+        std::fs::write(&debug_bin, "x").unwrap();
+
+        // No release sibling yet -> keep the debug path and flag it.
+        assert_eq!(
+            prefer_release_binary(debug_bin.clone()),
+            (debug_bin.clone(), true)
+        );
+
+        // Release sibling present -> prefer it, no warning.
+        let release_bin = release.join("clawde");
+        std::fs::write(&release_bin, "x").unwrap();
+        assert_eq!(prefer_release_binary(debug_bin), (release_bin, false));
+
+        // A non-debug path is returned unchanged without a warning.
+        let installed = PathBuf::from("/usr/local/bin/clawde");
+        assert_eq!(prefer_release_binary(installed.clone()), (installed, false));
     }
 }

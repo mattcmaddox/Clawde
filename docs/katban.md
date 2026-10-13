@@ -169,6 +169,36 @@ Wrong admin passwords use an independent policy: five failures make a
 short-lived lockout, three lockout strikes make a 24-hour block, and
 `/katban board unblock <IP>` or the corresponding board CLI command clears it.
 
+## Verifying the board UI
+
+The board web app is one embedded HTML+JS document with no frontend build step,
+so `cargo test` cannot exercise it. `scripts/probes/katban-board-ux-probe.py`
+drives a real browser over the whole signed-out to signed-in to signed-out
+journey: login gating, session restore across a reload, creating a board and
+cards, editing, search/sort/hide-done, the dependency picker, and sign-out.
+
+```bash
+cargo build
+python3 scripts/probes/katban-board-ux-probe.py --chromium /usr/bin/chromium
+```
+
+It also covers the two paths that only show up outside the happy flow: a
+refused write (session dropped out from under a loaded page) must report in the
+page's notice area and keep the unsaved draft, and an exposed board's reads are
+replayed with the `X-Forwarded-*` headers caddy adds — refused without a
+session, `Secure` on the session cookie, allowed with it — plus the sign-in gate
+the page renders to a signed-out visitor. The proxy leg itself stays in the Rust
+tests (`exposed_reads_require_auth_but_loopback_stays_open`).
+
+It needs `playwright` (`pip install playwright && playwright install chromium`)
+and exits 2, not 0, when a prerequisite is missing, so a wiring that treats
+non-zero as failure cannot read a skip as a pass. CI (the Linux leg of
+`.github/workflows/ci.yml`) installs playwright into a throwaway venv and passes
+`--require-browser`, which turns that skip into a failure — a browser that
+failed to install breaks the run instead of reporting green. It runs against a
+scratch `CLAWDE_HOME` and deliberately does not pass `board serve --run`, so it
+never dispatches an agent run at the cards it creates.
+
 ## State and services
 
 Katban state lives under:
@@ -189,6 +219,121 @@ For always-on operation, `clawde katban board expose --run NAME,...` renders
 `catchat.service`. Caddy configuration is generated into the managed include
 file, while the shared reload watcher only reloads Caddy after that managed
 file changes.
+
+## Diagnosing drift: `clawde katban doctor`
+
+`doctor` diffs the persisted desired state (exposed sites, Cat Chat links, the
+admin board) against what the host actually has, and prints one line per check:
+
+```bash
+clawde katban doctor
+clawde katban doctor --caddy-dir /etc/caddy   # non-default include dir
+clawde katban doctor --fix                    # rewrite the managed include + reload caddy
+clawde katban doctor --strict                 # exit non-zero when any error is found
+```
+
+It checks, one line per finding:
+
+- the managed include against the freshly rendered text;
+- that the Caddyfile actually loads it — a specific `.conf` import is flagged
+  (deleting that file makes Caddy refuse every reload and takes unrelated sites
+  down with it), and so is a Caddyfile that imports nothing at all, since then
+  none of the routes exist;
+- every exposed route's backend: each live site's proxy port, each locked
+  site's folder, and the Cat Chat / admin-board ports. A live site whose server
+  is down is a 502 and a locked site with a missing folder is a 404, neither of
+  which caddy itself reports;
+- each always-on unit's `ExecStart` binary — a unit pinned to a debug build
+  (which `cargo clean` removes) warns rather than passing, and a relative path
+  is resolved against the unit's `WorkingDirectory` rather than doctor's;
+- that each installed role unit serves the same port its caddy block proxies to
+  — the unit and the block are rendered at different times and installed by
+  hand, so a stale port is a 502 nothing else reports;
+- that `katban-reload.path` is installed and watches *this* caddy dir's include,
+  since otherwise a new `expose` never reaches caddy;
+- that the installed reload watcher **validates before it applies** — a watcher
+  running a bare `systemctl reload caddy` applies whatever is on disk, and it
+  also has to gate the *same* caddy dir doctor is looking at, or it is
+  validating a different Caddyfile than the one being served;
+- that caddy itself is running, when the host has a `caddy.service` unit (a
+  *failed* unit is an error, a stopped one warns, and a host with no caddy unit
+  — a container or a snap, say — is left alone rather than guessed at).
+
+Units are only expected for roles that are configured, so a missing
+`catchat.service` on a host that never ran `catchat expose` is not reported. A
+store that will not parse (`katban.json`, Cat Chat links, the admin store) is
+reported as an error finding instead of aborting the report. `--fix` rewrites
+the managed include from desired state, reloads caddy, and re-runs the checks so
+the summary reflects the repaired host; it refuses to write into a directory
+that holds neither a Caddyfile nor the managed include, so a typo'd
+`--caddy-dir` cannot leave a stray `katban.conf` behind.
+
+Exit status is 0 while there are warnings; `--strict` makes any error fatal.
+
+## Applying config: write, validate, reload
+
+Every `expose` (and `doctor --fix`) applies the managed include in the same
+three steps, in this order:
+
+1. **write** the include atomically (temp file + `rename`);
+2. **validate** the whole Caddyfile with `caddy adapt`, which parses and adapts
+   without starting anything and without root (~50 ms). If the result no longer
+   adapts, the include is **rolled back** to its previous contents and the
+   command fails with caddy's own diagnostic;
+3. **reload**, then report exactly which command ran.
+
+The rollback is the part that matters. Caddy keeps the last-good config when a
+reload fails, so a bad fragment cannot take the proxy down — but on its own that
+means the bad fragment stays on disk, failing every later reload until someone
+notices. Validating before reloading means an unadaptable state is never
+persisted.
+
+How the reload runs depends on the host:
+
+- **default** — `systemctl reload caddy`. This is the trusted path: the
+  Caddyfile is adapted by the host's own caddy, and the unauthenticated TCP
+  admin API is never used.
+- **socket-scoped admin endpoint** — if the Caddyfile sets
+  `admin unix//run/caddy/admin.sock`, the reload runs root-free as
+  `caddy reload --config <Caddyfile> --address <socket>`. Socket permissions do
+  the access control, and the path belongs to the install that names it, so a
+  scratch `--caddy-dir` can only fail to connect.
+- `CLAWDE_CADDY_RELOAD=systemd` forces the service reload;
+  `CLAWDE_CADDY_RELOAD=caddy` asks for the admin API and is **refused, with an
+explanation**, unless the endpoint is a socket — posting a different
+directory's Caddyfile to the default `localhost:2019` would replace the running
+proxy's entire config.
+
+The same choice is what the rendered `katban-reload.path` watcher uses, so a
+socket-scoped host gets a watcher that needs no root either.
+
+### The installed watcher runs the same gate
+
+`katban-reload.service` does not run `systemctl reload caddy` directly. It runs
+
+```bash
+clawde katban caddy reload --caddy-dir /etc/caddy
+```
+
+which is the same write-free half of the sequence above: `caddy adapt` first,
+reload only if the whole Caddyfile still adapts. That is what puts a *hand edit*
+and any other writer of the include behind the gate, not just Clawde's own
+`expose`:
+
+- healthy → `validated <Caddyfile> with caddy adapt`, then the reload;
+- unhealthy → `refused to reload: … no longer adapts` plus caddy's own syntax
+  error, exit 1, and **no reload**. Caddy keeps serving its last-good config,
+  and `journalctl -u katban-reload.service` names the file that needs fixing.
+
+The watcher re-detects the reload flavour when it fires, so moving caddy's admin
+endpoint to a socket later does not require re-rendering the unit. Because it
+now runs the clawde binary, the unit only works while that file exists **and is
+current**: a watcher rendered before this subcommand existed fails in the
+journal as `unknown katban command: caddy` until the binary is rebuilt
+(`cargo build --release`, or `clawded`) and the `expose` re-run. `doctor`
+reports a watcher whose `ExecStart` binary is missing, and a watcher that
+reloads unvalidated (a pre-gate unit) as `katban-reload gate`; a binary that
+exists but is older than the subcommand is not something it can see.
 
 ## Separation rule
 

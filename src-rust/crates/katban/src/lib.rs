@@ -17,6 +17,7 @@ pub mod catchat;
 pub mod commit;
 pub mod config;
 pub mod container;
+pub mod doctor;
 pub mod duckdns;
 pub mod git;
 pub mod host;

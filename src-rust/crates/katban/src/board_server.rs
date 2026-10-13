@@ -110,6 +110,7 @@ impl BoardServer {
             .route("/api/board/events", get(api_board_events))
             .route("/api/me", get(api_me))
             .route("/api/login", post(api_login))
+            .route("/api/logout", post(api_logout))
             .route("/api/boards", post(api_new_board))
             .route("/api/board/{project}/cards", post(api_add_card))
             .route(
@@ -156,7 +157,9 @@ fn maybe_reload_store(state: &BoardState) {
     };
     let changed = {
         let mtime = state.store_mtime.lock().unwrap_or_else(|e| e.into_inner());
-        mtime.is_some_and(|seen| seen != modified)
+        // A missing store at startup has no timestamp; its first creation
+        // must reload just like a later password rotation.
+        *mtime != Some(modified)
     };
     if !changed {
         return;
@@ -519,7 +522,14 @@ async fn api_login(
         if store.verify_password(&form.password) {
             store.reset_failed_attempts(&ip);
             let token = store.mint_session();
-            let _ = crate::admin_auth::save(&store);
+            if let Err(error) = crate::admin_auth::save(&store) {
+                tracing::error!(%error, "could not persist admin session");
+                store.revoke_session(&token);
+                return json_message(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not save sign-in session — check server storage permissions",
+                );
+            }
             token
         } else {
             let result = store.record_failed_attempt(&ip, now);
@@ -557,6 +567,30 @@ async fn api_login(
     response
         .headers_mut()
         .insert(header::SET_COOKIE, admin_cookie(&token, secure));
+    response
+}
+
+async fn api_logout(State(state): State<BoardState>, headers: HeaderMap) -> Response {
+    let token = match require_auth(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return *response,
+    };
+    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    let mut fresh = store.clone();
+    fresh.revoke_session(&token);
+    if let Err(error) = crate::admin_auth::save(&fresh) {
+        tracing::error!(%error, "could not persist admin sign-out");
+        return json_message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not save sign-out — try again",
+        );
+    }
+    *store = fresh;
+    let mut response = json_message(StatusCode::OK, "signed out");
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("katban_admin=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
+    );
     response
 }
 
@@ -1138,25 +1172,69 @@ const ADMIN_HTML: &str = r##"<!doctype html>
   #runner .r-ok { color:#b8e8c9; }
   #runner .r-wait { color:#ffb36b; }
   #runner .r-off { color:#ff6b6b; }
+  [hidden] { display:none !important; }
+  :root { --accent:#87b8ff; }
+  header { flex-wrap:wrap; position:sticky; top:0; z-index:2; box-shadow:0 4px 20px #0003; }
+  button:hover { background:#334052; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:wait; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  .board { gap:16px; }
+  .col { min-width:290px; width:290px; }
+  .col h2 { position:sticky; top:0; padding:8px 0; }
+  .card { padding:14px; box-shadow:0 3px 10px #0002; }
+  .card .prompt { white-space:pre-wrap; overflow-wrap:anywhere; font-weight:500; }
+  .card .actions, .card .rform { flex-wrap:wrap; }
+  .card .actions select { max-width:110px; }
+  .toolbar { padding:12px 0; flex-wrap:wrap; align-items:center; }
+  textarea, input, dialog select { background:#15181d; color:#e7ebf0; border:1px solid #3a424e; border-radius:6px; padding:9px; font:inherit; }
+  #newprompt { min-width:220px; flex:1; resize:vertical; }
+  .filters { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin:12px 0; }
+  #search { flex:1; min-width:200px; }
+  #notice { padding:12px 16px; margin:12px 0; border-radius:8px; background:#223b31; color:#c1f2d5; white-space:pre-wrap; }
+  #notice.error { background:#42292c; color:#ffd0d0; }
+  #empty { padding:24px; border:1px dashed #3a424e; border-radius:10px; }
+  dialog { width:min(640px,94vw); color:#e7ebf0; background:#1c2128; border:1px solid #526175; border-radius:12px; padding:24px; }
+  dialog::backdrop { background:#0009; }
+  dialog textarea { width:100%; min-height:180px; resize:vertical; margin:12px 0; }
+  dialog input { width:100%; margin:6px 0 12px; }
+  dialog footer { display:flex; justify-content:flex-end; gap:12px; }
+  .connection { font-size:12px; color:#8b96a5; }
+  /* Transient action confirmations. `#notice` is the persistent banner: it
+     carries guidance that must stay on screen (sign-in state, setup hints),
+     while a toast confirms one completed action and then gets out of the way. */
+  #toasts { position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px; z-index:50; pointer-events:none; }
+  .toast { background:#223b31; color:#c1f2d5; border:1px solid #2f6b4f; border-radius:8px; padding:10px 14px; box-shadow:0 6px 20px #0007; }
+  .toast.error { background:#42292c; color:#ffd0d0; border-color:#8a4a4a; }
+  @media(max-width:700px) { header, main { padding:12px; } .auth { margin-left:0; width:100%; } .col { min-width:85vw; width:85vw; } .toolbar { gap:8px; } }
 </style>
 </head>
 <body>
 <header>
   <h1>Katban</h1>
-  <select id="project" title="Board project"></select>
+  <label for="project">Project</label>
+  <select id="project" title="Board project" disabled><option>Loading projects…</option></select>
   <button id="refresh">Refresh</button>
   <span class="muted" id="meta"></span>
   <span id="runner" title="Always-on runner state"></span>
   <span class="auth">
-    <input id="password" type="password" placeholder="admin password" autocomplete="current-password" hidden>
+    <input id="password" type="password" placeholder="Admin password" aria-label="Admin password" autocomplete="current-password" hidden>
     <button id="login">Sign in</button>
-    <button id="authed" class="ok" hidden disabled>signed in</button>
+    <span id="authed" class="ok" hidden>Signed in</span>
+    <button id="logout" hidden>Sign out</button>
   </span>
 </header>
 <main>
+  <div id="notice" role="status" aria-live="polite" hidden></div>
+  <div class="filters">
+    <label for="search">Find tasks</label><input id="search" type="search" placeholder="Search task text, ID, or result">
+    <label><input id="hide-done" type="checkbox"> Hide done</label>
+    <label for="sort">Sort</label><select id="sort"><option value="created">Creation order</option><option value="updated">Recently updated</option><option value="oldest">Oldest first</option></select>
+    <span id="filtered-count" class="muted"></span>
+    <span id="connection" class="connection">Connecting…</span>
+  </div>
   <div id="empty" class="muted" hidden>No boards yet — add cards with <code>/katban board card add</code> or the Alt+G menu.</div>
   <div class="toolbar" id="toolbar" hidden>
-    <input id="newprompt" type="text" placeholder="new card prompt" autocomplete="off">
+    <textarea id="newprompt" rows="2" placeholder="Describe a task… (Ctrl+Enter to add)" aria-label="New task description"></textarea>
     <button id="addcard">Add card</button>
     <button id="toggleverify" title="Toggle the verification gate: run the project's detected checks in the card's worktree before it reaches review">verify on</button>
     <button id="toggleautoreview" title="Toggle the auto-review pass: a second agent reviews each card's diff">auto-review on</button>
@@ -1165,22 +1243,103 @@ const ADMIN_HTML: &str = r##"<!doctype html>
   </div>
   <div class="board" id="board"></div>
 </main>
+<div id="toasts" role="status" aria-live="polite"></div>
+<dialog id="editor" aria-labelledby="editor-title">
+  <form id="editor-form">
+    <h2 id="editor-title">Edit task</h2>
+    <label for="editor-text">Description</label>
+    <textarea id="editor-text" required></textarea>
+    <footer><button type="button" id="editor-cancel">Cancel</button><button type="submit">Save</button></footer>
+  </form>
+</dialog>
+<dialog id="dependency-dialog" aria-labelledby="dependency-title">
+  <form id="dependency-form">
+    <h2 id="dependency-title">Wait for another task</h2>
+    <p>This task cannot start until the selected task is done.</p>
+    <label for="dependency-target">Prerequisite task</label><select id="dependency-target"></select>
+    <footer><button type="button" onclick="document.querySelector('#dependency-dialog').close()">Cancel</button><button type="submit">Add dependency</button></footer>
+  </form>
+</dialog>
+<dialog id="new-board-dialog" aria-labelledby="newboard-title">
+  <form id="newboard-form">
+    <h2 id="newboard-title">New board</h2>
+    <p>A board groups the tasks for one project; its name also keys the project's data dir and worktrees.</p>
+    <label for="newboard-name">Project name</label>
+    <input id="newboard-name" name="name" required autocomplete="off" placeholder="my-project" aria-describedby="newboard-hint">
+    <p id="newboard-hint" class="muted">Letters, digits, dashes and underscores are kept as-is; other characters are escaped on disk.</p>
+    <footer><button type="button" id="newboard-cancel">Cancel</button><button type="submit">Create board</button></footer>
+  </form>
+</dialog>
 <script>
 // 'blocked' is a real CardStatus (manual hold) — it must have a column or
 // manually-held cards would be invisible on the board.
 const COLS = ["backlog","queued","running","blocked","review","failed","done"];
 const $ = (s) => document.querySelector(s);
+let promptOf = {}, currentBoard = null, boardRequest = 0;
+function notify(message, error = false) {
+  const el = $("#notice"); el.textContent = message; el.className = error ? "error" : ""; el.hidden = !message;
+}
+// Transient confirmation for one completed action. `notify` above stays for
+// guidance that must remain visible until the next action replaces it.
+function toast(message, error = false) {
+  const el = document.createElement("div");
+  el.className = error ? "toast error" : "toast";
+  el.textContent = message;
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+async function request(url, options) {
+  let response;
+  try {
+    const merged = { credentials: "same-origin", ...options };
+    response = await fetch(url, merged);
+  } catch { throw new Error("Cannot reach the board server. Check your connection and try Refresh."); }
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    if (response.status === 401 && url !== "/api/login") setAuth(false);
+    throw new Error(body?.error || "Request failed (" + response.status + "). Try again.");
+  }
+  return response;
+}
+// The board this page is showing. Every write targets the picker's current
+// value, so a stale render cannot write to a board the admin has switched
+// away from.
+function boardUrl(suffix) {
+  return "/api/board/" + encodeURIComponent($("#project").value) + suffix;
+}
+function jsonBody(payload) {
+  return { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
+}
+// Every auth-gated write goes through here. `request` throws on any non-ok
+// response (and drops the session on a 401), so there is no response left to
+// branch on afterwards. Failures land in the page's own notice area — never a
+// blocking alert(), never an unhandled rejection in the console.
+async function write(what, suffix, options) {
+  try { return await request(boardUrl(suffix), options); }
+  catch (error) { notify(what + ": " + (error.message || "please try again."), true); return null; }
+}
+window.addEventListener("unhandledrejection", e => { notify(e.reason?.message || "Something went wrong. Try again.", true); e.preventDefault(); });
+function askText(title, value = "") {
+  return new Promise(resolve => {
+    const dialog = $("#editor"), input = $("#editor-text");
+    $("#editor-title").textContent = title; input.value = value;
+    $("#editor-form").onsubmit = e => { e.preventDefault(); if (!input.value.trim()) return; dialog.close(); resolve(input.value.trim()); };
+    $("#editor-cancel").onclick = () => { dialog.close(); resolve(null); };
+    dialog.oncancel = () => resolve(null);
+    dialog.showModal(); input.focus();
+  });
+}
 
 // Always-on runner indicator: which projects the runner schedules right now
 // and which it is waiting to join (`--run all` boards with no registered
 // git repo). Rendered into the `#runner` header span.
 async function loadRunner() {
   let st;
-  try { st = await (await fetch("/api/runner")).json(); }
-  catch (e) { return; }
+  try { st = await (await request("/api/runner")).json(); }
+  catch (e) { $("#runner").textContent = authed ? "Runner status unavailable" : "Sign in to see runner status"; return; }
   const el = $("#runner");
   if (!st.configured) {
-    el.innerHTML = '<span class="r-off" title="The board isn\'t always-on: run `clawde katban board expose --run <NAME,...|all>` to schedule card execution.">runner: not configured</span>';
+    el.innerHTML = '<span class="r-off" title="The board isn\'t always-on: run `clawde katban board expose --run <NAME,...|all>` to schedule card execution.">Automatic tasks off — board only</span>';
     return;
   }
   if (st.mode === "all") {
@@ -1195,15 +1354,21 @@ async function loadRunner() {
 }
 
 async function loadProjects() {
-  const res = await fetch("/api/projects");
+  let res;
+  try { res = await fetch("/api/projects"); }
+  catch { throw new Error("Cannot load projects. Check your connection and try Refresh."); }
   if (res.status === 401) {
     // Exposed board, not signed in: reads are admin-gated. Show the gate
     // instead of "no boards" (which would be misleading).
     $("#board").hidden = true;
     $("#empty").hidden = false;
-    $("#empty").innerHTML = "Sign in to view this board.";
+    $("#empty").textContent = "Sign in above to view projects and tasks. If no password is set, run clawde katban board password on the server first.";
+    $("#project").disabled = true;
+    $("#project").innerHTML = '<option>Sign in to choose a project</option>';
+    $("#meta").textContent = "";
     return;
   }
+  if (!res.ok) throw new Error("Could not load projects. Try Refresh.");
   const projects = await res.json();
   const sel = $("#project");
   const prev = sel.value;
@@ -1213,17 +1378,24 @@ async function loadProjects() {
     o.value = p; o.textContent = p;
     sel.appendChild(o);
   }
-  if (!projects.length) { $("#empty").hidden = false; $("#board").hidden = true; return; }
+  sel.disabled = !projects.length;
+  if (!projects.length) { $("#empty").textContent = "No boards yet. Sign in and choose New board to create your first project board."; $("#empty").hidden = false; $("#board").hidden = true; return; }
   $("#empty").hidden = true; $("#board").hidden = false;
   // Keep the admin's current selection across Refresh; fall back to the first.
   sel.value = projects.includes(prev) ? prev : projects[0];
-  loadBoard(sel.value);
+  await loadBoard(sel.value);
 }
 
 async function loadBoard(project) {
-  const res = await fetch("/api/board/" + encodeURIComponent(project));
-  if (!res.ok) { $("#board").innerHTML = '<span class="blocked">' + (await res.text()) + "</span>"; return; }
+  const sequence = ++boardRequest;
+  const res = await request("/api/board/" + encodeURIComponent(project));
   const api = await res.json();
+  if (sequence !== boardRequest || $("#project").value !== project) return;
+  currentBoard = api;
+  renderBoard(api);
+}
+
+function renderBoard(api) {
   $("#meta").textContent = api.cards.length + " cards · cap " + api.parallelCap + " · retry " + api.autoRetry + (api.autoReview ? " · auto-review" : "") + " · verify " + (api.verify ? "on" : "off") + (api.attempts > 1 ? " · attempts " + api.attempts + (api.attemptUpstreams.length ? " (" + api.attemptUpstreams.join(",") + ")" : "") : "");
   // Keep the board-level toggle buttons truthful (and clickable when signed in).
   gateVerify = api.verify; gateAutoReview = api.autoReview;
@@ -1237,16 +1409,24 @@ async function loadBoard(project) {
     (waitMap[d.from] ||= []).push(d.to);
     (blocksMap[d.to] ||= []).push(d.from);
   });
-  const promptOf = {};
+  promptOf = {};
   api.cards.forEach((c) => promptOf[c.id] = c.prompt);
+  const query = $("#search").value.trim().toLowerCase();
+  const visible = api.cards.filter(c => (!$("#hide-done").checked || c.status !== "done") && [c.prompt, c.id, c.result || ""].some(text => text.toLowerCase().includes(query)));
+  if ($("#sort").value === "updated") visible.sort((a,b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
+  if ($("#sort").value === "oldest") visible.sort((a,b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+  $("#filtered-count").textContent = visible.length + " of " + api.cards.length + " tasks";
+  $("#empty").hidden = visible.length > 0;
+  $("#empty").textContent = api.cards.length ? "No tasks match these filters." : "This board is empty. Add a task above; it stays in backlog until you queue it.";
 
-  api.cards.forEach((c) => {
+  visible.forEach((c) => {
     if (!byStatus[c.status]) byStatus[c.status] = [];
     byStatus[c.status].push(c);
   });
 
   $("#board").innerHTML = "";
   for (const col of COLS) {
+    if (col === "done" && $("#hide-done").checked) continue;
     const colEl = document.createElement("section");
     colEl.className = "col";
     const h = document.createElement("h2");
@@ -1261,7 +1441,8 @@ async function loadBoard(project) {
               (c.retries ? " · retries " + c.retries : "") +
               (c.commit ? " · " + c.commit.slice(0,8) : "") + "</span>";
       if (c.blockedReason) html += '<div class="blocked">' + esc(c.blockedReason) + "</div>";
-      if (c.result) html += '<div class="blocked" title="last result">' + esc(c.result) + "</div>";
+      if (c.result) html += '<details class="diff"><summary>Agent result</summary><pre>' + esc(c.result) + '</pre></details>';
+      if (c.branch || c.workDir || c.commit) html += '<details class="diff"><summary>Execution details</summary><pre>' + esc([c.branch && 'Branch: ' + c.branch, c.workDir && 'Worktree: ' + c.workDir, c.commit && 'Commit: ' + c.commit].filter(Boolean).join('\n')) + '</pre></details>';
       if (c.status === "failed") html += '<div class="meta">failure: ' + esc(c.failureKind || "unknown") + '</div>';
       // Per-attempt matrix (spec §5 "record, don't discard"): one line per
       // rung — upstream, verdict, elapsed — with the picked rung marked.
@@ -1290,7 +1471,7 @@ async function loadBoard(project) {
         html += '<div class="deps">blocks: ' +
           blocks.map((id) => esc(promptOf[id] || id)).join(", ") + "</div>";
       }
-      if (c.diff_summary) html += '<div class="meta">' + c.diff_summary.filesChanged + ' file(s) · +' + c.diff_summary.additions + ' · -' + c.diff_summary.deletions + '</div>';
+      if (c.diffSummary) html += '<div class="meta">' + c.diffSummary.filesChanged + ' file(s) · +' + c.diffSummary.additions + ' · -' + c.diffSummary.deletions + '</div>';
       if (c.diff) html += '<details class="diff"><summary>diff (' + (c.diff.length) + ' ch)</summary><pre>' + esc(c.diff) + '</pre></details>';
       if (c.reviews && c.reviews.length) {
         html += '<div class="reviews">' + c.reviews.map((r) =>
@@ -1363,161 +1544,177 @@ let gateVerify = true, gateAutoReview = true;
 
 async function tryLogin() {
   const pw = $("#password").value;
-  const res = await fetch("/api/login", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password: pw })
-  });
-  if (res.ok) { setAuth(true); $("#password").value = ""; }
-  else { alert("login failed"); }
+  if (!pw.trim()) { notify("Enter your admin password first.", true); $("#password").focus(); return; }
+  $("#login").disabled = true; $("#login").textContent = "Signing in…";
+  let ok = false;
+  try {
+    await request("/api/login", jsonBody({ password: pw }));
+    ok = true;
+  } catch (error) {
+    // The password box stays open so the admin can retry; `login` is exempt
+    // from the session drop in `request`, so a wrong password is not a
+    // sign-out.
+    notify("Sign in failed: " + (error.message || "please try again."), true);
+  } finally { $("#login").disabled = false; $("#login").textContent = "Sign in"; }
+  if (ok) { $("#password").value = ""; setAuth(true); notify("Signed in. You can now edit tasks."); }
 }
 
 function setAuth(ok) {
   authed = ok;
-  $("#password").hidden = ok;
+  // Only an explicit Sign in click reveals the password box: restoring the
+  // signed-out state must not render an admin password field on every visit
+  // (the board can be exposed on a public subdomain).
+  $("#password").hidden = true;
   $("#login").hidden = ok;
   $("#authed").hidden = !ok;
+  $("#logout").hidden = !ok;
   $("#toolbar").hidden = !ok;
-  if (ok) { loadProjects(); wireEvents(); }
-  else stopEvents();
+  if (ok) { loadProjects(); loadRunner(); wireEvents(); }
+  else { stopEvents(); if (currentBoard) renderBoard(currentBoard); }
 }
 
 // Flip a board-level toggle (verify | auto-review) via its auth-gated POST
 // route, then reload the board so the toolbar labels + meta line update.
 async function toggleBoardFlag(route, enabled, label) {
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/" + route, {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled })
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  if (res.ok) loadBoard($("#project").value); else alert("could not toggle " + label);
+  const res = await write("Could not toggle " + label, "/" + route, jsonBody({ enabled }));
+  if (res) loadBoard($("#project").value);
 }
 
 async function addCard() {
   const prompt = $("#newprompt").value.trim();
   if (!prompt) return;
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards", {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt })
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
+  // On failure the draft stays in the box — `write` has already reported why.
+  const res = await write("Could not add the task", "/cards", jsonBody({ prompt }));
+  if (!res) return;
   $("#newprompt").value = "";
-  if (res.ok) loadBoard($("#project").value); else alert("failed to add card");
+  loadBoard($("#project").value);
+  notify("Task added to backlog. It has not been started.");
 }
 
 async function advanceCard(id) {
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/advance", {
-    method: "POST", credentials: "same-origin"
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  if (res.ok) loadBoard($("#project").value); else alert("could not advance card");
+  const res = await write("Could not advance the card", "/cards/" + id + "/advance", { method: "POST" });
+  if (res) loadBoard($("#project").value);
 }
 
 async function archiveCard(id) {
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/archive", {
-    method: "POST", credentials: "same-origin"
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  if (res.ok) loadBoard($("#project").value); else alert("could not archive card");
+  const res = await write("Could not archive the card", "/cards/" + id + "/archive", { method: "POST" });
+  if (res) loadBoard($("#project").value);
 }
 
 async function mergeCard(id) {
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/merge", {
-    method: "POST", credentials: "same-origin"
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  const data = await res.json().catch(() => null);
-  if (res.ok) loadBoard($("#project").value);
-  else alert((data && data.error) || "merge failed — see server log");
+  // The server's conflict text ("branch has no pinned commit", conflicts, …)
+  // arrives as the thrown message, so it is what the admin needs to read.
+  const res = await write("Merge failed", "/cards/" + id + "/merge", { method: "POST" });
+  if (res) loadBoard($("#project").value);
 }
 
 async function editCard(id) {
   const current = promptOf[id] || "";
-  const next = prompt("Edit the card prompt:", current);
+  const next = await askText("Edit task description", current);
   if (next === null) return;
   const text = next.trim();
   if (!text || text === current) return;
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/edit", {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt: text })
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  if (res.ok) loadBoard($("#project").value); else alert((await res.json().catch(() => null))?.error || "could not edit card");
+  const res = await write("Could not save the task description", "/cards/" + id + "/edit", jsonBody({ prompt: text }));
+  if (!res) return;
+  await loadBoard($("#project").value);
+  notify("Task description saved.");
 }
 
 async function setStatus(id, status) {
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/status", {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status })
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  if (res.ok) loadBoard($("#project").value); else alert("could not set status");
+  const res = await write("Could not set the status", "/cards/" + id + "/status", jsonBody({ status }));
+  if (res) loadBoard($("#project").value);
+}
+
+async function chooseDependency(id) {
+  if (!currentBoard) return;
+  const candidates = currentBoard.cards.filter(c => c.id !== id && !currentBoard.dependencies.some(d => d.from === id && d.to === c.id));
+  if (!candidates.length) { notify("No other tasks are available to link."); return; }
+  const dialog = $("#dependency-dialog"), select = $("#dependency-target");
+  select.replaceChildren(...candidates.map(c => {
+    const option = document.createElement("option"); option.value = c.id;
+    option.textContent = c.prompt.slice(0,100) + " (" + c.status + ")"; return option;
+  }));
+  $("#dependency-form").onsubmit = async e => {
+    e.preventDefault(); dialog.close();
+    // Confirm only what happened: `linkCard` reports its own failure through
+    // the notice area, so the success toast must not fire on a rejection.
+    if (await linkCard(id, select.value)) toast("Dependency added — this task waits for the selected task to finish.");
+  };
+  dialog.showModal(); select.focus();
 }
 
 async function linkCard(id, to) {
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/link", {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ from: id, to })
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  if (res.ok) loadBoard($("#project").value); else alert((await res.json()).error || "could not link cards");
+  const res = await write("Could not link the cards", "/link", jsonBody({ from: id, to }));
+  if (!res) return false;
+  loadBoard($("#project").value);
+  return true;
 }
 
 async function unlinkCard(from, to) {
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/unlink", {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ from, to })
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  if (res.ok) loadBoard($("#project").value); else alert("could not unlink cards");
+  const res = await write("Could not unlink the cards", "/unlink", jsonBody({ from, to }));
+  if (res) loadBoard($("#project").value);
 }
 
 async function postComment(id) {
   const loc = $('[data-rline="' + id + '"]').value.trim();
   const text = $('[data-rtext="' + id + '"]').value.trim();
-  if (!text) { alert("comment text is empty"); return; }
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/comment", {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ location: loc || null, text })
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  if (res.ok) loadBoard($("#project").value);
-  else alert((await res.json()).error || "could not comment");
+  if (!text) { notify("Enter a review comment first.", true); return; }
+  const res = await write("Could not add the comment", "/cards/" + id + "/comment", jsonBody({ location: loc || null, text }));
+  if (res) loadBoard($("#project").value);
 }
 
 async function sendFeedback(id) {
-  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/feedback", {
-    method: "POST", credentials: "same-origin"
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  if (res.ok) loadBoard($("#project").value);
-  else alert((await res.json()).error || "could not send feedback");
+  const res = await write("Could not send the feedback", "/cards/" + id + "/feedback", { method: "POST" });
+  if (res) loadBoard($("#project").value);
 }
 
-async function newBoard() {
-  const name = prompt("New board project name:");
-  if (!name || !name.trim()) return;
-  const res = await fetch("/api/boards", {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: name.trim() })
-  });
-  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
-  if (res.ok) loadProjects(); else alert((await res.json()).error || "could not create board");
+// A project name is not a task description, so this gets its own labelled
+// field and naming hint instead of reusing the task editor's dialog.
+function newBoard() {
+  const dialog = $("#new-board-dialog"), input = $("#newboard-name");
+  input.value = "";
+  $("#newboard-form").onsubmit = (e) => { e.preventDefault(); dialog.close(); createBoard(input.value.trim()); };
+  $("#newboard-cancel").onclick = () => dialog.close();
+  dialog.showModal(); input.focus();
 }
 
-$("#login").addEventListener("click", tryLogin);
+async function createBoard(name) {
+  if (!name) return;
+  try {
+    await request("/api/boards", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    });
+  } catch (error) {
+    // `request` throws the server's message (e.g. "a board for 'x' already
+    // exists"), so surface it instead of dropping it on the floor.
+    notify(error.message, true);
+    return;
+  }
+  const select = $("#project");
+  await loadProjects();
+  if (Array.from(select.options).some((o) => o.value === name)) { select.value = name; await loadBoard(name); }
+  toast("Board created: " + name);
+}
+
+// Two-step control: the first click reveals the password box, the second
+// submits. Keeps the admin field out of the header until it is asked for.
+$("#login").addEventListener("click", () => {
+  if ($("#password").hidden) { $("#password").hidden = false; $("#password").focus(); return; }
+  tryLogin();
+});
 $("#password").addEventListener("keydown", (e) => { if (e.key === "Enter") tryLogin(); });
 $("#addcard").addEventListener("click", addCard);
-$("#newprompt").addEventListener("keydown", (e) => { if (e.key === "Enter") addCard(); });
+$("#newprompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); addCard(); } });
+$("#search").addEventListener("input", () => { if (currentBoard) renderBoard(currentBoard); });
+$("#hide-done").addEventListener("change", () => { if (currentBoard) renderBoard(currentBoard); });
+$("#sort").addEventListener("change", () => { if (currentBoard) renderBoard(currentBoard); });
+$("#logout").addEventListener("click", async () => {
+  try { await request("/api/logout", { method: "POST" }); }
+  catch (error) { notify("Sign out failed: " + (error.message || "please try again."), true); return; }
+  setAuth(false); currentBoard = null; loadProjects(); loadRunner(); notify("Signed out.");
+});
 $("#toggleverify").addEventListener("click", () => toggleBoardFlag("verify", !gateVerify, "the verify gate"));
 $("#toggleautoreview").addEventListener("click", () => toggleBoardFlag("auto-review", !gateAutoReview, "auto-review"));
 
@@ -1537,8 +1734,7 @@ $("#board").addEventListener("click", (e) => {
   if (adv && window.confirm("Advance this card?")) advanceCard(adv.dataset.adv);
   if (arc && window.confirm("Archive this card (discards its pinned commit/branch)?")) archiveCard(arc.dataset.arc);
   if (link) {
-    const to = prompt("Enter the id of the card this one should wait for:");
-    if (to && to.trim()) linkCard(link.dataset.link, to.trim());
+    chooseDependency(link.dataset.link);
   }
   if (unlink && window.confirm("Remove this dependency?")) unlinkCard(unlink.dataset.unlink, unlink.dataset.unlinkTarget);
 });
@@ -1564,10 +1760,17 @@ let events = null;
 function wireEvents() {
   if (events) events.close();
   events = new EventSource("/api/board/events");
-  events.onmessage = () => { loadProjects(); loadRunner(); };
+  events.onopen = () => { $("#connection").textContent = "Live updates connected"; };
+  events.onerror = () => { $("#connection").textContent = "Live updates reconnecting…"; };
+  events.onmessage = () => {
+    // Do not erase a review comment or move controls while somebody is typing.
+    if ($("#editor").open || document.activeElement?.matches(".rform input")) return;
+    loadProjects(); loadRunner();
+  };
 }
 function stopEvents() {
   if (events) { events.close(); events = null; }
+  $("#connection").textContent = "Sign in for live updates";
 }
 
 // Restore signed-in state from the HttpOnly cookie, so a refresh doesn't
@@ -2070,6 +2273,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), HttpStatus::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn first_password_is_loaded_without_restarting_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _guard) = router_with_home(tmp.path(), Some("default"), None);
+        assert!(!crate::admin_auth::admin_path().exists());
+
+        let mut admin = AdminStore::default();
+        admin.set_password("first admin password!");
+        crate::admin_auth::save(&admin).unwrap();
+
+        let cookie = login_cookie(&app, "first admin password!").await.unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/projects")
+                    .header("x-forwarded-for", "192.168.1.100")
+                    .header("cookie", cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), HttpStatus::OK);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let projects: Vec<String> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(projects, vec!["default"]);
+    }
+
+    #[tokio::test]
+    async fn editing_preserves_card_status_and_rejects_empty_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _guard) = router_with_home(tmp.path(), Some("default"), Some("hunter2"));
+        let cookie = login_cookie(&app, "hunter2").await.unwrap();
+        let before = board::load_board("default").unwrap().unwrap();
+        let id = &before.cards[0].id;
+        for (prompt, expected) in [
+            (" ", HttpStatus::BAD_REQUEST),
+            ("Updated task\nwith details", HttpStatus::OK),
+        ] {
+            let body = serde_json::json!({"prompt": prompt}).to_string();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/board/default/cards/{id}/edit"))
+                        .header("cookie", &cookie)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let after = board::load_board("default").unwrap().unwrap();
+        assert_eq!(after.cards[0].id, *id);
+        assert_eq!(after.cards[0].status, before.cards[0].status);
+        assert_eq!(after.dependencies, before.dependencies);
+        assert_eq!(after.cards[0].prompt, "Updated task\nwith details");
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_session_and_rejects_cross_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _guard) = router_with_home(tmp.path(), Some("default"), Some("hunter2"));
+        let cookie = login_cookie(&app, "hunter2").await.unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/logout")
+                    .header("cookie", &cookie)
+                    .header("origin", "http://evil.example")
+                    .header("host", "127.0.0.1:8790")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), HttpStatus::FORBIDDEN);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/logout")
+                    .header("cookie", &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), HttpStatus::OK);
+        assert!(res
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .header("cookie", cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), HttpStatus::UNAUTHORIZED);
+        assert!(crate::admin_auth::load().unwrap().sessions.is_empty());
     }
 
     #[tokio::test]

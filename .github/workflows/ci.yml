@@ -6,6 +6,7 @@ on:
     paths:
       - 'src-rust/**'
       - 'scripts/probes/tui-permissions-smoke.py'
+      - 'scripts/probes/katban-board-ux-probe.py'
       - 'scripts/audit-env-tests.py'
       - 'scripts/audit-tokio-file-flush.py'
       - 'scripts/validate-acp-template.py'
@@ -16,6 +17,7 @@ on:
     paths:
       - 'src-rust/**'
       - 'scripts/probes/tui-permissions-smoke.py'
+      - 'scripts/probes/katban-board-ux-probe.py'
       - 'scripts/audit-env-tests.py'
       - 'scripts/audit-tokio-file-flush.py'
       - 'scripts/validate-acp-template.py'
@@ -150,3 +152,23 @@ jobs:
           python3 scripts/probes/tui-permissions-smoke.py \
             --binary src-rust/target/debug/clawde \
             --timeout-secs 20
+
+      # Board UI probe. The board web app is one embedded HTML+JS document with
+      # no frontend build step, so nothing above this line compiles or exercises
+      # it. playwright + chromium are installed into a throwaway venv rather than
+      # the runner's python (PEP 668 externally-managed installs reject a bare
+      # `pip install`), and the probe is run with --require-browser so a browser
+      # that failed to install fails this step instead of self-skipping green.
+      - name: Install chromium for the board UI probe
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv /tmp/board-probe-venv
+          /tmp/board-probe-venv/bin/pip install --quiet playwright
+          /tmp/board-probe-venv/bin/python -m playwright install --with-deps chromium
+
+      - name: Katban board UX probe
+        if: runner.os == 'Linux'
+        run: |
+          /tmp/board-probe-venv/bin/python scripts/probes/katban-board-ux-probe.py \
+            --binary src-rust/target/debug/clawde \
+            --require-browser

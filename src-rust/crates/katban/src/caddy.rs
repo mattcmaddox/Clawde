@@ -129,16 +129,34 @@ WantedBy=multi-user.target
 }
 
 /// Systemd oneshot service the path unit triggers.
-pub fn render_reloader_service_unit(reload_command: &str) -> String {
+///
+/// It runs the **checked** reload, not a bare `systemctl reload caddy`:
+/// `clawde katban caddy reload` validates the whole Caddyfile with `caddy adapt`
+/// and refuses to reload one that no longer adapts. A fragment written by
+/// anything — a second tool, a hand edit, a partial write — is therefore
+/// reported in the journal instead of being applied and left to make every
+/// later reload fail. The reload flavour (service vs. socket-scoped admin API)
+/// is re-detected at fire time, so this unit needs no re-rendering when the
+/// endpoint changes.
+///
+/// `binary` is the resolved clawde binary; the unit stops working while that
+/// file is missing — which `doctor` reports — or while it predates this
+/// subcommand, which nothing can see from the outside (it fails in the journal
+/// as `unknown katban command: caddy` until the binary is rebuilt).
+pub fn render_reloader_service_unit(binary: &str, caddy_dir: &Path) -> String {
     format!(
-        "# Installed by clawde katban site expose.
+        "# Installed by clawde katban site expose — reloads caddy only when the
+# whole Caddyfile still adapts.
+# Rebuild the binary in place (e.g. `clawded`), then:
+#   sudo systemctl daemon-reload && sudo systemctl restart katban-reload.path
 [Unit]
-Description=Reload caddy after a Katban config change
+Description=Reload caddy after a Katban config change (validated first)
 
 [Service]
 Type=oneshot
-ExecStart={reload_command}
-"
+ExecStart={binary} katban caddy reload --caddy-dir {}
+",
+        caddy_dir.display()
     )
 }
 
@@ -234,18 +252,30 @@ pub fn valid_hostname(s: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
+/// The include pattern the host Caddyfile should `import`. A **glob** (not a
+/// specific file): caddy aborts the entire reload when a specifically named
+/// file is missing, which would take down every unrelated site on the box,
+/// whereas an empty glob is a documented no-op. `katban*.conf` still matches
+/// exactly the managed file and not the atomic temp (`katban.conf.tmp`).
+pub fn managed_import_pattern(caddy_dir: &Path) -> String {
+    caddy_dir.join("katban*.conf").display().to_string()
+}
+
 /// The one-time bootstrap steps the user approves (spec §10.1a). The import
 /// line is the only change ever made to the host Caddyfile. `caddy_dir` is
 /// where the managed include lives (`--caddy-dir` or the default `/etc/caddy`)
 /// — the import uses the absolute path so the Caddyfile picks up the exact
 /// file the expose commands write, whatever directory was chosen.
 pub fn bootstrap_instructions(include_dir: &Path, caddy_dir: &Path) -> String {
-    let managed = caddy_dir.join(DEFAULT_INCLUDE_NAME);
+    let pattern = managed_import_pattern(caddy_dir);
     format!(
         "One-time bootstrap (approve once, then Cat Chat and Katban manage their own routes):\n\
          \n\
          1. Add this line to /etc/caddy/Caddyfile (site-block area, top level):\n\
             import {}\n\
+            (the `*` glob is deliberate: caddy treats an empty glob as a no-op,\n\
+             but a specifically named missing file aborts the whole reload and\n\
+             takes every other site on the box down with it)\n\
          \n\
          2. Install Cat Chat's always-on service (runs the sandbox server, \n\
             restarts on failure, survives reboots):\n\
@@ -254,15 +284,19 @@ pub fn bootstrap_instructions(include_dir: &Path, caddy_dir: &Path) -> String {
             sudo systemctl enable --now catchat.service\n\
          \n\
          3. Install the auto-reload watcher so future config changes need no \n\
-            manual reload:\n\
+            manual reload. It validates the whole Caddyfile with `caddy adapt` \n\
+            first and refuses to reload a config that no longer adapts, so a \n\
+            broken fragment is reported in the journal instead of applied:\n\
             sudo install -m 644 {} /etc/systemd/system/katban-reload.path\n\
             sudo install -m 644 {} /etc/systemd/system/katban-reload.service\n\
             sudo systemctl daemon-reload\n\
             sudo systemctl enable --now katban-reload.path\n\
          \n\
          4. Apply the new routes once:\n\
-            sudo systemctl reload caddy\n",
-        managed.display(),
+            sudo systemctl reload caddy\n\
+            (expose also reloads caddy itself: root-free via `caddy reload` when this\n\
+             Caddyfile scopes the admin endpoint to a socket, `admin unix//...`)\n",
+        pattern,
         include_dir.join("catchat.service").display(),
         include_dir.join("katban-reload.path").display(),
         include_dir.join("katban-reload.service").display(),
@@ -272,22 +306,28 @@ pub fn bootstrap_instructions(include_dir: &Path, caddy_dir: &Path) -> String {
 /// Katban-only bootstrap: installs the shared Caddy reload watcher without
 /// creating or mentioning Cat Chat's service.
 pub fn katban_bootstrap_instructions(include_dir: &Path, caddy_dir: &Path) -> String {
-    let managed = caddy_dir.join(DEFAULT_INCLUDE_NAME);
+    let pattern = managed_import_pattern(caddy_dir);
     format!(
         "One-time Katban bootstrap (approve once):\n\\
          \n\\
          1. Add this line to /etc/caddy/Caddyfile (site-block area, top level):\n\\
             import {}\n\\
+            (the `*` glob is deliberate: caddy treats an empty glob as a no-op,\n\\
+             but a specifically named missing file aborts the whole reload and\n\\
+             takes every other site on the box down with it)\n\\
          \n\\
-         2. Install the shared Caddy auto-reload watcher:\n\\
+         2. Install the shared Caddy auto-reload watcher (it validates the \n\\
+            whole Caddyfile with `caddy adapt` first and refuses to reload a \n\\
+            config that no longer adapts):\n\\
             sudo install -m 644 {} /etc/systemd/system/katban-reload.path\n\\
             sudo install -m 644 {} /etc/systemd/system/katban-reload.service\n\\
             sudo systemctl daemon-reload\n\\
             sudo systemctl enable --now katban-reload.path\n\\
-         \n\\
-         3. Apply the new routes once:\n\\
-            sudo systemctl reload caddy\n",
-        managed.display(),
+         \n\\          3. Apply the new routes once:\n\\
+             sudo systemctl reload caddy\n\\
+             (expose also reloads caddy itself: root-free via `caddy reload` when this\n\\
+              Caddyfile scopes the admin endpoint to a socket, `admin unix//...`)\n",
+        pattern,
         include_dir.join("katban-reload.path").display(),
         include_dir.join("katban-reload.service").display(),
     )
@@ -452,6 +492,8 @@ mod tests {
         assert!(instructions.contains("systemctl enable --now catchat.service"));
         assert!(instructions.contains("katban-reload.path"));
         assert!(instructions.contains("systemctl reload caddy"));
+        // The operator is told the watcher validates before it applies.
+        assert!(instructions.contains("caddy adapt"));
     }
 
     #[test]
@@ -463,29 +505,53 @@ mod tests {
         let custom = render_reloader_path_unit(Path::new("/home/user/caddy/katban.conf"));
         assert!(custom.contains("PathChanged=/home/user/caddy/katban.conf"));
 
-        let service_unit = render_reloader_service_unit("systemctl reload caddy");
+        // The watcher runs the *checked* reload: a bare `systemctl reload
+        // caddy` would apply whatever is on disk, so a fragment that stopped
+        // adapting would keep every later reload failing until a human
+        // noticed. The caddy dir it validates is the one being watched.
+        let service_unit =
+            render_reloader_service_unit("/usr/local/bin/clawde", Path::new("/home/user/caddy"));
         assert!(service_unit.contains("[Service]"));
         assert!(service_unit.contains("Type=oneshot"));
-        assert!(service_unit.contains("ExecStart=systemctl reload caddy"));
+        assert!(service_unit.contains(
+            "ExecStart=/usr/local/bin/clawde katban caddy reload --caddy-dir /home/user/caddy"
+        ));
+        assert!(!service_unit.contains("ExecStart=systemctl reload caddy"));
     }
 
     // The bootstrap text references /etc/caddy and systemctl — a Linux
     // server surface.
+    #[test]
+    fn managed_import_pattern_is_a_glob_not_a_specific_file() {
+        // A specific missing file aborts the whole reload; the glob does not.
+        let pattern = managed_import_pattern(Path::new("/etc/caddy"));
+        assert_eq!(pattern, "/etc/caddy/katban*.conf");
+        // It must read as a glob, not a specific file, and must not match the
+        // atomic temp file (`katban.conf.tmp`) either.
+        assert!(pattern.ends_with("*.conf"));
+        assert!(!pattern.contains(".tmp"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn catchat_bootstrap_mentions_import_and_reload() {
         let instructions =
             bootstrap_instructions(Path::new("/tmp/katban-caddy"), Path::new("/etc/caddy"));
-        assert!(instructions.contains("import /etc/caddy/katban.conf"));
+        // The import must be a glob: a specific file that goes missing would
+        // take every unrelated site down at the next reload.
+        assert!(instructions.contains("import /etc/caddy/katban*.conf"));
+        assert!(!instructions.contains("import /etc/caddy/katban.conf\n"));
         assert!(instructions.contains("katban-reload.path"));
         assert!(instructions.contains("systemctl reload caddy"));
+        // The root-free alternative is advertised where the operator looks.
+        assert!(instructions.contains("admin unix//"));
 
-        // A custom caddy dir gets an absolute import of the actual file.
+        // A custom caddy dir gets an absolute glob of the actual file.
         let custom = bootstrap_instructions(
             Path::new("/tmp/katban-caddy"),
             Path::new("/home/user/caddy"),
         );
-        assert!(custom.contains("import /home/user/caddy/katban.conf"));
+        assert!(custom.contains("import /home/user/caddy/katban*.conf"));
     }
 
     #[test]

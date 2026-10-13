@@ -191,6 +191,12 @@ impl AdminStore {
         })
     }
 
+    pub fn revoke_session(&mut self, token: &str) {
+        let token_hash = hash(ADMIN_COOKIE, token);
+        self.sessions
+            .retain(|session| session.token_hash != token_hash);
+    }
+
     pub fn touch_session(&mut self, token: &str) {
         let token_hash = hash(ADMIN_COOKIE, token);
         if let Some(session) = self

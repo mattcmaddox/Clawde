@@ -667,7 +667,9 @@ itself.** Two mechanisms; the host-side watcher is the recommended default:
   - A tiny **systemd path unit**: `katban-reload.path` watches
     `/etc/caddy/katban.conf` (`PathChanged`) and triggers
     `katban-reload.service`, which runs `systemctl reload caddy` (or
-    `caddy reload --config /etc/caddy/Caddyfile` for non-service installs). It
+    `caddy reload --config /etc/caddy/Caddyfile` for non-service installs) —
+    since 2026-10-12 it runs the *checked* reload instead, `clawde katban
+    caddy reload`, see the safety semantics below. It
     runs **on-demand only** when the file changes — not a daemon to forget —
     and is installed by the bootstrap. Equally valid: an `inotifywait`/
     `entr` watcher running the same reload.
@@ -683,12 +685,38 @@ itself.** Two mechanisms; the host-side watcher is the recommended default:
   the default localhost admin API was proven to work**without root** on the
 home server (2026-08-29).
 
-**Safety semantics:**
+**Safety semantics (implemented 2026-10-12):**
 - Katban writes `katban.conf` **atomically** (write temp file, then `rename()`)
   so a reload never sees a half-written file.
+- **Validated before it is kept.** After the atomic write, Katban runs
+  `caddy adapt --config <Caddyfile>` (root-free, ~50 ms, no instance started).
+  If the Caddyfile no longer adapts, the include is rolled back to its previous
+  bytes and the command fails with caddy's own diagnostic. Without this,
+  caddy keeping the last-good config protects *uptime* but leaves the bad
+  fragment on disk, failing every subsequent reload until a human notices.
 - `systemctl reload caddy` is graceful and atomic caddy-side: a bad template
   aborts the reload and caddy **keeps the last-good config** (no downtime);
   Katban surfaces any failed reload in `katban sites status`.
+- **Reload choice is detected, not assumed.** Default remains the service
+  reload (host-side adaptation, no admin-API dependency). When the Caddyfile
+  scopes the admin endpoint to a socket (`admin unix//...`), expose and the
+  rendered `katban-reload.service` use `caddy reload --config <Caddyfile>
+  --address <socket>` instead — root-free, with socket permissions as the ACL.
+  `CLAWDE_CADDY_RELOAD=systemd|caddy` overrides; forcing `caddy` on a host with
+  a TCP or absent admin endpoint is refused rather than obeyed, because the
+  unauthenticated `localhost:2019` API would accept another directory's
+  Caddyfile as the running config.
+- **The watcher runs the same gate (2026-10-12).** `katban-reload.service`
+  executes `clawde katban caddy reload --caddy-dir <dir>` rather than a bare
+  `systemctl reload caddy`: it validates the whole Caddyfile with `caddy adapt`
+  and reloads only if it still adapts, exiting non-zero (with caddy's own
+  diagnostic in the journal) otherwise. This extends the gate past Clawde's own
+  writes to *any* writer of the include — a hand edit, a second tool — which the
+  in-process check cannot cover. It also re-detects the reload flavour when it
+  fires, so moving the admin endpoint to a socket no longer needs the unit
+  re-rendered; the cost is that the unit now depends on the clawde binary
+  existing, which `doctor` reports. `doctor` gained a `katban-reload gate`
+  finding for an installed pre-gate watcher.
 
 ### 10.1b What one site looks like (per-site block shape)
 
