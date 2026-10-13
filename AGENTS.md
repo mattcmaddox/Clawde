@@ -157,6 +157,32 @@ admin session like every write, and the login cookie is marked `Secure`.
 (CI, Linux leg; `--require-browser` so a missing browser fails instead of
 skipping). Run it by hand per `docs/katban.md` after touching the board UI.
 
+### Cat Chat guest guard
+
+`crates/katban/src/catchat/pages.rs` is the same shape (one embedded HTML+JS
+document, nothing compiles it), and it has its own two rules:
+
+- **A guest sees the answer text and nothing else.** `render_text` in
+`catchat/engine.rs` tags reasoning and tool-use blocks into the string it
+builds — correct for the transcript fed back to the model, wrong for a friend.
+Guest-visible output goes through `visible_text` instead, which drops those
+blocks and strips reasoning an upstream folded into the content field
+(`reasoning</think>answer`, from a live guest summary). Adding a reply or
+summary path means routing it through `visible_text`.
+- **A lockout is cleared by bucket, and a miss is an error.** Both ladders key
+failures by client, and the client is *not always an address*: a loopback
+request without `X-Forwarded-For` is filed under
+`http_security::LOOPBACK_BUCKET` (`"loopback"`). Resolve an operator's argument
+with `http_security::lockout_bucket` before clearing, name the buckets in
+`status` with `describe_lockouts`, and never report a clear that matched
+nothing — that combination is how a locked-out guest stayed locked out while
+the command said it was handled.
+
+`scripts/probes/catchat-ux-probe.py` drives the whole guest journey in a real
+browser against a local mock upstream (so it needs no free-tier keys) and
+asserts both rules; CI runs it after the board probe. Run it by hand per
+`docs/catchat.md` after touching a Cat Chat page or the guest engine.
+
 ### `cargo check` skips test targets
 
 `cargo check --workspace` (and plain `cargo build`) do NOT compile `#[cfg(test)]`
@@ -169,17 +195,19 @@ cargo check -p clawde-tui --tests
 
 ### Pre-commit hook
 
-`.githooks/pre-commit` runs seven checks before a commit lands (see the script
-header for the full contract): the gitleaks secret scan, the async file-flush
-audit, rustfmt drift, the TUI test-target compile, an idle-CPU smoke probe, an
-**ACP registry-template guard** (`scripts/validate-acp-template.py`, runs only
-when the template, its vendored schema, or the validator is staged), and a
-**live eval gate** (`scripts/eval/run_eval.py --fixture
-scripts/eval/fixtures/catalog-order`) that runs the real free-provider chain and
-blocks the commit if it stops enumerating `FREE_CATALOG` order. The two slow
-checks self-skip when the debug binary is missing or older than the staged Rust
-sources, and the eval gate skips when no free keys are configured. Enable once
-per clone:
+`.githooks/pre-commit` runs eight checks before a commit lands (see the script
+header for the full contract): the gitleaks secret scan, a **feature-gate
+inventory** (`scripts/audits/feature-gate-scan.py`, runs when a `Cargo.toml` is
+staged — see [Feature declarations must gate code](#feature-declarations-must-gate-code)),
+the async file-flush audit, rustfmt drift, the TUI test-target compile, an
+idle-CPU smoke probe, an **ACP registry-template guard**
+(`scripts/validate-acp-template.py`, runs only when the template, its vendored
+schema, or the validator is staged), and a **live eval gate**
+(`scripts/eval/run_eval.py --fixture scripts/eval/fixtures/catalog-order`) that
+runs the real free-provider chain and blocks the commit if it stops enumerating
+`FREE_CATALOG` order. The two slow checks self-skip when the debug binary is
+missing or older than the staged Rust sources, and the eval gate skips when no
+free keys are configured. Enable once per clone:
 
 ```bash
 git config core.hooksPath .githooks
@@ -197,6 +225,38 @@ type, via `gitleaks protect --staged` with the repo baseline `gitleaks.toml`
 (allowlists only obviously-fake fixture placeholders — add exact literals
 there for new false positives, never real values). Gitleaks is skipped with
 a hint when the binary is absent: <https://github.com/gitleaks/gitleaks#installing>.
+
+### Feature declarations must gate code
+
+A name in a crate's `[features]` table has to turn real code on or off: it owns
+a `cfg(feature = "<name>")` site, carries an optional dependency
+(`dep:<crate>`), or delegates to one of those (a member feature, or a
+`<crate>/<feature>` pass-through). A name with none of the three compiles to
+nothing, and because `dev_full` promises "every gated feature", every empty
+declaration makes that promise false. `crates/core` had accumulated 30 such
+names before 2026-10-13 (`ultraplan`, `ultrathink`, `history_picker`,
+`quick_search`, the agent/memory and `ccr_*` families, …) and `crates/commands`
+declared `ultraplan = ["clawde-core/ultraplan"]` for a feature that existed
+nowhere — neither was visible, because nothing builds a gated configuration.
+
+A flag with no gate is not proof that the capability is missing, and deleting a
+flag is not deleting a capability: `/ultraplan` still ships in
+`crates/commands/src/named_commands.rs` and `bash_classifier` is still a public
+module, both ungated, because their gates had been dropped while the code stayed
+live. Read the call sites before deciding either way. Intended-but-unbuilt work
+belongs in `docs/plans/` and `docs/audits/unfinished-feature-plan.md`, never as
+a placeholder flag.
+
+`scripts/audits/feature-gate-scan.py` fails CI and the pre-commit hook on a
+name that gates nothing (`PHANTOM`) or a pass-through to a feature that does not
+exist (`DANGLING`). It self-tests its classifier on every run and keeps no
+baseline — the condition is an invariant, so a legitimate new feature never
+trips it. `--verbose` prints the evidence for every declaration.
+
+The companion `scripts/audits/unwired-code-scan.py` is deliberately **not** a
+gate: `#[allow(dead_code)]` is reserved surface here, and its list is a set of
+leads. CI publishes it to the job summary, and `--fail-on-unwired` makes it
+blocking for a run that is clearing the list.
 
 ### Parallel-safe tests (env mutations)
 

@@ -71,7 +71,7 @@ Legend:
 | `tools/src/lib.rs ~921` `advanced()` | On-demand tool disclosure (progressive disclosure) | In-flight active-tool-set refactor |
 | `Cargo.toml:38` | `wreq` pinned to rc line | No stable (non-rc) upstream release |
 | `tools/src/repl_tool.rs:46` | REPL interpreter session teardown | No session-end hook wired yet |
-| `core/Cargo.toml` default=`["ultraplan"]` | `cached_microcompact`, `verification_agent`, `agent_memory_snapshot`, `extract_memories` not in default build | Product decision on which ship |
+| `crates/core/Cargo.toml` feature table | **Corrected 2026-10-13:** the names this row weighed (`verification_agent`, `agent_memory_snapshot`, `extract_memories`) gated no code anywhere, so there was nothing to ship, and `default = ["ultraplan"]` was a flag whose gate had been dropped long before. The table now declares only names that gate real code (`voice`, `cached_microcompact`, `dev_full`), enforced by `scripts/audits/feature-gate-scan.py`. | No product decision needed — see §2.6 |
 
 ### 5. Already-wired / non-issues
 
@@ -150,6 +150,10 @@ tight" guidance more aggressively. Low priority — the current whole-file refre
   (feature-flag-gated via the existing `verification_agent` gate) continuation policy alongside
   the existing verify/decide machinery. Research basis: reflection loops — a separate rubric-check
   pass improves reliability; Clawde's existing `verify.rs` / `verify_container.rs` already models this.
+- **Correction (2026-10-13):** there was no `verification_agent` gate to use — the flag name
+  existed in `Cargo.toml` with zero `cfg` sites, so the auto-verify wiring was never blocked on a
+  flag, only on the decision. Auto-verify now runs as `auto_test_after_edit`; the scaffold named
+  here (`run_verify_after_edit`) no longer exists.
 
 ---
 
@@ -205,7 +209,7 @@ kept and is the supported path for anyone self-managing flags.
 | **Redundant duplicates** | ✅ REMOVED: `process_correction`, `context_refresh::{watch_file, check_for_changes, process_context_refresh, get_modified_files}`. |
 | **Cloud modules (Part 3)** | ✅ REMOVED per user decision. |
 | **Orphaned file** | ✅ REMOVED `spinner_verbs_backup.rs`. |
-| **auto-verify (2.6)** | ⏸ Not wired — `run_verify_after_edit` remains a scaffold; requires verification_agent ship decision (feature-gated). |
+| **auto-verify (2.6)** | ⏸ Not wired — `run_verify_after_edit` remains a scaffold (its `verification_agent` flag gated no code and was removed 2026-10-13, so the only thing missing was the decision). |
 | **`advanced()` progressive disclosure (2.5)** | ⏸ Blocked on active-tool-set refactor — do not force. |
 
 All removals verified with `cargo check --workspace` (clean), query test targets, and the

@@ -7,8 +7,11 @@ on:
       - 'src-rust/**'
       - 'scripts/probes/tui-permissions-smoke.py'
       - 'scripts/probes/katban-board-ux-probe.py'
+      - 'scripts/probes/catchat-ux-probe.py'
       - 'scripts/audit-env-tests.py'
       - 'scripts/audit-tokio-file-flush.py'
+      - 'scripts/audits/feature-gate-scan.py'
+      - 'scripts/audits/unwired-code-scan.py'
       - 'scripts/validate-acp-template.py'
       - 'scripts/registry-agent.schema.json'
       - '.github/workflows/ci.yml'
@@ -18,8 +21,11 @@ on:
       - 'src-rust/**'
       - 'scripts/probes/tui-permissions-smoke.py'
       - 'scripts/probes/katban-board-ux-probe.py'
+      - 'scripts/probes/catchat-ux-probe.py'
       - 'scripts/audit-env-tests.py'
       - 'scripts/audit-tokio-file-flush.py'
+      - 'scripts/audits/feature-gate-scan.py'
+      - 'scripts/audits/unwired-code-scan.py'
       - 'scripts/validate-acp-template.py'
       - 'scripts/registry-agent.schema.json'
       - '.github/workflows/ci.yml'
@@ -100,6 +106,46 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 scripts/audit-tokio-file-flush.py
 
+      # Feature-gate inventory: every feature declared in a workspace Cargo.toml
+      # must turn real code on or off (a cfg site or an optional dependency) or
+      # delegate to one that does. crates/core had accumulated 30 names that
+      # gated nothing, and crates/commands carried a `clawde-core/ultraplan`
+      # pass-through for a feature that no longer existed — invisible because
+      # nothing here builds a gated configuration. The scan self-tests its
+      # classifier first, so a rotted detector fails loudly instead of clearing
+      # the tree, and it gates on an invariant rather than a snapshot, so a
+      # legitimate new feature never trips it.
+      - name: Feature-gate inventory
+        if: runner.os == 'Linux'
+        run: python3 scripts/audits/feature-gate-scan.py
+
+      # Gated-feature build: the documented `--features dev_full` line from
+      # docs/installation.md, compiled for real. Plain `cargo test --workspace`
+      # builds no optional feature, so a gated module can rot unnoticed (and a
+      # passthrough that cargo would reject stay hidden until someone tries it).
+      - name: Gated-feature build (dev_full)
+        if: runner.os == 'Linux'
+        working-directory: src-rust
+        run: cargo check --locked --package clawde-cli --features dev_full
+
+      # Unwired-code inventory: report only, never a gate. `#[allow(dead_code)]`
+      # is deliberate reserved surface here (~99 sites) and a name mentioned
+      # elsewhere is not proof of wiring, so the list is a set of leads. It is
+      # published to the job summary so the audit has a current inventory
+      # instead of a hand-counted one. Run with --fail-on-unwired to make it
+      # blocking when clearing the list. The script self-tests its counter.
+      - name: Unwired-code inventory (report only)
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/audits/unwired-code-scan.py --summary \
+            | tee /tmp/unwired-code-inventory.txt
+          {
+            echo '## Unwired-code inventory'
+            echo '```'
+            cat /tmp/unwired-code-inventory.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # ACP registry manifest guard: validates the template against the vendored
       # registry schema and against the legs build.sh actually builds. Without
       # it, the template can re-advertise a macOS/Windows archive no release
@@ -170,5 +216,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           /tmp/board-probe-venv/bin/python scripts/probes/katban-board-ux-probe.py \
+            --binary src-rust/target/debug/clawde \
+            --require-browser
+
+      # Cat Chat guest journey. Same embedded-HTML gap as the board above, and
+      # the guest chat is backed by a local mock upstream (see the probe's
+      # header) so it needs no free-tier keys and the reply — including the
+      # inline reasoning an upstream can leave in its content — is
+      # deterministic.
+      - name: Cat Chat guest UX probe
+        if: runner.os == 'Linux'
+        run: |
+          /tmp/board-probe-venv/bin/python scripts/probes/catchat-ux-probe.py \
             --binary src-rust/target/debug/clawde \
             --require-browser

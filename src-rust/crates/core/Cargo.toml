@@ -5,70 +5,33 @@ description = "Foundation crate: config, auth, storage, types, permissions, keyb
 edition.workspace = true
 
 [features]
+# Every name declared here must turn real code on or off: either it owns a
+# `cfg(feature = "<name>")` site, or it carries an optional dependency. A name
+# with neither compiles to nothing, and because `dev_full` promises "every
+# gated feature", each empty declaration makes that promise false. Checked by
+# `scripts/audits/feature-gate-scan.py` (CI step "Feature-gate inventory").
+#
+# Capabilities that used to be listed here but gated no code at all —
+# ultraplan, ultrathink, history_picker, quick_search, message_actions,
+# hook_prompts, the kairos/lodestone/teammem and agent/memory families, the
+# tree-sitter and ccr_* families, and the rest — have been removed. Several of
+# those capabilities exist and ship ungated (e.g. `/ultraplan` in
+# crates/commands/src/named_commands.rs, `bash_classifier` as a public module),
+# so removing the flag did not remove the feature; it made the table describe
+# reality. Intended-but-unbuilt work is tracked in docs/plans/ and
+# docs/audits/unfinished-feature-plan.md, not as dead flag names.
+
 # Enable real microphone capture via cpal.
 # Without this feature the VoiceRecorder compiles but start_recording()
 # returns an error instead of accessing hardware.
 voice = ["dep:cpal"]
 
-# Experimental/feature-flagged capabilities
-default = ["ultraplan"]
-
-# Interaction & UI features
-ultraplan = []
-ultrathink = []
-history_picker = []
-token_budget = []
-message_actions = []
-quick_search = []
-hook_prompts = []
-kairos_brief = []
-kairos_channels = []
-lodestone = []
-
-# Agents & Memory features
-agent_triggers = []
-agent_triggers_remote = []
-extract_memories = []
-verification_agent = []
-builtin_explore_plan_agents = []
+# Cached micro-compaction: the `cached_microcompact` cfg sites live in
+# src/context_collapse.rs.
 cached_microcompact = []
-compaction_reminders = []
-agent_memory_snapshot = []
-teammem = []
 
-# Tools & Infrastructure features
-bash_classifier = []
-bridge_mode = []
-mcp_rich_output = []
-connector_text = []
-unattended_retry = []
-new_init = []
-powershell_auto_mode = []
-shot_stats = []
-tree_sitter_bash = []
-tree_sitter_bash_shadow = []
-prompt_cache_break_detection = []
-native_clipboard_image = []
-ccr_auto_connect = []
-ccr_mirror = []
-ccr_remote_setup = []
-
-# Full dev build — includes all experimental features
-dev_full = [
-    "voice",
-    "ultraplan", "ultrathink", "history_picker",
-    "token_budget", "message_actions", "quick_search",
-    "hook_prompts", "kairos_brief", "kairos_channels", "lodestone",
-    "agent_triggers", "agent_triggers_remote",
-    "extract_memories", "verification_agent", "builtin_explore_plan_agents",
-    "cached_microcompact", "compaction_reminders", "agent_memory_snapshot",
-    "teammem", "bash_classifier", "bridge_mode", "mcp_rich_output",
-    "connector_text", "unattended_retry", "new_init",
-    "powershell_auto_mode", "shot_stats", "tree_sitter_bash",
-    "tree_sitter_bash_shadow", "native_clipboard_image",
-    "ccr_auto_connect", "ccr_mirror", "ccr_remote_setup",
-    "prompt_cache_break_detection",
-]
+# Full dev build — every gated feature in this crate.
+dev_full = ["voice", "cached_microcompact"]
 
 [dependencies]
 tokio = { workspace = true }

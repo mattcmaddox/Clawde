@@ -5,49 +5,24 @@ description = "Ratatui-based terminal user interface with markdown rendering, di
 edition.workspace = true
 
 [features]
+# Only names that gate real code belong here; see the rule and the retired
+# names in crates/core/Cargo.toml. `scripts/audits/feature-gate-scan.py`
+# enforces it in CI.
+
 # Enable real microphone capture for voice PTT mode (capture lives in
 # clawde-core; the TUI just drives it).
 voice = ["clawde-core/voice"]
 
-# UI & Interaction features (pass-through from cc-core)
-token_budget = ["clawde-core/token_budget"]
-ultraplan = ["clawde-core/ultraplan"]
-ultrathink = ["clawde-core/ultrathink"]
-history_picker = ["clawde-core/history_picker"]
-message_actions = ["clawde-core/message_actions"]
-quick_search = ["clawde-core/quick_search"]
-hook_prompts = ["clawde-core/hook_prompts"]
-kairos_brief = ["clawde-core/kairos_brief"]
-kairos_channels = ["clawde-core/kairos_channels"]
-lodestone = ["clawde-core/lodestone"]
+# The one gated capability whose cfg sites live in this crate
+# (src/app.rs, src/render.rs), so it needs no core passthrough.
+token_budget = []
 
-# Agents & Memory features (pass-through from cc-core)
-agent_triggers = ["clawde-core/agent_triggers"]
-agent_triggers_remote = ["clawde-core/agent_triggers_remote"]
-extract_memories = ["clawde-core/extract_memories"]
-verification_agent = ["clawde-core/verification_agent"]
-builtin_explore_plan_agents = ["clawde-core/builtin_explore_plan_agents"]
+# Cached micro-compaction is gated in clawde-core (context_collapse.rs);
+# declared here so a TUI-only `--features` build can reach it.
 cached_microcompact = ["clawde-core/cached_microcompact"]
-compaction_reminders = ["clawde-core/compaction_reminders"]
-agent_memory_snapshot = ["clawde-core/agent_memory_snapshot"]
-teammem = ["clawde-core/teammem"]
 
-# Tools & Infrastructure features (pass-through from cc-core)
-bash_classifier = ["clawde-core/bash_classifier"]
-bridge_mode = ["clawde-core/bridge_mode"]
-mcp_rich_output = ["clawde-core/mcp_rich_output"]
-connector_text = ["clawde-core/connector_text"]
-unattended_retry = ["clawde-core/unattended_retry"]
-new_init = ["clawde-core/new_init"]
-powershell_auto_mode = ["clawde-core/powershell_auto_mode"]
-shot_stats = ["clawde-core/shot_stats"]
-tree_sitter_bash = ["clawde-core/tree_sitter_bash"]
-tree_sitter_bash_shadow = ["clawde-core/tree_sitter_bash_shadow"]
-native_clipboard_image = ["clawde-core/native_clipboard_image"]
-prompt_cache_break_detection = ["clawde-core/prompt_cache_break_detection"]
-ccr_auto_connect = ["clawde-core/ccr_auto_connect"]
-ccr_mirror = ["clawde-core/ccr_mirror"]
-ccr_remote_setup = ["clawde-core/ccr_remote_setup"]
+# Full dev build — every gated feature, voice included via clawde-core.dev_full.
+dev_full = ["clawde-core/dev_full", "token_budget"]
 
 [dependencies]
 clawde-core = { workspace = true }

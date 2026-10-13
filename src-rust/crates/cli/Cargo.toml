@@ -11,6 +11,10 @@ path = "src/main.rs"
 [features]
 default = ["voice"]
 voice = ["clawde-core/voice", "clawde-tui/voice"]
+# docs/installation.md documents `--features dev_full`, but a feature that
+# exists only on a dependency is rejected by cargo ("the package 'clawde-cli'
+# does not contain this feature"), so the binary crate carries the passthrough.
+dev_full = ["clawde-core/dev_full", "clawde-tui/dev_full"]
 
 [dependencies]
 clawde-core = { workspace = true }

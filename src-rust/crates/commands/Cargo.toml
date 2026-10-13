@@ -4,10 +4,6 @@ version.workspace = true
 description = "Slash command system implementing /help, /clear, /compact, /model, /config, and many other commands"
 edition.workspace = true
 
-[features]
-# Pass-through features from cc-core
-ultraplan = ["clawde-core/ultraplan"]
-
 [dependencies]
 clawde-core = { workspace = true }
 clawde-api = { workspace = true }

@@ -209,18 +209,33 @@ sudo pacman -S alsa-lib openssl
 
 ### Optional cargo features
 
-| Feature | Description |
-|---------|-------------|
-| `voice` | Microphone input / voice prompting |
-| `computer-use` | Screenshot capture and mouse/keyboard control |
-| `dev_full` | All experimental features combined |
+| Feature | Crate(s) | Description |
+|---------|----------|-------------|
+| `voice` | `clawde-cli` (default), `clawde-tui`, `clawde-core` | Microphone input / voice prompting. On by default; drop it with `--no-default-features` where the ALSA headers are unavailable. |
+| `cached_microcompact` | `clawde-core`, `clawde-tui` | Cached micro-compaction (`context_collapse.rs`). |
+| `token_budget` | `clawde-tui` | Token-budget accounting in the TUI. |
+| `computer-use` | `clawde-tools` | Screenshot capture and mouse/keyboard control; gates `ComputerUseTool` and its `enigo`/`xcap`/`image` dependencies. |
+| `dev_full` | `clawde-cli`, `clawde-tui`, `clawde-core` | Every gated feature reachable from the binary, `voice` included. |
 
 To enable a feature:
 
 ```bash
+# `voice` is on by default; this builds it explicitly
 cargo build --release --package clawde-cli --features voice
+
+# every gated feature reachable from the binary
 cargo build --release --package clawde-cli --features dev_full
+
+# `computer-use` lives on clawde-tools and is not forwarded by clawde-cli,
+# so it is enabled at the crate that declares it
+cargo build --package clawde-tools --features computer-use
 ```
+
+`dev_full` is forwarded from `clawde-cli` down through `clawde-tui` to
+`clawde-core`; a feature name that exists only on a dependency crate is
+rejected by cargo ("does not contain this feature"), so each crate in the chain
+declares its own passthrough. `scripts/audits/feature-gate-scan.py` fails CI
+when a declared feature gates no code.
 
 ### Cross-compiling for Linux aarch64
 
