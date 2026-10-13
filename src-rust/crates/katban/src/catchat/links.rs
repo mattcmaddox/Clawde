@@ -432,10 +432,39 @@ impl GuestStore {
             .filter(|until| *until > now)
     }
 
-    /// Cat Chat admin escape hatch: clear an IP's failed attempts and 24-hour
-    /// block. `catchat unblock <IP>`.
-    pub fn reset_failed_attempts(&mut self, ip: &str) {
-        self.failed_attempts.remove(ip);
+    /// Cat Chat admin escape hatch: clear one bucket's failed attempts and
+    /// 24-hour block. `catchat unblock <IP>`.
+    ///
+    /// The key is the *bucket* the failures were filed under, which is not
+    /// always the address the operator typed: a loopback client without
+    /// `X-Forwarded-For` is filed under `http_security::LOOPBACK_BUCKET`.
+    /// Callers resolve an operator's argument with
+    /// `http_security::lockout_bucket` first. Returns whether anything was
+    /// cleared, so a caller can report a miss instead of claiming success.
+    pub fn reset_failed_attempts(&mut self, key: &str) -> bool {
+        self.failed_attempts.remove(key).is_some()
+    }
+
+    /// Buckets with a live lockout or 24h block, as `(bucket, blocked, until)`
+    /// — `blocked` distinguishes the flat 24h refusal from a 3-minute lockout,
+    /// and `until` is the unix second it lapses. `status` and `unblock` use it
+    /// to name the buckets a client is actually held under.
+    pub fn active_lockouts(&self, now: u64) -> Vec<(String, bool, u64)> {
+        let mut active: Vec<(String, bool, u64)> = self
+            .failed_attempts
+            .iter()
+            .filter_map(|(bucket, attempt)| {
+                if let Some(until) = attempt.blocked_until.filter(|until| *until > now) {
+                    return Some((bucket.clone(), true, until));
+                }
+                attempt
+                    .locked_until
+                    .filter(|until| *until > now)
+                    .map(|until| (bucket.clone(), false, until))
+            })
+            .collect();
+        active.sort();
+        active
     }
 }
 
@@ -694,6 +723,54 @@ mod tests {
         let serialized = serde_json::to_string(&store).unwrap();
         assert!(!serialized.contains("hunter2-secret"));
         assert!(serialized.contains("passwordHash"));
+    }
+
+    /// The bug this locks down: `unblock 127.0.0.1` removed the literal
+    /// argument, but the ladder had filed the local client under
+    /// `LOOPBACK_BUCKET`, so the command reported success while the client
+    /// stayed locked out for the full window.
+    #[test]
+    fn unblock_clears_the_bucket_a_loopback_client_is_filed_under() {
+        let mut store = GuestStore::default();
+        let bucket = crate::http_security::client_ip(&axum::http::HeaderMap::new(), None);
+        assert_eq!(bucket, crate::http_security::LOOPBACK_BUCKET);
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            store.record_failed_attempt(&bucket);
+        }
+        let now = now_secs();
+        assert!(store.locked_until(&bucket, now).is_some());
+        assert_eq!(store.active_lockouts(now).len(), 1);
+
+        // Exactly what an operator types, resolved the way the CLI/TUI do it.
+        let resolved = crate::http_security::lockout_bucket("127.0.0.1");
+        assert_eq!(resolved, bucket);
+        assert!(store.reset_failed_attempts(&resolved));
+        assert!(store.locked_until(&bucket, now_secs()).is_none());
+        assert!(store.active_lockouts(now_secs()).is_empty());
+
+        // Clearing again reports the miss rather than claiming a second clear.
+        assert!(!store.reset_failed_attempts(&resolved));
+    }
+
+    /// The 24h block is the same bucket, so `unblock` has to clear it too —
+    /// otherwise a guest serving the third strike can never be let back in.
+    #[test]
+    fn unblock_also_clears_the_24h_block() {
+        let mut store = GuestStore::default();
+        let bucket = "203.0.113.9";
+        let mut blocked = false;
+        for _ in 0..(MAX_FAILED_ATTEMPTS + 2 * MAX_FAILED_ATTEMPTS_SUBSEQUENT) {
+            if store.record_failed_attempt(bucket) == LockoutResult::Blocked {
+                blocked = true;
+                break;
+            }
+        }
+        assert!(blocked, "nine failures should reach the 24h block");
+        let now = now_secs();
+        assert!(store.blocked_until(bucket, now).is_some());
+        assert!(store.reset_failed_attempts(bucket));
+        assert!(store.blocked_until(bucket, now_secs()).is_none());
+        assert!(store.active_lockouts(now_secs()).is_empty());
     }
 
     #[test]

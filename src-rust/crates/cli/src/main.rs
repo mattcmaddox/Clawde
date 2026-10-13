@@ -873,9 +873,13 @@ async fn main() -> anyhow::Result<()> {
     // Fast-path: `clawde katban` — the production development surface
     // (boards, agent execution, project repos, and hosted dev sites).
     if raw_args.get(1).map(|s| s.as_str()) == Some("katban") {
-        if raw_args[2..]
-            .iter()
-            .any(|arg| arg == "--help" || arg == "-h")
+        // Only a bare `clawde katban --help` gets the top-level usage.
+        // Anywhere else the flag belongs to the subcommand parser, which has
+        // its own help (`board`, `site`, `project`, `doctor`, `caddy`), so
+        // `clawde katban board --help` no longer answers with the site list.
+        if raw_args
+            .get(2)
+            .is_some_and(|arg| arg == "--help" || arg == "-h" || arg == "help")
         {
             print!("{}", katban::USAGE);
             return Ok(());
@@ -887,9 +891,12 @@ async fn main() -> anyhow::Result<()> {
     // exposure, share links, and lockout unblocks). Split from `clawde katban`
     // so the Kanban board surface and the chat surface are separate.
     if raw_args.get(1).map(|s| s.as_str()) == Some("catchat") {
-        if raw_args[2..]
-            .iter()
-            .any(|arg| arg == "--help" || arg == "-h")
+        // As with `katban` above: only the bare `clawde catchat --help`
+        // short-circuits, so `clawde catchat links --help` reaches the links
+        // parser (which prints LINK_USAGE) instead of the whole group's help.
+        if raw_args
+            .get(2)
+            .is_some_and(|arg| arg == "--help" || arg == "-h" || arg == "help")
         {
             print!("{}", katban::CATCHAT_USAGE);
             return Ok(());

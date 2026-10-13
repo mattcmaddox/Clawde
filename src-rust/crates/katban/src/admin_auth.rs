@@ -252,8 +252,39 @@ impl AdminStore {
         AdminLockoutResult::None
     }
 
-    pub fn reset_failed_attempts(&mut self, ip: &str) {
-        self.failed_attempts.remove(ip);
+    /// Katban admin escape hatch: clear one bucket's failed attempts and 24h
+    /// block. `/katban board unblock <IP>`.
+    ///
+    /// The key is the bucket the failures were filed under, which is not
+    /// always the address the operator typed: the board files a loopback
+    /// client without `X-Forwarded-For` under
+    /// `http_security::LOOPBACK_BUCKET`. Callers resolve an operator's
+    /// argument with `http_security::lockout_bucket` first. Returns whether
+    /// anything was cleared so a caller can report a miss.
+    pub fn reset_failed_attempts(&mut self, key: &str) -> bool {
+        self.failed_attempts.remove(key).is_some()
+    }
+
+    /// Buckets with a live lockout or 24h block, as `(bucket, blocked, until)`
+    /// — mirrors `catchat::links::GuestStore::active_lockouts` for the admin
+    /// store, so both status screens name the buckets a client is held under
+    /// ("loopback" is not an address, so it cannot be guessed).
+    pub fn active_lockouts(&self, now: u64) -> Vec<(String, bool, u64)> {
+        let mut active: Vec<(String, bool, u64)> = self
+            .failed_attempts
+            .iter()
+            .filter_map(|(bucket, attempt)| {
+                if let Some(until) = attempt.blocked_until.filter(|until| *until > now) {
+                    return Some((bucket.clone(), true, until));
+                }
+                attempt
+                    .locked_until
+                    .filter(|until| *until > now)
+                    .map(|until| (bucket.clone(), false, until))
+            })
+            .collect();
+        active.sort();
+        active
     }
 }
 
@@ -309,6 +340,28 @@ mod tests {
         assert!(validate_password("short!").is_err());
         assert!(validate_password("sixteen-character!").is_ok());
         assert!(validate_password("sixteencharacters").is_err());
+    }
+
+    /// Same defect class as Cat Chat's: the board files a loopback admin under
+    /// `LOOPBACK_BUCKET`, so `/katban board unblock 127.0.0.1` must resolve onto
+    /// that bucket or the operator's own lockout cannot be cleared.
+    #[test]
+    fn board_unblock_resolves_the_loopback_bucket() {
+        let mut store = AdminStore::default();
+        let bucket = crate::http_security::client_ip(&axum::http::HeaderMap::new(), None);
+        let now = now_secs();
+        for _ in 0..ADMIN_MAX_FAILED_ATTEMPTS {
+            store.record_failed_attempt(&bucket, now);
+        }
+        assert!(store.locked_until(&bucket, now).is_some());
+        assert_eq!(store.active_lockouts(now).len(), 1);
+
+        let resolved = crate::http_security::lockout_bucket("127.0.0.1");
+        assert_eq!(resolved, bucket);
+        assert!(store.reset_failed_attempts(&resolved));
+        assert!(store.locked_until(&bucket, now).is_none());
+        assert!(store.active_lockouts(now).is_empty());
+        assert!(!store.reset_failed_attempts(&resolved));
     }
 
     #[test]

@@ -42,8 +42,13 @@ Use `/katban` for the development command surface:
 /katban project list
 /katban site list
 /katban board password <PASSWORD>
-/katban board unblock <IP>
+/katban board unblock <BUCKET>
 ```
+
+`board unblock` takes the bucket `status`/Alt+G names: an address for a remote
+admin, or `loopback` for one on the host itself (a request with no
+`X-Forwarded-For`). The address spellings resolve onto it, so
+`/katban board unblock 127.0.0.1` clears a local lockout.
 
 `Alt+G` opens the Katban controls menu. It contains board/project/site
 operations and the Katban admin credential controls. It intentionally contains
@@ -167,7 +172,8 @@ for local inspection but do not turn Cat Chat into an admin surface.
 
 Wrong admin passwords use an independent policy: five failures make a
 short-lived lockout, three lockout strikes make a 24-hour block, and
-`/katban board unblock <IP>` or the corresponding board CLI command clears it.
+`/katban board unblock <BUCKET>` clears it — an address, or `loopback` for an
+admin on the host itself (see the TUI command list above).
 
 ## Verifying the board UI
 
@@ -189,6 +195,9 @@ replayed with the `X-Forwarded-*` headers caddy adds — refused without a
 session, `Secure` on the session cookie, allowed with it — plus the sign-in gate
 the page renders to a signed-out visitor. The proxy leg itself stays in the Rust
 tests (`exposed_reads_require_auth_but_loopback_stays_open`).
+
+Cat Chat's pages have the same gap and their own probe — see
+[catchat.md](catchat.md#verifying-the-guest-journey).
 
 It needs `playwright` (`pip install playwright && playwright install chromium`)
 and exits 2, not 0, when a prerequisite is missing, so a wiring that treats
@@ -242,7 +251,10 @@ It checks, one line per finding:
 - every exposed route's backend: each live site's proxy port, each locked
   site's folder, and the Cat Chat / admin-board ports. A live site whose server
   is down is a 502 and a locked site with a missing folder is a 404, neither of
-  which caddy itself reports;
+  which caddy itself reports. A site's proxy target is always its **registered**
+  port (the one `site list` prints): `site serve <NAME> --port N` re-points the
+  server without touching that registration, so serving anywhere else answers
+  locally and 502s through caddy — `site serve` warns when the two differ;
 - each always-on unit's `ExecStart` binary — a unit pinned to a debug build
   (which `cargo clean` removes) warns rather than passing, and a relative path
   is resolved against the unit's `WorkingDirectory` rather than doctor's;

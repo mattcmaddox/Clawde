@@ -2004,7 +2004,8 @@ impl SlashCommand for ChatCommand {
          /chat revoke <ID>           — revoke a link (kicks its devices)\n\
          /chat password <ID>         — rotate a link's password\n\
          /chat password <ID> --set \"PW\" — set your own password (not printed)\n\
-         /chat unblock <IP>          — clear lockouts + 24h blocks\n\n\
+         /chat unblock <BUCKET>      — clear a lockout / 24h block (an IP, or\n\
+                                       'loopback' for a local client)\n\n\
          The Kanban board lives under /katban — /chat is the guest chat."
     }
 
@@ -2020,7 +2021,7 @@ impl SlashCommand for ChatCommand {
                     ("show", "Show link details"),
                     ("revoke", "Revoke a guest link"),
                     ("password", "Rotate a link's password"),
-                    ("unblock", "Clear lockouts for an IP"),
+                    ("unblock", "Clear a lockout (IP, or 'loopback' locally)"),
                 ] {
                     out.push(ArgCompletion {
                         value: value.into(),
@@ -2132,14 +2133,29 @@ fn chat_execute(args: &str) -> CommandResult {
             }
         }
         ["unblock", ip] => {
+            // Resolve to the bucket the client is filed under before clearing:
+            // a loopback client with no `X-Forwarded-For` lives under
+            // `loopback`, so `unblock 127.0.0.1` has to map onto that name or
+            // the clear silently removes a key nothing was stored under.
+            let bucket = clawde_katban::http_security::lockout_bucket(ip);
             let mut store = chat_load_store();
-            store.reset_failed_attempts(ip);
+            if !store.reset_failed_attempts(&bucket) {
+                let active = store.active_lockouts(chat_now_secs());
+                if active.is_empty() {
+                    return CommandResult::Error(format!(
+                        "no lockout recorded for '{bucket}' — nothing to clear"
+                    ));
+                }
+                return CommandResult::Error(format!(
+                    "no lockout recorded for '{bucket}' — active: {} (a local client is filed \
+                     under 'loopback')",
+                    clawde_katban::http_security::describe_lockouts(&active, chat_now_secs())
+                ));
+            }
             if let Err(error) = chat_links::save(&store) {
                 return CommandResult::Error(format!("could not save: {error:#}"));
             }
-            CommandResult::Message(format!(
-                "cleared lockouts and 24h blocks for '{ip}'"
-            ))
+            CommandResult::Message(format!("cleared lockouts and 24h blocks for '{bucket}'"))
         }
         _ => CommandResult::Error(
             "Unknown /chat subcommand. Try /chat, /chat links, /chat create <NAME>, or /chat status."
@@ -2180,18 +2196,16 @@ fn chat_status_text() -> String {
         Some(sub) => format!("\npublic:     https://{sub} (via caddy)"),
         None => "\npublic:     (local only — serve with: clawde catchat serve)".to_string(),
     });
-    let blocked = store
-        .failed_attempts
-        .iter()
-        .filter(|(_, a)| {
-            a.blocked_until.is_some_and(|u| u > now) || a.locked_until.is_some_and(|u| u > now)
-        })
-        .count();
-    if blocked == 0 {
+    // Name the buckets: a locked-out loopback client is filed under
+    // 'loopback', which no operator can guess from an address, and that name
+    // is what `unblock` has to be given.
+    let lockouts = store.active_lockouts(now);
+    if lockouts.is_empty() {
         out.push_str("\nlockouts:   none");
     } else {
         out.push_str(&format!(
-            "\nlockouts:   {blocked} IP(s) — clear with: /chat unblock <IP>"
+            "\nlockouts:   {} — clear with: /chat unblock <BUCKET>",
+            clawde_katban::http_security::describe_lockouts(&lockouts, now)
         ));
     }
     out
@@ -4302,6 +4316,30 @@ mod tests {
                 assert!(matches!(result, CommandResult::Message(_)));
                 let store = clawde_katban::catchat::links::load().unwrap();
                 assert!(store.failed_attempts.is_empty());
+
+                // A local client is filed under the 'loopback' bucket, so
+                // `/chat unblock 127.0.0.1` has to resolve onto that key. Before
+                // the bucket fix this cleared nothing and still said it had.
+                let mut store = clawde_katban::catchat::links::GuestStore::default();
+                for _ in 0..5 {
+                    store.record_failed_attempt(clawde_katban::http_security::LOOPBACK_BUCKET);
+                }
+                clawde_katban::catchat::links::save(&store).unwrap();
+                let result = cmd.execute("unblock 127.0.0.1", &mut ctx).await;
+                assert!(
+                    matches!(result, CommandResult::Message(_)),
+                    "a loopback client must clear: {result:?}"
+                );
+                let store = clawde_katban::catchat::links::load().unwrap();
+                assert!(store.failed_attempts.is_empty());
+
+                // Clearing again is a miss, reported as one — never a fake
+                // success over a key nothing was stored under.
+                let result = cmd.execute("unblock 127.0.0.1", &mut ctx).await;
+                assert!(
+                    matches!(result, CommandResult::Error(_)),
+                    "a second unblock must report the miss: {result:?}"
+                );
             })
         })
         .await;

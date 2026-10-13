@@ -298,19 +298,12 @@ where
 /// (LAN mode, `--allow-non-loopback`) is identified by its TCP peer address —
 /// never by a header it can set itself, or the lockout ladder is trivially
 /// bypassed by rotating `X-Forwarded-For` on every wrong password.
+///
+/// One implementation, shared with the board (`http_security::client_ip`) and
+/// with the lockout reporting: that is what keeps the bucket a guest is filed
+/// under and the bucket `catchat unblock` has to be given the same string.
 pub(crate) fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    match peer {
-        Some(addr) if !addr.ip().is_loopback() => addr.ip().to_string(),
-        // Loopback peer (trusted proxy) or no peer info (tests): use the
-        // proxy-set header if present, else fall back to a shared bucket.
-        _ => headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next().map(str::trim))
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| "loopback".to_string()),
-    }
+    crate::http_security::client_ip(headers, peer)
 }
 
 async fn shutdown_signal() {

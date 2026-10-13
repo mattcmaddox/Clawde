@@ -97,7 +97,11 @@ Cat Chat: the password-protected guest chat you share with friends.
 
 Commands:
   serve [--port N] [--host IP] [--allow-non-loopback]
-                                              Run the Cat Chat server
+        [--search-endpoint URL]                Run the Cat Chat server
+                                              (guest search defaults to the
+                                              local SearXNG at 127.0.0.1:8080;
+                                              override with the flag or
+                                              CLAWDE_CATCHAT_SEARCH_ENDPOINT)
   expose [--subdomain HOST] [--port N] [--dry-run] [--caddy-dir DIR]
          [--duckdns-token TOKEN]              Put Cat Chat behind caddy
                                               (writes the managed katban.conf)
@@ -107,7 +111,9 @@ Commands:
   links show <ID>                             Show one link (URL, expiry, devices)
   links revoke <ID>                           Revoke a link (kicks its devices)
   links password <ID> [--set "PW"]            Rotate the password (generated, or --set your own)
-  unblock <IP>                                Clear an IP's lockouts / 24h block
+  unblock <IP|loopback>                       Clear a lockout / 24h block. The
+                                              argument is the bucket `status`
+                                              names; a local client is 'loopback'
   status                                      Overview of links, exposure, lockouts
   help                                        Show this help
 
@@ -150,20 +156,18 @@ fn catchat_status() -> anyhow::Result<()> {
         Some(sub) => println!("public:     https://{sub} (via caddy)"),
         None => println!("public:     (local only — run: clawde catchat expose)"),
     }
-    let blocked: Vec<_> = store
-        .failed_attempts
-        .iter()
-        .filter(|(_, a)| {
-            a.blocked_until.is_some_and(|u| u > now) || a.locked_until.is_some_and(|u| u > now)
-        })
-        .collect();
-    if blocked.is_empty() {
+    // Name the buckets, not a count: a locked-out loopback client is filed
+    // under 'loopback', which the operator cannot guess from an address, and
+    // that is exactly what `unblock` has to be given.
+    let lockouts = store.active_lockouts(now);
+    if lockouts.is_empty() {
         println!("lockouts:   none");
     } else {
         println!(
-            "lockouts:   {} IP(s) — clear with: clawde catchat unblock <IP>",
-            blocked.len()
+            "lockouts:   {}",
+            clawde_katban::http_security::describe_lockouts(&lockouts, now)
         );
+        println!("            clear with: clawde catchat unblock <BUCKET>");
     }
     Ok(())
 }
@@ -441,20 +445,46 @@ fn site_remove(opts: SiteOpts) -> anyhow::Result<()> {
 
 /// Resolve `serve`'s argument: a registered site name, else a directory.
 /// Returns (root, port, live).
+/// Where `site serve` should host, and which port the site is *registered*
+/// with when it was named rather than given as a directory.
+///
+/// The two ports differ only when a `--port` override is used, and that
+/// difference is how a site answers directly but 502s through caddy: the
+/// managed block `site expose` renders proxies the registered port, never the
+/// override. Keeping the registered port in the answer lets the command warn
+/// instead of leaving the operator to find out from a broken page.
+struct ServeTarget {
+    root: PathBuf,
+    port: u16,
+    live: bool,
+    registered_port: Option<u16>,
+}
+
 fn resolve_serve_target(
     config: &clawde_katban::config::KatbanConfig,
     arg: &str,
     port_override: Option<u16>,
     no_reload: bool,
     locked_override: bool,
-) -> anyhow::Result<(PathBuf, u16, bool)> {
+) -> anyhow::Result<ServeTarget> {
     if let Some(site) = find_site(config, arg) {
         let live = !(site.locked || no_reload || locked_override);
-        return Ok((site.root.clone(), port_override.unwrap_or(site.port), live));
+        return Ok(ServeTarget {
+            root: site.root.clone(),
+            port: port_override.unwrap_or(site.port),
+            live,
+            registered_port: Some(site.port),
+        });
     }
     let root = clawde_katban::config::canonical_site_root(Path::new(arg))?;
-    let port = port_override.unwrap_or(clawde_katban::config::DEFAULT_SITE_PORT);
-    Ok((root, port, !no_reload && !locked_override))
+    Ok(ServeTarget {
+        root,
+        port: port_override.unwrap_or(clawde_katban::config::DEFAULT_SITE_PORT),
+        live: !no_reload && !locked_override,
+        // A bare directory is not a registered site, so there is no registered
+        // port for an override to disagree with.
+        registered_port: None,
+    })
 }
 async fn site_serve(opts: SiteOpts) -> anyhow::Result<()> {
     use clawde_katban::config::load;
@@ -465,8 +495,12 @@ async fn site_serve(opts: SiteOpts) -> anyhow::Result<()> {
         .clone()
         .context("site serve needs a site name or directory")?;
     let config = load()?;
-    let (root, port, live) =
-        resolve_serve_target(&config, &arg, opts.port, opts.no_reload, opts.locked)?;
+    let ServeTarget {
+        root,
+        port,
+        live,
+        registered_port,
+    } = resolve_serve_target(&config, &arg, opts.port, opts.no_reload, opts.locked)?;
     let name = find_site(&config, &arg)
         .map(|s| s.name.as_str())
         .unwrap_or("site");
@@ -477,6 +511,17 @@ async fn site_serve(opts: SiteOpts) -> anyhow::Result<()> {
         );
     }
     println!("serving '{name}' at http://{addr}/  (Ctrl-C to stop)");
+    if let Some(registered) = registered_port {
+        if port != registered {
+            println!(
+                "WARNING: '{name}' is registered on port {registered} but serving on {port} — the \
+                 caddy block from `site expose` proxies the registered port, so the public URL \
+                 will return 502. Serve the registered port, or re-register the site on this one \
+                 with: clawde katban site remove {name} && clawde katban site add <DIR> --name \
+                 {name} --port {port}"
+            );
+        }
+    }
     if !host::is_loopback(addr) {
         println!(
             "WARNING: bound to {addr} — reachable by other machines on this network; no auth yet."
@@ -614,21 +659,34 @@ async fn site_expose(opts: SiteOpts) -> anyhow::Result<()> {
 
 const BOARD_USAGE: &str = r#"Usage: clawde katban board <command> [--project NAME]
 
+--project NAME picks the board each command below reads or writes; it defaults
+to "default". Three commands are board-wide and are the exception: `serve` and
+`expose` cover every registered board and REJECT the flag, and `password` sets
+the one admin password and IGNORES it.
+
   serve [--port N] [--host IP] [--allow-non-loopback] [--run NAME,...|all]
-                                         Run the admin board web UI (loopback);
+                                         Run the admin board web UI (loopback,
+                                         every board: no --project);
                                          --run also schedules the listed projects'
                                          cards ('all' = every registered project)
   expose [--subdomain HOST] [--port N] [--dry-run] [--caddy-dir DIR]
                 [--duckdns-token TOKEN] [--run NAME,...|all]
-                                         Publish the board behind caddy (https);
+                                         Publish the board behind caddy (https,
+                                         every board: no --project);
                                          --run renders the always-on board unit
                                          with one scheduler per listed project
   password <PASSWORD>                    Set/rotate the admin write password
+                                         (board-wide; --project is ignored)
   init                                   Create/ensure the board file
   card add <PROMPT>                      Add a card
   card list                              List cards with status
+  card show <ID>                         One card: status, result, commit, diff
   card set <ID> <STATUS>                 backlog|queued|running|blocked|review|failed|done
   card edit <ID> <PROMPT>                Replace a card's prompt (keeps id/status/reviews)
+  card scope <ID> [PATH...]              Set the card's scope allowlist (empty = clear)
+  card comment <ID> [--line N] <TEXT>    Append a diff-review comment
+  card feedback <ID>                     Send the card's review comments back to
+                                         its agent as a follow-up run
   card merge <ID>                        Merge a review card into the project
   card remove <ID>                       Archive (discards its pinned branch)
   link <A> <B>                           B must finish before A starts (cycle-checked)
@@ -2569,11 +2627,16 @@ const GUEST_USAGE: &str = r#"Usage: clawde catchat <command> [OPTIONS]
 Public-facing Cat Chat sandbox commands.
 
   serve [--port N] [--host IP] [--allow-non-loopback]
-                                              Run the Cat Chat sandbox server
+        [--search-endpoint URL]                Run the Cat Chat sandbox server
+                                              (guest web search; defaults to a
+                                              local SearXNG on 127.0.0.1:8080,
+                                              overridable via the flag or the
+                                              CLAWDE_CATCHAT_SEARCH_ENDPOINT env var)
   expose [--subdomain HOST] [--port N] [--dry-run] [--caddy-dir DIR]
          [--duckdns-token TOKEN]              Put the guest chat behind caddy
                                               (writes the managed katban.conf)
-  unblock <IP>                                Clear an IP's lockouts / 24h block
+  unblock <IP|loopback>                       Clear a lockout / 24h block (the
+                                              bucket `status` names)
 
 Runs the Cat Chat sandbox server: friends open the URL, type the shared password,
 and chat with Clawde (chat + web search only — no files, no shell, nothing
@@ -2811,6 +2874,7 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
     let mut port = DEFAULT_GUEST_PORT;
     let mut host = "127.0.0.1".to_string();
     let mut allow_non_loopback = false;
+    let mut search_endpoint: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -2829,6 +2893,14 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
                     .to_string();
                 index += 1;
             }
+            "--search-endpoint" => {
+                search_endpoint = Some(
+                    args.get(index + 1)
+                        .context("--search-endpoint needs a URL")?
+                        .to_string(),
+                );
+                index += 1;
+            }
             "--allow-non-loopback" => allow_non_loopback = true,
             flag if flag.starts_with("--port=") => {
                 port = flag["--port=".len()..]
@@ -2837,6 +2909,9 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
             }
             flag if flag.starts_with("--host=") => {
                 host = flag["--host=".len()..].to_string();
+            }
+            flag if flag.starts_with("--search-endpoint=") => {
+                search_endpoint = Some(flag["--search-endpoint=".len()..].to_string());
             }
             flag => anyhow::bail!("unknown option: {flag}\n\n{GUEST_USAGE}"),
         }
@@ -2859,10 +2934,11 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
     let public_url = store.public_subdomain.clone();
     store.prune(now_secs());
     let store = Arc::new(std::sync::Mutex::new(store));
-    let search: Arc<dyn clawde_katban::catchat::search::GuestSearch> =
-        Arc::new(clawde_katban::catchat::search::SearxClient::new(
-            clawde_katban::catchat::search::DEFAULT_ENDPOINT,
-        ));
+    let search_endpoint =
+        clawde_katban::catchat::search::resolve_endpoint(search_endpoint.as_deref());
+    let search: Arc<dyn clawde_katban::catchat::search::GuestSearch> = Arc::new(
+        clawde_katban::catchat::search::SearxClient::new(search_endpoint.clone()),
+    );
     let backend: Arc<dyn clawde_katban::catchat::engine::GuestBackend> =
         Arc::new(clawde_katban::catchat::engine::FreeBackend::new());
     let engine = Arc::new(clawde_katban::catchat::engine::ChatEngine::new(
@@ -2876,10 +2952,20 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
     if let Some(subdomain) = &public_url {
         println!("public:      https://{subdomain} (via caddy — see: clawde catchat expose)");
     }
-    println!(
-        "guest search: local SearXNG at {}",
-        clawde_katban::catchat::search::DEFAULT_ENDPOINT
-    );
+    // Ask the endpoint what it is instead of asserting it is a SearXNG: a
+    // host whose port 8080 belongs to something else (or whose SearXNG has the
+    // JSON API off) otherwise advertises a guest feature that can only fail.
+    match clawde_katban::catchat::search::probe_endpoint(&search_endpoint).await {
+        Ok(()) => println!("guest search: {search_endpoint} (SearXNG JSON API answered)"),
+        Err(reason) => {
+            println!("guest search: {search_endpoint}");
+            println!("              WARNING: unavailable — {reason}");
+            println!(
+                "              guests will be told search is unavailable. Point it somewhere else with:\n                clawde catchat serve --search-endpoint http://127.0.0.1:<port>   (or set {})",
+                clawde_katban::catchat::search::ENDPOINT_ENV
+            );
+        }
+    }
     println!(
         "guests ride free/limited providers; chat degrades gracefully if none are configured."
     );
@@ -3019,13 +3105,35 @@ async fn run_catchat_expose(args: &[String]) -> anyhow::Result<()> {
 fn run_catchat_unblock(args: &[String]) -> anyhow::Result<()> {
     use clawde_katban::catchat::links::{load, save};
 
-    let ip = args
+    let input = args
         .first()
         .context("unblock needs an IP: clawde catchat unblock <IP>")?;
+    // The bucket a client is filed under is not always the address the
+    // operator typed: a loopback client with no `X-Forwarded-For` is filed
+    // under `loopback`. Resolving first is what makes `unblock 127.0.0.1`
+    // actually clear that client instead of reporting success after removing
+    // a key nothing was stored under.
+    let bucket = clawde_katban::http_security::lockout_bucket(input);
     let mut store = load()?;
-    store.reset_failed_attempts(ip);
+    if !store.reset_failed_attempts(&bucket) {
+        let active = store.active_lockouts(now_secs());
+        if active.is_empty() {
+            anyhow::bail!("no lockout recorded for '{bucket}' — nothing to clear");
+        }
+        anyhow::bail!(
+            "no lockout recorded for '{bucket}' — active bucket(s): {}. A local client (curl, or a proxy that sets no X-Forwarded-For) is filed under 'loopback'.",
+            clawde_katban::http_security::describe_lockouts(&active, now_secs())
+        );
+    }
     save(&store)?;
-    println!("cleared lockouts and 24h blocks for '{ip}'");
+    if bucket == input.trim() {
+        println!("cleared lockouts and 24h blocks for '{bucket}'");
+    } else {
+        println!(
+            "cleared lockouts and 24h blocks for '{input}' (bucket '{bucket}' — every local \
+             client without X-Forwarded-For shares it)"
+        );
+    }
     Ok(())
 }
 
@@ -3054,28 +3162,58 @@ mod tests {
     #[test]
     fn resolve_serve_target_uses_registered_site() {
         let config = config_with(vec![site("demo", false, None), site("blog", true, None)]);
-        let (root, port, live) = resolve_serve_target(&config, "demo", None, false, false).unwrap();
-        assert_eq!(root, PathBuf::from("/srv/demo"));
-        assert_eq!(port, 8799);
-        assert!(live);
+        let target = resolve_serve_target(&config, "demo", None, false, false).unwrap();
+        assert_eq!(target.root, PathBuf::from("/srv/demo"));
+        assert_eq!(target.port, 8799);
+        assert!(target.live);
+        assert_eq!(target.registered_port, Some(8799));
 
         // Locked site -> live reload off unless overridden.
-        let (_, _, live) = resolve_serve_target(&config, "blog", None, false, false).unwrap();
-        assert!(!live);
-        let (_, _, live) = resolve_serve_target(&config, "blog", None, false, true).unwrap();
-        assert!(!live);
+        assert!(
+            !resolve_serve_target(&config, "blog", None, false, false)
+                .unwrap()
+                .live
+        );
+        assert!(
+            !resolve_serve_target(&config, "blog", None, false, true)
+                .unwrap()
+                .live
+        );
+    }
+
+    /// A `--port` override moves where the site is served but not what
+    /// `site expose` proxies; the target has to carry both numbers so the
+    /// command can warn about the mismatch instead of serving a 502 silently.
+    #[test]
+    fn resolve_serve_target_reports_a_port_override_against_the_registered_port() {
+        let config = config_with(vec![site("demo", false, None)]);
+        let target = resolve_serve_target(&config, "demo", Some(9123), false, false).unwrap();
+        assert_eq!(target.port, 9123, "the override is what gets served");
+        assert_eq!(
+            target.registered_port,
+            Some(8799),
+            "the registered port is what caddy proxies"
+        );
+        // Overriding with the registered port: the two agree, so there is
+        // nothing to warn about.
+        let target = resolve_serve_target(&config, "demo", Some(8799), false, false).unwrap();
+        assert_eq!(target.port, 8799);
+        assert_eq!(target.registered_port, Some(8799));
     }
 
     #[test]
     fn resolve_serve_target_falls_back_to_directory() {
         let config = config_with(vec![]);
         let tmp = tempfile::tempdir().unwrap();
-        let (root, port, live) =
+        let target =
             resolve_serve_target(&config, tmp.path().to_str().unwrap(), None, false, false)
                 .unwrap();
-        assert!(root.is_dir());
-        assert_eq!(port, clawde_katban::config::DEFAULT_SITE_PORT);
-        assert!(live);
+        assert!(target.root.is_dir());
+        assert_eq!(target.port, clawde_katban::config::DEFAULT_SITE_PORT);
+        assert!(target.live);
+        // A directory is not a registered site, so no port is on record for an
+        // override to disagree with.
+        assert_eq!(target.registered_port, None);
     }
 
     #[test]
@@ -3614,6 +3752,53 @@ mod tests {
             None => std::env::remove_var("CLAWDE_HOME"),
         }
         result.unwrap();
+    }
+
+    /// The bucket fix, end to end through the CLI. A loopback guest is filed
+    /// under `loopback`, so `unblock 127.0.0.1` must clear *that* bucket — and a
+    /// clear that matches nothing must fail loudly, because the old behaviour
+    /// (remove a key nothing was stored under, print success) is exactly how a
+    /// locked-out guest stayed locked out while the operator was told it was
+    /// handled.
+    #[tokio::test]
+    async fn catchat_unblock_resolves_a_loopback_spelling_and_reports_a_miss() {
+        let _guard = crate::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", home.path());
+        use clawde_katban::catchat::links::{load, save, GuestStore};
+        use clawde_katban::http_security::{lockout_bucket, LOOPBACK_BUCKET};
+
+        let mut store = GuestStore::default();
+        for _ in 0..5 {
+            store.record_failed_attempt(LOOPBACK_BUCKET);
+        }
+        save(&store).unwrap();
+
+        assert_eq!(lockout_bucket("127.0.0.1"), LOOPBACK_BUCKET);
+        run_catchat_unblock(&["127.0.0.1".to_string()])
+            .expect("127.0.0.1 must clear the bucket a loopback client is filed under");
+        assert!(load().unwrap().failed_attempts.is_empty());
+
+        // Nothing is locked out now, so a repeat has nothing to clear.
+        let miss = run_catchat_unblock(&["127.0.0.1".to_string()])
+            .expect_err("a clear that matched nothing must not report success");
+        assert!(miss.to_string().contains("nothing to clear"), "{miss}");
+
+        // With someone *else* locked out, the miss names the bucket to pass.
+        // Four attempts is what arms Cat Chat's 3-minute lockout window, so the
+        // store has to record that many before the bucket is "active".
+        let mut store = GuestStore::default();
+        for _ in 0..4 {
+            store.record_failed_attempt("1.2.3.4");
+        }
+        save(&store).unwrap();
+        let miss = run_catchat_unblock(&["10.9.9.9".to_string()])
+            .expect_err("an address with no lockout must not report success");
+        let message = miss.to_string();
+        assert!(
+            message.contains("1.2.3.4 (lockout"),
+            "the miss must name the active bucket: {message}"
+        );
     }
 
     /// A caddy dir and a systemd units dir for `doctor` to read, so its checks

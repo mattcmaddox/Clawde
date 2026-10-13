@@ -1748,7 +1748,8 @@ links directly. This is the chat-facing surface; the Kanban board stays under
 /chat revoke <ID>           — revoke a link (kicks its devices)
 /chat password <ID>         — rotate a link's password
 /chat password <ID> --set "PW" — set your own memorable password (not printed)
-/chat unblock <IP>          — clear Cat Chat lockouts + 24-hour blocks
+/chat unblock <BUCKET>      — clear a lockout / 24-hour block (an IP, or
+                              'loopback' for a client on the host)
 ```
 
 The server itself is managed from the shell: `clawde catchat serve|expose`.

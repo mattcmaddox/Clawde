@@ -225,7 +225,7 @@ impl ChatEngine {
                     turn_meta: None,
                 };
                 session.messages.push(assistant);
-                return Ok(render_text(&response.content));
+                return Ok(visible_text(&response.content));
             }
 
             if tool_round >= self.max_tool_rounds {
@@ -250,7 +250,16 @@ impl ChatEngine {
                                 .to_string();
                             match self.search.search(&query).await {
                                 Ok(results) => render_results(&results),
-                                Err(error) => format!("search failed: {error}"),
+                                // The tool result is a prompt, so it has to say
+                                // what to do instead: a bare "search failed"
+                                // invites the model to invent results or to
+                                // claim it searched. Name the failure and
+                                // require it to be admitted.
+                                Err(error) => format!(
+                                    "web search is unavailable on this host ({error}). Do not guess, \
+                                     and do not claim you searched: answer from what you already know \
+                                     and tell the guest you could not reach the web."
+                                ),
                             }
                         }
                         other => format!("unknown tool '{other}' — no such tool is available"),
@@ -312,7 +321,7 @@ impl ChatEngine {
             .chat(request)
             .await
             .map_err(ChatError::Unavailable)?;
-        Ok(render_text(&response.content))
+        Ok(visible_text(&response.content))
     }
 
     fn build_request(
@@ -370,6 +379,63 @@ pub fn web_search_definition() -> ToolDefinition {
     }
 }
 
+/// The text a *guest* may see from one assistant turn.
+///
+/// Deliberately narrower than [`render_text`]. That one tags the reasoning and
+/// tool-use blocks into the string it builds, which is right for the transcript
+/// fed back to the model and wrong for the answer shown to a friend: a guest
+/// must never be handed the model's chain of thought. Here
+///
+/// * `Thinking` and tool-use blocks contribute nothing, and
+/// * a text block is stripped of any reasoning the serving upstream folded into
+///   it (`reasoning</think>answer`) — the free chain includes upstreams
+///   that leave the chain of thought in the text field, and one live guest
+///   summary came back as `Hello there!</think>Hello there!`.
+fn visible_text(blocks: &[ContentBlock]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        if let ContentBlock::Text { text } = block {
+            out.push_str(&strip_inline_reasoning(text));
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Drop reasoning a provider folded into a text block.
+///
+/// Two shapes show up in practice: a complete `think` span in either spelling,
+/// and a response that opens with the reasoning and then carries a lone closing
+/// tag because the upstream ate the opening marker. A bare closing tag means
+/// everything before it was reasoning, so it is dropped too. With no marker at
+/// all the text is left alone — guessing there would risk eating a real answer
+/// that merely mentions the tag.
+fn strip_inline_reasoning(text: &str) -> String {
+    const TAGS: [(&str, &str); 2] = [("<think>", "</think>"), ("<thinking>", "</thinking>")];
+    let mut out = text.to_string();
+    for (open, close) in TAGS {
+        while let Some(start) = out.find(open) {
+            let after_open = start + open.len();
+            match out[after_open..].find(close) {
+                Some(offset) => {
+                    let end = after_open + offset + close.len();
+                    out.replace_range(start..end, "");
+                }
+                None => {
+                    // Unterminated: the rest of the block is reasoning.
+                    out.truncate(start);
+                    break;
+                }
+            }
+        }
+    }
+    for (_, close) in TAGS {
+        if let Some(at) = out.rfind(close) {
+            out = out[at + close.len()..].to_string();
+        }
+    }
+    out.trim().to_string()
+}
+
 fn render_text(blocks: &[ContentBlock]) -> String {
     let mut out = String::new();
     for block in blocks {
@@ -408,16 +474,29 @@ mod tests {
     use clawde_core::types::UsageInfo;
     use std::sync::Mutex;
 
-    /// Fake backend that returns canned responses in sequence.
+    /// Fake backend that returns canned responses in sequence and keeps every
+    /// request it was handed, so a test can inspect what the model actually saw
+    /// (e.g. the text of a tool result).
     struct FakeBackend {
         responses: Mutex<Vec<ProviderResponse>>,
+        requests: Mutex<Vec<ProviderRequest>>,
     }
 
     impl FakeBackend {
         fn new(responses: Vec<ProviderResponse>) -> Self {
             FakeBackend {
                 responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
             }
+        }
+
+        /// The most recent request the engine sent.
+        fn last_request(&self) -> Option<ProviderRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned()
         }
 
         fn text(text: &str) -> ProviderResponse {
@@ -452,7 +531,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GuestBackend for FakeBackend {
-        async fn chat(&self, _request: ProviderRequest) -> Result<ProviderResponse, String> {
+        async fn chat(&self, request: ProviderRequest) -> Result<ProviderResponse, String> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(request);
             self.responses
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -463,6 +546,62 @@ mod tests {
 
     struct FakeSearch {
         results: Vec<SearchResult>,
+    }
+
+    /// A guest must never be handed the model's chain of thought, in either
+    /// shape: a `Thinking` block, or reasoning an upstream folded into the text
+    /// block it returned (one live guest summary came back as
+    /// `Hello there!</think>Hello there!`).
+    #[test]
+    fn guest_visible_text_drops_thinking_tool_markers_and_inline_reasoning() {
+        let blocks = vec![
+            ContentBlock::Thinking {
+                thinking: "weighing the options".to_string(),
+                signature: String::new(),
+            },
+            ContentBlock::Text {
+                text: "<think>2+2 is basic arithmetic</think>The answer is 4.".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "web_search".to_string(),
+                input: serde_json::json!({ "query": "2+2" }),
+                thought_signature: None,
+            },
+        ];
+        assert_eq!(visible_text(&blocks), "The answer is 4.");
+    }
+
+    #[test]
+    fn guest_visible_text_drops_a_lone_closing_reasoning_tag() {
+        // The upstream ate the opening marker, so everything before the closing
+        // tag is reasoning. Guessing this shape away is what keeps
+        // `Hello there!</think>Hello there!` from reaching a friend.
+        assert_eq!(
+            strip_inline_reasoning("Hello there!</think>Hello there!"),
+            "Hello there!"
+        );
+        assert_eq!(
+            strip_inline_reasoning("<thinking>a long deliberation</thinking>Paris"),
+            "Paris"
+        );
+    }
+
+    #[test]
+    fn guest_visible_text_leaves_plain_answers_alone() {
+        assert_eq!(strip_inline_reasoning("Paris"), "Paris");
+        assert_eq!(strip_inline_reasoning("1 < 2 and 3 > 2"), "1 < 2 and 3 > 2");
+        // Unterminated reasoning: nothing after the marker is an answer.
+        assert_eq!(strip_inline_reasoning("<think>still thinking"), "");
+    }
+
+    #[test]
+    fn guest_visible_text_of_a_reasoning_only_turn_is_empty() {
+        let blocks = vec![ContentBlock::Thinking {
+            thinking: "no answer, only deliberation".to_string(),
+            signature: String::new(),
+        }];
+        assert_eq!(visible_text(&blocks), "");
     }
 
     #[async_trait::async_trait]
@@ -523,6 +662,39 @@ mod tests {
         assert_eq!(session.messages.len(), 2);
     }
 
+    /// Through the real reply path, not just the helper: an upstream that
+    /// leaves its reasoning in the text block must not put it in front of the
+    /// guest, while the session keeps the raw blocks for the next turn.
+    #[tokio::test]
+    async fn a_reply_never_carries_upstream_reasoning() {
+        let engine = ChatEngine::new(
+            // Split so the tag is not written whole in this file (a literal
+            // closing reasoning tag in source is easy to mangle); the value the
+            // backend returns is the real `… reasoning …</think>answer` shape.
+            Arc::new(FakeBackend::new(vec![FakeBackend::text(concat!(
+                "The user asked for the capital.</th",
+                "ink>Paris."
+            ))])),
+            Arc::new(FakeSearch {
+                results: Vec::new(),
+            }),
+        );
+        let mut session = GuestSession::new();
+        let reply = engine
+            .respond(&mut session, "capital of France?")
+            .await
+            .unwrap();
+        assert_eq!(reply, "Paris.");
+        // The stored turn is untouched, so a provider that needs its reasoning
+        // echoed back on the next turn still gets it.
+        let MessageContent::Blocks(blocks) = &session.messages.last().unwrap().content else {
+            panic!("assistant turn should be kept as blocks");
+        };
+        assert!(
+            matches!(blocks.first(), Some(ContentBlock::Text { text }) if text.contains("asked for the capital"))
+        );
+    }
+
     #[tokio::test]
     async fn tool_round_then_final_answer() {
         let engine = ChatEngine::new(
@@ -548,6 +720,65 @@ mod tests {
         // round is transient request-internal history.
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[1].role, Role::Assistant);
+    }
+
+    /// A failed search must be named to the model, not swallowed into an empty
+    /// result set: a bare "search failed" invites it to invent an answer or to
+    /// tell the guest it looked something up. The tool result it receives has
+    /// to forbid both.
+    #[tokio::test]
+    async fn an_unreachable_search_is_named_in_the_tool_result() {
+        struct FailingSearch;
+
+        #[async_trait::async_trait]
+        impl GuestSearch for FailingSearch {
+            async fn search(&self, _query: &str) -> Result<Vec<SearchResult>, String> {
+                Err("search endpoint returned 404 Not Found".to_string())
+            }
+        }
+
+        let backend = Arc::new(FakeBackend::new(vec![
+            FakeBackend::text("I could not reach the web just now."),
+            FakeBackend::tool_use("clawde release notes"),
+        ]));
+        let engine = ChatEngine::new(backend.clone(), Arc::new(FailingSearch));
+        let mut session = GuestSession::new();
+        let reply = engine
+            .respond(&mut session, "what shipped in the last release?")
+            .await
+            .unwrap();
+        assert_eq!(reply, "I could not reach the web just now.");
+
+        // The final round is the one that carries the tool result back.
+        let request = backend.last_request().expect("a second round was sent");
+        let result_text = request
+            .messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                MessageContent::Blocks(blocks) => Some(blocks),
+                _ => None,
+            })
+            .flatten()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content: clawde_core::types::ToolResultContent::Text(text),
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("the model was handed a tool result");
+        assert!(
+            result_text.contains("web search is unavailable on this host"),
+            "tool result must name the failure: {result_text}"
+        );
+        assert!(
+            result_text.contains("404"),
+            "tool result must carry the cause: {result_text}"
+        );
+        assert!(
+            result_text.contains("do not claim you searched"),
+            "tool result must forbid claiming a search that never happened: {result_text}"
+        );
     }
 
     #[tokio::test]

@@ -85,7 +85,7 @@ They use separate state directories and separate password policies. See [docs/ca
 | `/chat links` / `/chat show <ID>` | List links / link details |
 | `/chat password <ID>` | Rotate a Cat Chat link password (`--set "PW"` chooses the exact guest password) |
 | `/chat revoke <ID>` | Delete a link (kicks its devices) |
-| `/chat unblock <IP>` | Clear login lockouts for an IP |
+| `/chat unblock <BUCKET>` | Clear a login lockout (IP, or `loopback` locally) |
 | `/chat status` | Links, devices, exposure, lockouts |
 | `/katban ...` | Katban development: `board list`, `card add`, `project list`, `site list`, `board password` |
 | `Alt+G` | Katban controls menu (board quick actions) |

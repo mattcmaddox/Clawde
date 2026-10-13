@@ -15,9 +15,83 @@
 use serde::Deserialize;
 use std::time::Duration;
 
+/// The local SearXNG sidecar the spec assumes, used when nothing overrides it.
+///
+/// It is only a default: 8080 is the most contested port on a home host, and on
+/// 2026-10-13 this box had Nextcloud bound to it, so a hardcoded endpoint is a
+/// guest feature that silently does not exist. `--search-endpoint`,
+/// [`ENDPOINT_ENV`], and [`resolve_endpoint`] are how a host points Cat Chat at
+/// wherever its search sidecar actually listens.
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080";
+pub const ENDPOINT_ENV: &str = "CLAWDE_CATCHAT_SEARCH_ENDPOINT";
 pub const MAX_RESULTS: usize = 5;
 pub const MAX_SNIPPET_CHARS: usize = 500;
+
+/// The endpoint Cat Chat should search with: an explicit argument (the
+/// `--search-endpoint` flag) beats the environment, which beats the default.
+/// Empty values are ignored rather than treated as "no search", so an unset or
+/// blank variable cannot accidentally disable the feature.
+pub fn resolve_endpoint(explicit: Option<&str>) -> String {
+    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return value.to_string();
+    }
+    if let Ok(value) = std::env::var(ENDPOINT_ENV) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+    DEFAULT_ENDPOINT.to_string()
+}
+
+/// Check that `endpoint` really speaks the SearXNG JSON API, returning a
+/// human-readable reason when it does not.
+///
+/// `catchat serve` used to *claim* "guest search: local SearXNG at <url>"
+/// without asking, so a host whose port 8080 belongs to something else (or a
+/// SearXNG with the JSON API disabled) advertised a search feature that could
+/// only ever fail — every guest search ended as `search failed: search
+/// endpoint returned 404` handed to the model. Probing once at startup makes
+/// that visible where it can be fixed, and the message names what answered
+/// instead.
+pub async fn probe_endpoint(endpoint: &str) -> Result<(), String> {
+    let url = format!(
+        "{}/search?q=clawde+search+probe&format=json",
+        endpoint.trim_end_matches('/')
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| format!("could not build a search client: {error}"))?;
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Clawde-Katban/0.1 (guest search probe)")
+        .send()
+        .await
+        .map_err(|error| format!("could not reach it: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("could not read its reply: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "it answered HTTP {status} — not a SearXNG JSON API (is another service on that port?)"
+        ));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+        "it answered 200 with something that is not JSON — a SearXNG with the JSON API disabled \
+         returns a page instead; enable `search.formats: [json]` in its settings"
+            .to_string()
+    })?;
+    if parsed.get("results").map(|value| value.is_array()) != Some(true) {
+        return Err(
+            "its JSON reply has no `results` array — that is a different API, not SearXNG"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
 
 /// Injection patterns matched case-insensitively against result text. If a
 /// result looks like it is trying to steer the model, it is dropped.
@@ -267,5 +341,49 @@ mod tests {
     fn urlencoding_encodes_query() {
         assert_eq!(urlencoding_encode("rust async"), "rust+async");
         assert_eq!(urlencoding_encode("a/b?c=d"), "a%2Fb%3Fc%3Dd");
+    }
+
+    /// Run `f` with [`ENDPOINT_ENV`] set to `value`, restoring whatever the
+    /// process had before. Serializes on the crate's env lock, so it can run
+    /// under the parallel runner (see `scripts/audit-env-tests.py`).
+    fn with_endpoint_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(ENDPOINT_ENV).ok();
+        match value {
+            Some(value) => std::env::set_var(ENDPOINT_ENV, value),
+            None => std::env::remove_var(ENDPOINT_ENV),
+        }
+        let result = f();
+        match previous {
+            Some(value) => std::env::set_var(ENDPOINT_ENV, value),
+            None => std::env::remove_var(ENDPOINT_ENV),
+        }
+        result
+    }
+
+    #[test]
+    fn explicit_endpoint_beats_the_environment() {
+        with_endpoint_env(Some("http://127.0.0.1:9999"), || {
+            assert_eq!(
+                resolve_endpoint(Some("http://127.0.0.1:8888")),
+                "http://127.0.0.1:8888"
+            );
+            // A blank flag value is "not given", not "no search": it must
+            // fall through to the environment rather than disable the feature.
+            assert_eq!(resolve_endpoint(Some("   ")), "http://127.0.0.1:9999");
+        });
+    }
+
+    #[test]
+    fn endpoint_falls_back_to_env_then_default() {
+        with_endpoint_env(None, || {
+            assert_eq!(resolve_endpoint(None), DEFAULT_ENDPOINT);
+        });
+        with_endpoint_env(Some(""), || {
+            assert_eq!(resolve_endpoint(None), DEFAULT_ENDPOINT);
+        });
+        with_endpoint_env(Some(" http://search.lan:8081 "), || {
+            assert_eq!(resolve_endpoint(None), "http://search.lan:8081");
+        });
     }
 }

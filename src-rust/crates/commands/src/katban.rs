@@ -431,17 +431,33 @@ impl SlashCommand for KatbanCommand {
                 )
             }
             ["board", "unblock", ip] => {
+                // The board files a loopback client with no `X-Forwarded-For`
+                // under 'loopback', so resolve the operator's address onto the
+                // bucket before clearing it — and report a miss instead of
+                // claiming a clear that removed nothing.
+                let bucket = clawde_katban::http_security::lockout_bucket(ip);
                 let mut store = match admin_auth::load() {
                     Ok(store) => store,
                     Err(error) => {
                         return CommandResult::Error(format!("could not load admin store: {error:#}"))
                     }
                 };
-                store.reset_failed_attempts(ip);
+                if !store.reset_failed_attempts(&bucket) {
+                    let active = store.active_lockouts(now_secs());
+                    if active.is_empty() {
+                        return CommandResult::Error(format!(
+                            "no Katban admin lockout recorded for '{bucket}' — nothing to clear"
+                        ));
+                    }
+                    return CommandResult::Error(format!(
+                        "no Katban admin lockout recorded for '{bucket}' — active: {} (a local client is filed under 'loopback')",
+                        clawde_katban::http_security::describe_lockouts(&active, now_secs())
+                    ));
+                }
                 if let Err(error) = admin_auth::save(&store) {
                     return CommandResult::Error(format!("could not save admin store: {error:#}"));
                 }
-                CommandResult::Message(format!("cleared Katban admin lockouts for '{ip}'"))
+                CommandResult::Message(format!("cleared Katban admin lockouts for '{bucket}'"))
             }
             ["board", "unblock"] => CommandResult::Error(
                 "board unblock needs an IP: /katban board unblock <IP>".to_string(),
