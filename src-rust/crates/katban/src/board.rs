@@ -180,7 +180,7 @@ pub struct DiffSummary {
 
 /// Where card attempts execute (spec §8). `Host` is the default: the agent
 /// runs in the per-card worktree and safety comes from the worktree lane.
-/// `Incus` runs each attempt inside an ephemeral Incus container — the
+/// `Docker` runs each attempt inside an ephemeral Docker container — the
 /// container is the safety boundary (`bypass-permissions` is safe there),
 /// the verify gate runs in-container, and the FS-manifest diff gives the
 /// scope gate real data. Serde default keeps older boards on `Host`.
@@ -189,7 +189,15 @@ pub struct DiffSummary {
 pub enum ContainerRuntime {
     #[default]
     Host,
-    Incus,
+    /// Each attempt is an ephemeral Docker container.
+    ///
+    /// `alias = "incus"` is the migration for boards written before
+    /// 2026-10-13: the lane was built on Incus first and Docker replaced it,
+    /// so a stored `"incus"` loads as this variant instead of failing the
+    /// whole board file to deserialize. (`parse` deliberately does not accept
+    /// the token — that is user input, and it should be told the new name.)
+    #[serde(alias = "incus")]
+    Docker,
 }
 
 impl ContainerRuntime {
@@ -197,7 +205,7 @@ impl ContainerRuntime {
     pub fn as_str(&self) -> &'static str {
         match self {
             ContainerRuntime::Host => "host",
-            ContainerRuntime::Incus => "incus",
+            ContainerRuntime::Docker => "docker",
         }
     }
 
@@ -205,7 +213,7 @@ impl ContainerRuntime {
     pub fn parse(token: &str) -> Option<Self> {
         match token.trim().to_ascii_lowercase().as_str() {
             "host" => Some(ContainerRuntime::Host),
-            "incus" => Some(ContainerRuntime::Incus),
+            "docker" => Some(ContainerRuntime::Docker),
             _ => None,
         }
     }
@@ -370,9 +378,9 @@ pub struct Board {
     #[serde(default)]
     pub attempt_upstreams: Vec<String>,
     /// Where card attempts execute. Default `Host` (the worktree lane);
-    /// `Incus` runs each attempt in an ephemeral container with in-container
+    /// `Docker` runs each attempt in an ephemeral container with in-container
     /// verify + FS-manifest scope checking (spec §8). Set with
-    /// `clawde katban board runtime incus|host`.
+    /// `clawde katban board runtime docker|host`.
     #[serde(default)]
     pub runtime: ContainerRuntime,
 }
@@ -466,7 +474,7 @@ impl Board {
         clamped
     }
 
-    /// Set where attempts execute (`board runtime incus|host`, spec §8).
+    /// Set where attempts execute (`board runtime docker|host`, spec §8).
     /// Returns the stored value.
     pub fn set_runtime(&mut self, runtime: ContainerRuntime) -> ContainerRuntime {
         self.runtime = runtime;
@@ -967,26 +975,42 @@ mod tests {
     fn runtime_parses_tokens_and_defaults_to_host() {
         assert_eq!(ContainerRuntime::default(), ContainerRuntime::Host);
         assert_eq!(
-            ContainerRuntime::parse("incus"),
-            Some(ContainerRuntime::Incus)
+            ContainerRuntime::parse("docker"),
+            Some(ContainerRuntime::Docker)
         );
         assert_eq!(
-            ContainerRuntime::parse("INCUS"),
-            Some(ContainerRuntime::Incus)
+            ContainerRuntime::parse("DOCKER"),
+            Some(ContainerRuntime::Docker)
         );
         assert_eq!(
             ContainerRuntime::parse("host"),
             Some(ContainerRuntime::Host)
         );
-        assert_eq!(ContainerRuntime::parse("docker"), None);
-        assert_eq!(ContainerRuntime::Incus.as_str(), "incus");
+        assert_eq!(
+            ContainerRuntime::parse("incus"),
+            None,
+            "the Incus token is gone from the CLI; only stored board files migrate"
+        );
+        assert_eq!(ContainerRuntime::Docker.as_str(), "docker");
         let mut board = Board::new();
         assert_eq!(board.runtime, ContainerRuntime::Host, "serde default");
         assert_eq!(
-            board.set_runtime(ContainerRuntime::Incus),
-            ContainerRuntime::Incus
+            board.set_runtime(ContainerRuntime::Docker),
+            ContainerRuntime::Docker
         );
-        assert_eq!(board.runtime, ContainerRuntime::Incus);
+        assert_eq!(board.runtime, ContainerRuntime::Docker);
+    }
+
+    #[test]
+    fn a_stored_incus_runtime_migrates_to_docker() {
+        // The port's migration path: a board file written by the Incus lane
+        // must load as the Docker lane. Without the variant alias the whole
+        // file fails to deserialize and the board reads as empty — losing
+        // every card, not just the runtime knob.
+        let mut value = serde_json::to_value(Board::new()).expect("board serializes");
+        value["runtime"] = serde_json::json!("incus");
+        let migrated: Board = serde_json::from_value(value).expect("incus must migrate");
+        assert_eq!(migrated.runtime, ContainerRuntime::Docker);
     }
 
     #[test]

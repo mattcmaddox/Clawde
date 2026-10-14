@@ -55,6 +55,10 @@ const MAX_AGENT_TURNS: u32 = 40;
 /// upstream can be slow (first byte >30s measured on gemini), so this is
 /// generous — but an agent must never hold a container indefinitely.
 const AGENT_TIMEOUT: Duration = Duration::from_secs(1800);
+/// Budget for one in-container verify command. Its own constant because a real
+/// test suite is the one in-container command that legitimately runs for
+/// minutes, unlike the manifest/seed calls that share `exec_capture_sync`.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Structured result of one agent run (spec §4.1). The executor parses the
 /// headless `--output-format stream-json` events natively (the same shapes
@@ -295,6 +299,11 @@ impl AttemptPin {
 /// - Fewer available upstreams than N: run min(N, available) rungs — never
 ///   reuse the same upstream within one ladder unless families are
 ///   exhausted (admin lists are cycled, not truncated, per §4.2).
+/// - Upstreams whose free tier is a quick-task lane (`FreeUpstream::
+///   quick_task_lane` — poolside's preview, groq's token cap) fill rungs only
+///   after ordinary ones: a card is a long multi-turn run, so its lead rung
+///   must be a model that can finish one. They are demoted, never dropped,
+///   and an admin-set `attempt_upstreams` still wins verbatim.
 /// - Upstreams the free chain recently put into cooldown (5xx circuit
 ///   breaker or empty-completion track — the persisted snapshot the
 ///   dispatching provider writes) are ranked **after** healthy ones: they
@@ -372,7 +381,8 @@ fn catalog_entry_default(upstream: &str) -> Option<&'static str> {
 }
 
 /// Distinct `model_family` first, then distinct hosts of already-seen
-/// families (cerebras+groq both serving gpt-oss is still real diversity).
+/// families (cerebras+groq both serving gpt-oss is still real diversity), then
+/// quick-task lanes.
 fn family_ranked(
     entries: Vec<&clawde_api::providers::free::FreeUpstream>,
 ) -> Vec<&clawde_api::providers::free::FreeUpstream> {
@@ -387,7 +397,18 @@ fn family_ranked(
         }
     }
     primary.extend(secondary);
-    primary
+    // Constrained lanes last. A card is a long agentic run: poolside's free
+    // preview (200 requests/hour) and groq's token cap are workable rungs but
+    // wrong *lead* rungs, and leading with one spends rung 0 discovering the
+    // throttle (measured live 2026-10-13 — every card's first rung was poolside
+    // and every one of them died on `free-mode upstreams exhausted`). Stable
+    // partition: catalog order still holds inside each group, and an
+    // all-constrained keyed set still produces a full ladder, just in its
+    // original order.
+    let (ordinary, constrained): (Vec<_>, Vec<_>) = primary
+        .into_iter()
+        .partition(|entry| !entry.quick_task_lane);
+    ordinary.into_iter().chain(constrained).collect()
 }
 
 /// The upstream ids with at least one usable key in the auth store (the same
@@ -706,9 +727,9 @@ async fn run_one_card(
             })
             .unwrap_or((true, false, 1, Vec::new(), ContainerRuntime::default()));
     // Container tier (spec §8): the whole attempt flow moves into ephemeral
-    // Incus containers; this host-tier function is done (finalize happens on
+    // Docker containers; this host-tier function is done (finalize happens on
     // the container path).
-    if runtime == ContainerRuntime::Incus {
+    if runtime == ContainerRuntime::Docker {
         if let Some(repo) = repo_root {
             run_one_card_container(project, Some(repo), work_dir, prompt, executor).await;
         } else {
@@ -968,27 +989,27 @@ fn exec_capture_sync(name: &str, argv: &[String]) -> Result<(String, String), St
     crate::container::exec_capture(name, argv, Duration::from_secs(120))
 }
 
-/// Run one `incus exec` for the agent run with a hard wall-clock deadline.
+/// Run one `docker exec` for the agent run with a hard wall-clock deadline.
 /// Two reader threads drain the pipes as the stream arrives (a full pipe
-/// would otherwise deadlock incus), the poll loop kills the client at the
-/// deadline, and the buffers are joined after exit. Blocking — call from
+/// would otherwise deadlock the client), the poll loop kills the client at
+/// the deadline, and the buffers are joined after exit. Blocking — call from
 /// `spawn_blocking`. Returns (stdout, stderr, exit_code); a timeout yields
 /// code -1 with whatever streamed before the kill, so the caller's
 /// error/empty-completion checks classify the partial run honestly.
-fn incus_exec_lines(
+fn docker_exec_lines(
     name: &str,
     argv: &[String],
     timeout: Duration,
 ) -> Result<(String, String, i32), String> {
     use std::io::Read;
-    let mut child = std::process::Command::new("incus")
-        .args(["exec", name, "--"])
+    let mut child = std::process::Command::new("docker")
+        .args(["exec", name])
         .args(argv)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not start incus exec: {e}"))?;
+        .map_err(|e| format!("could not start docker exec: {e}"))?;
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
     let stdout_reader = std::thread::spawn(move || {
@@ -1005,7 +1026,7 @@ fn incus_exec_lines(
     let mut code: i32 = -1;
     loop {
         match child.try_wait() {
-            Err(e) => return Err(format!("incus exec wait failed: {e}")),
+            Err(e) => return Err(format!("docker exec wait failed: {e}")),
             Ok(Some(status)) => {
                 code = status.code().unwrap_or(-1);
                 break;
@@ -1024,8 +1045,8 @@ fn incus_exec_lines(
     Ok((stdout, stderr, code))
 }
 
-/// Run one card on the CONTAINER tier (board `runtime incus`, spec §8): each
-/// attempt is an ephemeral Incus container — worktree pushed in, agent with
+/// Run one card on the CONTAINER tier (board `runtime docker`, spec §8): each
+/// attempt is an ephemeral Docker container — worktree pushed in, agent with
 /// `bypass-permissions` (the container is the safety boundary), verify gate
 /// in-container, FS-manifest diff for the scope gate, task tar pulled as the
 /// attempt's artifact, all-or-nothing teardown. Selection semantics mirror
@@ -1044,7 +1065,11 @@ async fn run_one_card_container(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let Some(repo) = repo_root.filter(|r| git::is_repo(r)) else {
+    // The card worktree is the host tier's `run_one_card` create — it ran
+    // before this dispatch — so this tier only needs the repo to exist. It is
+    // deliberately not created again: `git worktree add` onto the existing
+    // path failed every rung with "already exists".
+    if repo_root.filter(|r| git::is_repo(r)).is_none() {
         finalize(
             project,
             &card_id,
@@ -1073,6 +1098,25 @@ async fn run_one_card_container(
         &keyed_upstream_ids(),
         &clawde_api::providers::free::cooling_free_upstreams(),
     );
+    if pins.is_empty() {
+        // The container tier has no unpinned mode — it is the attempts ladder
+        // (spec §8), so an empty ladder leaves nothing to run. The host tier has
+        // a single-unpinned-attempt fallback for this case; this tier does not,
+        // and without this branch the card fell through to the generic
+        // "all attempts failed" with no cause and no rung records at all.
+        finalize(
+            project,
+            &card_id,
+            work_dir,
+            true,
+            Some(
+                "container runtime needs an attempts ladder — set `board attempts 2`, then \
+                 either configure free keys or pin the ladder with `board attempts-upstreams <id>`",
+            ),
+            Some(FailureKind::Worktree),
+        );
+        return;
+    }
     let card_scope = board::load_board(project)
         .ok()
         .flatten()
@@ -1085,6 +1129,18 @@ async fn run_one_card_container(
         .iter()
         .map(|e| e.id)
         .collect();
+
+    // A no-op rung (tree unchanged vs its base) may only win when the card
+    // already had a commit: a follow-up run that legitimately changes nothing
+    // keeps the prior commit as the net result. On a first run an unchanged
+    // tree means the agent delivered nothing, and promoting it would reach
+    // review with no commit to merge (the host tier's "no-op run" rule).
+    let base_had_commit = board::load_board(project)
+        .ok()
+        .flatten()
+        .and_then(|b| b.card(&card_id).cloned())
+        .map(|c| c.commit.is_some())
+        .unwrap_or(false);
 
     let mut winner: Option<(usize, ManifestDiff)> = None;
     let mut last_failure: Option<FailureKind> = None;
@@ -1106,7 +1162,6 @@ async fn run_one_card_container(
         let started = std::time::Instant::now();
         let rung = run_container_attempt(
             project,
-            repo,
             work_dir,
             &card_id,
             &session,
@@ -1120,18 +1175,18 @@ async fn run_one_card_container(
             executor,
         )
         .await;
+        // The verdict is computed from the whole rung before its fields are
+        // moved out below (the outcome, the tar, the manifest diff).
+        let verdict = classify_container_rung(&rung, base_had_commit);
         let mut outcome = rung.outcome;
         outcome.elapsed_ms = Some(started.elapsed().as_millis() as u64);
 
-        if outcome.error.is_some() {
+        if let RungVerdict::Reject { kind, note } = verdict {
+            if let Some(note) = note {
+                outcome.error = Some(note);
+            }
             record_attempt(project, &card_id, outcome);
-            last_failure = Some(rung.failure_kind);
-            continue;
-        }
-        if outcome.verify_passed != Some(true) {
-            // run_container_attempt already recorded the error text.
-            record_attempt(project, &card_id, outcome);
-            last_failure = Some(rung.failure_kind);
+            last_failure = Some(kind);
             continue;
         }
         // Scope gate (container tier's advantage): any FS-diff path outside
@@ -1151,6 +1206,28 @@ async fn run_one_card_container(
                 ));
                 record_attempt(project, &card_id, outcome);
                 last_failure = Some(FailureKind::Verification);
+                continue;
+            }
+        }
+        // Write the winning container's tree back into the host worktree:
+        // `finalize` diffs and commits that checkout, and it otherwise holds
+        // exactly what was pushed in, not what the agent produced — so the card
+        // reached review with no pinned commit and `merge` then refused it.
+        // Only the winner is written: a restored *loser* would become the next
+        // rung's push source. This is also why the scope gate above must pass
+        // first — it judges the manifest diff of the tree being restored.
+        if let Some(tar) = rung.tar {
+            let restore_dir = work_dir.to_path_buf();
+            let deleted = rung.fs_diff.deleted.clone();
+            let restored = tokio::task::spawn_blocking(move || {
+                crate::container::restore_task_dir(&tar, &restore_dir, &deleted)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("restore panicked: {e}")));
+            if let Err(err) = restored {
+                outcome.error = Some(format!("could not write the container tree back: {err}"));
+                record_attempt(project, &card_id, outcome);
+                last_failure = Some(FailureKind::Worktree);
                 continue;
             }
         }
@@ -1181,11 +1258,72 @@ async fn run_one_card_container(
     );
 }
 
+/// What a completed container rung means to the ladder.
+#[derive(Debug, PartialEq, Eq)]
+enum RungVerdict {
+    /// Promote: the rung is a real, non-empty completion (the caller still
+    /// applies the scope gate, which reads the same manifest diff).
+    Winner,
+    /// Demote with this failure kind and, when the note differs from what the
+    /// rung already carries, this text on the attempt record.
+    Reject {
+        kind: FailureKind,
+        note: Option<String>,
+    },
+}
+
+/// The ladder's selection policy for one container rung, pure so the rules are
+/// testable without a Docker daemon — the gap that let two of them ship broken.
+///
+/// A pulled task tree is the completion signal: every failure path in
+/// `run_container_attempt` returns before the pull, so a rung that has one is a
+/// real completion whose `outcome.error` can only be the gate-skip note. The
+/// caller used to reject on `error.is_some()` *before* looking at the tree,
+/// which discarded exactly those rungs — so any project with no test/lint
+/// commands (every fresh project) failed the whole container ladder no matter
+/// what the agent delivered.
+fn classify_container_rung(rung: &ContainerRung, base_had_commit: bool) -> RungVerdict {
+    let reject = |kind: FailureKind| RungVerdict::Reject { kind, note: None };
+    if rung.tar.is_none() {
+        return reject(rung.failure_kind);
+    }
+    if rung.outcome.verify_passed != Some(true) {
+        return reject(rung.failure_kind);
+    }
+    // A skipped gate means no selector ran, so the rung wins on being a real
+    // (non-empty) completion — the documented first-wins degradation. An
+    // unchanged tree is not a completion: demote it unless the card already had
+    // a commit for the follow-up run to keep.
+    let skipped = rung
+        .outcome
+        .error
+        .as_deref()
+        .is_some_and(|e| e.starts_with("gate skipped:"));
+    if skipped && rung.fs_diff.all_paths().next().is_none() && !base_had_commit {
+        let reason = rung
+            .outcome
+            .error
+            .as_deref()
+            .unwrap_or("gate skipped")
+            .trim_start_matches("gate skipped: ");
+        return RungVerdict::Reject {
+            kind: FailureKind::Agent,
+            note: Some(format!("no-op run: {reason}")),
+        };
+    }
+    RungVerdict::Winner
+}
+
 /// Everything one container attempt produces beyond the standard outcome.
 struct ContainerRung {
     outcome: AttemptOutcome,
     fs_diff: ManifestDiff,
     failure_kind: FailureKind,
+    /// The container's final task tree, pulled while it is still alive. Only
+    /// the winning rung's is written back into the host worktree (see
+    /// `run_one_card_container`) — a restored loser would become the next
+    /// rung's push source. `None` on every failure path.
+    tar: Option<Vec<u8>>,
 }
 
 impl ContainerRung {
@@ -1195,6 +1333,7 @@ impl ContainerRung {
             outcome,
             fs_diff: ManifestDiff::default(),
             failure_kind: kind,
+            tar: None,
         }
     }
 }
@@ -1206,7 +1345,6 @@ impl ContainerRung {
 #[allow(clippy::too_many_arguments)]
 async fn run_container_attempt(
     _project: &str,
-    repo: &Path,
     work_dir: &Path,
     card_id: &str,
     session: &str,
@@ -1225,16 +1363,15 @@ async fn run_container_attempt(
         ..AttemptOutcome::default()
     };
 
-    // Materialize the worktree (the same per-card worktree the host tier
-    // uses — it is the push source and the finalize surface).
-    if let Err(e) = git::create_worktree(repo, work_dir, None) {
-        return ContainerRung::failure(
-            outcome,
-            FailureKind::Worktree,
-            format!("could not create worktree: {e}"),
-        );
-    }
+    // The card worktree is the caller's (`run_one_card` creates it before
+    // dispatching to this tier) and is the push source and the finalize
+    // surface. It must NOT be created again here: `git worktree add` is not
+    // idempotent, so a second call on the same path fails with "already
+    // exists" and failed every rung of the ladder.
     if let Err(err) = crate::container::launch(name, crate::container::DEFAULT_IMAGE) {
+        // Best-effort teardown: a launch that timed out (now that the deadline
+        // is real) or failed readiness may still have created the instance.
+        crate::container::stop_force(name);
         return ContainerRung::failure(outcome, FailureKind::Worktree, err);
     }
     // Seeded home: the real auth store (keys ride in the container only) plus
@@ -1336,7 +1473,7 @@ async fn run_container_attempt(
     };
     let before = crate::container::parse_manifest(&before_text);
 
-    // The agent run (spawn_blocking: incus exec blocks this thread otherwise).
+    // The agent run (spawn_blocking: docker exec blocks this thread otherwise).
     let argv = crate::container::agent_argv(
         prompt,
         &pin.model,
@@ -1346,7 +1483,7 @@ async fn run_container_attempt(
     );
     let agent_name = name.to_string();
     let agent_result =
-        tokio::task::spawn_blocking(move || incus_exec_lines(&agent_name, &argv, AGENT_TIMEOUT))
+        tokio::task::spawn_blocking(move || docker_exec_lines(&agent_name, &argv, AGENT_TIMEOUT))
             .await
             .unwrap_or_else(|e| Err(format!("agent exec panicked: {e}")));
     let (stdout, stderr, exit_code) = match agent_result {
@@ -1425,7 +1562,13 @@ async fn run_container_attempt(
         } else {
             let mut failures: Vec<String> = Vec::new();
             for cmd in &cmds {
-                let (vout, _) = match exec_capture_sync(name, &crate::container::verify_argv(cmd)) {
+                // The verify budget is its own: a real test suite is the one
+                // in-container command that legitimately runs for minutes.
+                let (vout, _) = match crate::container::exec_capture(
+                    name,
+                    &crate::container::verify_argv(cmd),
+                    VERIFY_TIMEOUT,
+                ) {
                     Ok(v) => v,
                     Err(err) => {
                         failures.push(format!("{cmd}: {err}"));
@@ -1463,6 +1606,7 @@ async fn run_container_attempt(
     if verify_passed != Some(true) {
         cleanup_container_home(name, &home);
         let detail = outcome.error.take().unwrap_or_default();
+        outcome.verify_passed = verify_passed; // Some(false): the gate really failed
         return ContainerRung::failure(outcome, FailureKind::Verification, detail);
     }
 
@@ -1485,23 +1629,41 @@ async fn run_container_attempt(
     let fs_diff = crate::container::diff_manifests(&before, &after);
     let _ = card_scope; // judged by the caller (selection order matters there)
 
-    // Artifact: pull the final tree for post-mortem review, best-effort.
+    // Pull the final tree: it is both the attempt's post-mortem artifact and
+    // the source the winner's changes are written back from, so a failed pull
+    // is an attempt failure — a "success" without it would reach `finalize`
+    // with an untouched worktree and pin no commit at all.
     let pull_name = name.to_string();
-    if let Ok(tar) =
-        tokio::task::spawn_blocking(move || crate::container::pull_task_tar(&pull_name))
-            .await
-            .unwrap_or_else(|e| Err(format!("artifact pull panicked: {e}")))
+    let tar = match tokio::task::spawn_blocking(move || crate::container::pull_task_tar(&pull_name))
+        .await
+        .unwrap_or_else(|e| Err(format!("artifact pull panicked: {e}")))
     {
-        let dir = crate::container::artifacts_dir(card_id, session);
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::write(dir.join("task.tar"), &tar);
+        Ok(tar) => tar,
+        Err(err) => {
+            cleanup_container_home(name, &home);
+            return ContainerRung::failure(
+                outcome,
+                FailureKind::Worktree,
+                format!("could not pull the container task tree: {err}"),
+            );
         }
+    };
+    let dir = crate::container::artifacts_dir(card_id, session);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join("task.tar"), &tar);
     }
     cleanup_container_home(name, &home);
+    // The gate's verdict must land on the record, not just the local: the
+    // caller's selection policy reads `outcome.verify_passed`, and leaving it
+    // at the `None` default made every rung look like one that never reached
+    // the gate — so no container rung could ever be promoted, and `card show`
+    // misreported the gate for the rungs that did run.
+    outcome.verify_passed = Some(true);
     ContainerRung {
         outcome,
         fs_diff,
         failure_kind: FailureKind::Agent,
+        tar: Some(tar),
     }
 }
 
@@ -2492,6 +2654,83 @@ mod tests {
         });
     }
 
+    /// The archive `pull_task_tar` takes from a container's task dir.
+    #[cfg(unix)]
+    fn task_tar_of(dir: &Path) -> Vec<u8> {
+        let out = std::process::Command::new("tar")
+            .arg("-C")
+            .arg(dir)
+            .args(["-cf", "-", "."])
+            .output()
+            .expect("tar is required by the container tier");
+        assert!(out.status.success(), "tar failed: {:?}", out.status);
+        out.stdout
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalize_pins_a_commit_from_a_restored_container_tree() {
+        // The container tier's write-back chain without Docker: restore the task
+        // tar into the host worktree, then `finalize` must pin the agent's work
+        // as a commit on the card's branch. This is exactly what a live run
+        // exercises — when it breaks, the card reaches review with no commit
+        // and `merge` refuses it, which the in-container assertions cannot see.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        with_home(tmp.path(), || {
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            let a = board.add_card("add a feature");
+            board::save_board(&board, "default").unwrap();
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            board::save_board(&b, "default").unwrap();
+
+            let wt = git::card_worktree_dir("default", &a);
+            git::create_worktree(repo.path(), &wt, None).unwrap();
+
+            // The container's final tree: the agent added a file and edited one.
+            let container = tempfile::tempdir().unwrap();
+            std::fs::write(container.path().join("probe.txt"), "hello-from-container\n").unwrap();
+            std::fs::write(container.path().join("README.md"), "# demo\n\nfeature\n").unwrap();
+            let tar = task_tar_of(container.path());
+
+            crate::container::restore_task_dir(&tar, &wt, &[]).unwrap();
+            finalize("default", &a, &wt, false, Some("container won"), None);
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(
+                card.status,
+                CardStatus::Review,
+                "the restored rung must reach review (result: {:?}, failure: {:?})",
+                card.result,
+                card.failure_kind
+            );
+            let commit = card
+                .commit
+                .as_deref()
+                .expect("the restored work must be pinned as a commit");
+            assert_eq!(
+                git::rev_parse(repo.path(), &format!("katban/{a}")),
+                Some(commit.to_string())
+            );
+            // The agent's file is in that commit's tree.
+            let shown = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(["show", &format!("katban/{a}:probe.txt")])
+                .output()
+                .unwrap();
+            assert!(shown.status.success(), "git show failed: {:?}", shown);
+            assert_eq!(
+                String::from_utf8_lossy(&shown.stdout).trim(),
+                "hello-from-container"
+            );
+        });
+    }
+
     #[test]
     fn finalize_does_not_pin_a_commit_on_failure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2792,6 +3031,47 @@ mod tests {
     }
 
     #[test]
+    fn ladder_pins_quick_task_lanes_never_lead() {
+        // The live board that produced this rule: poolside is catalog #1, it is
+        // the highest-priority keyed entry, and its free preview (200
+        // requests/hour) ran dry on every card's first rung. A card is a long
+        // agentic run, so the ladder leads with an ordinary upstream instead.
+        let keyed: HashSet<String> = ["poolside", "nvidia", "cerebras", "google", "zai"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let pins = ladder_pins(2, &[], &keyed, &HashSet::new());
+        let ups: Vec<&str> = pins.iter().map(|p| p.upstream.as_str()).collect();
+        assert_eq!(ups.first(), Some(&"nvidia"), "lead rung: {ups:?}");
+        assert!(
+            !ups.contains(&"poolside"),
+            "a constrained lane must not take a rung while ordinary ones are keyed: {ups:?}"
+        );
+        // With a rung for every keyed upstream it still appears — demoted, not
+        // dropped.
+        let pins = ladder_pins(5, &[], &keyed, &HashSet::new());
+        let ups: Vec<&str> = pins.iter().map(|p| p.upstream.as_str()).collect();
+        assert_eq!(ups.last(), Some(&"poolside"), "demoted to last: {ups:?}");
+
+        // A keyed set of only constrained lanes still produces a full ladder,
+        // in catalog order (never an empty pin list).
+        let only_constrained: HashSet<String> = ["poolside", "groq"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let pins = ladder_pins(2, &[], &only_constrained, &HashSet::new());
+        let ups: Vec<&str> = pins.iter().map(|p| p.upstream.as_str()).collect();
+        assert_eq!(ups, vec!["poolside", "groq"], "all-constrained runs as-is");
+
+        // An admin list still wins verbatim (§4.2): explicit intent is not
+        // second-guessed by the lane ranking.
+        let list = vec!["poolside".to_string(), "zai".to_string()];
+        let pins = ladder_pins(2, &list, &HashSet::new(), &HashSet::new());
+        let ups: Vec<&str> = pins.iter().map(|p| p.upstream.as_str()).collect();
+        assert_eq!(ups, vec!["poolside", "zai"]);
+    }
+
+    #[test]
     fn ladder_empty_without_keys_or_attempts_one() {
         // No keyed upstreams -> no pins (the ladder degrades to the default
         // single run rather than pinning dead upstreams, spec §6.3).
@@ -2801,13 +3081,133 @@ mod tests {
         assert!(ladder_pins(1, &[], &keyed, &HashSet::new()).is_empty());
     }
 
+    /// A finished container rung. `tar` is the completion signal (every
+    /// failure path returns before the pull); on the winning path `error`
+    /// carries the gate's note, which is the skip note when the gate skipped.
+    fn rung(
+        tar: bool,
+        verify_passed: Option<bool>,
+        error: Option<&str>,
+        changed_paths: &[&str],
+    ) -> ContainerRung {
+        let fs_diff = ManifestDiff {
+            modified: changed_paths.iter().map(|p| p.to_string()).collect(),
+            ..ManifestDiff::default()
+        };
+        ContainerRung {
+            outcome: AttemptOutcome {
+                verify_passed,
+                error: error.map(str::to_string),
+                ..AttemptOutcome::default()
+            },
+            fs_diff,
+            failure_kind: FailureKind::Agent,
+            tar: tar.then(Vec::new),
+        }
+    }
+
+    #[test]
+    fn container_rung_with_a_skipped_gate_and_real_work_wins() {
+        // The regression that made the container tier unusable on any project
+        // without test/lint commands: the skip note lives in `outcome.error` on
+        // the WINNING path, so a caller that rejects on `error.is_some()` throws
+        // away every skipped-gate rung no matter what the agent delivered.
+        let skipped = rung(
+            true,
+            Some(true),
+            Some("gate skipped: no test/lint commands detected"),
+            &["./probe.txt"],
+        );
+        assert_eq!(
+            classify_container_rung(&skipped, false),
+            RungVerdict::Winner
+        );
+    }
+
+    #[test]
+    fn container_rung_that_changed_nothing_is_demoted_as_a_no_op() {
+        // A skipped gate selects nothing, so an unchanged tree is not a
+        // deliverable: promoting it would send the card to review with no commit
+        // to merge (the host tier's "no-op run" rule).
+        let no_op = rung(
+            true,
+            Some(true),
+            Some("gate skipped: no test/lint commands detected"),
+            &[],
+        );
+        assert_eq!(
+            classify_container_rung(&no_op, false),
+            RungVerdict::Reject {
+                kind: FailureKind::Agent,
+                note: Some("no-op run: no test/lint commands detected".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn container_rung_that_changed_nothing_still_wins_a_follow_up() {
+        // A follow-up run may legitimately change nothing: the card's prior
+        // commit is the net result, so the rung must not be demoted.
+        let follow_up = rung(
+            true,
+            Some(true),
+            Some("gate skipped: board verify off"),
+            &[],
+        );
+        assert_eq!(
+            classify_container_rung(&follow_up, true),
+            RungVerdict::Winner
+        );
+    }
+
+    #[test]
+    fn container_rung_with_a_real_gate_pass_is_never_demoted_for_being_empty() {
+        // The no-op rule is for a SKIPPED gate only: a gate that actually ran
+        // and passed judged a real tree, so an empty manifest diff (the agent's
+        // work already matched the base) is not a reason to demote it.
+        let passed = rung(true, Some(true), None, &[]);
+        assert_eq!(classify_container_rung(&passed, false), RungVerdict::Winner);
+    }
+
+    #[test]
+    fn container_rung_without_a_pulled_tree_is_rejected_with_its_kind() {
+        // No tar = a failure path, and the rung's own failure kind must survive
+        // so the card's classification (and auto-retry) stays honest.
+        let mut failed = rung(false, None, Some("`docker run` exited 1"), &[]);
+        failed.failure_kind = FailureKind::Worktree;
+        assert_eq!(
+            classify_container_rung(&failed, false),
+            RungVerdict::Reject {
+                kind: FailureKind::Worktree,
+                note: None,
+            }
+        );
+    }
+
+    #[test]
+    fn container_rung_that_failed_the_real_gate_is_rejected() {
+        let failed_gate = rung(
+            true,
+            Some(false),
+            Some("cargo test: exit 1"),
+            &["./src/lib.rs"],
+        );
+        assert_eq!(
+            classify_container_rung(&failed_gate, false),
+            RungVerdict::Reject {
+                kind: FailureKind::Agent,
+                note: None,
+            }
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn container_runtime_without_incus_fails_loudly_per_rung() {
-        // Container tier (spec §8) with incus unavailable: every rung records
+    async fn container_runtime_without_docker_fails_loudly_per_rung() {
+        // Container tier (spec §8) with Docker unavailable: every rung records
         // a loud environment error (Worktree failure kind), the card fails —
         // nothing silently passes or misclassifies as an agent error. This
-        // is the CI-safe contract; a live incus run exercises the happy path.
+        // is the CI-safe contract; a live container run exercises the happy path.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
@@ -2822,7 +3222,7 @@ mod tests {
             .unwrap();
             crate::projects::set_repo_root("default", repo.path()).unwrap();
             let mut board = Board::new();
-            board.runtime = crate::board::ContainerRuntime::Incus;
+            board.runtime = crate::board::ContainerRuntime::Docker;
             board.attempts = 2;
             board.attempt_upstreams = vec!["zai".to_string(), "groq".to_string()];
             board.auto_review = false;
@@ -2855,7 +3255,7 @@ mod tests {
             let b = board::load_board("default").unwrap().unwrap();
             let card = b.card(&a).unwrap();
             if crate::container::available() {
-                // incus IS reachable on this host: the happy path ran (or a
+                // Docker IS reachable on this host: the happy path ran (or a
                 // real infra error surfaced). Either way the ladder engaged —
                 // assert the matrix exists and skip the unavailable-path
                 // assertions.
@@ -2867,9 +3267,79 @@ mod tests {
                     assert_eq!(rung.verify_passed, None, "no gate without a container");
                     let err = rung.error.as_deref().unwrap_or_default();
                     assert!(!err.is_empty(), "loud failure: {err}");
+                    // The rung must fail at the ENVIRONMENT step (no Docker),
+                    // not at worktree setup. `run_one_card` already created the
+                    // card worktree and `git worktree add` is not idempotent,
+                    // so a second create failed every rung with "already
+                    // exists" and no container card ever ran. The runtime error
+                    // is what pins that; the old message named no runtime.
+                    assert!(
+                        err.contains("docker"),
+                        "the rung must fail on the missing runtime, not on worktree setup: {err}"
+                    );
                 }
                 assert!(card.picked_attempt.is_none());
             }
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn container_runtime_without_a_ladder_fails_with_the_reason() {
+        // `runtime docker` on the default `attempts 1` board has no ladder to
+        // containerize — the tier IS the containerized attempts ladder, it has
+        // no single-attempt mode (unlike the host tier's unpinned fallback).
+        // The old path fell through to the generic "all attempts failed" with
+        // zero rung records, which named no cause and launched nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.runtime = crate::board::ContainerRuntime::Docker;
+            // attempts stays at the default (1) — that is the case under test.
+            board.attempt_upstreams = vec!["zai".to_string()];
+            let a = board.add_card("add a feature");
+            seeded_board(&board);
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            board::save_board(&b, "default").unwrap();
+
+            let executor: Arc<dyn CardExecutor> = Arc::new(FakeExecutor::new(true));
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Failed);
+            assert!(
+                card.attempts.is_empty(),
+                "no rung runs without a ladder: {:?}",
+                card.attempts
+            );
+            assert_eq!(card.failure_kind, Some(FailureKind::Worktree));
+            let result = card.result.as_deref().unwrap_or_default();
+            assert!(
+                result.contains("attempts ladder"),
+                "the failure must name the fix, not just 'all attempts failed': {result}"
+            );
             match previous {
                 Some(value) => std::env::set_var("CLAWDE_HOME", value),
                 None => std::env::remove_var("CLAWDE_HOME"),

@@ -1,6 +1,6 @@
 {
   "source": "src-rust/crates/api/src/providers/free/catalog.rs",
-  "source_sha256": "fbeb13ef7b2d9e5a6b17a4efe99eca49d755c78ae946fed940e9bfcb1a52978d",
+  "source_sha256": "32f2cd793d759649244794a70048f81cfc704ba14b78f1db4624a5877df483e9",
   "upstreams": [
     {
       "id": "github-copilot",

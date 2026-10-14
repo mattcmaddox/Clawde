@@ -7,6 +7,7 @@ on:
       - 'src-rust/**'
       - 'scripts/probes/tui-permissions-smoke.py'
       - 'scripts/probes/katban-board-ux-probe.py'
+      - 'scripts/probes/katban-docker-card-probe.py'
       - 'scripts/probes/catchat-ux-probe.py'
       - 'scripts/audit-env-tests.py'
       - 'scripts/audit-tokio-file-flush.py'
@@ -21,6 +22,7 @@ on:
       - 'src-rust/**'
       - 'scripts/probes/tui-permissions-smoke.py'
       - 'scripts/probes/katban-board-ux-probe.py'
+      - 'scripts/probes/katban-docker-card-probe.py'
       - 'scripts/probes/catchat-ux-probe.py'
       - 'scripts/audit-env-tests.py'
       - 'scripts/audit-tokio-file-flush.py'
@@ -198,6 +200,20 @@ jobs:
           python3 scripts/probes/tui-permissions-smoke.py \
             --binary src-rust/target/debug/clawde \
             --timeout-secs 20
+
+      # Container-tier plumbing (`board runtime docker`). The card phase runs a
+      # real free-tier agent, so it stays a dev-machine probe; what CI can prove
+      # is the plumbing the lane rests on — instance launch, worktree/binary/home
+      # push, exec with a deadline, artifact pull and teardown against a real
+      # Docker daemon, plus the tar/restore facts `restore_task_dir` assumes. No
+      # keys, no agent, about a minute. The lane was built on Incus and ported to
+      # Docker (2026-10-13) for exactly this step: runners ship Docker, not Incus.
+      - name: Katban container plumbing probe
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/probes/katban-docker-card-probe.py \
+            --binary src-rust/target/debug/clawde \
+            --plumbing
 
       # Board UI probe. The board web app is one embedded HTML+JS document with
       # no frontend build step, so nothing above this line compiles or exercises

@@ -74,7 +74,7 @@ Two separate products:
 
 - **Cat Chat** is a public-facing sandbox for guest conversations.
 - **Katban** is the real development feature for agent Kanban work, project repos, execution, review, verification, and dev sites.
-- **Katban attempts:N** — `clawde katban board attempts <N>` runs each card up to N times on different free-catalog model families; the verify gate promotes the first pass. `board attempts-upstreams [ids...]` pins the rotation (empty = auto). `board runtime incus` moves attempts into ephemeral Incus containers (in-container verify, FS-manifest scope gate via `board card scope <ID> <paths...>`); default `host`.
+- **Katban attempts:N** — `clawde katban board attempts <N>` runs each card up to N times on different free-catalog model families; the verify gate promotes the first pass. `board attempts-upstreams [ids...]` pins the rotation (empty = auto). `board runtime docker` moves attempts into ephemeral Docker containers (in-container verify, FS-manifest scope gate via `board card scope <ID> <paths...>`); default `host`.
 
 They use separate state directories and separate password policies. See [docs/catchat.md](catchat.md) and [docs/katban.md](katban.md).
 

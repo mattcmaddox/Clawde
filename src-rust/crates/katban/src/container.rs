@@ -1,7 +1,9 @@
-//! Incus container plumbing for the container tier (spec §8, Phase 3).
+//! Docker container plumbing for the container tier (spec §8, Phase 3).
 //!
-//! Ported from the proven eval harness (`scripts/eval/best_of_n.py`): an
-//! ephemeral container per attempt, the card worktree pushed in, the agent
+//! Ported from the proven eval harness (`scripts/eval/best_of_n.py`, which
+//! still drives Incus) and moved from Incus to Docker on 2026-10-13 so this
+//! plumbing can run in CI — GitHub runners ship Docker, not Incus. The shape
+//! is unchanged: an ephemeral container per attempt, the card worktree pushed in, the agent
 //! run with `bypass-permissions` (the container IS the safety boundary), the
 //! verify gate run in-container, and a sha256 filesystem manifest of the
 //! task dir before and after the run — whose diff is what the scope gate
@@ -10,16 +12,20 @@
 //!
 //! The dependency-provisioning phase mirrors the gate's install-failure
 //! semantics: an apt failure is an environment error (`Err`), not a card
-//! failure.
+//! failure. Docker's stock `ubuntu:24.04` is barer than the Incus cloud image
+//! the lane was proven on — no CA store, no git — so `ensure_binary_deps`
+//! installs its base set unconditionally (see `BASE_PACKAGES`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Container image the tier launches (cloud image so `apt` and a root shell
-/// work out of the box).
-pub const DEFAULT_IMAGE: &str = "images:ubuntu/24.04/cloud";
+/// Container image the tier launches. The binary pushed in is the *host's*
+/// debug build, so the image has to be the host's distro for its glibc link
+/// to resolve; its remaining dynamic deps are apt-installed in-container (see
+/// [`ensure_binary_deps`]).
+pub const DEFAULT_IMAGE: &str = "ubuntu:24.04";
 /// Prefix for ephemeral instances; collisions use a uuid suffix.
 pub const CONTAINER_PREFIX: &str = "clawde-katban";
 /// Where the card worktree is mounted inside the container (the agent's cwd).
@@ -112,74 +118,147 @@ pub fn diff_manifests(
 }
 
 // ---------------------------------------------------------------------------
-// Incus plumbing. Every call surfaces the exact argv on failure.
+// Docker plumbing. Every call surfaces the exact argv on failure.
 // ---------------------------------------------------------------------------
 
-fn run_incus(args: &[String], timeout: Duration) -> Result<(String, String, i32), String> {
-    let argv: Vec<&str> = std::iter::once("incus")
+/// Run `program` with a real wall-clock deadline. `Command::output()` has no
+/// timeout seam, so the child is spawned with piped streams, two reader
+/// threads drain them (a full pipe would otherwise deadlock it), and the poll
+/// loop kills the client at the deadline — an unbounded runtime call used to
+/// hang the whole attempt, and with it the card's runner slot forever.
+/// `not_found_hint` is the caller's advice for a missing binary.
+fn run_program(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    not_found_hint: &str,
+) -> Result<(String, String, i32), String> {
+    use std::io::Read;
+    let argv: Vec<&str> = std::iter::once(program)
         .chain(args.iter().map(String::as_str))
         .collect();
-    let output = Command::new("incus")
-        .args(&argv[1..])
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                "`incus` binary not found on PATH — the container tier requires Incus".to_string()
+                not_found_hint.to_string()
             } else {
-                format!("could not run `incus`: {e}")
+                format!("could not run `{program}`: {e}")
             }
         })?;
-    // Timeout on `output()` is not available; spawn+wait where it matters
-    // (launch, apt) is bounded by the callers' own retry/deadline logic and
-    // incus's own behavior. Capture-based calls here are all sub-second.
-    let _ = timeout;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let code = output.status.code().unwrap_or(-1);
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "child stdout was not piped".to_string())?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "child stderr was not piped".to_string())?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("could not wait for `{}`: {e}", argv.join(" ")));
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(format!(
+                "`{}` exceeded its {}s deadline and was killed",
+                argv.join(" "),
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+    let code = status.code().unwrap_or(-1);
     if code != 0 {
         return Err(format!(
             "`{}` exited {code}  stderr: {}",
             argv.join(" "),
-            stderr
-                .trim()
-                .chars()
-                .rev()
-                .take(400)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
+            tail(&stderr, 400)
         ));
     }
     Ok((stdout, stderr, code))
 }
 
-/// Whether incusd is reachable (a cheap `incus list`). False = the tier is
-/// unavailable and the runner must not use it.
-pub fn available() -> bool {
-    Command::new("incus")
-        .args(["list", "--format", "csv"])
-        .stdin(Stdio::null())
-        .output()
-        .is_ok_and(|o| o.status.success())
+/// `docker` with the container tier's not-found advice. Every call site is
+/// deadline-bounded (see [`run_program`]).
+fn run_docker(args: &[String], timeout: Duration) -> Result<(String, String, i32), String> {
+    run_program(
+        "docker",
+        args,
+        timeout,
+        "`docker` binary not found on PATH — the container tier requires Docker",
+    )
 }
 
-/// Launch an ephemeral container and wait until `incus exec` is ready.
+/// The last `n` characters of `text`, for the error tails the tier prints.
+fn tail(text: &str, n: usize) -> String {
+    let mut chars: Vec<char> = text.trim().chars().rev().take(n).collect();
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
+/// Whether dockerd is reachable (a cheap `docker info`, deadline-bounded like
+/// every other docker call — an unresponsive daemon must not wedge
+/// `board runtime docker`). False = the tier is unavailable and the runner
+/// must not use it.
+pub fn available() -> bool {
+    run_docker(&["info".to_string()], Duration::from_secs(10)).is_ok()
+}
+
+/// Launch an ephemeral container and wait until `docker exec` is ready.
+///
+/// `--rm` is the ephemeral half: Docker removes the container when it exits,
+/// so a killed attempt cannot leave an instance behind. A stale container
+/// still holding this name (a SIGKILLed run) would otherwise fail `docker run`
+/// on the name alone, so it is force-removed first — free when there is
+/// nothing to remove.
 pub fn launch(name: &str, image: &str) -> Result<(), String> {
-    run_incus(
+    stop_force(name);
+    run_docker(
         &[
-            "launch".into(),
-            "--ephemeral".into(),
-            image.to_string(),
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
             name.to_string(),
+            "--rm".into(),
+            image.to_string(),
+            "sleep".into(),
+            "infinity".into(),
         ],
         Duration::from_secs(300),
     )?;
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        if let Ok((_, _, code)) = run_incus(
-            &["exec".into(), name.into(), "--".into(), "true".into()],
+        if let Ok((_, _, code)) = run_docker(
+            &["exec".into(), name.into(), "true".into()],
             Duration::from_secs(10),
         ) {
             if code == 0 {
@@ -194,13 +273,12 @@ pub fn launch(name: &str, image: &str) -> Result<(), String> {
 }
 
 /// Push a host directory's contents into `container_dir` by piping a tar
-/// stream (the harness's `push_home` mechanism).
+/// stream through `docker exec -i` (the harness's `push_home` mechanism).
 pub fn push_dir(host_dir: &Path, name: &str, container_dir: &str) -> Result<(), String> {
-    run_incus(
+    run_docker(
         &[
             "exec".into(),
             name.into(),
-            "--".into(),
             "mkdir".into(),
             "-p".into(),
             container_dir.into(),
@@ -215,11 +293,11 @@ pub fn push_dir(host_dir: &Path, name: &str, container_dir: &str) -> Result<(), 
         .spawn()
         .map_err(|e| format!("could not start tar: {e}"))?;
     let tar_stdout = tar.stdout.take().expect("stdout was piped");
-    let extract = Command::new("incus")
-        .args(["exec", name, "--", "tar", "-x", "-C", container_dir])
+    let extract = Command::new("docker")
+        .args(["exec", "-i", name, "tar", "-x", "-C", container_dir])
         .stdin(Stdio::from(tar_stdout))
         .output()
-        .map_err(|e| format!("tar extract via incus failed: {e}"))?;
+        .map_err(|e| format!("tar extract via docker failed: {e}"))?;
     let tar_rc = tar.wait().map_err(|e| format!("tar wait failed: {e}"))?;
     if !extract.status.success() || !tar_rc.success() {
         let err = String::from_utf8_lossy(&extract.stderr);
@@ -228,28 +306,42 @@ pub fn push_dir(host_dir: &Path, name: &str, container_dir: &str) -> Result<(), 
             host_dir.display(),
             tar_rc.code().unwrap_or(-1),
             extract.status.code().unwrap_or(-1),
-            err.trim()
-                .chars()
-                .rev()
-                .take(400)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
+            tail(&err, 400)
         ));
     }
     Ok(())
 }
 
-/// Push one host file into the container (`--create-dirs` for the target).
+/// Push one host file into the container.
+///
+/// `docker cp` has no `--create-dirs` (its Incus counterpart did), so the
+/// destination's parent is created first — the binary lands at
+/// `/usr/local/bin/clawde` and the seeded auth store at
+/// `/root/.clawde/auth.json`, neither of which exists in a bare image.
+/// Creating the parent also pins `docker cp`'s meaning: a destination that
+/// exists as a *directory* means "copy into it", which is not what any caller
+/// here wants.
 pub fn push_file(host_file: &Path, name: &str, container_path: &str) -> Result<(), String> {
-    run_incus(
+    let parent = container_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or("/");
+    run_docker(
         &[
-            "file".into(),
-            "push".into(),
-            "--create-dirs".into(),
+            "exec".into(),
+            name.into(),
+            "mkdir".into(),
+            "-p".into(),
+            parent.to_string(),
+        ],
+        Duration::from_secs(15),
+    )?;
+    run_docker(
+        &[
+            "cp".into(),
             host_file.display().to_string(),
-            format!("{name}{container_path}"),
+            format!("{name}:{container_path}"),
         ],
         Duration::from_secs(600),
     )
@@ -257,14 +349,17 @@ pub fn push_file(host_file: &Path, name: &str, container_path: &str) -> Result<(
 }
 
 /// Run argv inside the container, capturing all output.
+///
+/// No `--` separator (Incus wanted one): Docker's CLI takes everything after
+/// CONTAINER as the command, so a literal `--` would be read as the command.
 pub fn exec_capture(
     name: &str,
     argv: &[String],
     timeout: Duration,
 ) -> Result<(String, String), String> {
-    let mut args = vec!["exec".to_string(), name.to_string(), "--".to_string()];
+    let mut args = vec!["exec".to_string(), name.to_string()];
     args.extend(argv.iter().cloned());
-    let (stdout, stderr, _) = run_incus(&args, timeout)?;
+    let (stdout, stderr, _) = run_docker(&args, timeout)?;
     Ok((stdout, stderr))
 }
 
@@ -287,33 +382,53 @@ fn missing_shared_libs(name: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Install missing runtime libs for the binary inside the container. Returns
-/// what was installed (empty when nothing was missing). `Err` = the attempt's
+/// Packages every attempt installs, whatever `ldd` reports.
+///
+/// `ca-certificates` is the one that bit live (2026-10-13, first Docker run):
+/// the pushed binary builds a `reqwest` client at startup, and a bare
+/// `ubuntu:24.04` ships no system trust store, so the process panicked before
+/// its first request ("No CA certificates were loaded from the system"). A
+/// missing *shared library* is visible to `ldd`; a missing trust store is
+/// not — which is why this set is unconditional. `git` restores parity with
+/// the image the lane was proven on (the Incus cloud image had it), so an
+/// agent or a project check that shells out to git finds the tool.
+const BASE_PACKAGES: &[&str] = &["ca-certificates", "git"];
+
+/// The container's system trust store — what `BASE_PACKAGES` exists to
+/// provide, asserted rather than assumed.
+const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+/// Provision the container so the pushed binary and the agent can run in it:
+/// the base packages every attempt needs plus whichever runtime libs `ldd`
+/// reports missing. Returns what was installed. `Err` = the attempt's
 /// environment cannot host the binary — the caller treats this as an
 /// environment error, not a card failure (the gate's install-failure skip
 /// semantics).
 pub fn ensure_binary_deps(name: &str) -> Result<Vec<String>, String> {
     let missing = missing_shared_libs(name)?;
-    if missing.is_empty() {
-        return Ok(Vec::new());
+    let mut pkgs: Vec<String> = BASE_PACKAGES.iter().map(|p| p.to_string()).collect();
+    if !missing.is_empty() {
+        // The distro decides which package carries the missing .so (libasound
+        // is `libasound2t64` on Ubuntu/Debian post-t64).
+        let (os_release, _) = exec_capture(
+            name,
+            &["bash".into(), "-c".into(), "cat /etc/os-release".into()],
+            Duration::from_secs(15),
+        )?;
+        let distro = os_release
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("ID=")
+                    .map(|v| v.trim_matches('"').to_string())
+            })
+            .unwrap_or_default();
+        let lib_pkgs = APT_PACKAGES_BY_DISTRO
+            .iter()
+            .find(|(id, _)| *id == distro)
+            .map(|(_, p)| *p)
+            .unwrap_or(APT_FALLBACK_PACKAGES);
+        pkgs.extend(lib_pkgs.iter().map(|p| p.to_string()));
     }
-    let (os_release, _) = exec_capture(
-        name,
-        &["bash".into(), "-c".into(), "cat /etc/os-release".into()],
-        Duration::from_secs(15),
-    )?;
-    let distro = os_release
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("ID=")
-                .map(|v| v.trim_matches('"').to_string())
-        })
-        .unwrap_or_default();
-    let pkgs: &[&str] = APT_PACKAGES_BY_DISTRO
-        .iter()
-        .find(|(id, _)| *id == distro)
-        .map(|(_, p)| *p)
-        .unwrap_or(APT_FALLBACK_PACKAGES);
     let install = format!(
         "apt-get update -qq && apt-get install -y -qq {}",
         pkgs.join(" ")
@@ -326,36 +441,39 @@ pub fn ensure_binary_deps(name: &str) -> Result<Vec<String>, String> {
     let still = missing_shared_libs(name)?;
     if !still.is_empty() {
         return Err(format!(
-            "binary still missing shared libs after apt install: {} (tail: {})",
+            "binary still missing shared libs after installing {}: {} (tail: {})",
+            pkgs.join(" "),
             still.join(", "),
-            stderr
-                .trim()
-                .chars()
-                .rev()
-                .take(160)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
+            tail(&stderr, 160)
         ));
     }
-    Ok(pkgs.iter().map(|p| p.to_string()).collect())
+    // Prove the trust store landed. Without it the binary panics on its first
+    // HTTPS client, which would surface on the rung as an agent error instead
+    // of the environment error it is.
+    let (certs, _) = exec_capture(
+        name,
+        &[
+            "bash".into(),
+            "-c".into(),
+            format!("test -s {CA_BUNDLE} && echo ok"),
+        ],
+        Duration::from_secs(15),
+    )?;
+    if !certs.contains("ok") {
+        return Err(format!(
+            "the container has no system CA bundle at {CA_BUNDLE} after installing {} — the \
+             pushed binary cannot make an HTTPS request without one",
+            pkgs.join(" ")
+        ));
+    }
+    Ok(pkgs)
 }
 
 /// Pull the container task dir back as a tar byte stream (the attempt's
 /// artifact, attached to the record for post-mortem).
 pub fn pull_task_tar(name: &str) -> Result<Vec<u8>, String> {
-    let output = Command::new("incus")
-        .args([
-            "exec",
-            name,
-            "--",
-            "tar",
-            "-c",
-            "-C",
-            CONTAINER_TASK_DIR,
-            ".",
-        ])
+    let output = Command::new("docker")
+        .args(["exec", name, "tar", "-c", "-C", CONTAINER_TASK_DIR, "."])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("could not pull task tar: {e}"))?;
@@ -369,11 +487,13 @@ pub fn pull_task_tar(name: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Force-stop an ephemeral instance (its teardown). Best-effort: a failed
+/// Force-stop an ephemeral container (its teardown). Best-effort: a failed
 /// stop is logged by the caller, never fatal — the eval's `finally` block.
+/// `rm -f` covers both states (running and already-exited) and, together with
+/// `--rm` on the run, is what removes the instance for good.
 pub fn stop_force(name: &str) {
-    let _ = Command::new("incus")
-        .args(["stop", "--force", name])
+    let _ = Command::new("docker")
+        .args(["rm", "-f", name])
         .stdin(Stdio::null())
         .output();
 }
@@ -457,7 +577,7 @@ pub fn pin_settings_json(pin_upstream: &str, catalog_ids: &[&str]) -> String {
 }
 
 /// Container name for a card attempt: prefix + card + rung index, sanitized
-/// to the charset incus accepts. Callers append a short unique suffix.
+/// to the charset Docker accepts. Callers append a short unique suffix.
 pub fn container_name(card_id: &str, rung: usize) -> String {
     let safe: String = card_id
         .chars()
@@ -479,6 +599,73 @@ pub fn artifacts_dir(card_id: &str, session: &str) -> PathBuf {
         .join("container-artifacts")
         .join(sanitize(card_id))
         .join(session)
+}
+
+/// Write the container's final task tree back into the host worktree.
+///
+/// The tar is the archive `pull_task_tar` took from the container's task dir,
+/// which was itself pushed from this worktree — so extracting it restores the
+/// agent's modified and added files. A tar cannot express a *deletion*, so the
+/// paths the agent removed come from the manifest diff (`deleted`) and are
+/// removed on the host explicitly.
+///
+/// `.git` is excluded: inside the container the worktree's `.git` is a pointer
+/// file into a path that does not exist there, so the archive's copy is
+/// meaningless and must never overwrite the host's real worktree metadata.
+///
+/// Without this the host checkout is exactly what was pushed in, `finalize`
+/// diffs an untouched tree, and the card reaches review with no pinned commit.
+pub fn restore_task_dir(tar: &[u8], work_dir: &Path, deleted: &[String]) -> Result<(), String> {
+    use std::io::Write;
+    let dir = work_dir
+        .to_str()
+        .ok_or_else(|| "worktree path is not valid UTF-8".to_string())?;
+    let mut child = Command::new("tar")
+        .args(["-x", "-C", dir, "--exclude=./.git"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start tar: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "tar stdin was not piped".to_string())?;
+    let payload = tar.to_vec();
+    // A writer thread: tar may exit early (a truncated archive) and the write
+    // then fails with EPIPE rather than blocking this thread on a full pipe.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&payload);
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("tar wait failed: {e}"))?;
+    let _ = writer.join();
+    if !output.status.success() {
+        return Err(format!(
+            "extracting the container task tar into {} failed (rc={}): {}",
+            work_dir.display(),
+            output.status.code().unwrap_or(-1),
+            tail(&String::from_utf8_lossy(&output.stderr), 400)
+        ));
+    }
+    for entry in deleted {
+        // The manifest is container data: refuse absolute paths and any
+        // traversal rather than deleting outside the worktree.
+        let Some(relative) = entry.strip_prefix("./") else {
+            continue;
+        };
+        let path = Path::new(relative);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let _ = std::fs::remove_file(work_dir.join(path));
+    }
+    Ok(())
 }
 
 fn sanitize(id: &str) -> String {
@@ -584,9 +771,137 @@ short  ./x
     }
 
     #[test]
-    fn container_name_is_incus_safe() {
+    fn container_name_is_docker_safe() {
         let name = container_name("abc123", 2);
         assert!(name.starts_with("clawde-katban-abc123-2"));
         assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    // The deadline used to be discarded (`let _ = timeout;`), so a `docker`
+    // call that never returned hung the attempt — and its runner slot —
+    // forever. `run_program` is the seam that made the deadline real, and it
+    // is exercised here with a plain `sleep` so no Docker daemon is needed.
+    #[cfg(unix)]
+    #[test]
+    fn run_program_kills_a_child_that_outlives_its_deadline() {
+        let started = Instant::now();
+        let err = run_program(
+            "sleep",
+            &["30".to_string()],
+            Duration::from_millis(200),
+            "missing",
+        )
+        .expect_err("a 30s child must not outlive a 200ms deadline");
+        assert!(err.contains("deadline"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the child should be killed promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_program_captures_output_and_reports_a_nonzero_exit() {
+        let (out, _, code) = run_program(
+            "sh",
+            &["-c".to_string(), "echo hi".to_string()],
+            Duration::from_secs(10),
+            "missing",
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "hi");
+
+        let err = run_program(
+            "sh",
+            &["-c".to_string(), "echo boom >&2; exit 3".to_string()],
+            Duration::from_secs(10),
+            "missing",
+        )
+        .unwrap_err();
+        assert!(err.contains("exited 3"), "{err}");
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    /// Build the archive `pull_task_tar` would return for `dir` (the same
+    /// `tar -c -C <dir> .` argv), so the restore test needs no Docker daemon.
+    #[cfg(unix)]
+    fn task_tar_of(dir: &Path) -> Vec<u8> {
+        let out = Command::new("tar")
+            .arg("-C")
+            .arg(dir)
+            .args(["-cf", "-", "."])
+            .output()
+            .expect("tar is required by the container tier");
+        assert!(out.status.success(), "tar failed: {:?}", out.status);
+        out.stdout
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_task_dir_writes_the_container_tree_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let container = tmp.path().join("container");
+        std::fs::create_dir_all(container.join("src")).unwrap();
+        std::fs::write(container.join("src/modified.rs"), "agent version\n").unwrap();
+        std::fs::write(container.join("src/added.rs"), "brand new\n").unwrap();
+        std::fs::write(container.join(".git"), "container pointer\n").unwrap();
+
+        // The host worktree as it was pushed in: the old file, a file the
+        // agent deleted, and the real worktree git metadata.
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/modified.rs"), "old version\n").unwrap();
+        std::fs::write(work.join("src/gone.rs"), "deleted by the agent\n").unwrap();
+        std::fs::write(work.join(".git"), "gitdir: /repo/.git/worktrees/card\n").unwrap();
+
+        let tar = task_tar_of(&container);
+        restore_task_dir(&tar, &work, &["./src/gone.rs".to_string()])
+            .expect("restore should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(work.join("src/modified.rs")).unwrap(),
+            "agent version\n",
+            "the agent's edit must land on the host"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join("src/added.rs")).unwrap(),
+            "brand new\n"
+        );
+        assert!(
+            !work.join("src/gone.rs").exists(),
+            "a manifest-deleted path must be removed from the worktree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join(".git")).unwrap(),
+            "gitdir: /repo/.git/worktrees/card\n",
+            "the host worktree metadata must never be overwritten"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_task_dir_refuses_to_delete_outside_the_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let container = tmp.path().join("container");
+        std::fs::create_dir_all(&container).unwrap();
+        std::fs::write(container.join("keep.txt"), "hi\n").unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, "must survive\n").unwrap();
+
+        let tar = task_tar_of(&container);
+        restore_task_dir(
+            &tar,
+            &work,
+            &["../outside.txt".to_string(), "/etc/hosts".to_string()],
+        )
+        .unwrap();
+        assert!(
+            outside.exists(),
+            "a traversal entry must not delete outside the worktree"
+        );
     }
 }

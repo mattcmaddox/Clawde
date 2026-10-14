@@ -80,6 +80,9 @@ impl SlashCommand for KatbanCommand {
          /katban board card show <id>    — show a card's status, result, commit, diff\n\
          /katban board link <a> <b>      — make <a> wait for <b> (cycle-checked)\n\
          /katban board unlink <a> <b>    — remove that dependency\n\
+         /katban board card edit <id> <prompt> — replace a card's prompt\n\
+         /katban board card scope <id> [paths...] — pin a card's allowed paths\n\
+         /katban board runtime host|docker — where card attempts execute\n\
          /katban project list            — board -> git repo registry\n\
          /katban site list               — hosted sites\n\n\
          Board commands take an optional `--project NAME` (default: 'default'),\n\
@@ -738,18 +741,43 @@ fn board_set_attempts(project: Option<&str>, n: &str) -> Result<String, String> 
     ))
 }
 
-/// Set where card attempts execute (`/katban board runtime incus|host`,
-/// spec §8). Container attempts need the `incus` CLI; `host` is the default.
+/// Set where card attempts execute (`/katban board runtime docker|host`,
+/// spec §8). Container attempts need a reachable Docker daemon; `host` is the
+/// default.
 fn board_set_runtime(project: Option<&str>, token: &str) -> Result<String, String> {
+    // The lane moved from Incus to Docker (2026-10-13). A stored `"incus"`
+    // board migrates on load; a typed token is user intent, so name the new
+    // value rather than a bare "unknown".
+    if token.trim().eq_ignore_ascii_case("incus") {
+        return Err(
+            "the container tier moved from Incus to Docker — use `/katban board runtime docker` \
+             (a board already storing 'incus' loads as the docker lane)"
+                .to_string(),
+        );
+    }
     let Some(runtime) = clawde_katban::board::ContainerRuntime::parse(token) else {
-        return Err(format!("runtime needs 'host' or 'incus', got '{token}'"));
+        return Err(format!("runtime needs 'host' or 'docker', got '{token}'"));
     };
-    if runtime == clawde_katban::board::ContainerRuntime::Incus
+    if runtime == clawde_katban::board::ContainerRuntime::Docker
         && !clawde_katban::container::available()
     {
         return Err(
-            "incus is not reachable (`incus list` failed) — is incusd running?".to_string(),
+            "docker is not reachable (`docker info` failed) — is dockerd running?".to_string(),
         );
+    }
+    if runtime == clawde_katban::board::ContainerRuntime::Docker {
+        // Same gate as the CLI switch: the tier runs the attempts ladder in
+        // containers (spec §8), and `attempts` defaults to 1, so a board with
+        // no ladder would fail every card on an empty rung list with only the
+        // generic "all attempts failed". Refuse where the fix is namable.
+        let attempts = with_board_lock(project, |board| board.attempts)?;
+        if attempts < 2 {
+            return Err(format!(
+                "the docker tier runs the attempts ladder in containers, so it needs at least 2 \
+                 attempts (this board has {attempts}) — run `/katban board attempts 2`, then \
+                 either `/katban board attempts-upstreams <ID>` or configure free keys"
+            ));
+        }
     }
     let stored = with_board_lock(project, |board| board.set_runtime(runtime))?;
     Ok(format!(

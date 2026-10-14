@@ -542,10 +542,38 @@ async fn site_serve(opts: SiteOpts) -> anyhow::Result<()> {
     host::run_on(root, addr, live).await
 }
 
+/// The complete managed-config text for a `site expose`: every exposed dev
+/// site, the Cat Chat guest block when Cat Chat is exposed, and the admin-board
+/// block when the board is exposed.
+///
+/// `apply_managed_include` replaces the entire file, so every expose path must
+/// render the *complete* set — a role omitted here is a role this command
+/// silently deletes from caddy. `site expose` used to pass `None` for the
+/// guest block, which took `chat.example.com` offline (with a reload) on any
+/// host that also exposed Cat Chat.
+fn managed_config_text(
+    exposed: &[(
+        clawde_katban::config::SiteConfig,
+        clawde_katban::caddy::SiteKind,
+    )],
+) -> anyhow::Result<String> {
+    let guest = guest_block_for_expose()?;
+    let board = admin_board_block()?;
+    Ok(clawde_katban::caddy::render_config(
+        exposed,
+        guest.as_ref().map(|(host, port)| (host.as_str(), *port)),
+        board.as_ref().map(|(host, port)| (host.as_str(), *port)),
+    ))
+}
+
+/// The Cat Chat guest block `(host, port)` when Cat Chat has been exposed.
+fn guest_block_for_expose() -> anyhow::Result<Option<(String, u16)>> {
+    let store = clawde_katban::catchat::links::load()?;
+    Ok(guest_block_from(&store))
+}
+
 async fn site_expose(opts: SiteOpts) -> anyhow::Result<()> {
-    use clawde_katban::caddy::{
-        katban_bootstrap_instructions, render_config, site_kind, DEFAULT_INCLUDE_NAME,
-    };
+    use clawde_katban::caddy::{katban_bootstrap_instructions, site_kind, DEFAULT_INCLUDE_NAME};
     use clawde_katban::config::load;
 
     if let Some(kind) = &opts.kind {
@@ -594,12 +622,7 @@ async fn site_expose(opts: SiteOpts) -> anyhow::Result<()> {
         })
         .collect();
 
-    let board = admin_board_block()?;
-    let text = render_config(
-        &exposed,
-        None,
-        board.as_ref().map(|(h, p)| (h.as_str(), *p)),
-    );
+    let text = managed_config_text(&exposed)?;
     let caddy_dir = opts
         .caddy_dir
         .unwrap_or_else(|| PathBuf::from("/etc/caddy"));
@@ -706,11 +729,11 @@ the one admin password and IGNORES it.
                                          first attempt to pass the verify gate wins
   attempts-upstreams [ID...]             Pin the attempts rotation to catalog
                                          upstream ids (empty = auto-derive)
-  runtime host|incus                     Where attempts execute: the host
+  runtime host|docker                    Where attempts execute: the host
                                          worktree lane (default) or an
-                                         ephemeral Incus container per attempt
+                                         ephemeral Docker container per attempt
                                          (in-container verify, FS-manifest
-                                         scope gate; requires incusd)
+                                         scope gate; requires a docker daemon)
   run [--project NAME]                   Run the scheduler for one project (executes ready cards)
 
 The board UI serves on 127.0.0.1:<port> (default 8790). Binding a
@@ -1240,18 +1263,42 @@ async fn run_board(args: &[String]) -> anyhow::Result<()> {
         "runtime" => {
             // Container tier switch (spec §8): where card attempts execute.
             if rest.len() != 1 {
-                anyhow::bail!("board runtime needs 'host' or 'incus'");
+                anyhow::bail!("board runtime needs 'host' or 'docker'");
+            }
+            // The lane was built on Incus and moved to Docker (2026-10-13).
+            // A stored `"incus"` board migrates on load, but a typed token is
+            // user intent — name the new value instead of a bare "unknown".
+            if rest[0].eq_ignore_ascii_case("incus") {
+                anyhow::bail!(
+                    "the container tier moved from Incus to Docker — use `board runtime docker` \
+                     (a board already storing 'incus' loads as the docker lane)"
+                );
             }
             let Some(runtime) = clawde_katban::board::ContainerRuntime::parse(&rest[0]) else {
-                anyhow::bail!("runtime needs 'host' or 'incus' (got '{}')", rest[0]);
+                anyhow::bail!("runtime needs 'host' or 'docker' (got '{}')", rest[0]);
             };
-            if runtime == clawde_katban::board::ContainerRuntime::Incus
+            if runtime == clawde_katban::board::ContainerRuntime::Docker
                 && !clawde_katban::container::available()
             {
-                anyhow::bail!("incus is not reachable (`incus list` failed) — is incusd running?");
+                anyhow::bail!(
+                    "docker is not reachable (`docker info` failed) — is dockerd running?"
+                );
             }
             let _guard = clawde_katban::board::BoardLock::acquire(project)?;
             let mut board = load_board(project)?.unwrap_or_default();
+            // The docker tier IS the attempts ladder, containerized (spec §8),
+            // and `attempts` defaults to 1: with no rungs there is nothing to
+            // containerize, so every card would fail on an empty ladder with
+            // only the generic "all attempts failed". Refuse at the switch,
+            // where the fix is obvious, instead of per card.
+            if runtime == clawde_katban::board::ContainerRuntime::Docker && board.attempts < 2 {
+                anyhow::bail!(
+                    "the docker tier runs the attempts ladder in containers, so it needs at \
+                     least 2 attempts (this board has {}) — run: `clawde katban board attempts 2`, \
+                     then either `clawde katban board attempts-upstreams <ID>` or configure free keys",
+                    board.attempts
+                );
+            }
             let stored = board.set_runtime(runtime);
             save_board(&board, project)?;
             println!("runtime {} for board '{project}'", stored.as_str());
@@ -2886,6 +2933,8 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
     let mut host = "127.0.0.1".to_string();
     let mut allow_non_loopback = false;
     let mut search_endpoint: Option<String> = None;
+    let mut commands: Option<String> = None;
+    let mut models: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -3860,6 +3909,65 @@ mod tests {
         std::fs::create_dir_all(home.join("katban")).unwrap();
         let config = serde_json::json!({ "version": 1, "sites": sites });
         std::fs::write(home.join("katban/katban.json"), config.to_string()).unwrap();
+    }
+
+    /// Regression: `site expose` renders the managed include itself, and
+    /// `apply_managed_include` replaces the whole file — so a block this path
+    /// forgets is a block it deletes. It used to pass `None` for the Cat Chat
+    /// guest block, taking `chat.example.com` offline (with a reload) on any
+    /// host that also exposed Cat Chat. Every expose path must render the full
+    /// set: sites + guest + board.
+    #[test]
+    fn site_expose_config_keeps_the_cat_chat_and_board_blocks() {
+        let _guard = crate::ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", home.path());
+
+        write_sites(
+            home.path(),
+            serde_json::json!([
+                { "name": "demo", "root": "/tmp", "port": 8788,
+                  "publicSubdomain": "demo.example.com", "locked": false }
+            ]),
+        );
+        let guests = clawde_katban::catchat::links::GuestStore {
+            public_subdomain: Some("chat.example.com".to_string()),
+            guest_port: Some(8789),
+            ..Default::default()
+        };
+        clawde_katban::catchat::links::save(&guests).unwrap();
+        let admin = clawde_katban::admin_auth::AdminStore {
+            public_subdomain: Some("board.example.com".to_string()),
+            board_port: Some(8790),
+            ..Default::default()
+        };
+        clawde_katban::admin_auth::save(&admin).unwrap();
+
+        let exposed: Vec<_> = clawde_katban::config::load()
+            .unwrap()
+            .sites
+            .iter()
+            .filter(|site| site.public_subdomain.is_some())
+            .map(|site| (site.clone(), clawde_katban::caddy::site_kind(site)))
+            .collect();
+        let text = managed_config_text(&exposed).unwrap();
+
+        assert!(text.contains("demo.example.com"), "site block: {text}");
+        assert!(
+            text.contains("chat.example.com"),
+            "a site expose must not drop the Cat Chat block: {text}"
+        );
+        assert!(
+            text.contains("reverse_proxy 127.0.0.1:8789"),
+            "the guest block still proxies its registered port: {text}"
+        );
+        assert!(text.contains("board.example.com"), "board block: {text}");
+
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
     }
 
     fn finding<'a>(findings: &'a [Finding], subject: &str) -> &'a Finding {

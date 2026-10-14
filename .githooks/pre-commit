@@ -1,30 +1,38 @@
 #!/usr/bin/env bash
 # Clawde pre-commit hook (enable once per clone: git config core.hooksPath .githooks).
 #
-# Fast, read-only checks that run before a commit is created:
-#   0. Secret scan (gitleaks, `gitleaks.toml` baseline) — blocks commits that
-#      introduce credentials in ANY staged file type. Scans the staged
+# Fast, read-only checks that run before a commit is created, in this order:
+#
+#   1. Secret scan (gitleaks, `gitleaks.toml` baseline) — blocks a commit that
+#      introduces credentials in ANY staged file type. Scans the staged
 #      snapshot, not the whole history (CI/history stays covered by
-#      `gitleaks detect` runs and the baseline config). Self-skips when the
-#      binary is not on PATH; bypass via CLAWDE_HOOK_SKIP_GITLEAKS=1.
-#   1. Feature-gate inventory (`scripts/audits/feature-gate-scan.py`) — runs when
+#      `gitleaks detect` runs and the baseline config). Self-skips with a
+#      one-time hint when the binary is not on PATH.
+#   2. ACP registry-template guard (`scripts/validate-acp-template.py`) — runs
+#      when the template, its vendored schema, or the validator itself is
+#      staged. Validates the manifest against the ACP schema AND against the
+#      legs build.sh actually builds, so the template cannot re-advertise a
+#      macOS/Windows archive that no release publishes (registry CI would fail).
+#      Instant; stdlib-only tier always runs, deep schema tier when jsonschema
+#      is importable.
+#   3. Feature-gate inventory (`scripts/audits/feature-gate-scan.py`) — runs when
 #      a Cargo.toml is staged, instant. A declared feature with no cfg site and
 #      no optional dependency gates nothing, and `dev_full` promises every
 #      gated feature, so an empty name makes that promise false; the same scan
 #      catches a pass-through (`x = ["crate/feat"]`) naming a feature the
 #      dependency does not declare, which cargo only rejects in configurations
 #      someone actually builds. Self-tests its classifier on every run.
-#   2. Async file-flush audit (`scripts/audit-tokio-file-flush.py`) — instant.
+#   4. Async file-flush audit (`scripts/audit-tokio-file-flush.py`) — instant.
 #      tokio's fs::File returns Ok from `write_all` once the bytes are queued
 #      to a blocking task and has no Drop impl, so a write with no following
 #      `flush()` is fire-and-forget and can silently lose data (issue #3).
 #      The script self-tests its detector first, so a broken detector fails
 #      loudly rather than reporting a false all-clear.
-#   3. rustfmt drift (`cargo fmt --all --check`) — instant.
-#   4. TUI test-target compile (`cargo check -p clawde-tui --tests`) — catches
+#   5. rustfmt drift (`cargo fmt --all --check`) — instant.
+#   6. TUI test-target compile (`cargo check -p clawde-tui --tests`) — catches
 #      test-code compile breaks that plain `cargo check --workspace` skips
 #      (test targets are not compiled by the default check/build).
-#   5. Idle-CPU smoke probe (`scripts/probes/idle-cpu-probe.py`) — fails if an
+#   7. Idle-CPU smoke probe (`scripts/probes/idle-cpu-probe.py`) — fails if an
 #      idle TUI session repaints at full rate, i.e. the
 #      `App::needs_fast_repaint()` / poll-timeout throttle regressed. Runs with
 #      a shortened window (25s warmup / 6s idle) to stay quick; Linux-only, and
@@ -32,30 +40,32 @@
 #      sources (a stale binary would silently test the previous code). A warmup
 #      that never settled is retried once (slow-network startup sweep); a
 #      window that burned too much CPU is not, since it fails deterministically.
-#   6. Live eval gate (`scripts/eval/run_eval.py`, catalog-order fixture) —
+#   8. Live eval gate (`scripts/eval/run_eval.py`, catalog-order fixture) —
 #      runs the real free-provider chain and blocks the commit if the model
 #      stops enumerating the FREE_CATALOG order (answer-quality regression).
 #      Same binary staleness skip as the probe; skips when no free keys are
 #      configured; exit 2 (provider error / timeout) warns without blocking.
-#   7. ACP template guard (`scripts/validate-acp-template.py`) — runs when the
-#      registry template, its vendored schema, or the validator itself is
-#      staged. Validates the manifest against the ACP schema AND against the
-#      legs build.sh actually builds, so the template cannot re-advertise a
-#      macOS/Windows archive that no release publishes (registry CI would fail).
-#      Instant; stdlib-only tier always runs, deep schema tier when jsonschema
-#      is importable.
+#
+# Checks 1-3 run before the Rust-only early-exit, because they police non-.rs
+# files (a leaked key can be in any file type, the ACP template is JSON, and the
+# feature mistake is always in a Cargo.toml), so a commit that touches no Rust
+# source still gets them. Checks 4-8 need Rust sources; the staged snapshot, the
+# cargo presence, and the binary's freshness are each resolved once, near their
+# first use.
+#
+# This hook prints a line for every check it skips — skip flag, missing tool,
+# missing/stale binary, absent keys — and a line when a slow check starts and
+# finishes. A silent skip and a silent multi-minute wait both read like a pass.
 #
 # Skip for a single commit:  SKIP_CLAWDE_HOOK=1 git commit ...
-# Skip the secret scan (gitleaks):
-#   CLAWDE_HOOK_SKIP_GITLEAKS=1 git commit ...
-# Skip only the slower cargo check + probe (keep the instant fmt check):
-#   CLAWDE_HOOK_SKIP_TESTS=1 git commit ...
-# Skip only the idle-CPU probe:
-#   CLAWDE_HOOK_SKIP_IDLE_CPU=1 git commit ...
-# Skip the live eval gate (catalog-order fixture, runs the free provider):
-#   CLAWDE_HOOK_SKIP_EVAL=1 git commit ...
-# Skip the ACP template guard:
-#   CLAWDE_HOOK_SKIP_ACP=1 git commit ...
+# Each CLAWDE_HOOK_SKIP_* flag disables exactly ONE check, never a later one:
+#   CLAWDE_HOOK_SKIP_GITLEAKS=1  — check 1, the gitleaks secret scan
+#   CLAWDE_HOOK_SKIP_ACP=1       — check 2, the ACP template guard
+#   CLAWDE_HOOK_SKIP_TESTS=1     — check 6, the TUI test-target compile
+#   CLAWDE_HOOK_SKIP_IDLE_CPU=1  — check 7, the idle-CPU probe
+#   CLAWDE_HOOK_SKIP_EVAL=1      — check 8, the live eval gate
+# (Check 3 has no flag: it is instant, deterministic, and the only guard against
+# a feature name that gates nothing.)
 set -u
 
 if [ "${SKIP_CLAWDE_HOOK:-0}" = "1" ]; then
@@ -70,59 +80,132 @@ cd "$ROOT" || exit 0
 # keeps a clean X.Y.Z that only moves when a release is cut deliberately via
 # scripts/build.sh. Local builds are made unique by the +N suffix.
 
-# ---- Secret scan (gitleaks) ----------------------------------------------
+# ---- Shared helpers -------------------------------------------------------
+
+# The staged snapshot, read once. The guards below match against this string;
+# re-running `git diff --cached --name-only` per guard was four invocations of
+# the same git plumbing, and the staleness block could disagree with them.
+STAGED="$(git diff --cached --name-only)"
+
+# staged_matches <ERE> — true when a staged path matches (any line).
+staged_matches() { grep -qE "$1" <<<"$STAGED"; }
+
+# skip_if_set <flag-value> <check name> <flag name> — announce and return true
+# when a CLAWDE_HOOK_SKIP_* flag is set. Call sites read
+#   if ! skip_if_set "${CLAWDE_HOOK_SKIP_X:-0}" "the X check" CLAWDE_HOOK_SKIP_X; then ...
+# so a skipped check falls through to the next one instead of ending the hook:
+# an `exit 0` here used to make CLAWDE_HOOK_SKIP_TESTS=1 drop the idle-CPU probe
+# and the eval gate too (and SKIP_IDLE_CPU drop the eval gate) — the wrong
+# direction, since those two are the only checks CI does not duplicate.
+skip_if_set() { # <flag-value> <check name> <flag name>
+    if [ "$1" = "1" ]; then
+        echo "pre-commit: SKIPPING $2 — $3=1"
+        return 0
+    fi
+    return 1
+}
+
+# python_audit_available <repo-relative script> <check name> — true when python3
+# and the audit script are both present, otherwise announce the skip and return
+# false. Without it a missing script reached the check's own failure block and
+# reported that check's specific diagnostic (e.g. "a tokio file handle is
+# written with no following flush()") for a file that was never scanned.
+python_audit_available() { # <script> <check name>
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "pre-commit: SKIPPING $2 — python3 not found"
+        return 1
+    fi
+    if [ ! -f "$ROOT/$1" ]; then
+        echo "pre-commit: SKIPPING $2 — $1 is missing from this checkout"
+        return 1
+    fi
+    return 0
+}
+
+# mtime in seconds: GNU stat, then BSD/macOS, then 0 so callers never see an
+# empty value under `set -u`.
+file_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
+# Newest mtime among the staged Rust sources (0 when none are staged, e.g. a
+# deletion-only commit). A commit that only deletes sources leaves `STAGED`
+# entries that no longer exist on disk; those are skipped.
+newest_staged_rs_mtime() {
+    local newest=0 mtime
+    while IFS= read -r f; do
+        case "$f" in
+            src-rust/*.rs) ;;
+            *) continue ;;
+        esac
+        [ -f "$ROOT/$f" ] || continue
+        mtime="$(file_mtime "$ROOT/$f")"
+        if [ "$mtime" -gt "$newest" ]; then
+            newest="$mtime"
+        fi
+    done <<<"$STAGED"
+    printf '%s' "$newest"
+}
+
+# ---- 1. Secret scan (gitleaks) -------------------------------------------
 # Runs on every commit regardless of file type: keys leak through docs,
 # configs, and fixtures as easily as through source. `--staged` scans the
 # exact snapshot being committed (including new files), and `--redact`
 # keeps any finding out of hook output. Blocking by design — a secret that
 # reaches a commit reaches every future clone. If gitleaks is not installed,
-# skip with a one-time hint rather than nagging on every commit.
-if [ "${CLAWDE_HOOK_SKIP_GITLEAKS:-0}" = "1" ]; then
-    :  # scan skipped; fall through so the remaining checks still run
-elif command -v gitleaks >/dev/null 2>&1; then
-    if ! gitleaks protect --staged --config "$ROOT/gitleaks.toml" \
-        --no-banner --redact >/dev/null 2>&1; then
-        echo "pre-commit: gitleaks found a secret in the staged changes."
-        echo "  Inspect what tripped:  git diff --staged"
-        echo "  Re-scan with details:   gitleaks protect --staged --config gitleaks.toml -v"
-        echo "  Real secret?  Remove it, rotate the credential, then re-commit."
-        echo "  False positive? Add an exact-literal allowlist entry to gitleaks.toml"
-        echo "  (placeholders only — never a value that could authenticate anywhere)."
-        echo "  One-commit bypass: CLAWDE_HOOK_SKIP_GITLEAKS=1 git commit ..."
-        exit 1
-    fi
-elif [ -z "${CLAWDE_GITLEAKS_HINT_SHOWN:-}" ]; then
-    echo "pre-commit: gitleaks not found — secret scan skipped (install:"
-    echo "  https://github.com/gitleaks/gitleaks#installing) to enable check 0."
-    CLAWDE_GITLEAKS_HINT_SHOWN=1
-fi
-
-# ---- ACP registry template guard -----------------------------------------
-# Runs before the Rust-only early-exit because the template is JSON, not .rs.
-# The template advertises release archives; if it lists a platform build.sh does
-# not build, the registry CI rejects the manifest and editors offer a download
-# that 404s. The validator self-tests its own detector on every run.
-if [ "${CLAWDE_HOOK_SKIP_ACP:-0}" != "1" ] && command -v python3 >/dev/null 2>&1; then
-    if git diff --cached --name-only | grep -q \
-        -e '^src-rust/crates/acp/registry-template/agent\.json$' \
-        -e '^scripts/registry-agent\.schema\.json$' \
-        -e '^scripts/validate-acp-template\.py$'; then
-        if ! python3 "$ROOT/scripts/validate-acp-template.py" --quiet; then
-            echo "pre-commit: ACP registry template validation FAILED (see above)."
-            echo "  Fix the manifest, or bypass this check with CLAWDE_HOOK_SKIP_ACP=1."
+# skip with a one-time hint rather than nagging on every commit; the stamp
+# lives in the git dir (per clone), which is what "one-time" has to mean for a
+# process that exits after every commit.
+GITLEAKS_HINT_STAMP="$(git rev-parse --git-dir)/clawde-hook-gitleaks-hint"
+if ! skip_if_set "${CLAWDE_HOOK_SKIP_GITLEAKS:-0}" "secret scan (gitleaks)" CLAWDE_HOOK_SKIP_GITLEAKS; then
+    if command -v gitleaks >/dev/null 2>&1; then
+        if ! gitleaks protect --staged --config "$ROOT/gitleaks.toml" \
+            --no-banner --redact >/dev/null 2>&1; then
+            echo "pre-commit: gitleaks found a secret in the staged changes."
+            echo "  Inspect what tripped:  git diff --staged"
+            echo "  Re-scan with details:   gitleaks protect --staged --config gitleaks.toml -v"
+            echo "  Real secret?  Remove it, rotate the credential, then re-commit."
+            echo "  False positive? Add an exact-literal allowlist entry to gitleaks.toml"
+            echo "  (placeholders only — never a value that could authenticate anywhere)."
+            echo "  One-commit bypass: CLAWDE_HOOK_SKIP_GITLEAKS=1 git commit ..."
             exit 1
         fi
+    elif [ ! -f "$GITLEAKS_HINT_STAMP" ]; then
+        echo "pre-commit: gitleaks not found — secret scan skipped (install:"
+        echo "  https://github.com/gitleaks/gitleaks#installing) to enable check 1."
+        printf '%s\n' \
+            "clawde pre-commit: the gitleaks hint was already shown for this clone." \
+            "Delete this file to see it again." \
+            >"$GITLEAKS_HINT_STAMP" 2>/dev/null || true
     fi
 fi
 
-# ---- Feature-gate inventory -----------------------------------------------
-# Runs before the Rust-only early-exit below, because the mistake it catches is
-# always in a Cargo.toml: a feature that gates no code (no cfg site, no optional
-# dependency, no member features) makes `dev_full`'s "every gated feature"
-# promise false, and a pass-through naming a feature the dependency does not
-# declare is only rejected by cargo in the configurations someone builds.
-if command -v python3 >/dev/null 2>&1 && \
-    git diff --cached --name-only | grep -q '^src-rust/.*Cargo\.toml$'; then
+# ---- 2. ACP registry template guard --------------------------------------
+# The template advertises release archives; if it lists a platform build.sh does
+# not build, the registry CI rejects the manifest and editors offer a download
+# that 404s. The validator self-tests its own detector on every run. The guard
+# only exists for its own files, so both the staged-match test and the skip flag
+# come before anything is announced: SKIP_ACP=1 on an unrelated commit says
+# nothing, because there was no guard to skip.
+if staged_matches \
+    '^src-rust/crates/acp/registry-template/agent\.json$|^scripts/registry-agent\.schema\.json$|^scripts/validate-acp-template\.py$' &&
+    ! skip_if_set "${CLAWDE_HOOK_SKIP_ACP:-0}" "ACP registry template guard" CLAWDE_HOOK_SKIP_ACP &&
+    python_audit_available scripts/validate-acp-template.py "ACP registry template guard"; then
+    if ! python3 "$ROOT/scripts/validate-acp-template.py" --quiet; then
+        echo "pre-commit: ACP registry template validation FAILED (see above)."
+        echo "  Fix the manifest, or bypass this check with CLAWDE_HOOK_SKIP_ACP=1."
+        exit 1
+    fi
+fi
+
+# ---- 3. Feature-gate inventory -------------------------------------------
+# The mistake it catches is always in a Cargo.toml: a feature that gates no code
+# (no cfg site, no optional dependency, no member features) makes `dev_full`'s
+# "every gated feature" promise false, and a pass-through naming a feature the
+# dependency does not declare is only rejected by cargo in the configurations
+# someone builds.
+if staged_matches '^src-rust/.*Cargo\.toml$' &&
+    python_audit_available scripts/audits/feature-gate-scan.py "feature-gate inventory"; then
     if ! python3 "$ROOT/scripts/audits/feature-gate-scan.py"; then
         echo "pre-commit: feature-gate inventory FAILED (see above)."
         echo "  Gate real code with the name, give it an optional dependency, or"
@@ -131,157 +214,162 @@ if command -v python3 >/dev/null 2>&1 && \
     fi
 fi
 
-# Only relevant when Rust sources are staged.
-if ! git diff --cached --name-only | grep -q '^src-rust/.*\.rs$'; then
+# ---- 4. Async file-flush audit -------------------------------------------
+# Only relevant when Rust sources are staged. Instant, so it runs before the
+# cargo checks. tokio's fs::File returns Ok from write_all once the bytes are
+# queued to a blocking task and has no Drop impl, so dropping the handle
+# detaches the write: an unflushed append is acknowledged and silently lost
+# (issue #3). The script validates its own detector against built-in fixtures on
+# every run.
+if ! staged_matches '^src-rust/.*\.rs$'; then
     exit 0
 fi
-# ---- Async file-flush audit ----------------------------------------------
-# Instant, so it runs before the cargo checks. tokio's fs::File returns Ok
-# from write_all once the bytes are queued to a blocking task and has no Drop
-# impl, so dropping the handle detaches the write: an unflushed append is
-# acknowledged and silently lost (issue #3). The script validates its own
-# detector against built-in fixtures on every run.
-if command -v python3 >/dev/null 2>&1; then
+if python_audit_available scripts/audit-tokio-file-flush.py "async file-flush audit"; then
     if ! python3 "$ROOT/scripts/audit-tokio-file-flush.py" >/dev/null 2>&1; then
         echo "pre-commit: async file-flush audit FAILED."
         echo "  A tokio file handle is written with no following flush(), so the"
         echo "  queued write can be dropped and the data silently lost."
         echo "  Inspect:  python3 scripts/audit-tokio-file-flush.py --verbose"
-        echo "  Fix:      add `handle.flush().await?` after the write (see #3)."
+        # Escaped backticks: unescaped ones in a double-quoted string are
+        # command substitution, which turned this line into a parse error
+        # (shellcheck SC1073/SC1009 on the old revision) and ate the code sample
+        # it exists to show.
+        echo "  Fix:      add \`handle.flush().await?\` after the write (see #3)."
         exit 1
     fi
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not found — rustfmt, TUI test-target, idle-CPU, and"
+    echo "  eval checks skipped."
     exit 0
 fi
 
-cd "$ROOT/src-rust"
+cd "$ROOT/src-rust" || exit 0
 
+# ---- 5. rustfmt drift ----------------------------------------------------
 if ! cargo fmt --all --check >/dev/null 2>&1; then
     echo "pre-commit: cargo fmt --all --check failed — run 'cargo fmt --all' and stage the result."
     exit 1
 fi
 
-if [ "${CLAWDE_HOOK_SKIP_TESTS:-0}" = "1" ]; then
-    exit 0
-fi
-if ! cargo check -p clawde-tui --tests >/dev/null 2>&1; then
-    echo "pre-commit: clawde-tui test targets do not compile."
-    echo "  Note: plain 'cargo check --workspace' skips test targets; CI's"
-    echo "  'cargo test --workspace' compiles them and would fail."
-    exit 1
-fi
-
-# ---- Idle-CPU smoke probe ------------------------------------------------
-# The probe needs the debug binary, and only tells us anything if that binary
-# is at least as new as every staged .rs file. Otherwise we'd measure the
-# previous build (a false pass). Missing/stale binary → skip with a hint;
-# non-Linux → the probe self-skips with exit 2 (treat as a pass).
-if [ "${CLAWDE_HOOK_SKIP_IDLE_CPU:-0}" = "1" ]; then
-    exit 0
-fi
-if ! command -v python3 >/dev/null 2>&1; then
-    exit 0
+# ---- 6. TUI test-target compile ------------------------------------------
+if ! skip_if_set "${CLAWDE_HOOK_SKIP_TESTS:-0}" "TUI test-target compile" CLAWDE_HOOK_SKIP_TESTS; then
+    echo "pre-commit: compiling clawde-tui test targets (cargo check -p clawde-tui --tests) ..."
+    t0="$(date +%s)"
+    if ! cargo check -p clawde-tui --tests >/dev/null 2>&1; then
+        echo "pre-commit: clawde-tui test targets do not compile."
+        echo "  Note: plain 'cargo check --workspace' skips test targets; CI's"
+        echo "  'cargo test --workspace' compiles them and would fail."
+        exit 1
+    fi
+    echo "pre-commit: TUI test-target compile ok ($(($(date +%s) - t0))s)"
 fi
 
+# ---- Debug binary freshness (shared by checks 7 and 8) --------------------
+# Both remaining checks drive the debug binary, and both are meaningless if it
+# predates the staged Rust sources: they would measure the previous build and
+# pass. Resolve it once, here, so the probe and the eval gate cannot disagree
+# about freshness or print contradicting skip notices.
 BINARY="$ROOT/src-rust/target/debug/clawde"
 if [ ! -x "$BINARY" ]; then
-    echo "pre-commit: skipping idle-CPU probe — debug binary not built"
-    echo "  (run 'cargo build' in src-rust/ to enable this check)."
-    exit 0
+    BINARY_STATE="not built"
+elif [ "$(newest_staged_rs_mtime)" -gt "$(file_mtime "$BINARY")" ]; then
+    BINARY_STATE="older than the staged Rust sources"
+else
+    BINARY_STATE="ok"
 fi
 
-newest_staged_rs=$(git diff --cached --name-only | grep '^src-rust/.*\.rs$' | while read -r f; do
-    if [ -f "$ROOT/$f" ]; then
-        stat -c %Y "$ROOT/$f" 2>/dev/null
+# ---- 7. Idle-CPU smoke probe ---------------------------------------------
+if ! skip_if_set "${CLAWDE_HOOK_SKIP_IDLE_CPU:-0}" "idle-CPU probe" CLAWDE_HOOK_SKIP_IDLE_CPU; then
+    if [ "$BINARY_STATE" != "ok" ]; then
+        echo "pre-commit: SKIPPING idle-CPU probe — debug binary $BINARY_STATE"
+        echo "  (run 'cargo build' in src-rust/ so the probe tests the staged code)."
+    elif python_audit_available scripts/probes/idle-cpu-probe.py "idle-CPU probe"; then
+        echo "pre-commit: running the idle-CPU probe (~30s) ..."
+        t0="$(date +%s)"
+        # Capture the probe's own output: its failure text separates a repaint
+        # regression ("Ns window ... -> FAIL") from a warmup that never settled
+        # ("never settled"), and only the latter is retryable.
+        run_idle_cpu_probe() {
+            python3 "$ROOT/scripts/probes/idle-cpu-probe.py" \
+                --binary "$BINARY" --warmup-secs 25 --idle-secs 6 --max-cpu-secs 1.2 2>&1
+        }
+
+        probe_out="$(run_idle_cpu_probe)"
+        status=$?
+        if [ "$status" -eq 2 ]; then
+            echo "pre-commit: idle-CPU probe self-skipped (non-Linux) — not blocking."
+        else
+            # A warmup that never settled is a one-time startup sweep (health-key
+            # probe / model discovery) stretched past the budget on a slow
+            # network, not a repaint regression — a real regression fails the
+            # idle window deterministically, so a retry cannot mask one. Retry
+            # that mode once; never retry a CPU-burn failure.
+            if [ "$status" -ne 0 ] && printf '%s' "$probe_out" | grep -q 'never settled'; then
+                echo "pre-commit: probe warmup never settled — retrying once ..."
+                probe_out="$(run_idle_cpu_probe)"
+                status=$?
+            fi
+            if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then
+                echo "pre-commit: idle-CPU probe FAILED."
+                printf '%s\n' "$probe_out" | sed 's/^/  /'
+                echo "  Either the TUI repaints at full rate while idle (check"
+                echo "  App::needs_fast_repaint() in crates/tui/src/app.rs and the poll"
+                echo "  timeout in crates/cli/src/main.rs), or the process never went idle"
+                echo "  within the warmup (startup health probes / model discovery hanging"
+                echo "  on a slow network). Run the probe manually for details:"
+                echo "    python3 scripts/probes/idle-cpu-probe.py --binary src-rust/target/debug/clawde"
+                exit 1
+            fi
+            echo "pre-commit: idle-CPU probe passed ($(($(date +%s) - t0))s)"
+        fi
     fi
-done | sort -rn | head -1)
-binary_mtime=$(stat -c %Y "$BINARY" 2>/dev/null || echo 0)
-if [ "${newest_staged_rs:-0}" -gt "$binary_mtime" ]; then
-    echo "pre-commit: skipping idle-CPU probe — debug binary is stale"
-    echo "  (run 'cargo build' in src-rust/ so the probe tests the staged code)."
-    exit 0
 fi
 
-# Capture the probe's own output: its failure text separates a repaint
-# regression ("Ns window ... -> FAIL") from a warmup that never settled
-# ("never settled"), and only the latter is retryable.
-run_idle_cpu_probe() {
-    python3 "$ROOT/scripts/probes/idle-cpu-probe.py" \
-        --binary "$BINARY" --warmup-secs 25 --idle-secs 6 --max-cpu-secs 1.2 2>&1
-}
-
-probe_out="$(run_idle_cpu_probe)"
-status=$?
-if [ "$status" -eq 2 ]; then
-    exit 0  # probe self-skipped (non-Linux)
-fi
-# A warmup that never settled is a one-time startup sweep (health-key probe /
-# model discovery) stretched past the budget on a slow network, not a repaint
-# regression — a real regression fails the idle window deterministically, so a
-# retry cannot mask one. Retry that mode once; never retry a CPU-burn failure.
-if [ "$status" -ne 0 ] && printf '%s' "$probe_out" | grep -q 'never settled'; then
-    probe_out="$(run_idle_cpu_probe)"
-    status=$?
-fi
-if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then
-    echo "pre-commit: idle-CPU probe FAILED."
-    printf '%s\n' "$probe_out" | sed 's/^/  /'
-    echo "  Either the TUI repaints at full rate while idle (check"
-    echo "  App::needs_fast_repaint() in crates/tui/src/app.rs and the poll"
-    echo "  timeout in crates/cli/src/main.rs), or the process never went idle"
-    echo "  within the warmup (startup health probes / model discovery hanging"
-    echo "  on a slow network). Run the probe manually for details:"
-    echo "    python3 scripts/probes/idle-cpu-probe.py --binary src-rust/target/debug/clawde"
-    exit 1
-fi
-
-# ---- Live eval gate (answer-quality regression) -------------------------
-# Runs the catalog-order fixture through the real free-provider chain and
-# fails the commit if the model stops enumerating the fallback order (e.g. an
-# upstream routing/prompting regression). Exit code contract of run_eval.py:
+# ---- 8. Live eval gate (answer-quality regression) ------------------------
+# Runs the catalog-order fixture through the real free-provider chain and fails
+# the commit if the model stops enumerating the fallback order (e.g. an upstream
+# routing/prompting regression). Exit code contract of run_eval.py:
 #   0 = assertions passed
 #   1 = ran but assertions failed  → BLOCK the commit
 #   2 = could not be evaluated (provider error / timeout / no keys) → warn only
-# Skips are identical to the idle-CPU probe: no binary, stale binary, or
-# CLAWDE_HOOK_SKIP_EVAL=1. Costs ~$0.1 of free-tier tokens per run.
-if [ "${CLAWDE_HOOK_SKIP_EVAL:-0}" = "1" ]; then
-    exit 0
-fi
-if [ ! -x "$BINARY" ]; then
-    echo "pre-commit: skipping eval gate — debug binary not built"
-    exit 0
-fi
-if [ "${newest_staged_rs:-0}" -gt "$binary_mtime" ]; then
-    echo "pre-commit: skipping eval gate — debug binary is stale"
-    echo "  (run 'cargo build' in src-rust/ so the gate tests the staged code)."
-    exit 0
-fi
-# Free-provider keys must exist; without them the gate cannot run.
-AUTH_STORE="$HOME/.clawde/auth.json"
-if [ ! -f "$AUTH_STORE" ] || ! python3 -c "import json,sys; d=json.load(open('$AUTH_STORE')); sys.exit(0 if d.get('keys') else 1)" 2>/dev/null; then
-    echo "pre-commit: skipping eval gate — no free-provider keys in $AUTH_STORE"
-    exit 0
+# Costs ~$0.1 of free-tier tokens per run.
+if ! skip_if_set "${CLAWDE_HOOK_SKIP_EVAL:-0}" "live eval gate" CLAWDE_HOOK_SKIP_EVAL; then
+    if [ "$BINARY_STATE" != "ok" ]; then
+        echo "pre-commit: SKIPPING eval gate — debug binary $BINARY_STATE"
+        echo "  (run 'cargo build' in src-rust/ so the gate tests the staged code)."
+    elif python_audit_available scripts/eval/run_eval.py "live eval gate"; then
+        # Free-provider keys must exist; without them the gate cannot run.
+        AUTH_STORE="$HOME/.clawde/auth.json"
+        if [ ! -f "$AUTH_STORE" ] || ! python3 -c "import json,sys; d=json.load(open('$AUTH_STORE')); sys.exit(0 if d.get('keys') else 1)" 2>/dev/null; then
+            echo "pre-commit: SKIPPING eval gate — no free-provider keys in $AUTH_STORE"
+        else
+            echo "pre-commit: running the live eval gate (catalog-order fixture, up to 240s) ..."
+            t0="$(date +%s)"
+            EVAL_OUT="$(mktemp)"
+            python3 "$ROOT/scripts/eval/run_eval.py" \
+                --fixture "$ROOT/scripts/eval/fixtures/catalog-order" \
+                --quiet --timeout 240 --tag precommit >"$EVAL_OUT" 2>&1
+            eval_status=$?
+            if [ "$eval_status" -eq 0 ]; then
+                echo "pre-commit: eval gate passed ($(($(date +%s) - t0))s)"
+            else
+                cat "$EVAL_OUT"
+                if [ "$eval_status" -eq 2 ]; then
+                    echo "pre-commit: eval gate could not run (provider/timeout) — not blocking."
+                    echo "  Run it manually: python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/catalog-order"
+                else
+                    echo "pre-commit: eval gate FAILED — the model no longer enumerates the"
+                    echo "  FREE_CATALOG order (catalog-order fixture). Investigate routing/prompt"
+                    echo "  changes before committing; see scripts/eval/README.md."
+                    rm -f "$EVAL_OUT"
+                    exit 1
+                fi
+            fi
+            rm -f "$EVAL_OUT"
+        fi
+    fi
 fi
 
-EVAL_OUT=$(mktemp)
-python3 "$ROOT/scripts/eval/run_eval.py" \
-    --fixture "$ROOT/scripts/eval/fixtures/catalog-order" \
-    --quiet --timeout 240 --tag precommit >"$EVAL_OUT" 2>&1
-eval_status=$?
-if [ "$eval_status" -eq 0 ]; then
-    rm -f "$EVAL_OUT"
-    exit 0
-fi
-cat "$EVAL_OUT"
-rm -f "$EVAL_OUT"
-if [ "$eval_status" -eq 2 ]; then
-    echo "pre-commit: eval gate could not run (provider/timeout) — not blocking."
-    echo "  Run it manually: python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/catalog-order"
-    exit 0
-fi
-echo "pre-commit: eval gate FAILED — the model no longer enumerates the"
-echo "  FREE_CATALOG order (catalog-order fixture). Investigate routing/prompt"
-echo "  changes before committing; see scripts/eval/README.md."
-exit 1
+exit 0

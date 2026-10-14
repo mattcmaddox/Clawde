@@ -6,13 +6,16 @@ filter + empty-completion guard, rotation (§6), early promotion, per-attempt
 matrix on the card, CLI `board attempts [N]` / `board attempts-upstreams`,
 `/katban` parity, web meta + card matrix. Phase 2's dead-upstream skip is in
 (`cooling_free_upstreams()` reads the persisted cooldown snapshot the free
-chain writes; `ladder_pins` ranks cooling upstreams after healthy ones).
+chain writes; `ladder_pins` ranks cooling upstreams after healthy ones, and
+quick-task lanes after ordinary ones — see §6.5).
 Phase 3's container tier is in (`board.rs::ContainerRuntime`,
-`container.rs` incus plumbing, `scope.rs` FS-manifest scope gate,
-`runner.rs::run_one_card_container`): `board runtime incus` + `board card
+`container.rs` Docker plumbing, `scope.rs` FS-manifest scope gate,
+`runner.rs::run_one_card_container`): `board runtime docker` + `board card
 scope <ID> [PATHS...]`, ephemeral container per attempt with in-container
 verify, manifest-diff scope checking, artifact tar pull, env-error
-provisioning semantics. Phase 4 (parallel racing) remains proposed.
+provisioning semantics. The lane shipped on Incus first and moved to Docker on
+2026-10-13 so the plumbing could run in CI (GitHub runners ship Docker, not
+Incus). Phase 4 (parallel racing) remains proposed.
 Companions: [best-of-n-eval-spec.md](best-of-n-eval-spec.md) (the measured
 experiment this promotes), [katban.md](../katban.md) (current board behavior),
 [katban-selfhost-spec.md](katban-selfhost-spec.md) (§12 agent execution model).
@@ -186,6 +189,17 @@ When `attempt_upstreams` is empty, derive N upstreams at spawn time:
 4. Fewer available upstreams than N: run min(N, available) attempts; never
    reuse the same upstream twice within one card's ladder unless families
    are exhausted.
+5. **Quick-task lanes last**: an upstream whose free tier is a constrained
+   lane (`FreeUpstream::quick_task_lane` — poolside's preview, groq's token
+   cap) fills a rung only after ordinary upstreams. A card is a long
+   multi-turn run, so its lead rung must be a model that can finish one;
+   leading with a tier that throttles mid-run spends rung 0 discovering that
+   (measured live 2026-10-13: with poolside as catalog slot 1 and the
+   highest-priority keyed entry, every card's first rung was poolside and
+   every one of them died on the chain-level `free-mode upstreams
+   exhausted`). Demoted, never dropped: an all-constrained keyed set still
+   runs, in catalog order, and an admin `attempt_upstreams` list still wins
+   verbatim (§4.2).
 
 ## 7. Settings surface
 
@@ -202,14 +216,15 @@ When `attempt_upstreams` is empty, derive N upstreams at spawn time:
 The eval harness (`scripts/eval/best_of_n.py`) already proves the mechanics:
 hermetic container, seeded home, binary push, task push, in-container verify,
 sha256 FS manifests, tar artifact pull, ephemeral teardown. Phase 3 wires the
-same primitives behind a board-level flag:
+same primitives behind a board-level flag — first on Incus, ported to Docker on
+2026-10-13 (`docker run -d --rm`, `docker exec`, `docker cp`, `docker rm -f`)
+so the plumbing runs in CI, which GitHub's Incus-less runners cannot do:
 
-- `clawde katban board runtime incus` (default `host`).
-- With it, each attempt runs inside an ephemeral `images:ubuntu/24.04/cloud`
-  container: worktree pushed in, agent runs with `bypass-permissions`
-  (the container is the safety boundary), verify gate runs in-container,
-  FS manifest diff gives real `scope_violations`, artifact tar attached to
-  the attempt record.
+- `clawde katban board runtime docker` (default `host`).
+- With it, each attempt runs inside an ephemeral `ubuntu:24.04` container:
+  worktree pushed in, agent runs with `bypass-permissions` (the container is
+  the safety boundary), verify gate runs in-container, FS manifest diff gives
+  real `scope_violations`, artifact tar attached to the attempt record.
 - The binary-deps lesson applies: the probe must provision the container
   (distro-keyed packages) or the attempt dies on `libasound.so.2`. The
   dependency phase is part of attempt setup, and its failure is an

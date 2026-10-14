@@ -5109,6 +5109,9 @@ mod tests {
             fallback_models: &[],
             specialty: "",
             usage: "",
+            // Synthetic lanes are never ladder-ranked; ordinary is the neutral
+            // value here (the ladder is Katban's, not this crate's).
+            quick_task_lane: false,
         }
     }
 

@@ -116,6 +116,15 @@ pub struct FreeUpstream {
     /// "OAuth", "2 keys", …). Replaces the repetitive "$0.00 per M" so the
     /// user knows at a glance how much quota each upstream actually has.
     pub usage: &'static str,
+    /// Whether this upstream's free tier is a *quick-task lane*: a preview or
+    /// small-request-window tier that answers a short turn fine but tends to
+    /// run dry partway through a long agentic run. The Katban attempts ladder
+    /// (`katban::runner::ladder_pins`) fills its rungs with ordinary upstreams
+    /// first and these after them, so a card's lead rung is a model suited to
+    /// multi-turn work. They are demoted, never dropped — a keyed set of only
+    /// these still runs. Catalog order still decides the `free/auto` chain;
+    /// this only orders ladder rungs.
+    pub quick_task_lane: bool,
 }
 
 /// Ordered priority of providers we stack into Free mode. Order matters —
@@ -139,6 +148,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         fallback_models: &["gpt-4o-2024-08-06"],
         specialty: "best overall",
         usage: "OAuth · 16K",
+        quick_task_lane: false,
     },
     // Tier 1: Best-quality open-weight models
     FreeUpstream {
@@ -156,6 +166,12 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         fallback_models: &[],
         specialty: "coding specialist",
         usage: "free preview · 256K",
+        // Measured on a live board (2026-10-13): every card's lead rung landed
+        // on poolside and every one of them died on the chain-level
+        // `free-mode upstreams exhausted`, so the ladder spent its first rung
+        // discovering the 200-requests/hour preview was throttled. It is still
+        // a strong coding model and a fine later rung.
+        quick_task_lane: true,
     },
     FreeUpstream {
         id: "nvidia",
@@ -184,6 +200,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         // 30s upstream timeout). Fall back to the always-warm 20B sibling on the
         // same key before giving up on NVIDIA entirely.
         fallback_models: &["openai/gpt-oss-20b"],
+        quick_task_lane: false,
     },
     FreeUpstream {
         id: "cerebras",
@@ -204,6 +221,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         fallback_models: &[],
         specialty: "large context",
         usage: "65K ctx",
+        quick_task_lane: false,
     },
     // Tier 2: Very good models (some currently rate-limited)
     FreeUpstream {
@@ -221,6 +239,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         fallback_models: &[],
         specialty: "multimodal",
         usage: "free tier · 8K",
+        quick_task_lane: false,
     },
     FreeUpstream {
         id: "cloudflare",
@@ -237,6 +256,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         fallback_models: &[],
         specialty: "coding",
         usage: "10K/day · 8K",
+        quick_task_lane: false,
     },
     FreeUpstream {
         id: "groq",
@@ -256,6 +276,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: None,
         context_window: 128_000,
         fallback_models: &[],
+        // AGENTS.md's own judgement: "fast but token-capped … a quick-task
+        // lane, not a daily driver". A card run is the daily-driver case.
+        quick_task_lane: true,
     },
     // Tier 3: Decent fallbacks
     FreeUpstream {
@@ -280,6 +303,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         fallback_models: &[],
         specialty: "fast",
         usage: "auto-pick · 8K",
+        quick_task_lane: false,
     },
     FreeUpstream {
         id: "opencode-zen",
@@ -298,6 +322,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         fallback_models: &[],
         specialty: "general purpose",
         usage: "2 keys · 8K",
+        quick_task_lane: false,
     },
     FreeUpstream {
         id: "zai",
@@ -316,6 +341,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         fallback_models: &[],
         specialty: "reasoning",
         usage: "free · 8K",
+        quick_task_lane: false,
     },
     // Tier 4: Paywalled — kept as last resort
     FreeUpstream {
@@ -333,6 +359,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         fallback_models: &[],
         specialty: "variety pack",
         usage: "$10 credits · varies",
+        quick_task_lane: false,
     },
 ];
 

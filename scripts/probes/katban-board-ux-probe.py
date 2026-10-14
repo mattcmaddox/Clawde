@@ -56,6 +56,7 @@ Usage:
 import argparse
 import json
 import os
+from pathlib import Path
 import shutil
 import socket
 import subprocess
@@ -265,7 +266,53 @@ def start_board(binary, env, cwd, port, log_path, timeout):
     )
 
 
-def run_checks(args, report, page, context, base, env, project, log_path, refused):
+def current_board_card_id(page):
+    """ID of the card currently rendered first in the board's backlog."""
+    return js(page, "document.querySelector('.card [data-status]')?.getAttribute('data-status')")
+
+
+def seed_single_attempt_result(home, prompt):
+    """Seed a realistic one-rung result into the scratch board for UI rendering.
+
+    The UX probe deliberately starts `board serve` without a scheduler, so this
+    adds the persisted shape the runner normally writes; the browser still
+    loads it through `/api/board` and renders it via the production page code.
+    """
+    board_files = list((Path(home) / "katban").rglob("board.json"))
+    target_path = None
+    target_board = None
+    target_card = None
+    for candidate in board_files:
+        try:
+            candidate_board = json.loads(candidate.read_text())
+        except (OSError, ValueError):
+            continue
+        candidate_card = next(
+            (item for item in candidate_board.get("cards", []) if item.get("prompt") == prompt),
+            None,
+        )
+        if candidate_card is not None:
+            target_path, target_board, target_card = candidate, candidate_board, candidate_card
+            break
+    if target_path is None:
+        return False
+    board_path, board, card = target_path, target_board, target_card
+    card["attempts"] = [{
+        "upstream": "nvidia",
+        "model": "free/nvidia/nemotron-3.5-lightning-30b-a3b",
+        "servedUpstream": "nvidia",
+        "verifyPassed": True,
+        "elapsedMs": 12000,
+        "scopeViolations": 0,
+        "error": None,
+    }]
+    card["pickedAttempt"] = 0
+    temporary = board_path.with_suffix(".probe.tmp")
+    temporary.write_text(json.dumps(board, indent=2) + "\n")
+    os.replace(temporary, board_path)
+
+
+def run_checks(args, report, page, context, base, env, project, home, log_path, refused):
     # ---- signed-out board: reads open, writes admin-gated -----------------
     status, body, headers = http("GET", base + "/api/me")
     report.check(
@@ -446,6 +493,62 @@ def run_checks(args, report, page, context, base, env, project, log_path, refuse
     page.locator("#addcard").click()
     ok, _ = wait_for(page, "document.querySelectorAll('.card').length === 1", 10)
     report.check("Add card renders the new card", ok, f"cards={prompts_of(page)!r}")
+    # A single successful attempt is the common path; the board must still show
+    # the serving upstream and verification result instead of hiding the matrix
+    # until a multi-rung retry occurs. The scratch server does not run agents,
+    # so seed one realistic outcome into its test-only board file, then refresh
+    # through the UI and assert what a reviewer sees.
+    # Wait for the POST-side write to finish, then edit the sole card directly
+    # in the scratch board file. This avoids racing the UI's async reload while
+    # exercising precisely the persisted one-rung shape the real runner writes.
+    deadline = time.monotonic() + 5
+    board_path = None
+    seeded_board = None
+    while time.monotonic() < deadline:
+        candidates = list((Path(home) / "katban").rglob("board.json"))
+        for candidate in candidates:
+            try:
+                candidate_board = json.loads(candidate.read_text())
+            except (OSError, ValueError):
+                continue
+            if any(card.get("prompt") == "probe card one" for card in candidate_board.get("cards", [])):
+                board_path, seeded_board = candidate, candidate_board
+                break
+        if board_path is not None:
+            break
+        time.sleep(POLL_SECS)
+    if board_path is None:
+        report.check("the scratch card is persisted before seeding its outcome", False)
+    else:
+        card = next(card for card in seeded_board["cards"] if card.get("prompt") == "probe card one")
+        card["attempts"] = [{
+            "upstream": "nvidia", "model": "free/nvidia/nemotron-3.5-lightning-30b-a3b",
+            "servedUpstream": "nvidia", "verifyPassed": True, "elapsedMs": 12000,
+            "scopeViolations": 0, "error": None,
+        }]
+        card["pickedAttempt"] = 0
+        temporary = board_path.with_suffix(".probe.tmp")
+        temporary.write_text(json.dumps(seeded_board, indent=2) + "\n")
+        os.replace(temporary, board_path)
+    with page.expect_response(lambda response: "/api/board/" + board_name in response.url) as board_response:
+        page.locator("#refresh").click()
+    board_payload = board_response.value.json()
+    seeded_api_card = next((c for c in board_payload.get("cards", []) if c.get("prompt") == "probe card one"), {})
+    report.check("the board API exposes the seeded one-rung outcome", len(seeded_api_card.get("attempts", [])) == 1, repr(seeded_api_card.get("attempts")))
+    attempt_expr = "Array.from(document.querySelectorAll('.card .attempts')).map(e => e.textContent)"
+    rendered_attempts = []
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        rendered_attempts = js(page, attempt_expr)
+        if any("picked: nvidia pass" in text for text in rendered_attempts):
+            break
+        time.sleep(POLL_SECS)
+    ok = any("picked: nvidia pass" in text for text in rendered_attempts)
+    report.check(
+        "a one-rung success shows its picked upstream and verify result",
+        ok,
+        "attempt rows=" + repr(rendered_attempts),
+    )
     time.sleep(1.2)  # distinct created/updated timestamps for the sort checks
     page.locator("#newprompt").fill("probe card two")
     page.locator("#addcard").click()
@@ -720,7 +823,7 @@ def main():
             )
             page.on("pageerror", lambda error: console_errors.append(("pageerror", str(error), "")))
 
-            run_checks(args, report, page, context, base, env, project, log_path, refused)
+            run_checks(args, report, page, context, base, env, project, home, log_path, refused)
 
             bad = unexpected_console_errors(console_errors, refused)
             report.check("no console or page errors on the verified routes", not bad, "\n".join(bad))

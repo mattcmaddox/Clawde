@@ -87,6 +87,14 @@ clawde katban board attempts-upstreams nvidia zai --project my-app   # empty = a
   Empty (`auto`) derives rungs from the keyed free catalog, distinct model
   families first, then distinct hosts of the same family — serving stacks
   differ measurably even for the same model.
+- **The lead rung must be able to finish a card**: a constrained free tier
+  (`FreeUpstream::quick_task_lane` — poolside's preview, groq's token cap)
+  fills a rung only after ordinary upstreams, because a card is a long
+  multi-turn run and starting on a tier that throttles mid-run spends the
+  first rung discovering that. Constrained lanes are demoted, never dropped:
+  with only constrained keys the ladder still runs them, and an explicit
+  `attempts-upstreams` list still wins verbatim. Upstreams the chain recently
+  put into cooldown are ranked last of all.
 - **Selection is never the agent's opinion**: the verify gate decides. A rung
   whose served-upstream attribution doesn't match its pin never wins (a pin
   that falls through is excluded even if its checks pass), and an empty
@@ -103,37 +111,44 @@ clawde katban board attempts-upstreams nvidia zai --project my-app   # empty = a
   fully-failed ladder fails the card with the matrix in the result, and
   `auto_retry` applies as usual from there.
 
-### Container tier (`board runtime incus`)
+### Container tier (`board runtime docker`)
 
 By default attempts execute on the host: the agent runs in the card's
 worktree and safety comes from the worktree lane. Boards that want a hard
 boundary can opt into the container tier:
 
-    clawde katban board runtime incus --project my-app   # default: host
+    clawde katban board runtime docker --project my-app   # default: host
 
-With `incus`, every attempt runs inside an ephemeral Incus container
-(`images:ubuntu/24.04/cloud`, torn down no matter how the attempt ends): the
-worktree is pushed in, the agent runs with `bypass-permissions` (the
-container IS the safety boundary), the verify gate runs in-container, and a
-sha256 filesystem manifest before/after the run captures everything the
-agent actually touched — including untracked and gitignored files the git
-diff cannot see.
+With `docker`, every attempt runs inside an ephemeral Docker container
+(`ubuntu:24.04`, torn down no matter how the attempt ends): the worktree is
+pushed in, the agent runs with `bypass-permissions` (the container IS the
+safety boundary), the verify gate runs in-container, and a sha256 filesystem
+manifest before/after the run captures everything the agent actually touched
+— including untracked and gitignored files the git diff cannot see. The lane
+was first built on Incus and moved to Docker on 2026-10-13 so its plumbing
+could run in CI: GitHub runners ship Docker, not Incus.
 
 - **Scope gate**: give a card an allowlist with
   `clawde katban board card scope <ID> src/ stats.py` (empty = no scope
   opinion). Any manifest-diff path outside the allowlist is a scope
   violation and the rung cannot win — an out-of-scope edit is exactly the
   blast-radius signal the host tier's git diff misses.
-- **Dependency provisioning is setup, not card state**: missing shared libs
-  for the binary are apt-installed into the container; a failed install
-  excludes the rung as an environment error instead of failing the card
-  (mirrors the verify gate's install-failure skip semantics).
+- **Dependency provisioning is setup, not card state**: every attempt
+  installs a base set — `ca-certificates` and `git`, which Docker's stock
+  `ubuntu:24.04` lacks (the Incus cloud image this lane was proven on had
+  both) — plus whichever shared libs `ldd` reports missing for the pushed
+  binary. A missing trust store is not a shared library, so it is asserted
+  afterwards rather than left to `ldd`: without it the binary panics on its
+  first HTTPS client, which is the first Docker card run's actual failure. A
+  failed install or a missing CA bundle excludes the rung as an environment
+  error instead of failing the card (mirrors the verify gate's
+  install-failure skip semantics).
 - **Artifacts**: the attempt's final tree is pulled as a tar under
   `~/.clawde/katban/container-artifacts/<card>/` for post-mortem review.
-- **Requirements**: the `incus` CLI must be installed and incusd reachable
-  (`incus list`); `board runtime incus` refuses to switch otherwise. The
-  per-attempt cost is real (container launch + push + apt), so host tier
-  remains the default.
+- **Requirements**: the `docker` CLI must be installed with a reachable
+  daemon (`docker info`); `board runtime docker` refuses to switch otherwise.
+  The per-attempt cost is real (container launch + push + apt), so the host
+  tier remains the default.
 
 Spec: [plans/katban-attempts-n-spec.md](plans/katban-attempts-n-spec.md)
 (motivated by the measured best-of-N eval:
@@ -212,6 +227,62 @@ pass. CI (the Linux leg of
 failed to install breaks the run instead of reporting green. It runs against a
 scratch `CLAWDE_HOME` and deliberately does not pass `board serve --run`, so it
 never dispatches an agent run at the cards it creates.
+
+## Verifying the container tier
+
+`board runtime docker` moves a card's `attempts: N` ladder into ephemeral
+Docker containers. The full card path cannot be a `cargo test` — it needs a
+reachable dockerd, a base image, network, and live free-tier keys — so the happy
+path is a dev-machine probe, manual-only, like the best-of-N eval harness. The
+runtime plumbing is the part CI can run, because GitHub runners ship Docker;
+that is why the tier was moved off Incus.
+
+What the suite does cover: `restore_task_dir` against real `tar`, the rung
+selection rules (`classify_container_rung`), and the write-back chain
+(`finalize_pins_a_commit_from_a_restored_container_tree`). The rest is
+`scripts/probes/katban-docker-card-probe.py`:
+
+```bash
+cargo build
+python3 scripts/probes/katban-docker-card-probe.py              # all three phases
+python3 scripts/probes/katban-docker-card-probe.py --plumbing   # no keys needed
+```
+
+The `plumbing` phase launches one container, pushes a tree in, mutates it
+inside, pulls the task tar back, and extracts it the way `restore_task_dir`
+does. It asserts the three facts that code rests on: `./.git` is a member of the
+archive (so the restore must exclude it), the container's `.git` never lands on
+the host worktree, and a deletion is invisible to a tar (the stale host copy
+survives extraction, which is why the manifest diff's deleted list is applied on
+top). No keys, no agent, about a minute — this is the phase CI runs on the Linux
+leg, since GitHub runners ship Docker.
+
+The `card` phase consumes free-tier quota: it seeds a scratch `CLAWDE_HOME` with
+the real auth store, registers a scratch repo, and drives one trivial card
+through the scheduler. It asserts the card reaches `review` with a pinned commit
+whose tree holds the agent's file, that the attempt artifact tar was pulled, and
+that no `clawde-katban` container is left behind. On failure it keeps the
+scratch state and prints the rung records plus the scheduler log — a
+40-character summary in the card result hides the difference between an agent
+error, a failed gate and a skipped one.
+
+The tier needs a ladder: `attempts` defaults to 1, and `runtime docker` with one
+attempt has nothing to containerize. The CLI and the slash command refuse that
+combination at the switch and name the fix (`board attempts 2`, then
+`board attempts-upstreams <ID>` or free keys); the runner fails the card with the
+same reason when the ladder is empty by run time, because keys can disappear
+between the two.
+
+Exit code 2 means a prerequisite was missing (dockerd unreachable, no debug
+binary, no auth store), so a wiring that reads non-zero as failure cannot read a
+skip as a pass. The card phase starts the scheduler in its own session and stops
+it in a `finally`, so Ctrl-C is safe; a SIGKILL skips that, leaving the
+scheduler and possibly a container behind:
+
+```bash
+pkill -f 'clawde katban board run --project probe'
+docker ps -aq -f 'name=^clawde-katban' | xargs -r docker rm -f
+```
 
 ## State and services
 

@@ -157,6 +157,30 @@ admin session like every write, and the login cookie is marked `Secure`.
 (CI, Linux leg; `--require-browser` so a missing browser fails instead of
 skipping). Run it by hand per `docs/katban.md` after touching the board UI.
 
+### Container tier guard (`board runtime docker`)
+
+`crates/katban/src/container.rs` drives one ephemeral Docker container per
+rung (`ubuntu:24.04`), with the agent run under `bypass-permissions` — the
+container is the safety boundary that makes that acceptable. Two facts cost a
+live run each and are easy to undo:
+
+- **The image is bare, so provisioning is not optional.** A stock
+  `ubuntu:24.04` has no CA store and no git; `ca-certificates` is invisible to
+  `ldd`, so `ensure_binary_deps` installs its base set unconditionally and then
+  asserts the bundle exists. Without it the pushed binary panics on its first
+  HTTPS client (2026-10-13, the first Docker card run) and the rung reports an
+  agent error for what is an environment error.
+- **`docker cp` has no `--create-dirs`, and a destination that exists as a
+  directory means "copy into it".** `push_file` creates the parent first, which
+  also pins that meaning; the binary and the seeded `auth.json` both rely on
+  it.
+
+`cargo test` cannot cover any of this (no daemon), which is why the rung
+selection rules stay pure (`classify_container_rung`) and the plumbing is
+probed instead: `scripts/probes/katban-docker-card-probe.py --plumbing` runs in
+CI on the Linux leg (real Docker, no keys, no agent), while `--card` drives a
+real card and needs free keys, so it stays a dev-machine probe.
+
 ### Cat Chat guest guard
 
 `crates/katban/src/catchat/pages.rs` is the same shape (one embedded HTML+JS
@@ -231,17 +255,30 @@ git config core.hooksPath .githooks
 ```
 
 Opt out of a single commit: `SKIP_CLAWDE_HOOK=1 git commit ...`
-Skip the secret scan only: `CLAWDE_HOOK_SKIP_GITLEAKS=1 git commit ...`
-Skip the slower cargo check + probes: `CLAWDE_HOOK_SKIP_TESTS=1 git commit ...`
-Skip only the idle-CPU probe: `CLAWDE_HOOK_SKIP_IDLE_CPU=1 git commit ...`
-Skip only the live eval gate: `CLAWDE_HOOK_SKIP_EVAL=1 git commit ...`
-Skip only the ACP template guard: `CLAWDE_HOOK_SKIP_ACP=1 git commit ...`
 
-The secret scan (check 0) blocks any commit staging credentials in any file
+Each skip flag disables exactly ONE check and never the checks after it, and
+the hook prints a `SKIPPING` line for every check it drops — a flag, a missing
+tool, a missing/stale debug binary, or absent free-tier keys — so a skipped
+check can never be mistaken for a passing one. `CLAWDE_HOOK_SKIP_TESTS=1` used
+to end the hook where check 6 starts, which silently took the idle-CPU probe and
+the eval gate with it; skip them individually now, or bypass everything with
+`SKIP_CLAWDE_HOOK=1`.
+
+Skip the secret scan only: `CLAWDE_HOOK_SKIP_GITLEAKS=1 git commit ...`
+Skip the TUI test-target compile only: `CLAWDE_HOOK_SKIP_TESTS=1 git commit ...`
+Skip the idle-CPU probe only: `CLAWDE_HOOK_SKIP_IDLE_CPU=1 git commit ...`
+Skip the live eval gate only: `CLAWDE_HOOK_SKIP_EVAL=1 git commit ...`
+Skip the ACP template guard only: `CLAWDE_HOOK_SKIP_ACP=1 git commit ...`
+
+The feature-gate inventory has no flag: it is instant, deterministic, and runs
+only when a `Cargo.toml` is staged.
+
+The secret scan (check 1) blocks any commit staging credentials in any file
 type, via `gitleaks protect --staged` with the repo baseline `gitleaks.toml`
 (allowlists only obviously-fake fixture placeholders — add exact literals
 there for new false positives, never real values). Gitleaks is skipped with
-a hint when the binary is absent: <https://github.com/gitleaks/gitleaks#installing>.
+a hint when the binary is absent — once per clone, the hint leaving a stamp in
+the git dir: <https://github.com/gitleaks/gitleaks#installing>.
 
 ### Feature declarations must gate code
 
@@ -761,7 +798,14 @@ Synthetic only — never calls upstream `discover_models()`. Produces one `free/
 ### Chain Assembly (`build_free_provider`)
 
 - `FREE_CATALOG` in `crates/api/src/providers/free/catalog.rs` defines the upstreams by priority (11 as of 2026-10-11)
-- Each `FreeUpstream` has: id, title, key_url, default_model, fallback_models, model_family, note, specialty, usage, tool_calling, vision, thinking, context_window, max_tokens_cap
+- Each `FreeUpstream` has: id, title, key_url, default_model, fallback_models, model_family, note, specialty, usage, tool_calling, vision, thinking, context_window, max_tokens_cap, quick_task_lane
+- `quick_task_lane` marks a constrained free tier (poolside's preview, groq's
+  token cap): fine for a short turn, wrong to *lead* a long agentic run. The
+  Katban attempts ladder fills its rungs with ordinary upstreams first and
+  these after them (demoted, never dropped — a keyed set of only these still
+  runs, and an explicit `attempts-upstreams` list still wins verbatim).
+  `free/auto` chain order is unaffected: catalog order is still fallback
+  priority.
 - Cloudflare: OpenAI-compat endpoint embeds the account ID in the URL path,
   so its stored key is the composite `ACCOUNT_ID:API_TOKEN`; key validation
   uses the chat probe (the `/ai/v1/models` endpoint returns 405 for GET)

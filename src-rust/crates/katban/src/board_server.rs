@@ -1444,11 +1444,13 @@ function renderBoard(api) {
       if (c.result) html += '<details class="diff"><summary>Agent result</summary><pre>' + esc(c.result) + '</pre></details>';
       if (c.branch || c.workDir || c.commit) html += '<details class="diff"><summary>Execution details</summary><pre>' + esc([c.branch && 'Branch: ' + c.branch, c.workDir && 'Worktree: ' + c.workDir, c.commit && 'Commit: ' + c.commit].filter(Boolean).join('\n')) + '</pre></details>';
       if (c.status === "failed") html += '<div class="meta">failure: ' + esc(c.failureKind || "unknown") + '</div>';
-      // Per-attempt matrix (spec §5 "record, don't discard"): one line per
-      // rung — upstream, verdict, elapsed — with the picked rung marked.
-      if (c.attempts && c.attempts.length > 1) {
-        html += '<div class="deps">' + c.attempts.map((a, i) =>
-          (i === c.pickedAttempt ? "▶ " : (i + 1) + ": ") +
+      // Attempt results matter even when the first rung wins: a one-rung card
+      // is the common success path, and hiding its matrix left reviewers unable
+      // to tell which upstream actually did the work or whether verify passed.
+      // Show the same summary for one or many rungs, with the winner explicit.
+      if (c.attempts && c.attempts.length) {
+        html += '<div class="deps attempts" aria-label="Attempt outcomes">' + c.attempts.map((a, i) =>
+          (i === c.pickedAttempt ? "picked: " : "attempt " + (i + 1) + ": ") +
           esc(a.upstream || "default") +
           (a.verifyPassed === true ? " pass" : a.verifyPassed === false ? " FAIL" : " err") +
           (a.elapsedMs ? " " + Math.round(a.elapsedMs / 1000) + "s" : "") +
