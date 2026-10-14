@@ -88,8 +88,10 @@ impl SlashCommand for KatbanCommand {
          Board commands take an optional `--project NAME` (default: 'default'),\n\
          matching the CLI: e.g. /katban board list --project my-repo\n\
          Guest chat management is the /chat command (Cat Chat), not /katban.\n\
-         Everything this command can do is also reachable from the Katban\n\
-         controls menu (Alt+G in the TUI)."
+         The board, board-settings, admin and project/site operations are also\n\
+         reachable from the Katban controls menu (Alt+G in the TUI), whose rows\n\
+         state the live values. Card editing (edit / remove / comment / scope)\n\
+         stays here and in the board's web UI."
     }
     fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
         let mut out = Vec::new();

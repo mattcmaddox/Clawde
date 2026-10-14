@@ -8370,32 +8370,11 @@ impl App {
             return false;
         }
 
-        // Katban controls menu (Alt+G)
+        // Katban controls menu (Alt+G). Every key resolves through
+        // `KeyContext::KatbanControls`, so the menu's navigation is listed in
+        // the `/keybindings` reference and rebindable like any other overlay's.
         if self.katban_controls.visible {
-            match key.code {
-                KeyCode::Esc => self.katban_controls.close(),
-                KeyCode::Up => self.katban_controls.select_prev(),
-                KeyCode::Down => self.katban_controls.select_next(),
-                KeyCode::PageUp => self.katban_controls.page_up(),
-                KeyCode::PageDown => self.katban_controls.page_down(),
-                // Always-on j/k (the Ollama dialog pattern): the menu has no
-                // text-entry state, so plain letters cannot collide with
-                // typing.
-                KeyCode::Char('k') => self.katban_controls.select_prev(),
-                KeyCode::Char('j') => self.katban_controls.select_next(),
-                KeyCode::Enter => {
-                    if let Some(item) = self.katban_controls.selected_item().cloned() {
-                        self.katban_controls.close();
-                        self.prompt_input.replace_text(item.command);
-                        // Complete commands (a specific link id / IP already in
-                        // the row) submit immediately; incomplete ones (e.g.
-                        // `create `) seed the prompt for the user to finish.
-                        return item.complete;
-                    }
-                }
-                _ => {}
-            }
-            return false;
+            return self.handle_katban_controls_navigation(&key);
         }
 
         // Cat Chat popup (/chat)
@@ -10015,7 +9994,9 @@ impl App {
         // These modal overlays are handled before the resolver (see
         // `handle_key_event`), but their navigation keys resolve through their
         // own contexts so they stay rebindable.
-        if self.keys_dialog.visible {
+        if self.katban_controls.visible {
+            KeyContext::KatbanControls
+        } else if self.keys_dialog.visible {
             KeyContext::KeysDialog
         } else if self.models_menu.visible {
             KeyContext::ModelsMenu
@@ -12515,6 +12496,67 @@ impl App {
             "select" => {
                 self.hooks_config_menu.enter();
                 true
+            }
+            _ => false,
+        }
+    }
+
+    /// Dispatch a key against the configured `KatbanControls` bindings for the
+    /// Alt+G menu. Returns the `should submit` signal for the selected row:
+    /// `true` for a complete command, `false` otherwise.
+    ///
+    /// The menu swallows every key while it is open (it has no text entry, so
+    /// nothing typed can be lost): an unbound key simply does nothing. On
+    /// `select` the row's command is written into the prompt and the menu
+    /// closes, so the user sees exactly what is about to run — every row seeds
+    /// it; `complete` says whether it is a finished command or a prefix. The
+    /// interactive loop submits a prompt only when no modal is open
+    /// (`crates/cli/src/main.rs`), so the run lands on the next Enter, after
+    /// the menu has closed.
+    fn handle_katban_controls_navigation(&mut self, key: &KeyEvent) -> bool {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::KatbanControls) else {
+            return false;
+        };
+        match action.as_str() {
+            "cancel" => {
+                self.katban_controls.close();
+                false
+            }
+            "prev" => {
+                self.katban_controls.select_prev();
+                false
+            }
+            "next" => {
+                self.katban_controls.select_next();
+                false
+            }
+            "pageUp" => {
+                self.katban_controls.page_up();
+                false
+            }
+            "pageDown" => {
+                self.katban_controls.page_down();
+                false
+            }
+            "first" => {
+                self.katban_controls.scroll_to_top();
+                false
+            }
+            "last" => {
+                self.katban_controls.scroll_to_bottom();
+                false
+            }
+            "select" => {
+                let Some(item) = self.katban_controls.selected_item().cloned() else {
+                    return false;
+                };
+                self.katban_controls.close();
+                self.prompt_input.replace_text(item.command);
+                // Complete commands (a card id, bucket, or toggle target
+                // already in the row) submit immediately; incomplete ones
+                // (e.g. `board card add `) seed the prompt for the user to
+                // finish.
+                item.complete
             }
             _ => false,
         }
@@ -19296,11 +19338,52 @@ mod tests {
         app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.katban_controls.visible);
 
-        // Reopen; Enter on the status row seeds + submits the command.
+        // Reopen; Enter on the status row seeds the command and reports it as
+        // ready to run. The run belongs to the caller: the interactive loop
+        // submits only when no modal is open, and the menu is a modal on the
+        // Enter that picked the row, so the command lands on the next one.
         app.handle_key_event(press_key(KeyCode::Char('g'), KeyModifiers::ALT));
         let should_submit = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(should_submit);
+        assert!(!app.katban_controls.visible);
         assert!(app.prompt_input.text.starts_with("/katban "));
+    }
+
+    /// The menu's navigation is no longer a raw `match key.code`: every key
+    /// resolves through `KeyContext::KatbanControls`, so the menu appears in
+    /// the `/keybindings` reference and its keys can be rebound.
+    #[test]
+    fn katban_controls_navigation_flows_through_keybindings() {
+        let mut app = make_app();
+        app.katban_controls.open();
+        assert_eq!(app.current_key_context(), KeyContext::KatbanControls);
+
+        // `j`/`k` (unconditional here — the menu has no text entry) and the
+        // arrows are the prev/next chords.
+        let first = app.katban_controls.selected;
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_ne!(app.katban_controls.selected, first);
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.katban_controls.selected, first);
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        assert_ne!(app.katban_controls.selected, first);
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.katban_controls.selected, first);
+
+        // End/Home land on the last/first actionable row, never a header.
+        app.handle_key_event(press_key(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(
+            app.katban_controls.selected,
+            app.katban_controls.items.len() - 1
+        );
+        app.handle_key_event(press_key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.katban_controls.selected, first);
+
+        // `q` is the context's cancel chord: it closes without touching the
+        // prompt (unlike Enter, which seeds it).
+        app.handle_key_event(press_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.katban_controls.visible);
+        assert!(app.prompt_input.text.is_empty());
     }
 
     #[test]

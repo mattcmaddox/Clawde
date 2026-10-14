@@ -40,7 +40,7 @@ These bindings are active in all contexts.
 | `Alt+R` | historySearch | Open interactive history search |
 | `Alt+B` | createBranch | Create a new git branch |
 | `Alt+C` | compact | Compact the conversation |
-| `Alt+G` | openKatbanControls | Open the Katban controls menu (links, boards, IPs) |
+| `Alt+G` | openKatbanControls | Open the Katban controls menu (board settings, cards, projects, admin buckets) |
 | `Alt+S` | showSources | Toggle the sources display |
 | `Alt+/` | openHelp | Open the help panel |
 | `Alt+Shift+H` | clearFollowupHistory | Clear the followup history |
@@ -224,6 +224,34 @@ Active while the read-only paste viewer is open (opened from a
 Vim mode adds `h` / `l` prev/next. `g` / `G` (jump to top / bottom) and `Alt+E`
 (expand the paste in place, then close) stay with the view's own handler.
 
+### Katban Controls Context
+
+Active while the Katban controls menu (`Alt+G`) is open. It has its own context
+rather than reusing `Select` because a row carries board state — `verify on`,
+`attempts 2`, the pinned attempt upstreams — and `Enter` on a row seeds the
+matching `/katban …` command into the prompt.
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Up` / `k` | prev | Move the highlight up |
+| `Down` / `j` | next | Move the highlight down |
+| `Shift+K` / `Shift+J` | verticalPrev / verticalNext | Resolved to the arrow keys |
+| `PageUp` / `PageDown` | pageUp / pageDown | Scroll ten rows |
+| `Home` / `End` | first / last | Jump to the first / last actionable row |
+| `Enter` | select | Write the row's `/katban …` command into the prompt and close the menu |
+| `Escape` / `q` | cancel | Close the menu (the prompt is left alone) |
+
+Vim mode adds `h` / `l` prev/next. There is no filter bar, so `j` / `k` are
+unconditional.
+
+`Enter` always seeds the prompt and closes the menu, so the command is visible
+before it runs. A row that needs more input (`board card add `, an attempt
+count, a pinned upstream list) is a prefix to finish; a complete row (a card id,
+a bucket name, a toggle's target state) is ready as-is. The run itself is the
+prompt's: the input loop submits only when no modal is open, so a complete row
+executes on the **next** `Enter` — the menu is still up on the one that picked
+it.
+
 ---
 
 ## Keybinding Contexts
@@ -252,6 +280,7 @@ These are the contexts the TUI produces while handling keys today.
 | `ModelsMenu` | The `/models` provider menu (Auto + per-provider on/off) |
 | `Keybindings` | The `/keybindings` reference overlay |
 | `PasteViewer` | The read-only paste viewer |
+| `KatbanControls` | The Katban controls menu (`Alt+G`) |
 | `MessageSelector` | Step 1 of the `/rewind` flow (browse messages) |
 | `ModelPicker` | The model picker overlay (open with `Alt+M` or `/model`) |
 | `Task` | The task-list overlay (`Ctrl+T`) |

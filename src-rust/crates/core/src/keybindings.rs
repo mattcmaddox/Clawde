@@ -88,6 +88,12 @@ pub enum KeyContext {
     /// The read-only paste viewer opened from a `[Pasted text #N ...]`
     /// placeholder. No filter, so the arrows and `j`/`k` are unconditional.
     PasteViewer,
+    /// The Alt+G Katban controls menu. A dedicated context (not `Select`)
+    /// because the menu also carries board state in its rows — a reviewer reads
+    /// "verify on"/"attempts 2" off the row titles — and its own vocabulary
+    /// (`select` submits the seeded `/katban` command, `cancel` just closes).
+    /// The menu has no text entry, so `j`/`k` are unconditional.
+    KatbanControls,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,9 +249,12 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("alt+c", "compact", KeyContext::Global),
         ("ctrl+/", "showKeybindings", KeyContext::Global),
         ("alt+s", "showSources", KeyContext::Global),
-        // Alt+G: Katban controls menu — a scrollable picker for guest links
-        // (rotate password, revoke, create), unblocking locked IPs, and the
-        // Katban status overview. See openKatbanControls in app.rs.
+        // Alt+G: Katban controls menu — a scrollable picker for the Katban
+        // status overview, board/project/site operations, the board's
+        // verify/auto-review/attempts/runtime settings, and the admin
+        // credential plus its locked IP buckets. Guest-link management is NOT
+        // here (that is the /chat Cat Chat popup). Its own keys resolve through
+        // `KeyContext::KatbanControls`; see openKatbanControls in app.rs.
         ("alt+g", "openKatbanControls", KeyContext::Global),
         // ========== CHAT / INPUT CONTEXT ==========
         // Message submission
@@ -568,6 +577,24 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("pagedown", "pageDown", KeyContext::PasteViewer),
         ("home", "first", KeyContext::PasteViewer),
         ("end", "last", KeyContext::PasteViewer),
+        // ========== KATBAN CONTROLS MENU (Alt+G) ==========
+        // No text entry, so vim j/k are unconditional navigation. `select`
+        // seeds the row's `/katban ...` command into the prompt and submits it
+        // when the row is complete; `cancel` only closes the menu (the prompt
+        // is left untouched).
+        ("escape", "cancel", KeyContext::KatbanControls),
+        ("q", "cancel", KeyContext::KatbanControls),
+        ("up", "prev", KeyContext::KatbanControls),
+        ("k", "prev", KeyContext::KatbanControls),
+        ("shift+k", "verticalPrev", KeyContext::KatbanControls),
+        ("down", "next", KeyContext::KatbanControls),
+        ("j", "next", KeyContext::KatbanControls),
+        ("shift+j", "verticalNext", KeyContext::KatbanControls),
+        ("pageup", "pageUp", KeyContext::KatbanControls),
+        ("pagedown", "pageDown", KeyContext::KatbanControls),
+        ("home", "first", KeyContext::KatbanControls),
+        ("end", "last", KeyContext::KatbanControls),
+        ("enter", "select", KeyContext::KatbanControls),
     ];
 
     defaults
@@ -630,6 +657,8 @@ const VIM_PRESET_EXTRAS: &[(&str, &str, KeyContext)] = &[
     ("l", "next", KeyContext::Keybindings),
     ("h", "prev", KeyContext::PasteViewer),
     ("l", "next", KeyContext::PasteViewer),
+    ("h", "prev", KeyContext::KatbanControls),
+    ("l", "next", KeyContext::KatbanControls),
 ];
 
 /// Emacs (readline-style) additions on top of the defaults.
@@ -1858,6 +1887,42 @@ mod tests {
             assert_eq!(a.chord, b.chord);
             assert_eq!(a.action, b.action);
             assert_eq!(a.context, b.context);
+        }
+    }
+
+    /// The Alt+G Katban controls menu resolves its keys through its own
+    /// context, so they are listed in `/keybindings` and rebindable. This pins
+    /// the defaults the TUI's handler reads off that context: move, page, jump
+    /// and select. Before this context existed the menu matched `key.code`
+    /// inline and none of it could be rebound.
+    #[test]
+    fn katban_controls_context_binds_its_menu_keys() {
+        let resolver = KeybindingResolver::new(&UserKeybindings::default());
+        for (chord, action) in [
+            ("up", "prev"),
+            ("k", "prev"),
+            ("shift+k", "verticalPrev"),
+            ("down", "next"),
+            ("j", "next"),
+            ("shift+j", "verticalNext"),
+            ("pageup", "pageUp"),
+            ("pagedown", "pageDown"),
+            ("home", "first"),
+            ("end", "last"),
+            ("enter", "select"),
+            ("escape", "cancel"),
+            ("q", "cancel"),
+        ] {
+            let keystroke = parse_keystroke(chord).expect("chord must parse");
+            let resolved = match resolver.resolve_single(&keystroke, &KeyContext::KatbanControls) {
+                Some(KeybindingResult::Action(action)) => Some(action),
+                _ => None,
+            };
+            assert_eq!(
+                resolved.as_deref(),
+                Some(action),
+                "chord {chord} in KatbanControls"
+            );
         }
     }
 

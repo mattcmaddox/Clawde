@@ -1759,11 +1759,13 @@ The server itself is managed from the shell: `clawde catchat serve|expose`.
 ### /katban
 
 Control the Kanban/agent-board surface from inside Clawde: task boards
-(cards, statuses, dependencies), the board → git project registry, hosted
-dev sites, and the status overview. Everything `/katban` does is also
-reachable from the Katban controls menu (`Alt+G` — see
-[keybindings.md](./keybindings.md)). Guest-chat management is the separate
-[`/chat`](#chat) command (Cat Chat).
+(cards, statuses, dependencies), the board's own settings, the board → git
+project registry, hosted dev sites, and the status overview. The board,
+board-settings, admin and project/site operations are also reachable from the
+Katban controls menu (`Alt+G` — see [keybindings.md](./keybindings.md)), whose
+rows state the live values; card editing (`card edit` / `card remove` /
+`card comment` / `card scope`) stays with this command and the board's web UI.
+Guest-chat management is the separate [`/chat`](#chat) command (Cat Chat).
 
 ```
 /katban                              — status overview
@@ -1773,14 +1775,29 @@ reachable from the Katban controls menu (`Alt+G` — see
 /katban board card add <PROMPT> [--project NAME]
 /katban board card set <ID> <STATUS> [--project NAME]
 /katban board card edit <ID> <PROMPT> [--project NAME] — replace a card's prompt
-/katban board card remove <ID> [--project NAME]
+/katban board card remove <ID> [--project NAME] — discards the card's branch
+/katban board card show <ID> [--project NAME] — status, result, commit, diff
+/katban board card merge <ID> [--project NAME] — land a reviewed card
+/katban board card comment <ID> [--line N] <TEXT> [--project NAME]
+/katban board card feedback <ID> [--project NAME] — send its review comments to its agent
+/katban board card scope <ID> [PATHS...] [--project NAME]
+/katban board link <A> <B> [--project NAME] — A waits for B
+/katban board unlink <A> <B> [--project NAME]
+/katban board verify on|off [--project NAME] — the verification gate
+/katban board auto-review on|off [--project NAME] — the second-agent review pass
+/katban board attempts <N> [--project NAME] — rungs per card (1-5)
+/katban board attempts-upstreams [ID...] [--project NAME] — pin the rotation
+/katban board runtime host|docker [--project NAME] — where attempts execute
+/katban board password <PASSWORD>    — set or rotate the board admin credential
+/katban board unblock <BUCKET>       — clear an admin lockout
 /katban project list                 — board -> git repo registry
 /katban site list                    — hosted sites
 ```
 
 Board commands take `--project NAME` exactly like `clawde katban board ...`
-(default: `default`). This command mirrors the `clawde katban` CLI; see the
-Katban spec (`docs/plans/katban-selfhost-spec.md`) for the full feature plan.
+(default: `default`). This command mirrors the `clawde katban` CLI; see
+[katban.md](./katban.md) for operating guidance and the Katban spec
+(`docs/plans/katban-selfhost-spec.md`) for the full feature plan.
 
 ---
 

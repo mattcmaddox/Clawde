@@ -50,9 +50,28 @@ admin, or `loopback` for one on the host itself (a request with no
 `X-Forwarded-For`). The address spellings resolve onto it, so
 `/katban board unblock 127.0.0.1` clears a local lockout.
 
-`Alt+G` opens the Katban controls menu. It contains board/project/site
-operations and the Katban admin credential controls. It intentionally contains
-no Cat Chat link or guest-lockout rows. `/chat` is the separate popup for that.
+`Alt+G` opens the Katban controls menu, built live from the board and admin
+stores. It has six sections: **Status** (`/katban status`), **Boards** (list,
+ready, add, link, and one advance / merge / review-feedback / inspect row per
+open card), **Board settings** (the verification gate, auto-review, attempts and
+its pinned upstreams, and the card runtime — each row states the value the board
+holds now and runs the command that flips it), **Admin** (set or rotate the
+dashboard password), **Locked buckets** (one unblock row per live lockout,
+named as `status` names it), and **Projects & sites** (`project list`,
+`site list`). Card editing that needs room to read what it will do — `card edit`,
+`card remove`, `card comment`, `card scope` — stays on `/katban` and the web
+board. The menu intentionally contains no Cat Chat link or guest-lockout rows;
+`/chat` is the separate popup for that.
+
+The menu's keys resolve through the `KatbanControls` keybinding context, so
+they are listed in `/keybindings` and rebindable. Defaults: `↑`/`↓` (and `j`/`k`)
+move, `PgUp`/`PgDn` scroll, `Home`/`End` jump to the first/last row, `Enter`
+runs the highlighted row, `Esc`/`q` close. `Enter` writes the row's command
+into the prompt and closes the menu, so it is visible before it runs: a complete
+row (a toggle's target state, a card id, a bucket name) is ready as-is, while a
+row that still needs input (a card prompt, an attempt count) is a prefix to
+finish. The command itself runs on the next `Enter` — the input loop submits
+only when no modal is open, and the menu is a modal.
 
 ## Board workflow
 
