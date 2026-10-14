@@ -160,7 +160,7 @@ skipping). Run it by hand per `docs/katban.md` after touching the board UI.
 ### Cat Chat guest guard
 
 `crates/katban/src/catchat/pages.rs` is the same shape (one embedded HTML+JS
-document, nothing compiles it), and it has its own two rules:
+document, nothing compiles it), and it has its own three rules:
 
 - **A guest sees the answer text and nothing else.** `render_text` in
 `catchat/engine.rs` tags reasoning and tool-use blocks into the string it
@@ -177,11 +177,28 @@ with `http_security::lockout_bucket` before clearing, name the buckets in
 `status` with `describe_lockouts`, and never report a clear that matched
 nothing — that combination is how a locked-out guest stayed locked out while
 the command said it was handled.
+- **A guest command is host-authored, allowlist-gated, and never reaches the
+model.** `catchat/commands.rs` resolves a `/name` line *before* the model path
+(`server.rs::api_chat`), so its reply is built by the host and needs no
+`visible_text` filtering; `run` is only called when the typed line is a command
+shape, and every command's scope is that guest's own session. The host owns the
+vocabulary (`--commands` / `CLAWDE_CATCHAT_COMMANDS`) and the model list
+(`--models` / `CLAWDE_CATCHAT_MODELS`); `/katban` is excluded from the default
+set because it is the only command that reads host state, and even when enabled
+it reports board names and site counts only — never a path, never admin state.
+A command must not consume the chat rate budget or a concurrency slot (it costs
+no model call); `/new` clears the transcript and so must clear the cached
+summary. Adding a command means adding it to `GuestCommand::ALL`, its one-line
+`description`, and a host allowlist entry default — never a bare `if msg ==
+"/foo"` in the handler.
 
 `scripts/probes/catchat-ux-probe.py` drives the whole guest journey in a real
 browser against a local mock upstream (so it needs no free-tier keys) and
-asserts both rules; CI runs it after the board probe. Run it by hand per
-`docs/catchat.md` after touching a Cat Chat page or the guest engine.
+asserts all three rules — including that a guest `/help` is answered from the
+host's list with no new upstream request, that a withheld command is refused,
+and that the modeline follows a command. CI runs it after the board probe. Run
+it by hand per `docs/catchat.md` after touching a Cat Chat page or the guest
+engine.
 
 ### `cargo check` skips test targets
 

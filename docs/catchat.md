@@ -56,6 +56,7 @@ The shell namespace is intentionally separate from Katban:
 
 ```bash
 clawde catchat serve [--port 8789] [--host 127.0.0.1] [--search-endpoint URL]
+                    [--commands SPEC] [--models LIST]
 clawde catchat expose --subdomain chat.example.com
 clawde catchat links create friends
 clawde catchat links list
@@ -99,6 +100,54 @@ and not to claim it searched, and the guest gets an answer from what the model
 already knows. Results themselves are untrusted web content and are screened
 before reaching the model (capped in number, snippets truncated, control
 characters stripped, instruction-shaped results dropped).
+
+## Guest slash commands
+
+A guest's message that looks like a command — a `/` followed by a run of ASCII
+letters — is resolved by the host **before** the model call. A command costs no
+model call, never reaches the provider, and can only change that guest's own
+session; nothing in the vocabulary can touch the host's files, keys, other
+guests, or the board. A line that merely starts with a slash but is not a
+command shape (`/etc/hosts is missing`) goes to the model as prose, so a guest
+can still ask about paths.
+
+The vocabulary comes from the TUI's command set, with guest semantics:
+
+| Command | Guest effect |
+|---|---|
+| `/help` | List the commands this host offers. |
+| `/model` | Show the current model; `/model <id>` picks one (only when the host publishes a list). |
+| `/auto` | Release a pinned model and ride the host's default chain. |
+| `/effort` | Show or set reasoning effort for this chat (the `ultracode` coding workflow is refused). |
+| `/mode` | Show or set the chat mode (`default`, `careful`, `fast`); `walkaway` is refused — a guest has no filesystem to auto-approve. |
+| `/new` | Clear this chat's transcript and notes; the link and settings stay. |
+| `/history` | List the prompts typed in this chat. |
+| `/katban` | Show board names and hosted/exposed site counts (opt-in only). |
+| `/cathead` | Speak in the cat persona (the host default). |
+| `/caveman` | Speak in the caveman persona. |
+| `/normal` | Drop the persona and speak plainly. |
+
+The host decides the vocabulary with `--commands SPEC` (`all`, `none`, or a
+comma-separated list) or `CLAWDE_CATCHAT_COMMANDS`, and the models a guest may
+pick with `--models LIST` or `CLAWDE_CATCHAT_MODELS`. The default set is every
+command except `/katban`: it is the only one that reads host state, so a friend
+must be opted in to see the owner's project names. `/katban` reports names and
+counts only — never a path and never admin state — even when enabled.
+
+`--models` is also where a guest gains any model choice at all: with the
+default single entry (`free/auto`) `/model` is read-only and says so. The first
+listed model is the default, and every pin is validated against the list, so a
+guest's own text can never widen it.
+
+An unknown command name in a `--commands` spec is a startup error, not a silent
+skip: a typo in an always-on unit would otherwise leave a surface the host
+believes it enabled. An empty value is "unset" and keeps the default, mirroring
+`--search-endpoint ''`.
+
+The chat page's modeline is live: it is filled from `GET /api/state` at load
+and from the `state` object carried by every `/api/chat` reply, so `/model`,
+`/effort` and `/mode` show up without a reload. When commands are enabled the
+right side of the modeline links `/help` and shows how many there are.
 
 ## Cat Chat password policy
 
@@ -158,7 +207,9 @@ real browser through the whole guest journey: the sign-in gate a stranger hits
 first, a wrong password refused in the page, the shared password landing in the
 chat, a reply rendering, the session surviving a reload, the downloadable
 summary, and a locked-out local guest being let back in through
-`catchat unblock`.
+`catchat unblock`. It also exercises the command surface: a `/help` that
+renders the host's list while adding no upstream request, a withheld `/katban`
+refused by name, and `/effort` moving the live modeline.
 
 Guest web search is covered end to end as well. The probe starts a second local
 mock that speaks the SearXNG JSON API and passes it with `--search-endpoint`,

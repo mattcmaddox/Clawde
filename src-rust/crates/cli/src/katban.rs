@@ -97,11 +97,18 @@ Cat Chat: the password-protected guest chat you share with friends.
 
 Commands:
   serve [--port N] [--host IP] [--allow-non-loopback]
-        [--search-endpoint URL]                Run the Cat Chat server
+        [--search-endpoint URL] [--commands SPEC] [--models LIST]
+                                              Run the Cat Chat server
                                               (guest search defaults to the
                                               local SearXNG at 127.0.0.1:8080;
                                               override with the flag or
-                                              CLAWDE_CATCHAT_SEARCH_ENDPOINT)
+                                              CLAWDE_CATCHAT_SEARCH_ENDPOINT;
+                                              --commands picks the guest slash
+                                              vocabulary (all|none|names) and
+                                              --models the models a guest may
+                                              pick — both also read from
+                                              CLAWDE_CATCHAT_COMMANDS /
+                                              CLAWDE_CATCHAT_MODELS)
   expose [--subdomain HOST] [--port N] [--dry-run] [--caddy-dir DIR]
          [--duckdns-token TOKEN]              Put Cat Chat behind caddy
                                               (writes the managed katban.conf)
@@ -2627,11 +2634,15 @@ const GUEST_USAGE: &str = r#"Usage: clawde catchat <command> [OPTIONS]
 Public-facing Cat Chat sandbox commands.
 
   serve [--port N] [--host IP] [--allow-non-loopback]
-        [--search-endpoint URL]                Run the Cat Chat sandbox server
+        [--search-endpoint URL] [--commands SPEC] [--models LIST]
+                                              Run the Cat Chat sandbox server
                                               (guest web search; defaults to a
                                               local SearXNG on 127.0.0.1:8080,
                                               overridable via the flag or the
-                                              CLAWDE_CATCHAT_SEARCH_ENDPOINT env var)
+                                              CLAWDE_CATCHAT_SEARCH_ENDPOINT env var;
+                                              --commands picks the guest slash
+                                              vocabulary and --models the models
+                                              a guest may pick)
   expose [--subdomain HOST] [--port N] [--dry-run] [--caddy-dir DIR]
          [--duckdns-token TOKEN]              Put the guest chat behind caddy
                                               (writes the managed katban.conf)
@@ -2901,6 +2912,22 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
                 );
                 index += 1;
             }
+            "--commands" => {
+                commands = Some(
+                    args.get(index + 1)
+                        .context("--commands needs a spec (all, none, or a comma-separated list)")?
+                        .to_string(),
+                );
+                index += 1;
+            }
+            "--models" => {
+                models = Some(
+                    args.get(index + 1)
+                        .context("--models needs a comma-separated model list")?
+                        .to_string(),
+                );
+                index += 1;
+            }
             "--allow-non-loopback" => allow_non_loopback = true,
             flag if flag.starts_with("--port=") => {
                 port = flag["--port=".len()..]
@@ -2912,6 +2939,12 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
             }
             flag if flag.starts_with("--search-endpoint=") => {
                 search_endpoint = Some(flag["--search-endpoint=".len()..].to_string());
+            }
+            flag if flag.starts_with("--commands=") => {
+                commands = Some(flag["--commands=".len()..].to_string());
+            }
+            flag if flag.starts_with("--models=") => {
+                models = Some(flag["--models=".len()..].to_string());
             }
             flag => anyhow::bail!("unknown option: {flag}\n\n{GUEST_USAGE}"),
         }
@@ -2944,7 +2977,16 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
     let engine = Arc::new(clawde_katban::catchat::engine::ChatEngine::new(
         backend, search,
     ));
-    let server = GuestServer::new(engine, store);
+    // Guest policy: which commands and models a friend may use. A bad spec is
+    // fatal — an always-on unit with a typo must not start with a surface the
+    // host did not ask for.
+    let options = clawde_katban::catchat::commands::GuestOptions::resolve(
+        commands.as_deref(),
+        models.as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let commands_list = options.commands.names().join(", ");
+    let server = GuestServer::new(engine, store, options);
     println!("Cat Chat serving at http://{addr}/  (Ctrl-C to stop)");
     if !clawde_katban::host::is_loopback(addr) {
         println!("WARNING: bound to {addr} — reachable by other machines; guests can chat but have no access to your system.");
@@ -2965,6 +3007,11 @@ async fn catchat_serve(args: &[String]) -> anyhow::Result<()> {
                 clawde_katban::catchat::search::ENDPOINT_ENV
             );
         }
+    }
+    if commands_list.is_empty() {
+        println!("guest commands: none (guests just chat)");
+    } else {
+        println!("guest commands: {commands_list}   (a guest types /help)");
     }
     println!(
         "guests ride free/limited providers; chat degrades gracefully if none are configured."

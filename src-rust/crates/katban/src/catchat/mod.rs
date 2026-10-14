@@ -4,6 +4,7 @@
 //! store, and search adapter. It is not a development board, project runner,
 //! git worktree manager, or Katban admin surface.
 
+pub mod commands;
 pub mod engine;
 pub mod links;
 pub mod pages;

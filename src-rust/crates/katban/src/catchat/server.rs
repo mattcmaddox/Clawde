@@ -12,6 +12,7 @@
 //! - The surface only renders chat + the guest's own session; there are no
 //!   routes to boards, projects, settings, or host files (spec §7).
 
+use super::commands::{self, CommandOutcome, GuestBoardFacts, GuestOptions};
 use super::engine::{ChatEngine, GuestSession};
 use super::links::{link_active, GuestStore, DEFAULT_MAX_CONCURRENT};
 use axum::extract::{ConnectInfo, State};
@@ -69,9 +70,17 @@ pub(crate) struct RateWindow {
     pub(crate) count: u32,
 }
 
+/// Reads the host facts `/katban` may report to a guest. Called only when a
+/// host opts that command in — never on the chat path.
+pub type BoardFactsFn = Arc<dyn Fn() -> GuestBoardFacts + Send + Sync>;
+
 pub struct GuestServer {
     pub(crate) store: Arc<Mutex<GuestStore>>,
     pub(crate) engine: Arc<ChatEngine>,
+    /// The host's guest policy: which commands and models a guest may use.
+    pub(crate) options: GuestOptions,
+    /// Board names/site counts for `/katban`; names and counts only.
+    pub(crate) board: BoardFactsFn,
     pub(crate) sessions: Arc<tokio::sync::Mutex<HashMap<String, LiveSession>>>,
     /// link_id -> in-flight chat count (concurrency cap).
     pub(crate) inflight: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
@@ -82,14 +91,34 @@ pub struct GuestServer {
     pub(crate) store_mtime: Arc<Mutex<Option<std::time::SystemTime>>>,
 }
 
+/// The default `/katban` facts source: the host's own overview, reduced to the
+/// names and counts a guest may see. Reads disk, which is why the command is
+/// opt-in and the closure runs only when it is invoked.
+pub fn host_board_facts() -> BoardFactsFn {
+    Arc::new(|| {
+        let summary = crate::status::status();
+        GuestBoardFacts {
+            boards: summary.board_projects,
+            sites: summary.site_count,
+            exposed: summary.exposed_count,
+        }
+    })
+}
+
 impl GuestServer {
-    pub fn new(engine: Arc<ChatEngine>, store: Arc<Mutex<GuestStore>>) -> Self {
+    pub fn new(
+        engine: Arc<ChatEngine>,
+        store: Arc<Mutex<GuestStore>>,
+        options: GuestOptions,
+    ) -> Self {
         let store_mtime = std::fs::metadata(super::links::storage_path())
             .and_then(|metadata| metadata.modified())
             .ok();
         GuestServer {
             store,
             engine,
+            options,
+            board: host_board_facts(),
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             chat_rate: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -121,6 +150,7 @@ impl GuestServer {
             .route("/auth", post(auth))
             .route("/chat", get(chat_page))
             .route("/api/chat", post(api_chat))
+            .route("/api/state", get(api_state))
             .route("/api/summary", post(api_summary))
             .with_state(state)
     }
@@ -129,6 +159,8 @@ impl GuestServer {
         GuestState {
             store: self.store.clone(),
             engine: self.engine.clone(),
+            options: self.options.clone(),
+            board: self.board.clone(),
             sessions: self.sessions.clone(),
             inflight: self.inflight.clone(),
             chat_rate: self.chat_rate.clone(),
@@ -142,6 +174,8 @@ impl GuestServer {
 struct GuestState {
     store: Arc<Mutex<GuestStore>>,
     engine: Arc<ChatEngine>,
+    options: GuestOptions,
+    board: BoardFactsFn,
     sessions: Arc<tokio::sync::Mutex<HashMap<String, LiveSession>>>,
     inflight: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
     chat_rate: Arc<tokio::sync::Mutex<HashMap<String, RateWindow>>>,
@@ -534,6 +568,45 @@ struct ChatRequest {
 #[derive(Serialize)]
 struct ChatReply {
     reply: String,
+    /// The guest session's live settings after this turn, so the page's
+    /// modeline follows a `/model`, `/effort` or `/mode` without a reload.
+    state: SessionState,
+}
+
+/// The guest-visible slice of a session: what the modeline shows and the
+/// command names `/help` would list. Nothing here is host state.
+#[derive(Serialize)]
+struct SessionState {
+    model: String,
+    effort: String,
+    mode: String,
+    voice: String,
+    /// Allowed command names — the page uses presence to show its `/help` hint.
+    commands: Vec<String>,
+}
+
+fn session_state(session: &GuestSession, options: &GuestOptions) -> SessionState {
+    SessionState {
+        model: session
+            .model
+            .clone()
+            .unwrap_or_else(|| options.default_model().to_string()),
+        effort: session
+            .effort
+            .map(|effort| effort.as_str().to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        mode: session
+            .mode
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+        voice: session.voice.as_str().to_string(),
+        commands: options
+            .commands
+            .names()
+            .iter()
+            .map(|n| n.to_string())
+            .collect(),
+    }
 }
 
 /// True when the per-link fixed-window rate limit has headroom; records the
@@ -574,10 +647,48 @@ async fn api_chat(
     let (link_id, token) = authenticated(&state, &headers)
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "not logged in").into_response())?;
 
+    let now = now_secs();
+
+    // Guest commands are resolved before the model path, before the rate
+    // limit and before the concurrency cap: they cost no model call and no
+    // chat slot, so a guest running them must not spend the budget the model
+    // path is protected by. They *do* require the device token above, since
+    // they read and mutate this session's own settings.
+    let command = {
+        let mut sessions = state.sessions.lock().await;
+        sweep_sessions(&mut sessions, now);
+        let session = sessions
+            .entry(token.clone())
+            .or_insert_with(|| LiveSession {
+                last_used: now,
+                ..Default::default()
+            });
+        session.last_used = now;
+        let board = state.board.clone();
+        let facts = move || board();
+        match commands::run(&form.message, &mut session.chat, &state.options, &facts) {
+            CommandOutcome::Reply(reply) => {
+                // `/new` cleared the transcript, so a cached summary now
+                // describes a conversation that no longer exists.
+                if reply.cleared_history {
+                    session.summary = None;
+                }
+                Some((reply.text, session_state(&session.chat, &state.options)))
+            }
+            CommandOutcome::NotACommand => None,
+        }
+    };
+    if let Some((reply, state_json)) = command {
+        return Ok(Json(ChatReply {
+            reply,
+            state: state_json,
+        })
+        .into_response());
+    }
+
     // Per-link rate limit (spec §9): bounds sustained throughput, not just
     // simultaneity, so a script with the shared password can't burn the
     // host's free-tier quota or SearXNG in a tight loop.
-    let now = now_secs();
     if rate_limited(&state.chat_rate, &link_id, CHAT_MAX_PER_MINUTE, now).await {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
@@ -622,7 +733,9 @@ async fn api_chat(
                 ..Default::default()
             });
         session.last_used = now;
-        state.engine.respond(&mut session.chat, &form.message).await
+        let reply = state.engine.respond(&mut session.chat, &form.message).await;
+        let state_json = session_state(&session.chat, &state.options);
+        (reply, state_json)
     };
 
     {
@@ -633,9 +746,39 @@ async fn api_chat(
     }
 
     match reply {
-        Ok(reply) => Ok(Json(ChatReply { reply }).into_response()),
-        Err(error) => Err((StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()),
+        (Ok(reply), state_json) => Ok(Json(ChatReply {
+            reply,
+            state: state_json,
+        })
+        .into_response()),
+        (Err(error), _) => {
+            Err((StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response())
+        }
     }
+}
+
+/// The live session settings the page's modeline renders (`GET /api/state`),
+/// so a reload does not lose what a `/model` or `/mode` set.
+#[allow(clippy::result_large_err)]
+async fn api_state(
+    State(state): State<GuestState>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    check_origin(&headers, &state).map_err(IntoResponse::into_response)?;
+    let (_link_id, token) = authenticated(&state, &headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "not logged in").into_response())?;
+
+    let now = now_secs();
+    let mut sessions = state.sessions.lock().await;
+    sweep_sessions(&mut sessions, now);
+    let session = sessions
+        .entry(token.clone())
+        .or_insert_with(|| LiveSession {
+            last_used: now,
+            ..Default::default()
+        });
+    session.last_used = now;
+    Ok(Json(session_state(&session.chat, &state.options)).into_response())
 }
 
 #[derive(Serialize)]
@@ -755,6 +898,18 @@ mod tests {
         Arc<Mutex<GuestStore>>,
         std::sync::MutexGuard<'static, ()>,
     ) {
+        setup_with(GuestOptions::guest_default())
+    }
+
+    fn setup_with(
+        options: GuestOptions,
+    ) -> (
+        Router,
+        String,
+        String,
+        Arc<Mutex<GuestStore>>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
         let guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
         std::env::set_var("CLAWDE_HOME", tmp.path());
@@ -762,7 +917,7 @@ mod tests {
         let id = store.create_link("friends", "correct-pw", None, 2);
         save(&store).unwrap();
         let store = Arc::new(Mutex::new(store));
-        let server = GuestServer::new(stub_engine(), store.clone());
+        let server = GuestServer::new(stub_engine(), store.clone(), options);
         let router = server.router();
         (router, id, "correct-pw".to_string(), store, guard)
     }
@@ -774,6 +929,8 @@ mod tests {
         GuestState {
             store,
             engine: stub_engine(),
+            options: GuestOptions::guest_default(),
+            board: host_board_facts(),
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             chat_rate: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -787,6 +944,58 @@ mod tests {
             .await
             .unwrap();
         String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// Log in and return the device token, for tests that need an
+    /// authenticated request without re-walking the auth flow.
+    async fn login_token(router: &Router, password: &str) -> String {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "password": password }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("katban_guest=")
+            .expect("cookie carries the device token")
+            .to_string()
+    }
+
+    /// POST a message as `token` and return the parsed JSON reply.
+    async fn chat(router: &Router, token: &str, message: &str) -> serde_json::Value {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("cookie", format!("katban_guest={token}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "message": message }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_str(&body_text(response).await).unwrap()
     }
 
     #[tokio::test]
@@ -870,10 +1079,16 @@ mod tests {
         // The mascot is animated from JS with the TUI's frame timings.
         assert!(page.contains("mascotTick"));
         assert!(page.contains("%7000"));
-        // Modeline pill + effort glyph, prompt rules, status bar.
+        // Modeline pill + effort glyph, prompt rules, status bar. The
+        // modeline is live now (filled from `/api/state`), so it starts at the
+        // session defaults and carries the ids `applyState` writes.
         for marker in [
             "BUILD",
-            "&#9680; medium",
+            "&#9680; default",
+            "id=\"mlModel\"",
+            "id=\"mlEffort\"",
+            "id=\"mlHint\"",
+            "applyState",
             "class=\"rule\"",
             "ctx: 0%",
             "&#8806; catchat",
@@ -1097,6 +1312,169 @@ mod tests {
         assert_eq!(reply.status(), StatusCode::OK);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(reply).await).unwrap();
         assert_eq!(parsed["reply"], "hi from stub");
+    }
+
+    #[tokio::test]
+    async fn guest_command_is_answered_by_the_host_not_the_model() {
+        // The stub backend answers "hi from stub" for anything it is given, so
+        // a `/help` that returns the command list proves the model was never
+        // called: the reply is host-authored text.
+        let (router, _, _, _, _guard) = setup();
+        let token = login_token(&router, "correct-pw").await;
+        let reply = chat(&router, &token, "/help").await;
+        let text = reply["reply"].as_str().unwrap();
+        assert!(text.contains("Cat Chat commands"), "{text}");
+        assert!(text.contains("/model"), "{text}");
+        assert!(!text.contains("hi from stub"));
+        // `/katban` is recognised but not enabled here, so it refuses without
+        // reaching the model either.
+        let refused = chat(&router, &token, "/katban").await;
+        let refused = refused["reply"].as_str().unwrap();
+        assert!(refused.contains("host-only command"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn guest_command_does_not_spend_the_chat_rate_budget() {
+        // Commands cost no model call, so they must not consume the per-minute
+        // budget that protects the model path: a guest could otherwise run
+        // `/help` 20 times and be locked out of real chat for a minute.
+        let (router, _, _, _, _guard) = setup();
+        let token = login_token(&router, "correct-pw").await;
+        for _ in 0..(CHAT_MAX_PER_MINUTE + 5) {
+            let reply = chat(&router, &token, "/help").await;
+            assert!(reply["reply"]
+                .as_str()
+                .unwrap()
+                .contains("Cat Chat commands"));
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_commands_change_the_reported_session_state() {
+        let options = GuestOptions {
+            commands: super::super::commands::GuestCommandSet::all(),
+            models: vec!["free/auto".to_string(), "free/groq/llama".to_string()],
+        };
+        let (router, _, _, _, _guard) = setup_with(options);
+        let token = login_token(&router, "correct-pw").await;
+
+        let initial = chat(&router, &token, "/model").await;
+        assert_eq!(initial["state"]["model"], "free/auto");
+
+        let picked = chat(&router, &token, "/model free/groq/llama").await;
+        assert_eq!(picked["state"]["model"], "free/groq/llama");
+        // `/model` with no argument reports the pick it just set.
+        assert!(picked["reply"]
+            .as_str()
+            .unwrap()
+            .contains("free/groq/llama"));
+
+        let effort = chat(&router, &token, "/effort high").await;
+        assert_eq!(effort["state"]["effort"], "high");
+        let mode = chat(&router, &token, "/mode careful").await;
+        assert_eq!(mode["state"]["mode"], "careful");
+        let voice = chat(&router, &token, "/caveman").await;
+        assert_eq!(voice["state"]["voice"], "caveman");
+
+        // `/auto` releases the pin, and the state says so.
+        let reset = chat(&router, &token, "/auto").await;
+        assert_eq!(reset["state"]["model"], "free/auto");
+    }
+
+    #[tokio::test]
+    async fn katban_reports_host_facts_when_the_host_opts_in() {
+        let options = GuestOptions {
+            commands: super::super::commands::GuestCommandSet::parse("katban").unwrap(),
+            models: vec!["free/auto".to_string()],
+        };
+        let (router, _, _, _, _guard) = setup_with(options);
+        let token = login_token(&router, "correct-pw").await;
+        let reply = chat(&router, &token, "/katban").await;
+        let text = reply["reply"].as_str().unwrap();
+        assert!(text.contains("boards:"), "{text}");
+        // Names and counts only: no path, no admin language.
+        assert!(!text.contains('/'), "no path may leak: {text}");
+        assert!(!text.to_ascii_lowercase().contains("admin"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn api_state_reports_the_session_and_requires_a_token() {
+        let (router, _, _, _, _guard) = setup();
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let token = login_token(&router, "correct-pw").await;
+        let state = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state")
+                    .header("cookie", format!("katban_guest={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.status(), StatusCode::OK);
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(state).await).unwrap();
+        assert_eq!(parsed["model"], "free/auto");
+        assert_eq!(parsed["effort"], "default");
+        assert_eq!(parsed["mode"], "default");
+        // The default set is advertised, so the page shows its `/help` hint.
+        let commands = parsed["commands"].as_array().unwrap();
+        assert!(commands.iter().any(|c| c == "help"));
+        assert!(!commands.iter().any(|c| c == "katban"));
+    }
+
+    #[tokio::test]
+    async fn new_clears_the_cached_summary() {
+        // `/new` drops the transcript, so a summary cached for the old
+        // conversation must not be served afterwards.
+        let (router, _, _, _, _guard) = setup();
+        let token = login_token(&router, "correct-pw").await;
+        // Give the session a transcript so the first summary is a real one.
+        chat(&router, &token, "hello").await;
+        let summary = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/summary")
+                    .header("cookie", format!("katban_guest={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.status(), StatusCode::OK);
+        let cached: serde_json::Value = serde_json::from_str(&body_text(summary).await).unwrap();
+        assert_eq!(cached["summary"], "hi from stub");
+
+        chat(&router, &token, "/new").await;
+
+        let after = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/summary")
+                    .header("cookie", format!("katban_guest={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(after).await).unwrap();
+        assert_eq!(parsed["summary"], "(empty session — nothing to summarize)");
     }
 
     #[tokio::test]

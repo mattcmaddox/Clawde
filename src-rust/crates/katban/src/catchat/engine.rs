@@ -15,6 +15,7 @@
 //!   TUI's `/cathead`), composed behind the fixed guest contract.
 
 use super::search::{GuestSearch, SearchResult};
+use clawde_core::effort::EffortLevel;
 use clawde_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -142,11 +143,58 @@ impl GuestBackend for FreeBackend {
     }
 }
 
+/// Which voice a guest's session speaks in.
+///
+/// The host-fixed default is Cathead — the same persona `/cathead` activates in
+/// the TUI, so a friend meets the mascot's voice. A guest may swap it for their
+/// own session with `/cathead`, `/caveman` or `/normal`; all three choices are
+/// host-authored prompt text, so the guest contract above them cannot be
+/// altered by a guest's message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GuestVoice {
+    #[default]
+    Cathead,
+    Caveman,
+    /// No persona: the contract alone.
+    Normal,
+}
+
+impl GuestVoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuestVoice::Cathead => "cathead",
+            GuestVoice::Caveman => "caveman",
+            GuestVoice::Normal => "normal",
+        }
+    }
+
+    /// The persona text appended after the fixed guest contract. `Normal`
+    /// appends none — the contract is the whole prompt.
+    pub fn prompt(self) -> Option<String> {
+        match self {
+            GuestVoice::Cathead => Some(cathead_voice()),
+            GuestVoice::Caveman => {
+                Some(clawde_core::output_styles::OutputStyleDef::builtin_caveman().prompt)
+            }
+            GuestVoice::Normal => None,
+        }
+    }
+}
+
 /// One guest's ephemeral session state.
 #[derive(Debug, Default)]
 pub struct GuestSession {
     pub messages: Vec<Message>,
     pub notes: String,
+    /// Voice for this session (host default: [`GuestVoice::Cathead`]).
+    pub voice: GuestVoice,
+    /// Effort override chosen with `/effort`; `None` = the model's default.
+    pub effort: Option<EffortLevel>,
+    /// Mode chosen with `/mode`. A guest has no tools, so only the mode's
+    /// prompt guidance applies; its permission/plan knobs are inert here.
+    pub mode: Option<String>,
+    /// Model pinned with `/model`; `None` = the host's default chain.
+    pub model: Option<String>,
 }
 
 impl GuestSession {
@@ -163,6 +211,30 @@ impl GuestSession {
         } else {
             &self.messages[len - MAX_HISTORY_MESSAGES..]
         }
+    }
+
+    /// The prompts the guest typed in this chat, oldest first.
+    ///
+    /// Commands are never recorded as messages (they are answered by the host,
+    /// not by the model), so this is exactly what the guest asked.
+    pub fn prompts(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .filter_map(|message| match &message.content {
+                MessageContent::Text(text) => Some(text.clone()),
+                MessageContent::Blocks(_) => None,
+            })
+            .filter(|text| !text.trim().is_empty())
+            .collect()
+    }
+
+    /// Drop this chat's transcript and working notes. `/new`: the session, its
+    /// link, its device token and its settings all stay — only the conversation
+    /// starts over.
+    pub fn clear_history(&mut self) {
+        self.messages.clear();
+        self.notes.clear();
     }
 }
 
@@ -201,7 +273,7 @@ impl ChatEngine {
         let mut history = session.window().to_vec();
         let mut tool_round = 0;
         loop {
-            let request = self.build_request(&history, tool_round == 0);
+            let request = self.build_request(session, &history, tool_round == 0);
             let response = self
                 .backend
                 .chat(request)
@@ -326,6 +398,7 @@ impl ChatEngine {
 
     fn build_request(
         &self,
+        session: &GuestSession,
         history: &[Message],
         with_tools: bool,
     ) -> clawde_api::provider_types::ProviderRequest {
@@ -335,10 +408,16 @@ impl ChatEngine {
             Vec::new()
         };
         clawde_api::provider_types::ProviderRequest {
-            model: GUEST_MODEL.to_string(),
+            // A pinned model still rides the free chain when the pin is absent;
+            // the host's `--models` list is what a pin is validated against
+            // (`catchat::commands`), so an unlisted id never reaches here.
+            model: session
+                .model
+                .clone()
+                .unwrap_or_else(|| GUEST_MODEL.to_string()),
             messages: history.to_vec(),
             system_prompt: Some(clawde_api::provider_types::SystemPrompt::Text(
-                guest_system_prompt(),
+                guest_system_prompt_for(session),
             )),
             tools,
             max_tokens: 1024,
@@ -347,19 +426,42 @@ impl ChatEngine {
             top_k: None,
             stop_sequences: Vec::new(),
             thinking: None,
-            effort_level: None,
+            effort_level: session.effort,
             provider_options: serde_json::Value::Object(Default::default()),
             strict_route: false,
         }
     }
 }
 
-/// The effective guest system prompt: the fixed guest contract first (the
-/// security posture — no host access, cite sources), then the Cathead voice.
-/// The host controls this composition; a guest's message text can never alter
-/// either half.
+/// The guest system prompt for a session: the fixed contract first (the
+/// security posture — no host access, cite sources), then the session's voice,
+/// then the mode guidance its `/mode` choice asked for.
+///
+/// Every part is host-authored text. A guest's message can never alter the
+/// contract, and `/cathead`-style commands can only swap in another host
+/// persona or a built-in mode block — the ordering here is what keeps the
+/// contract first no matter what the session holds.
+pub fn guest_system_prompt_for(session: &GuestSession) -> String {
+    let mut prompt = GUEST_CONTRACT_PROMPT.to_string();
+    if let Some(voice) = session.voice.prompt() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&voice);
+    }
+    if let Some(mode) = &session.mode {
+        // `&[]` = the built-in registry: a guest session cannot load modes from
+        // the host's disk, and an unknown name yields no block.
+        if let Some(block) = clawde_core::modes::resolve_mode_block(&[], mode) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&block);
+        }
+    }
+    prompt
+}
+
+/// The default guest prompt: the contract with the Cathead voice and no mode —
+/// exactly a fresh [`GuestSession`].
 pub fn guest_system_prompt() -> String {
-    format!("{}\n\n{}", GUEST_CONTRACT_PROMPT, cathead_voice())
+    guest_system_prompt_for(&GuestSession::default())
 }
 
 pub fn web_search_definition() -> ToolDefinition {
@@ -870,5 +972,96 @@ mod tests {
             .push(Message::user("what is the best pizza?"));
         let summary = engine.summarize(&session).await.unwrap();
         assert_eq!(summary, "We discussed web search.");
+    }
+
+    /// What a guest changed with `/cathead`, `/mode`, `/effort` and `/model`
+    /// reaches the request — and the fixed contract still comes first, so a
+    /// session setting can never reorder or replace the security posture.
+    #[tokio::test]
+    async fn session_settings_reach_the_request_under_the_contract() {
+        let backend: Arc<FakeBackend> = Arc::new(FakeBackend::new(vec![FakeBackend::text("ok")]));
+        let engine = ChatEngine::new(
+            backend.clone(),
+            Arc::new(FakeSearch {
+                results: Vec::new(),
+            }),
+        );
+        let mut session = GuestSession::new();
+        session.voice = GuestVoice::Caveman;
+        session.mode = Some("careful".to_string());
+        session.effort = Some(EffortLevel::High);
+        session.model = Some("free/groq/x".to_string());
+
+        engine.respond(&mut session, "hi").await.unwrap();
+
+        let request = backend.last_request().expect("a request was sent");
+        assert_eq!(request.model, "free/groq/x");
+        assert_eq!(request.effort_level, Some(EffortLevel::High));
+        let prompt = match request.system_prompt {
+            Some(clawde_api::provider_types::SystemPrompt::Text(text)) => text,
+            other => panic!("expected a text system prompt, got {other:?}"),
+        };
+        assert!(
+            prompt.starts_with(GUEST_CONTRACT_PROMPT),
+            "the contract must come first: {prompt}"
+        );
+        // Compare against core's own persona text: the caveman prompt never
+        // says "Caveman" (its text is the concise-output rules), so asserting
+        // on the label would pass only by accident.
+        let expected_voice = clawde_core::output_styles::OutputStyleDef::builtin_caveman().prompt;
+        assert!(
+            prompt.contains(&expected_voice),
+            "voice text missing: {prompt}"
+        );
+        // Compare against core's own block so a rewrite of the mode guidance
+        // follows here instead of drifting.
+        let expected =
+            clawde_core::modes::resolve_mode_block(&[], "careful").expect("careful is a builtin");
+        assert!(
+            prompt.ends_with(&expected),
+            "mode guidance missing: {prompt}"
+        );
+    }
+
+    /// `/normal` drops the persona entirely: contract only, byte for byte.
+    #[test]
+    fn normal_voice_is_the_bare_contract() {
+        let session = GuestSession {
+            voice: GuestVoice::Normal,
+            ..Default::default()
+        };
+        assert_eq!(guest_system_prompt_for(&session), GUEST_CONTRACT_PROMPT);
+        // A fresh session still composes the historical default (contract +
+        // Cathead), which is what `guest_system_prompt` promised before.
+        assert_eq!(
+            guest_system_prompt_for(&GuestSession::default()),
+            guest_system_prompt()
+        );
+    }
+
+    /// `/history` reads the guest's own prompts, and `/new` clears the
+    /// transcript (plus the working notes) without touching the session's
+    /// settings.
+    #[test]
+    fn prompts_lists_user_turns_and_clear_history_keeps_settings() {
+        let mut session = GuestSession::new();
+        session.notes = "scratch".to_string();
+        session.messages.push(Message::user("first"));
+        session.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("an answer".to_string()),
+            uuid: None,
+            cost: None,
+            snapshot_patch: None,
+            turn_meta: None,
+        });
+        session.messages.push(Message::user("second"));
+        assert_eq!(session.prompts(), vec!["first", "second"]);
+
+        session.voice = GuestVoice::Caveman;
+        session.clear_history();
+        assert!(session.prompts().is_empty());
+        assert!(session.notes.is_empty());
+        assert_eq!(session.voice, GuestVoice::Caveman);
     }
 }

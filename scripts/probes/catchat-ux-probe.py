@@ -714,6 +714,71 @@ def run_checks(args, report, page, base, env, binary, log_path):
         f"leaked={leaked} rows={rows}",
     )
 
+    # --- Guest slash commands are answered by the host, not the model ------
+    # `/help` must render the host's own vocabulary, which means it also must
+    # not cost a model call: the mock upstream sees no new request and the
+    # reply is not the mock's answer text. `/katban` is the one command the
+    # default host withholds, so it must refuse instead of pretending not to
+    # exist. The modeline has to follow the command that changed it.
+    ok, hint = wait_text(page, "#mlHint", "/help")
+    report.check(
+        "the modeline advertises the guest command surface",
+        ok and "commands" in hint,
+        f"hint={hint!r}",
+    )
+    with args.upstream_state["lock"]:
+        before_requests = len(args.upstream_state["requests"])
+    before_rows = len(bot_rows(page))
+    page.fill("#msg", "/help")
+    page.click("#send")
+    deadline = time.monotonic() + args.timeout_secs
+    help_rows = []
+    while time.monotonic() < deadline:
+        help_rows = bot_rows(page)
+        if len(help_rows) > before_rows:
+            break
+        page.wait_for_timeout(POLL_SECS * 1000)
+    help_text = " | ".join(help_rows[before_rows:])
+    report.check(
+        "a guest `/help` is answered with the host's command list",
+        "/model" in help_text and "/cathead" in help_text and REPLY_ANSWER not in help_text,
+        f"rows={help_rows}",
+    )
+    with args.upstream_state["lock"]:
+        after_requests = len(args.upstream_state["requests"])
+    report.check(
+        "a guest command never reaches the upstream",
+        after_requests == before_requests,
+        f"before={before_requests} after={after_requests}",
+    )
+    # A command the host withholds is refused by name, still without a model
+    # call, rather than answered as prose.
+    before_rows = len(bot_rows(page))
+    page.fill("#msg", "/katban")
+    page.click("#send")
+    deadline = time.monotonic() + args.timeout_secs
+    katban_rows = []
+    while time.monotonic() < deadline:
+        katban_rows = bot_rows(page)
+        if len(katban_rows) > before_rows:
+            break
+        page.wait_for_timeout(POLL_SECS * 1000)
+    report.check(
+        "a command the host withholds is refused, not sent to the model",
+        "host-only command" in " | ".join(katban_rows[before_rows:]),
+        f"rows={katban_rows}",
+    )
+    # `/effort` moves the live modeline, which is the browser-visible proof
+    # that the command mutated this session rather than answering in prose.
+    page.fill("#msg", "/effort high")
+    page.click("#send")
+    ok, effort = wait_text(page, "#mlEffort", "high")
+    report.check(
+        "`/effort` updates the live modeline",
+        ok,
+        f"effort={effort!r}",
+    )
+
     # --- The startup line tells the truth about the search endpoint --------
     # `catchat serve` used to announce a local SearXNG without asking, so a host
     # whose port belonged to something else advertised a search feature that

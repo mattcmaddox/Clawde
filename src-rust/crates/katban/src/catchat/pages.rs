@@ -374,8 +374,8 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
   <div id="log" class="section fade-in d-3"><div class="note">Chat with Clawde</div></div>
   <div class="summary-row"><div id="summary"><div class="summary-head"><span>session summary</span><button id="sumClose" title="Close">&times;</button></div><span id="sumBody"></span></div></div>
   <div class="modeline">
-    <span><span class="pill">BUILD</span> <span class="ml-model">auto</span> <span class="ml-dim">&#183; guest</span> <span class="ml-effort">&#183; &#9680; medium</span></span>
-    <span class="ml-right"><b>Auto</b> &#183; Type a message</span>
+    <span><span class="pill">BUILD</span> <span class="ml-model" id="mlModel">auto</span> <span class="ml-dim">&#183; guest</span> <span class="ml-effort" id="mlEffort">&#183; &#9680; default</span></span>
+    <span class="ml-right" id="mlHint"><b>Auto</b> &#183; Type a message</span>
   </div>
   <div class="rule"></div>
   <form id="f" class="section"><div class="field"><span class="glyph">&#10095;</span><span class="cursor"></span><input id="msg" placeholder="Ask anything&#8230;" autocomplete="off"></div><button id="send" type="submit">Send</button></form>
@@ -454,13 +454,33 @@ function startSpinner(){
   t.textContent=verb+'\u2026';
   return {el:n,stop(){clearInterval(timer);n.remove()}};
 }
+/* The live modeline: the server sends this session's settings with every
+   reply and at load, so /model, /effort and /mode show up immediately
+   without a reload. With no commands enabled the right side stays a plain
+   prompt hint. */
+function applyState(s){
+  if(!s)return;
+  const model=document.getElementById('mlModel');
+  if(model)model.textContent=(s.model||'').replace(/^free\//,'');
+  const effort=document.getElementById('mlEffort');
+  if(effort)effort.innerHTML='&#183; &#9680; '+(s.effort||'default');
+  const hint=document.getElementById('mlHint');
+  if(!hint)return;
+  hint.textContent='';
+  if(s.commands&&s.commands.length){
+    const b=document.createElement('b');b.textContent='/help';
+    hint.appendChild(b);
+    hint.appendChild(document.createTextNode(' \u00b7 '+s.commands.length+' commands'));
+  }else{hint.appendChild(document.createTextNode('Type a message'));}
+}
+fetch('/api/state').then(r=>r.ok?r.json():null).then(applyState).catch(()=>{});
 form.addEventListener('submit',async e=>{e.preventDefault();
   const text=msg.value.trim();if(!text)return;msg.value='';add(text,'user');
   send.disabled=true;const spin=startSpinner();
   try{
     const res=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
     spin.stop();
-    if(res.ok){const data=await res.json();add(data.reply,'bot')}
+    if(res.ok){const data=await res.json();add(data.reply,'bot');applyState(data.state)}
     else{add('Sorry \u2014 '+await res.text(),'note error')}
   }catch(err){spin.stop();add('Network error \u2014 try again.','note error')}
   send.disabled=false;msg.focus()});
