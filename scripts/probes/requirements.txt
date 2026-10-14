@@ -1,0 +1,15 @@
+# Python packages the browser probes need (katban-board-ux-probe.py,
+# catchat-ux-probe.py). Everything else under scripts/probes/ is stdlib-only.
+#
+# These are NOT installed into the system python: on a distro whose python is
+# externally managed (PEP 668) `pip install playwright` is refused outright.
+# Install them into a venv instead:
+#
+#     scripts/probes/browser-probes.sh setup     # create/refresh the venv
+#     scripts/probes/browser-probes.sh board     # run a probe from it
+#     scripts/probes/browser-probes.sh catchat
+#
+# The venv lives outside the repo (default ~/.local/share/clawde/probes-venv,
+# override with CLAWDE_PROBE_VENV). A system chromium is used when present, so
+# playwright's own browser download is only needed where none exists.
+playwright

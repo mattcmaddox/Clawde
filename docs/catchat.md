@@ -172,7 +172,7 @@ unavailable). The adapter itself also has Rust coverage over real HTTP in
 
 ```bash
 cargo build
-python3 scripts/probes/catchat-ux-probe.py --chromium /usr/bin/chromium
+scripts/probes/browser-probes.sh catchat
 ```
 
 It needs no configured free-tier keys: the probe points the guest chain at a
@@ -185,7 +185,9 @@ only the answer.
 
 It runs against a scratch `CLAWDE_HOME` and exits 2, not 0, when a prerequisite
 is missing; CI (the Linux leg) passes `--require-browser`, which turns that skip
-into a failure.
+into a failure. `playwright` comes from the shared probe venv
+(`scripts/probes/browser-probes.sh setup`), not the system python, which
+refuses a bare `pip install` on an externally-managed distro (PEP 668).
 
 ## What Cat Chat is not
 

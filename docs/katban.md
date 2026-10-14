@@ -185,7 +185,7 @@ cards, editing, search/sort/hide-done, the dependency picker, and sign-out.
 
 ```bash
 cargo build
-python3 scripts/probes/katban-board-ux-probe.py --chromium /usr/bin/chromium
+scripts/probes/browser-probes.sh board
 ```
 
 It also covers the two paths that only show up outside the happy flow: a
@@ -199,9 +199,14 @@ tests (`exposed_reads_require_auth_but_loopback_stays_open`).
 Cat Chat's pages have the same gap and their own probe — see
 [catchat.md](catchat.md#verifying-the-guest-journey).
 
-It needs `playwright` (`pip install playwright && playwright install chromium`)
-and exits 2, not 0, when a prerequisite is missing, so a wiring that treats
-non-zero as failure cannot read a skip as a pass. CI (the Linux leg of
+It needs the `playwright` Python package, which
+`scripts/probes/browser-probes.sh setup` installs into a venv outside the repo
+— a bare `pip install playwright` is refused where the distro python is
+externally managed (PEP 668). The wrapper then runs the probe with a system
+chromium when one is installed, so playwright's own browser download is only
+needed where none exists. The probe exits 2, not 0, when a prerequisite is
+missing, so a wiring that treats non-zero as failure cannot read a skip as a
+pass. CI (the Linux leg of
 `.github/workflows/ci.yml`) installs playwright into a throwaway venv and passes
 `--require-browser`, which turns that skip into a failure — a browser that
 failed to install breaks the run instead of reporting green. It runs against a

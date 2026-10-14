@@ -40,8 +40,11 @@ CI wiring that treats non-zero as failure can never read a skip as success.
 `--require-browser` turns that skip into a failure instead, for CI — where a
 silently skipped browser probe must not read as green:
 
-    python3 -c "import playwright"       # pip install playwright
-    playwright install chromium          # or pass --chromium /path/to/chrome
+    scripts/probes/browser-probes.sh setup    # playwright, into a private venv
+    scripts/probes/browser-probes.sh board    # then just run it
+
+  (pip install into the system python is refused on an externally-managed
+  distro, PEP 668 — see scripts/probes/requirements.txt.)
 
 Usage:
 
@@ -664,7 +667,8 @@ def main():
     except Exception as error:  # noqa: BLE001
         reason = (
             f"playwright is not installed — {error}\n"
-            "  pip install playwright && playwright install chromium"
+            "  scripts/probes/browser-probes.sh setup  # installs it into a venv\n"
+            "  scripts/probes/browser-probes.sh board  # then run this probe"
         )
         if args.require_browser:
             print(f"katban-board-ux-probe: FAIL — {reason}")
