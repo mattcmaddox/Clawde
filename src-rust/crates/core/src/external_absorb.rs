@@ -454,6 +454,23 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
+    /// A scratch dir together with its canonical path, the pair an absorb test
+    /// needs.
+    ///
+    /// `absorb_paths` takes a `cwd_canonical`: its only caller canonicalizes
+    /// first (`absorb_new_external_sessions_for`), and the relevance check
+    /// compares that path against the *canonicalized* `working_dir` of each
+    /// session. `tempdir()` is not canonical — on macOS it returns
+    /// `/var/folders/...`, a symlink to `/private/var/...` — so a scratch path
+    /// used raw matches no session and the absorb silently imports nothing,
+    /// which is how these tests passed on Linux and failed the macOS leg with
+    /// `left: 0`.
+    fn canonical_scratch() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, canonical)
+    }
+
     fn state_with(fp: &str, key: &str) -> ExternalAbsorptionState {
         ExternalAbsorptionState {
             sessions: HashMap::from([(
@@ -545,8 +562,7 @@ mod tests {
 
     #[test]
     fn absorb_absorbs_relevant_session_then_skips_it_as_unchanged() {
-        let dir = tempdir().unwrap();
-        let cwd = dir.path().to_path_buf();
+        let (dir, cwd) = canonical_scratch();
         // 3 alternating messages = user/assistant/user; the trailing dangling
         // user turn is trimmed so it cannot merge with the real prompt.
         let file = write_cline(dir.path(), "s.json", &cwd, 3);
@@ -566,10 +582,11 @@ mod tests {
 
     #[test]
     fn absorb_routes_out_irrelevant_session_without_absorbing() {
-        let dir = tempdir().unwrap();
-        let cwd = dir.path().to_path_buf();
-        let other = tempdir().unwrap();
-        let file = write_cline(dir.path(), "s.json", other.path(), 3);
+        let (dir, cwd) = canonical_scratch();
+        // Canonical too, so the mismatch under test is "a different project"
+        // rather than "the same dir spelled two ways".
+        let (_other, other) = canonical_scratch();
+        let file = write_cline(dir.path(), "s.json", &other, 3);
         let mut state = ExternalAbsorptionState::default();
         let (absorbed, _, _) = absorb_paths(vec![("cline", file)], &cwd, &mut state);
         assert_eq!(absorbed.len(), 0, "other-project session not absorbed");
@@ -579,8 +596,7 @@ mod tests {
 
     #[test]
     fn absorb_respects_message_cap() {
-        let dir = tempdir().unwrap();
-        let cwd = dir.path().to_path_buf();
+        let (dir, cwd) = canonical_scratch();
         let a = write_cline(dir.path(), "a.json", &cwd, 100);
         let b = write_cline(dir.path(), "b.json", &cwd, 100);
         let c = write_cline(dir.path(), "c.json", &cwd, 100);
