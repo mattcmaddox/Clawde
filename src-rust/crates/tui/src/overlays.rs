@@ -2221,6 +2221,7 @@ fn context_label(ctx: &clawde_core::keybindings::KeyContext) -> &'static str {
         KeyContext::Keybindings => "/keybindings Overlay",
         KeyContext::PasteViewer => "Paste Viewer",
         KeyContext::KatbanControls => "Katban Controls",
+        KeyContext::AgentsMenu => "/agents Menu",
     }
 }
 

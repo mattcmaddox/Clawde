@@ -160,61 +160,61 @@ impl SlashCommand for AgentCommand {
             .collect()
     }
     fn help(&self) -> &str {
-        "Usage: /agent [name]\n\nWithout arguments, lists all available named agents.\nWith a name, shows details for that agent.\n\n         To use an agent, start Clawde with: --agent <name>"
+        "Usage: /agent [name]\n\nWithout arguments, lists every available agent.\nWith a name, shows that agent's details.\n\nIn the TUI this opens the /agents popup (pre-selected on <name>).\n\n         To use an agent, start Clawde with: --agent <name>"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        use std::collections::HashMap;
-
-        // Merge built-in defaults with user-defined agents (user wins on collision).
-        let mut all_agents: HashMap<String, clawde_core::AgentDefinition> =
-            clawde_core::default_agents();
-        all_agents.extend(ctx.config.agents.clone());
-
+        // One loader for every surface: built-in defaults, the `agents` map in
+        // settings.json, and markdown files under ~/.clawde/agents and
+        // .clawde/agents. Precedence is resolved there, so a shadowed
+        // definition is listed as such rather than duplicated silently.
+        let defs =
+            clawde_tui::agents_view::load_agent_definitions(&ctx.working_dir, &ctx.config.agents);
         let agent_name = args.trim();
 
         if agent_name.is_empty() {
-            // List all visible agents.
-            let mut keys: Vec<&String> = all_agents
+            let mut listed: Vec<&clawde_tui::agents_view::AgentDefinition> = defs
                 .iter()
-                .filter(|(_, d)| d.visible)
-                .map(|(k, _)| k)
+                .filter(|def| def.visible && def.shadowed_by.is_none())
                 .collect();
-            keys.sort();
+            listed.sort_by(|a, b| a.name.cmp(&b.name));
 
-            let mut output = "Available agents:\n\n".to_string();
-            for name in keys {
-                let def = &all_agents[name];
+            let mut output = format!("Available agents ({}):\n\n", listed.len());
+            for def in listed {
                 output.push_str(&format!(
-                    "  @{} — {}\n    access: {}{}\n",
-                    name,
-                    def.description.as_deref().unwrap_or(""),
-                    def.access,
-                    def.max_turns
-                        .map(|t| format!(", max_turns: {}", t))
-                        .unwrap_or_default(),
+                    "  @{} — {}\n    access: {}  ·  source: {}\n",
+                    def.name,
+                    def.description,
+                    def.access_tier(),
+                    def.source_label(),
                 ));
             }
-            output.push_str("\nUse --agent <name> when starting Clawde to activate an agent.");
+            output.push_str(
+                "\nUse --agent <name> when starting Clawde, or /agents in the TUI to edit them.",
+            );
             CommandResult::Message(output)
-        } else if let Some(def) = all_agents.get(agent_name) {
-            // Show details for the named agent.
+        } else if let Some(def) = defs.iter().find(|def| def.name == agent_name) {
             let mut output = format!("Agent: @{}\n", agent_name);
-            if let Some(ref desc) = def.description {
-                output.push_str(&format!("Description: {}\n", desc));
+            for (label, value) in clawde_tui::agents_view::agent_detail_fields(def) {
+                if label == "Name" {
+                    continue;
+                }
+                output.push_str(&format!("{}: {}\n", label, value));
             }
-            output.push_str(&format!("Access: {}\n", def.access));
-            if let Some(ref model) = def.model {
-                output.push_str(&format!("Model: {}\n", model));
+            if !def.description.is_empty() {
+                output.push_str(&format!("\nDescription:\n  {}\n", def.description));
             }
-            if let Some(t) = def.max_turns {
-                output.push_str(&format!("Max turns: {}\n", t));
+            if !def.instructions.is_empty() {
+                output.push_str(&format!(
+                    "\nSystem prompt prefix:\n  {}\n",
+                    def.instructions
+                ));
             }
-            if let Some(ref color) = def.color {
-                output.push_str(&format!("Color: {}\n", color));
-            }
-            if let Some(ref prompt) = def.prompt {
-                output.push_str(&format!("\nSystem prompt prefix:\n  {}\n", prompt));
+            if let Some(shadow) = &def.shadowed_by {
+                output.push_str(&format!(
+                    "\n⚠ This definition is shadowed by {}; activating @{} runs that one.",
+                    shadow, agent_name
+                ));
             }
             output.push_str(&format!("\nTo activate: clawde --agent {}", agent_name));
             CommandResult::Message(output)

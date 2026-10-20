@@ -1614,18 +1614,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Wire in the named agent (--agent flag).
-    // Merge built-in default agents with user-defined agents (user wins on collision).
+    // One resolver for every store: built-in defaults, the settings `agents`
+    // map, and markdown agents under ~/.clawde/agents or .clawde/agents.
+    //
+    // The non-agent turn cap is captured first because an agent may raise it:
+    // switching agents at runtime (Tab, or activate in /agents) has to restore
+    // this value, otherwise the previous agent's cap leaks into the next one.
+    let default_max_turns = query_config.max_turns;
     let tools = if let Some(ref agent_name) = cli.agent {
         query_config.agent_name = Some(agent_name.clone());
-        let mut all_agents = clawde_core::default_agents();
-        all_agents.extend(config.agents.clone());
-        if let Some(def) = all_agents.get(agent_name) {
+        if let Some(def) = clawde_tui::agents_view::resolve_agent(&cwd, &config.agents, agent_name)
+        {
             let access = def.access.clone();
             query_config.agent_definition = Some(def.clone());
-            // Override max_turns from agent definition when specified.
-            if let Some(turns) = def.max_turns {
-                query_config.max_turns = turns;
-            }
+            query_config.max_turns = def.max_turns.unwrap_or(default_max_turns);
             filter_tools_for_agent(
                 tools,
                 &access,
@@ -1700,6 +1702,7 @@ async fn main() -> anyhow::Result<()> {
             tools,
             tool_ctx,
             query_config,
+            default_max_turns,
             cli_effort_override,
             cost_tracker,
             cli.resume,
@@ -2594,6 +2597,7 @@ fn filter_tools_for_agent(
 fn tools_for_agent_mode(
     all_tools: Arc<Vec<Box<dyn clawde_tools::Tool>>>,
     mode: Option<&str>,
+    working_dir: &std::path::Path,
     config: &Config,
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
     non_interactive: bool,
@@ -2602,20 +2606,16 @@ fn tools_for_agent_mode(
         return all_tools;
     };
 
-    let mut all_agents = clawde_core::default_agents();
-    all_agents.extend(config.agents.clone());
-    all_agents
-        .get(mode)
-        .map(|def| {
-            filter_tools_for_agent(
-                all_tools.clone(),
-                &def.access,
-                config,
-                mcp_manager,
-                non_interactive,
-            )
-        })
-        .unwrap_or(all_tools)
+    match clawde_tui::agents_view::resolve_agent(working_dir, &config.agents, mode) {
+        Some(def) => filter_tools_for_agent(
+            all_tools.clone(),
+            &def.access,
+            config,
+            mcp_manager,
+            non_interactive,
+        ),
+        None => all_tools,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3938,6 +3938,9 @@ async fn run_interactive(
     tools: Arc<Vec<Box<dyn clawde_tools::Tool>>>,
     tool_ctx: ToolContext,
     query_config: clawde_query::QueryConfig,
+    // Turn cap before any `--agent` override; restored whenever the session
+    // leaves an agent that raised it.
+    default_max_turns: u32,
     cli_effort_override: Option<clawde_core::effort::EffortLevel>,
     cost_tracker: Arc<CostTracker>,
     resume_id: Option<String>,
@@ -5589,6 +5592,7 @@ async fn run_interactive(
                                     tools_arc = tools_for_agent_mode(
                                         all_tools_arc.clone(),
                                         app.agent_mode.as_deref(),
+                                        &cmd_ctx.working_dir,
                                         &cmd_ctx.config,
                                         tool_ctx.mcp_manager.clone(),
                                         tool_ctx.non_interactive,
@@ -5669,6 +5673,7 @@ async fn run_interactive(
                                     tools_arc = tools_for_agent_mode(
                                         all_tools_arc.clone(),
                                         app.agent_mode.as_deref(),
+                                        &cmd_ctx.working_dir,
                                         &cmd_ctx.config,
                                         tool_ctx.mcp_manager.clone(),
                                         tool_ctx.non_interactive,
@@ -6494,6 +6499,7 @@ async fn run_interactive(
                         tools_arc = tools_for_agent_mode(
                             all_tools_arc.clone(),
                             app.agent_mode.as_deref(),
+                            &cmd_ctx.working_dir,
                             &cmd_ctx.config,
                             tool_ctx.mcp_manager.clone(),
                             tool_ctx.non_interactive,
@@ -6541,21 +6547,24 @@ async fn run_interactive(
                     if !app.model_name.is_empty() {
                         session.model = app.model_name.clone();
                     }
-                    // Handle agent mode change (Tab key cycles build→plan)
+                    // Handle agent mode change (Tab cycles build→plan→image;
+                    // activating an agent in /agents sets the same flag).
                     if app.agent_mode_changed {
                         app.agent_mode_changed = false;
                         let mode = app.agent_mode.as_deref().unwrap_or("build");
-                        let mut all_agents = clawde_core::default_agents();
-                        all_agents.extend(cmd_ctx.config.agents.clone());
-                        if let Some(def) = all_agents.get(mode) {
+                        if let Some(def) = clawde_tui::agents_view::resolve_agent(
+                            &cmd_ctx.working_dir,
+                            &cmd_ctx.config.agents,
+                            mode,
+                        ) {
                             base_query_config.agent_name = Some(mode.to_string());
-                            base_query_config.agent_definition = Some(def.clone());
-                            if let Some(turns) = def.max_turns {
-                                base_query_config.max_turns = turns;
-                            }
+                            base_query_config.max_turns =
+                                def.max_turns.unwrap_or(default_max_turns);
+                            base_query_config.agent_definition = Some(def);
                             tools_arc = tools_for_agent_mode(
                                 all_tools_arc.clone(),
                                 Some(mode),
+                                &cmd_ctx.working_dir,
                                 &cmd_ctx.config,
                                 tool_ctx.mcp_manager.clone(),
                                 tool_ctx.non_interactive,
@@ -6564,6 +6573,7 @@ async fn run_interactive(
                             // "build" with no explicit definition = full access, no agent
                             base_query_config.agent_name = None;
                             base_query_config.agent_definition = None;
+                            base_query_config.max_turns = default_max_turns;
                             tools_arc = all_tools_arc.clone();
                         }
                     }
@@ -8437,6 +8447,7 @@ async fn run_interactive(
             tools_arc = tools_for_agent_mode(
                 all_tools_arc.clone(),
                 app.agent_mode.as_deref(),
+                &cmd_ctx.working_dir,
                 &cmd_ctx.config,
                 new_mcp_manager.clone(),
                 tool_ctx.non_interactive,

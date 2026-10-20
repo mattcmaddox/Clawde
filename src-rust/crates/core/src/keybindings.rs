@@ -94,6 +94,11 @@ pub enum KeyContext {
     /// (`select` submits the seeded `/katban` command, `cancel` just closes).
     /// The menu has no text entry, so `j`/`k` are unconditional.
     KatbanControls,
+    /// The `/agents` popup. A dedicated context (not `Select`) because the menu
+    /// owns three actions a generic list does not have — `activate`, `edit` and
+    /// `delete` — and `Select` is shared with dialogs where those letters must
+    /// keep meaning something else.
+    AgentsMenu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,6 +600,23 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("home", "first", KeyContext::KatbanControls),
         ("end", "last", KeyContext::KatbanControls),
         ("enter", "select", KeyContext::KatbanControls),
+        // `/agents` popup: list → detail → editor, plus the two actions that
+        // make it a CRUD surface. `d` only arms a confirmation; it never
+        // deletes on the first press.
+        ("escape", "cancel", KeyContext::AgentsMenu),
+        ("left", "cancel", KeyContext::AgentsMenu),
+        ("q", "cancel", KeyContext::AgentsMenu),
+        ("up", "prev", KeyContext::AgentsMenu),
+        ("shift+k", "verticalPrev", KeyContext::AgentsMenu),
+        ("k", "prev", KeyContext::AgentsMenu),
+        ("down", "next", KeyContext::AgentsMenu),
+        ("shift+j", "verticalNext", KeyContext::AgentsMenu),
+        ("j", "next", KeyContext::AgentsMenu),
+        ("enter", "select", KeyContext::AgentsMenu),
+        ("right", "select", KeyContext::AgentsMenu),
+        ("a", "activate", KeyContext::AgentsMenu),
+        ("e", "edit", KeyContext::AgentsMenu),
+        ("d", "delete", KeyContext::AgentsMenu),
     ];
 
     defaults
@@ -659,6 +681,8 @@ const VIM_PRESET_EXTRAS: &[(&str, &str, KeyContext)] = &[
     ("l", "next", KeyContext::PasteViewer),
     ("h", "prev", KeyContext::KatbanControls),
     ("l", "next", KeyContext::KatbanControls),
+    ("h", "prev", KeyContext::AgentsMenu),
+    ("l", "next", KeyContext::AgentsMenu),
 ];
 
 /// Emacs (readline-style) additions on top of the defaults.

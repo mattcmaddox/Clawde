@@ -59,28 +59,38 @@ impl NamedCommand for AgentsCommand {
     fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
         match args.first().copied().unwrap_or("list") {
             "list" => {
-                // Load agent definitions from .clawde/agents/ in working dir
-                // (and home dir), using the same loader as the TUI agents view.
-                let defs = clawde_tui::agents_view::load_agent_definitions(&ctx.working_dir);
+                // Load agent definitions from every store (built-ins, the
+                // settings `agents` map, and .clawde/agents in the working dir
+                // and home dir), using the same loader as the TUI agents view.
+                let defs = clawde_tui::agents_view::load_agent_definitions(
+                    &ctx.working_dir,
+                    &ctx.config.agents,
+                );
 
-                if defs.is_empty() {
-                    return CommandResult::Message(
-                        "Available Agents (0)\n\n\
-                         No custom agents defined. Create one with /new-agent\n\
-                         or run: clawde agents create <name>"
-                            .to_string(),
-                    );
-                }
-
-                let mut out = format!("Available Agents ({})\n\n", defs.len());
-                for def in &defs {
+                // A shadowed definition is still listed by the popup (it can
+                // be edited, which overrides the winner only if its source
+                // ranks higher), but the text listing shows the winners.
+                let visible: Vec<&clawde_tui::agents_view::AgentDefinition> = defs
+                    .iter()
+                    .filter(|def| def.shadowed_by.is_none())
+                    .collect();
+                let mut out = format!("Available Agents ({})\n\n", visible.len());
+                for def in visible {
                     let model_str = def.model.as_deref().unwrap_or("default model");
                     if def.description.is_empty() {
-                        out.push_str(&format!("  \u{2022} {} ({})\n", def.name, model_str));
+                        out.push_str(&format!(
+                            "  \u{2022} {} ({})  ·  {}\n",
+                            def.name,
+                            model_str,
+                            def.source_label()
+                        ));
                     } else {
                         out.push_str(&format!(
-                            "  \u{2022} {}: {}\n    Model: {}\n",
-                            def.name, def.description, model_str
+                            "  \u{2022} {}: {}\n    Model: {}  ·  {}\n",
+                            def.name,
+                            def.description,
+                            model_str,
+                            def.source_label()
                         ));
                     }
                 }

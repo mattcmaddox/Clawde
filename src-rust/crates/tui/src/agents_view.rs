@@ -88,14 +88,21 @@ pub struct AgentInfo {
     /// Cost in USD accumulated by this agent.
     pub cost_usd: f64,
 }
-/// A defined agent (from .clawde/agents/*.md or plugin).
+/// One agent definition, from any of the three stores the popup manages: the
+/// built-in defaults, the `agents` map in `settings.json`, or a markdown file
+/// under `<config dir>/agents/` or `<project>/.clawde/agents/`.
+///
+/// [`load_agent_definitions`] merges all three and resolves name collisions by
+/// precedence. A row with `shadowed_by` set is still listed and still editable
+/// (editing it rewrites its own file), but activation resolves to the winner.
 #[derive(Debug, Clone)]
 pub struct AgentDefinition {
-    /// Backing markdown file path.
-    pub file_path: PathBuf,
+    /// Backing markdown file. `None` for built-in and settings-declared agents.
+    pub file_path: Option<PathBuf>,
     /// Agent name.
     pub name: String,
-    /// Source: "user" | "plugin:{name}" | "builtin".
+    /// Where the definition came from: `"project"` | `"user"` | `"settings"` |
+    /// `"builtin"`. Precedence follows that order, highest first.
     pub source: String,
     /// Model name.
     pub model: Option<String>,
@@ -105,10 +112,96 @@ pub struct AgentDefinition {
     pub description: String,
     /// Tool list (empty = all tools).
     pub tools: Vec<String>,
-    /// If another agent overrides this one.
+    /// If a higher-precedence definition overrides this one.
     pub shadowed_by: Option<String>,
     /// Markdown body / instructions.
     pub instructions: String,
+    /// Access tier. Only built-in and settings-declared agents carry one; a
+    /// markdown agent runs with full access.
+    pub access: Option<String>,
+    /// Per-agent turn cap (built-in / settings only).
+    pub max_turns: Option<u32>,
+    /// Per-agent temperature (built-in / settings only).
+    pub temperature: Option<f64>,
+    /// Accent colour (built-in / settings only).
+    pub color: Option<String>,
+    /// Settings-declared agents may opt out of agent listings. Defaults to
+    /// `true` for every other source.
+    pub visible: bool,
+}
+
+impl AgentDefinition {
+    /// Name of the source, as the popup and `/agent` print it.
+    pub fn source_label(&self) -> &'static str {
+        match self.source.as_str() {
+            "builtin" => "built-in",
+            "settings" => "settings.json",
+            "project" => ".clawde/agents",
+            "user" => "~/.clawde/agents",
+            _ => "agent",
+        }
+    }
+
+    /// Access tier used when this agent is activated. Markdown agents run with
+    /// full access; built-in and settings agents carry an explicit tier.
+    pub fn access_tier(&self) -> &str {
+        self.access.as_deref().unwrap_or("full")
+    }
+
+    /// Precedence rank. Higher wins a name collision.
+    fn rank(&self) -> u8 {
+        match self.source.as_str() {
+            "project" => 3,
+            "user" => 2,
+            "settings" => 1,
+            _ => 0,
+        }
+    }
+
+    /// The runtime definition activation installs. A markdown agent has no
+    /// access tier or turn cap, so it becomes a full-access agent whose body is
+    /// the system-prompt prefix.
+    pub fn to_core(&self) -> clawde_core::AgentDefinition {
+        clawde_core::AgentDefinition {
+            description: (!self.description.is_empty()).then(|| self.description.clone()),
+            model: self.model.clone(),
+            temperature: self.temperature,
+            prompt: (!self.instructions.is_empty()).then(|| self.instructions.clone()),
+            access: self.access_tier().to_string(),
+            visible: self.visible,
+            max_turns: self.max_turns,
+            color: self.color.clone(),
+        }
+    }
+}
+
+/// The metadata rows shared by the popup's detail screen and `/agent <name>`'s
+/// text output, so the two projections cannot describe an agent differently.
+pub fn agent_detail_fields(def: &AgentDefinition) -> Vec<(&'static str, String)> {
+    let mut rows = vec![
+        ("Name", def.name.clone()),
+        ("Source", def.source_label().to_string()),
+        (
+            "Model",
+            def.model.clone().unwrap_or_else(|| "default".to_string()),
+        ),
+        ("Access", def.access_tier().to_string()),
+    ];
+    if let Some(turns) = def.max_turns {
+        rows.push(("Max turns", turns.to_string()));
+    }
+    if let Some(memory) = &def.memory_scope {
+        rows.push(("Memory", memory.clone()));
+    }
+    rows.push((
+        "Tools",
+        if def.tools.is_empty() {
+            "All tools".to_string()
+        } else {
+            def.tools.join(", ")
+        },
+    ));
+    rows
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +332,11 @@ pub struct AgentsMenuState {
     pub selected_row: usize,
     pub project_root: Option<PathBuf>,
     pub editor: AgentEditorState,
+    /// The `agents` map from `settings.json`, kept so a save or delete can
+    /// reload the full merged list without the caller re-supplying it.
+    pub settings_agents: std::collections::HashMap<String, clawde_core::AgentDefinition>,
+    /// Index of the definition awaiting delete confirmation, if any.
+    pub pending_delete: Option<usize>,
 }
 
 impl AgentsMenuState {
@@ -251,19 +349,50 @@ impl AgentsMenuState {
             selected_row: 0,
             project_root: None,
             editor: AgentEditorState::new(),
+            settings_agents: std::collections::HashMap::new(),
+            pending_delete: None,
         }
     }
 
-    pub fn open(&mut self, project_root: &std::path::Path) {
-        self.definitions = load_agent_definitions(project_root);
+    pub fn open(
+        &mut self,
+        project_root: &std::path::Path,
+        settings_agents: &std::collections::HashMap<String, clawde_core::AgentDefinition>,
+    ) {
+        self.project_root = Some(project_root.to_path_buf());
+        self.settings_agents = settings_agents.clone();
+        self.reload();
         self.selected_row = 0;
         self.route = AgentsRoute::List;
-        self.project_root = Some(project_root.to_path_buf());
+        self.pending_delete = None;
         self.visible = true;
+    }
+
+    /// Re-read every agent store. Used after a save or delete so the merged
+    /// list (and its shadowing) reflects what just hit the filesystem.
+    pub fn reload(&mut self) {
+        self.definitions = match &self.project_root {
+            Some(root) => load_agent_definitions(root, &self.settings_agents),
+            None => Vec::new(),
+        };
+    }
+
+    /// Select the definition for `name` and open its detail screen. Returns
+    /// `false` when no definition carries that name (shadowed rows included).
+    pub fn select_by_name(&mut self, name: &str) -> bool {
+        match self.definitions.iter().position(|def| def.name == name) {
+            Some(idx) => {
+                self.selected_row = idx + 1;
+                self.route = AgentsRoute::Detail(idx);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn close(&mut self) {
         self.visible = false;
+        self.pending_delete = None;
     }
 
     pub fn select_prev(&mut self) {
@@ -349,16 +478,100 @@ impl AgentsMenuState {
         self.editor.selected_field = self.editor.selected_field.prev();
     }
 
+    /// Index of the definition under the cursor, if the route has one. Row 0 of
+    /// the list is the "Create new agent" entry and has no definition.
+    pub fn selected_index(&self) -> Option<usize> {
+        match self.route {
+            AgentsRoute::Detail(idx) => (idx < self.definitions.len()).then_some(idx),
+            AgentsRoute::List => self
+                .selected_row
+                .checked_sub(1)
+                .filter(|idx| *idx < self.definitions.len()),
+            AgentsRoute::Editor(_) => None,
+        }
+    }
+
+    /// The definition under the cursor, if the route has one.
+    pub fn selected_definition(&self) -> Option<&AgentDefinition> {
+        self.definitions.get(self.selected_index()?)
+    }
+
+    /// The definition activation should install: the winner for the selected
+    /// name, so activating a shadowed row runs the definition that outranks it.
+    pub fn activation_target(&self) -> Option<&AgentDefinition> {
+        let name = &self.selected_definition()?.name;
+        self.definitions
+            .iter()
+            .find(|def| def.name == *name && def.shadowed_by.is_none())
+    }
+
+    /// Ask for confirmation before deleting the agent on screen.
+    ///
+    /// Only a markdown-backed definition can be deleted: a built-in lives in
+    /// the binary and a settings-declared agent lives in `settings.json`, so
+    /// both need a different editing surface.
+    pub fn request_delete(&mut self) -> Result<(), String> {
+        let Some(def) = self.selected_definition() else {
+            return Err("Select an agent before deleting it.".to_string());
+        };
+        if def.file_path.is_none() {
+            return Err(match def.source.as_str() {
+                "builtin" => format!(
+                    "@{} is built in — save a project override instead of deleting it.",
+                    def.name
+                ),
+                _ => format!(
+                    "@{} is declared in settings.json — remove it there, not here.",
+                    def.name
+                ),
+            });
+        }
+        self.pending_delete = Some(match self.route {
+            AgentsRoute::Detail(idx) => idx,
+            _ => return Err("Open an agent before deleting it.".to_string()),
+        });
+        Ok(())
+    }
+
+    pub fn cancel_delete(&mut self) {
+        self.pending_delete = None;
+    }
+
+    pub fn confirm_delete(&mut self) -> Result<String, String> {
+        let idx = self
+            .pending_delete
+            .take()
+            .ok_or_else(|| "Nothing to delete.".to_string())?;
+        let Some(def) = self.definitions.get(idx) else {
+            return Err("Agent is no longer listed.".to_string());
+        };
+        let Some(path) = def.file_path.clone() else {
+            return Err("That agent has no file to delete.".to_string());
+        };
+        let name = def.name.clone();
+        std::fs::remove_file(&path)
+            .map_err(|err| format!("Failed to delete {}: {}", path.display(), err))?;
+        self.reload();
+        self.route = AgentsRoute::List;
+        // Keep the cursor near the removed row, clamped to the new list.
+        self.selected_row = (idx + 1).min(self.definitions.len());
+        Ok(format!("Deleted @{} ({})", name, path.display()))
+    }
+
     pub fn save_editor(&mut self) -> Result<String, String> {
         validate_editor(&self.editor)?;
         let root = self
             .project_root
             .clone()
             .ok_or_else(|| "Project root is unavailable.".to_string())?;
+        // A built-in or settings-declared agent has no file of its own: saving
+        // writes a project override, which then outranks the definition it was
+        // copied from (see `load_agent_definitions`).
         let file_path = self
             .editor
             .original_index
-            .and_then(|idx| self.definitions.get(idx).map(|def| def.file_path.clone()))
+            .and_then(|idx| self.definitions.get(idx))
+            .and_then(|def| def.file_path.clone())
             .unwrap_or_else(|| {
                 root.join(".clawde")
                     .join("agents")
@@ -366,12 +579,12 @@ impl AgentsMenuState {
             });
 
         write_editor_to_disk(&file_path, &self.editor)?;
-        self.definitions = load_agent_definitions(&root);
+        self.reload();
 
         let saved_idx = self
             .definitions
             .iter()
-            .position(|def| def.file_path == file_path)
+            .position(|def| def.file_path.as_deref() == Some(file_path.as_path()))
             .unwrap_or(0);
         self.selected_row = saved_idx + 1;
         self.route = AgentsRoute::Detail(saved_idx);
@@ -390,33 +603,131 @@ impl Default for AgentsMenuState {
 
 // ---------------------------------------------------------------------------
 // Data loading
-// ---------------------------------------------------------------------------    /// Load agent definitions from `.clawde/agents/` in project root and home dir.
-pub fn load_agent_definitions(project_root: &std::path::Path) -> Vec<AgentDefinition> {
-    let mut defs = Vec::new();
-    let dirs = [
-        Some(clawde_core::config::Settings::config_dir().join("agents")),
-        Some(project_root.join(".clawde").join("agents")),
-    ];
+// ---------------------------------------------------------------------------
 
-    for dir_opt in &dirs {
-        let Some(dir) = dir_opt else { continue };
-        let Ok(entries) = std::fs::read_dir(dir) else {
+/// Load every agent definition, merged across the three stores and ordered by
+/// name.
+///
+/// Precedence, highest first: project markdown (`<root>/.clawde/agents`), user
+/// markdown (`<config dir>/agents`), the `agents` map in `settings.json`, and
+/// the built-in defaults. A definition that loses a name collision keeps
+/// `shadowed_by` set to the winner, so the popup lists it as overridden instead
+/// of hiding it.
+pub fn load_agent_definitions(
+    project_root: &std::path::Path,
+    settings_agents: &std::collections::HashMap<String, clawde_core::AgentDefinition>,
+) -> Vec<AgentDefinition> {
+    let mut defs: Vec<AgentDefinition> = Vec::new();
+
+    for (name, def) in clawde_core::default_agents() {
+        defs.push(AgentDefinition {
+            file_path: None,
+            name,
+            source: "builtin".to_string(),
+            model: def.model,
+            memory_scope: None,
+            description: def.description.unwrap_or_default(),
+            tools: Vec::new(),
+            shadowed_by: None,
+            instructions: def.prompt.unwrap_or_default(),
+            access: Some(def.access),
+            max_turns: def.max_turns,
+            temperature: def.temperature,
+            color: def.color,
+            visible: def.visible,
+        });
+    }
+
+    let mut settings_names: Vec<&String> = settings_agents.keys().collect();
+    settings_names.sort();
+    for name in settings_names {
+        let def = &settings_agents[name];
+        defs.push(AgentDefinition {
+            file_path: None,
+            name: name.clone(),
+            source: "settings".to_string(),
+            model: def.model.clone(),
+            memory_scope: None,
+            description: def.description.clone().unwrap_or_default(),
+            tools: Vec::new(),
+            shadowed_by: None,
+            instructions: def.prompt.clone().unwrap_or_default(),
+            access: Some(def.access.clone()),
+            max_turns: def.max_turns,
+            temperature: def.temperature,
+            color: def.color.clone(),
+            visible: def.visible,
+        });
+    }
+
+    // Global agents first, then project ones, so a same-named project file is
+    // the definition the collision pass keeps.
+    for (dir, source) in [
+        (
+            clawde_core::config::Settings::config_dir().join("agents"),
+            "user",
+        ),
+        (project_root.join(".clawde").join("agents"), "project"),
+    ] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "md") {
-                if let Some(def) = parse_agent_def(&path) {
-                    defs.push(def);
-                }
+            if !path.extension().is_some_and(|ext| ext == "md") {
+                continue;
+            }
+            if let Some(def) = parse_agent_def(&path, source) {
+                defs.push(def);
             }
         }
     }
 
+    mark_shadowed(&mut defs);
+    defs.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| b.rank().cmp(&a.rank())));
     defs
 }
 
-fn parse_agent_def(path: &std::path::Path) -> Option<AgentDefinition> {
+/// Flag every definition whose name is claimed by a higher-precedence one.
+fn mark_shadowed(defs: &mut [AgentDefinition]) {
+    let mut winners: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (idx, def) in defs.iter().enumerate() {
+        match winners.get(&def.name).copied() {
+            Some(current) if defs[current].rank() >= def.rank() => {}
+            _ => {
+                winners.insert(def.name.clone(), idx);
+            }
+        }
+    }
+    let shadowed: Vec<Option<String>> = (0..defs.len())
+        .map(|idx| {
+            let winner = winners[&defs[idx].name];
+            (winner != idx)
+                .then(|| format!("{} ({})", defs[winner].name, defs[winner].source_label()))
+        })
+        .collect();
+    for (def, shadow) in defs.iter_mut().zip(shadowed) {
+        def.shadowed_by = shadow;
+    }
+}
+
+/// Resolve the definition activation installs for `name`.
+///
+/// `--agent`, the mode-cycle arm, `tools_for_agent_mode` and the popup's
+/// activate action all resolve through here, so a markdown agent becomes
+/// activatable exactly when the popup lists it as the winner.
+pub fn resolve_agent(
+    project_root: &std::path::Path,
+    settings_agents: &std::collections::HashMap<String, clawde_core::AgentDefinition>,
+    name: &str,
+) -> Option<clawde_core::AgentDefinition> {
+    load_agent_definitions(project_root, settings_agents)
+        .into_iter()
+        .find(|def| def.name == name && def.shadowed_by.is_none())
+        .map(|def| def.to_core())
+}
+
+fn parse_agent_def(path: &std::path::Path, source: &str) -> Option<AgentDefinition> {
     let content = std::fs::read_to_string(path).ok()?;
     let stem = path.file_stem()?.to_string_lossy().to_string();
 
@@ -444,15 +755,23 @@ fn parse_agent_def(path: &std::path::Path) -> Option<AgentDefinition> {
         };
 
     Some(AgentDefinition {
-        file_path: path.to_path_buf(),
+        file_path: Some(path.to_path_buf()),
         name,
-        source: "user".to_string(),
+        source: source.to_string(),
         model,
         memory_scope: memory,
         description,
         tools,
         shadowed_by: None,
         instructions,
+        // A markdown agent declares no runtime policy of its own: it runs
+        // with full access and inherits the session's turn cap and model
+        // unless the frontmatter names one.
+        access: None,
+        max_turns: None,
+        temperature: None,
+        color: None,
+        visible: true,
     })
 }
 
@@ -558,6 +877,7 @@ pub fn render_agents_menu(state: &AgentsMenuState, area: Rect, buf: &mut Buffer)
     }
 
     let layout = begin_modal_buf(buf, area, 92, 30, 2, 1);
+    let deleting = state.pending_delete.is_some();
     let (title, subtitle, footer) = match &state.route {
         AgentsRoute::List => (
             "Agents".to_string(),
@@ -566,7 +886,7 @@ pub fn render_agents_menu(state: &AgentsMenuState, area: Rect, buf: &mut Buffer)
                 state.active_agents.len(),
                 state.definitions.len()
             ),
-            " enter open  ·  esc close".to_string(),
+            " enter open  ·  a activate  ·  esc close".to_string(),
         ),
         AgentsRoute::Detail(idx) => (
             state
@@ -575,7 +895,11 @@ pub fn render_agents_menu(state: &AgentsMenuState, area: Rect, buf: &mut Buffer)
                 .map(|def| def.name.clone())
                 .unwrap_or_else(|| "Agent".to_string()),
             " Review configuration and prompt details.".to_string(),
-            " enter edit  ·  esc back".to_string(),
+            if deleting {
+                " Delete this agent?  y confirm  ·  n cancel".to_string()
+            } else {
+                " enter edit  ·  a activate  ·  d delete  ·  esc back".to_string()
+            },
         ),
         AgentsRoute::Editor(Some(_)) => (
             "Edit agent".to_string(),
@@ -611,13 +935,15 @@ pub fn render_agents_menu(state: &AgentsMenuState, area: Rect, buf: &mut Buffer)
             render_agent_editor(state, layout.body_area, buf);
         }
     }
-    Paragraph::new(Line::from(vec![Span::styled(
-        footer,
+    let footer_style = if deleting {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
         Style::default()
             .fg(CLAWDE_MUTED)
-            .add_modifier(Modifier::ITALIC),
-    )]))
-    .render(layout.footer_area, buf);
+            .add_modifier(Modifier::ITALIC)
+    };
+    Paragraph::new(Line::from(vec![Span::styled(footer, footer_style)]))
+        .render(layout.footer_area, buf);
 }
 
 fn render_agents_list(state: &AgentsMenuState, area: Rect, buf: &mut Buffer) {
@@ -672,17 +998,14 @@ fn render_agents_list(state: &AgentsMenuState, area: Rect, buf: &mut Buffer) {
         let abs_idx = start + i;
         let selected = state.selected_row == abs_idx + 1;
         let model_str = def.model.as_deref().unwrap_or("default");
-        let shadow_suffix = if def.shadowed_by.is_some() {
-            " ⚠"
-        } else {
-            ""
-        };
-        lines.push(agent_list_row(
-            def.name.clone(),
-            format!("{}  ·  {}{}", model_str, def.source, shadow_suffix),
-            selected,
-            area.width,
-        ));
+        let mut meta = format!("{}  ·  {}", model_str, def.source_label());
+        if !def.visible {
+            meta.push_str("  ·  hidden");
+        }
+        if def.shadowed_by.is_some() {
+            meta.push_str("  ⚠");
+        }
+        lines.push(agent_list_row(def.name.clone(), meta, selected, area.width));
     }
     Paragraph::new(lines)
         .style(Style::default().bg(CLAWDE_PANEL_BG))
@@ -691,38 +1014,22 @@ fn render_agents_list(state: &AgentsMenuState, area: Rect, buf: &mut Buffer) {
 
 fn render_agent_detail(def: &AgentDefinition, area: Rect, buf: &mut Buffer) {
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(" Name       ", Style::default().fg(CLAWDE_MUTED)),
-        Span::styled(
-            def.name.clone(),
+    // One field list for the popup and `/agent <name>`; see
+    // `agent_detail_fields`.
+    for (label, value) in agent_detail_fields(def) {
+        let bold = label == "Name";
+        let value_style = if bold {
             Style::default()
                 .fg(CLAWDE_TEXT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  ({})", def.source),
-            Style::default().fg(CLAWDE_MUTED),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" Model      ", Style::default().fg(CLAWDE_MUTED)),
-        Span::raw(def.model.as_deref().unwrap_or("default").to_string()),
-    ]));
-    if let Some(mem) = &def.memory_scope {
+                .add_modifier(Modifier::BOLD)
+        } else if label == "Tools" && value == "All tools" {
+            Style::default().fg(CLAWDE_MUTED)
+        } else {
+            Style::default().fg(CLAWDE_TEXT)
+        };
         lines.push(Line::from(vec![
-            Span::styled(" Memory     ", Style::default().fg(CLAWDE_MUTED)),
-            Span::raw(mem.clone()),
-        ]));
-    }
-    if !def.tools.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(" Tools      ", Style::default().fg(CLAWDE_MUTED)),
-            Span::raw(def.tools.join(", ")),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled(" Tools      ", Style::default().fg(CLAWDE_MUTED)),
-            Span::styled("All tools", Style::default().fg(CLAWDE_MUTED)),
+            Span::styled(format!(" {label:<10} "), Style::default().fg(CLAWDE_MUTED)),
+            Span::styled(value, value_style),
         ]));
     }
     lines.push(Line::default());
@@ -1037,7 +1344,7 @@ mod tests {
 
     fn make_definition(name: &str) -> AgentDefinition {
         AgentDefinition {
-            file_path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
+            file_path: Some(std::path::PathBuf::from(format!("/tmp/{name}.md"))),
             name: name.to_string(),
             source: "user".to_string(),
             model: Some("claude-sonnet-4-6".to_string()),
@@ -1046,7 +1353,172 @@ mod tests {
             tools: Vec::new(),
             shadowed_by: None,
             instructions: "Do the thing.".to_string(),
+            access: None,
+            max_turns: None,
+            temperature: None,
+            color: None,
+            visible: true,
         }
+    }
+
+    fn write_agent(root: &std::path::Path, name: &str, model: &str) -> std::path::PathBuf {
+        let dir = root.join(".clawde").join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.md"));
+        std::fs::write(
+            &path,
+            format!(
+                "---\nname: {name}\nmodel: {model}\ndescription: probe agent\n---\n\nBody for {name}.\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    /// Every store is merged, and a shared name is ordered project → settings →
+    /// built-in so the winner is the first row.
+    #[test]
+    fn loader_orders_project_files_above_settings_and_builtins() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            "build".to_string(),
+            clawde_core::AgentDefinition {
+                description: Some("settings build".to_string()),
+                access: "read-only".to_string(),
+                ..Default::default()
+            },
+        );
+        write_agent(temp.path(), "build", "probe/model");
+
+        let defs = load_agent_definitions(temp.path(), &settings);
+        let build: Vec<&AgentDefinition> = defs.iter().filter(|def| def.name == "build").collect();
+        assert_eq!(build.len(), 3, "builtin + settings + project: {build:?}");
+        assert_eq!(build[0].source, "project");
+        assert!(build[0].shadowed_by.is_none());
+        assert_eq!(build[0].model.as_deref(), Some("probe/model"));
+        assert_eq!(build[0].access_tier(), "full");
+        assert_eq!(build[1].source, "settings");
+        assert_eq!(build[1].access_tier(), "read-only");
+        assert_eq!(build[2].source, "builtin");
+        assert!(
+            build[1].shadowed_by.is_some() && build[2].shadowed_by.is_some(),
+            "both losers must be flagged: {build:?}"
+        );
+    }
+
+    #[test]
+    fn saving_a_builtin_writes_a_project_override_that_shadows_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AgentsMenuState::new();
+        state.open(temp.path(), &std::collections::HashMap::new());
+        let idx = state
+            .definitions
+            .iter()
+            .position(|def| def.name == "plan" && def.source == "builtin")
+            .expect("built-in plan agent");
+        state.route = AgentsRoute::Detail(idx);
+        state.open_editor(Some(idx));
+        state.editor.prompt = "Project plan body.".to_string();
+
+        let msg = state.save_editor().expect("save override");
+        assert!(msg.contains("plan.md"), "{msg}");
+
+        let plan: Vec<&AgentDefinition> = state
+            .definitions
+            .iter()
+            .filter(|def| def.name == "plan")
+            .collect();
+        assert_eq!(plan[0].source, "project");
+        assert_eq!(plan[0].instructions, "Project plan body.");
+        assert!(
+            plan[1].shadowed_by.is_some(),
+            "the built-in must be flagged as shadowed: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn delete_refuses_builtin_and_settings_definitions() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            "settings-probe".to_string(),
+            clawde_core::AgentDefinition::default(),
+        );
+        let mut state = AgentsMenuState::new();
+        state.open(temp.path(), &settings);
+
+        let builtin = state
+            .definitions
+            .iter()
+            .position(|def| def.name == "explore")
+            .expect("built-in explore agent");
+        state.route = AgentsRoute::Detail(builtin);
+        let err = state
+            .request_delete()
+            .expect_err("built-ins are not deletable");
+        assert!(err.contains("built in"), "{err}");
+
+        let from_settings = state
+            .definitions
+            .iter()
+            .position(|def| def.name == "settings-probe")
+            .expect("settings agent");
+        state.route = AgentsRoute::Detail(from_settings);
+        let err = state
+            .request_delete()
+            .expect_err("settings agents are not deletable");
+        assert!(err.contains("settings.json"), "{err}");
+        assert!(state.pending_delete.is_none());
+    }
+
+    #[test]
+    fn delete_needs_confirmation_and_removes_the_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_agent(temp.path(), "delete-probe", "probe/model");
+        let mut state = AgentsMenuState::new();
+        state.open(temp.path(), &std::collections::HashMap::new());
+        let idx = state
+            .definitions
+            .iter()
+            .position(|def| def.name == "delete-probe")
+            .expect("file agent");
+        state.route = AgentsRoute::Detail(idx);
+
+        state.request_delete().expect("arm the confirmation");
+        assert_eq!(state.pending_delete, Some(idx));
+        assert!(path.exists(), "arming must not delete anything");
+
+        let msg = state.confirm_delete().expect("delete");
+        assert!(msg.contains("delete-probe"), "{msg}");
+        assert!(!path.exists());
+        assert!(state
+            .definitions
+            .iter()
+            .all(|def| def.name != "delete-probe"));
+        assert_eq!(state.route, AgentsRoute::List);
+    }
+
+    #[test]
+    fn resolve_agent_returns_the_winning_definition() {
+        let temp = tempfile::tempdir().unwrap();
+        write_agent(temp.path(), "resolver-probe", "probe/model");
+
+        let def = resolve_agent(
+            temp.path(),
+            &std::collections::HashMap::new(),
+            "resolver-probe",
+        )
+        .expect("file agent resolves");
+        assert_eq!(def.access, "full");
+        assert_eq!(def.model.as_deref(), Some("probe/model"));
+        assert_eq!(def.prompt.as_deref(), Some("Body for resolver-probe."));
+        assert!(resolve_agent(
+            temp.path(),
+            &std::collections::HashMap::new(),
+            "no-such-agent"
+        )
+        .is_none());
     }
 
     #[test]

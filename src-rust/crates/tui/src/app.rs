@@ -4857,6 +4857,22 @@ impl App {
         if cmd == "plugin" && !args.trim().is_empty() {
             return false;
         }
+        // `/agent` is the text projection of the registry `/agents` edits, so
+        // both names open the popup in the TUI; a trailing name jumps straight
+        // to that agent's detail screen. Headless mode still runs the slash
+        // command, which prints the same fields.
+        if cmd == "agent" {
+            self.close_secondary_views();
+            self.open_agents_menu();
+            let name = args.trim();
+            if !name.is_empty() && !self.agents_menu.select_by_name(name) {
+                self.status_message = Some(format!(
+                    "Unknown agent '{name}' — showing all {} agents.",
+                    self.agents_menu.definitions.len()
+                ));
+            }
+            return true;
+        }
         // `/ollama status` is an async command because it queries the native
         // Ollama endpoint; leave it for the commands/CLI layer instead of
         // treating it as the mode toggle.
@@ -6194,7 +6210,7 @@ impl App {
 
     fn open_agents_menu(&mut self) {
         let root = self.project_root();
-        self.agents_menu.open(&root);
+        self.agents_menu.open(&root, &self.config.agents);
         self.agents_menu.active_agents = self
             .agent_status
             .iter()
@@ -10035,7 +10051,9 @@ impl App {
             KeyContext::Attachments
         } else if self.diff_viewer.visible {
             KeyContext::DiffDialog
-        } else if self.agents_menu.visible || self.stats_dialog.visible {
+        } else if self.agents_menu.visible {
+            KeyContext::AgentsMenu
+        } else if self.stats_dialog.visible {
             KeyContext::Select
         } else if self.mcp_view.visible {
             KeyContext::McpView
@@ -10489,12 +10507,11 @@ impl App {
         false
     }
 
-    /// Dispatch a key against the configured `Select` bindings for the agents
-    /// menu list. Returns `true` when a bound action handled it; `false` lets
-    /// the caller fall through to the menu's own controls (Left back, Right
-    /// confirm, Backspace close).
+    /// Dispatch a key against the configured `AgentsMenu` bindings. Returns
+    /// `true` when a bound action handled it; `false` lets the caller fall
+    /// through to the menu's own controls (Backspace close).
     fn handle_agents_menu_navigation(&mut self, key: &KeyEvent) -> bool {
-        let Some(action) = self.resolve_dialog_action(key, &KeyContext::Select) else {
+        let Some(action) = self.resolve_dialog_action(key, &KeyContext::AgentsMenu) else {
             return false;
         };
         match action.as_str() {
@@ -10502,11 +10519,11 @@ impl App {
                 self.agents_menu.go_back();
                 true
             }
-            "prev" => {
+            "prev" | "verticalPrev" => {
                 self.agents_menu.select_prev();
                 true
             }
-            "next" => {
+            "next" | "verticalNext" => {
                 self.agents_menu.select_next();
                 true
             }
@@ -10514,8 +10531,47 @@ impl App {
                 self.agents_menu.confirm_selection();
                 true
             }
+            "edit" => {
+                if let Some(idx) = self.agents_menu.selected_index() {
+                    self.agents_menu.open_editor(Some(idx));
+                }
+                true
+            }
+            "activate" => {
+                self.activate_selected_agent();
+                true
+            }
+            "delete" => {
+                if let Err(err) = self.agents_menu.request_delete() {
+                    self.status_message = Some(err);
+                }
+                true
+            }
             _ => false,
         }
+    }
+
+    /// Switch the session to the selected agent definition.
+    ///
+    /// The CLI loop observes `agent_mode_changed` and installs
+    /// `query_config.agent_definition` plus the filtered tool set, the same
+    /// path Tab (`cycle_agent_mode`) and `--agent` use — including for
+    /// markdown-defined agents, which the loop resolves through
+    /// `agents_view::resolve_agent`.
+    fn activate_selected_agent(&mut self) {
+        let Some(name) = self
+            .agents_menu
+            .activation_target()
+            .map(|def| def.name.clone())
+        else {
+            self.status_message = Some("Select an agent to activate.".to_string());
+            return;
+        };
+        self.agent_mode = Some(name.clone());
+        self.accent_color = accent_for_mode(Some(&name));
+        self.agent_mode_changed = true;
+        self.agents_menu.close();
+        self.status_message = Some(format!("Agent @{name} active."));
     }
 
     fn handle_agents_menu_key(&mut self, key: KeyEvent) {
@@ -10540,6 +10596,23 @@ impl App {
                     let ch = self.shift_normalize(ch, key.modifiers);
                     self.agents_menu.editor_insert_char(ch);
                 }
+                _ => {}
+            }
+            return;
+        }
+
+        // An armed delete owns the keyboard until it is answered, so `y` cannot
+        // leak into navigation or the prompt.
+        if self.agents_menu.pending_delete.is_some() {
+            match self
+                .resolve_dialog_action(&key, &KeyContext::Confirmation)
+                .as_deref()
+            {
+                Some("yes") => match self.agents_menu.confirm_delete() {
+                    Ok(msg) => self.status_message = Some(msg),
+                    Err(err) => self.status_message = Some(err),
+                },
+                Some("no") => self.agents_menu.cancel_delete(),
                 _ => {}
             }
             return;
@@ -20116,7 +20189,7 @@ mod tests {
 
         app.agents_menu.visible = true;
         app.agents_menu.definitions = vec![AgentDefinition {
-            file_path: std::path::PathBuf::from("/tmp/a.md"),
+            file_path: Some(std::path::PathBuf::from("/tmp/a.md")),
             name: "a".to_string(),
             source: "user".to_string(),
             model: None,
@@ -20125,8 +20198,13 @@ mod tests {
             tools: Vec::new(),
             shadowed_by: None,
             instructions: String::new(),
+            access: None,
+            max_turns: None,
+            temperature: None,
+            color: None,
+            visible: true,
         }];
-        assert_eq!(app.current_key_context(), KeyContext::Select);
+        assert_eq!(app.current_key_context(), KeyContext::AgentsMenu);
         assert_eq!(app.agents_menu.selected_row, 0);
         app.handle_key_event(press_key(KeyCode::Char('l'), KeyModifiers::NONE));
         assert_eq!(app.agents_menu.selected_row, 1);

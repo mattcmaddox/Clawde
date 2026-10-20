@@ -1714,6 +1714,21 @@ pub(crate) fn compute_slash_suggestions(
                 }
             }
         }
+        // A fully typed name is what the user asked for, so it must be the
+        // highlighted entry: Enter accepts the selection and runs it in one
+        // press (see `App::accept_suggestion_for_submit`), so leaving a longer
+        // neighbour in front silently runs the wrong command — `/new` opened
+        // `/new-agent`'s editor and `/auto` ran `/autopilot`, because table
+        // order decides the list. Promoting the exact match fixes every such
+        // pair at once, whatever order the table grows in.
+        let exact = format!("/{}", cmd_prefix.trim_end());
+        if let Some(index) = suggestions.iter().position(|s| s.text == exact) {
+            if index > 0 {
+                let matched = suggestions.remove(index);
+                suggestions.insert(0, matched);
+            }
+        }
+
         if !nested_suggestions.is_empty() {
             return nested_suggestions;
         }
@@ -6284,6 +6299,48 @@ mod tests {
         let suggestions = compute_slash_suggestions("/he", &cmds, &[], None);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/help");
+    }
+
+    #[test]
+    fn exact_command_name_ranks_before_a_longer_neighbour() {
+        // `/new` and `/new-agent` both match the `/new` prefix; the table lists
+        // the longer name first, so without promotion Enter ran the agent
+        // editor instead of starting a session.
+        let cmds = vec![
+            ("new-agent", "Create a new sub-agent"),
+            ("new", "Start a fresh session"),
+        ];
+        let suggestions = compute_slash_suggestions("/new", &cmds, &[], None);
+        assert_eq!(
+            suggestions.first().map(|s| s.text.as_str()),
+            Some("/new"),
+            "an exactly typed command must be the highlighted suggestion, got {suggestions:?}"
+        );
+        assert!(
+            suggestions.iter().any(|s| s.text == "/new-agent"),
+            "the longer neighbour must stay selectable, got {suggestions:?}"
+        );
+
+        // Same shape, different pair: `/auto` must beat `/autopilot`.
+        let cmds = vec![
+            ("autopilot", "Toggle autopilot"),
+            ("auto", "Switch to free/auto"),
+        ];
+        let suggestions = compute_slash_suggestions("/auto", &cmds, &[], None);
+        assert_eq!(
+            suggestions.first().map(|s| s.text.as_str()),
+            Some("/auto"),
+            "got {suggestions:?}"
+        );
+
+        // A partial name keeps the table order (no exact match to promote).
+        let cmds = vec![("new-agent", "Create a new sub-agent"), ("new", "Start")];
+        let suggestions = compute_slash_suggestions("/ne", &cmds, &[], None);
+        assert_eq!(
+            suggestions.first().map(|s| s.text.as_str()),
+            Some("/new-agent"),
+            "got {suggestions:?}"
+        );
     }
 
     #[test]

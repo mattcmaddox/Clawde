@@ -799,11 +799,95 @@ mod tests {
         );
     }
 
+    /// `/agent` is the text projection of the same registry `/agents` edits, so
+    /// both names open one popup and a trailing name selects that agent.
+    #[test]
+    fn agent_slash_command_opens_the_popup_on_the_named_agent() {
+        let temp = tempdir().unwrap();
+        let mut app = make_app();
+        app.config.project_dir = Some(temp.path().to_path_buf());
+
+        assert!(app.intercept_slash_command_with_args("agent", "plan"));
+        assert!(app.agents_menu.visible);
+        let selected = app
+            .agents_menu
+            .selected_definition()
+            .expect("the named agent is selected");
+        assert_eq!(selected.name, "plan");
+    }
+
+    #[test]
+    fn agent_slash_command_with_unknown_name_keeps_the_list_and_reports_it() {
+        let temp = tempdir().unwrap();
+        let mut app = make_app();
+        app.config.project_dir = Some(temp.path().to_path_buf());
+
+        assert!(app.intercept_slash_command_with_args("agent", "no-such-agent"));
+        assert!(app.agents_menu.visible);
+        assert!(matches!(
+            app.agents_menu.route,
+            agents_view::AgentsRoute::List
+        ));
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Unknown agent"),
+            "status: {:?}",
+            app.status_message
+        );
+    }
+
+    /// Activation is the popup half of the Tab/`--agent` path: it sets
+    /// `agent_mode` and raises `agent_mode_changed`, which is what the CLI loop
+    /// watches to install `agent_definition` and re-filter the tool set.
+    #[test]
+    fn activate_sets_agent_mode_and_flags_the_cli_loop() {
+        let temp = tempdir().unwrap();
+        let mut app = make_app();
+        app.config.project_dir = Some(temp.path().to_path_buf());
+        app.intercept_slash_command_with_args("agent", "plan");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert_eq!(app.agent_mode.as_deref(), Some("plan"));
+        assert!(app.agent_mode_changed);
+        assert!(!app.agents_menu.visible);
+    }
+
+    /// `d` only arms the delete; the file survives until `y`. Built-in and
+    /// settings-declared agents are refused by `request_delete` instead.
+    #[test]
+    fn delete_key_requires_confirmation_before_removing_the_agent_file() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join(".clawde").join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key-probe.md");
+        std::fs::write(
+            &path,
+            "---\nname: key-probe\nmodel: probe/model\ndescription: probe\n---\n\nBody.\n",
+        )
+        .unwrap();
+
+        let mut app = make_app();
+        app.config.project_dir = Some(temp.path().to_path_buf());
+        app.intercept_slash_command_with_args("agent", "key-probe");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(path.exists(), "arming must not delete");
+        assert!(app.agents_menu.pending_delete.is_some());
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!path.exists(), "confirmation must delete");
+        assert!(app.agents_menu.pending_delete.is_none());
+    }
+
     #[test]
     fn test_agents_editor_ctrl_s_saves_new_agent() {
         let temp = tempdir().unwrap();
         let mut app = make_app();
-        app.agents_menu.open(temp.path());
+        app.agents_menu
+            .open(temp.path(), &std::collections::HashMap::new());
         app.agents_menu.open_editor(None);
         app.agents_menu.editor.name = "Planner".to_string();
         app.agents_menu.editor.description = "Plans complex work".to_string();
@@ -830,7 +914,7 @@ mod tests {
     fn test_agents_editor_render_uses_live_editor_state() {
         let temp = tempdir().unwrap();
         let mut state = AgentsMenuState::new();
-        state.open(temp.path());
+        state.open(temp.path(), &std::collections::HashMap::new());
         state.open_editor(None);
         state.editor.name = "Builder".to_string();
         state.editor.description = "Builds code".to_string();
