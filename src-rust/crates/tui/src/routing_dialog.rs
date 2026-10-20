@@ -119,8 +119,10 @@ pub struct RoutingDialogState {
     /// upstreams (spec §8.4 "capability match").
     pub capabilities: Vec<(String, bool, u32)>,
     /// Per-upstream cooldown state `(upstream_id, kind, retry_secs)` where
-    /// `kind` is `"5xx"` or `"empty"`, captured at open time so the upstream
-    /// pane can show why a provider is currently being skipped.
+    /// `kind` is `"5xx"`, `"empty"`, or `"tool-cap"` (a short-lived routing
+    /// demotion after the upstream ended a turn at its own tool-call cap),
+    /// captured at open time so the upstream pane can show why a provider is
+    /// currently being skipped or ordered lower.
     pub cooldowns: Vec<(String, String, Option<u64>)>,
     /// Per-upstream key-ring health `(upstream_id, active, total, retry)` for
     /// upstreams wrapped in a KeyRotatingProvider (2+ keys), captured at open
@@ -269,8 +271,9 @@ impl RoutingDialogState {
     }
 
     /// The shortest remaining cooldown `(kind, retry_secs)` for an upstream
-    /// id, if it is currently cooling down (`kind` is `"5xx"` or `"empty"`).
-    /// `None` when the upstream is not in any cooldown.
+    /// id, if it is currently cooling down or carrying a tool-call-cap penalty
+    /// (`kind` is `"5xx"`, `"empty"`, or `"tool-cap"`). `None` when the
+    /// upstream has neither.
     pub fn cooldown_for(&self, upstream_id: &str) -> Option<(String, u64)> {
         self.cooldowns
             .iter()
@@ -697,11 +700,17 @@ fn render_upstreams_pane(buf: &mut Buffer, area: Rect, state: &RoutingDialogStat
                 row.push_str(&format!(" \u{b7}{}/{}", active, total));
             }
         }
-        // Cooldown tag (spec §8.6): an upstream currently cooling down (5xx
-        // or empty-completion) shows the shortest remaining retry — the same
-        // state the router skips it for at dispatch time.
+        // Cooldown tag (spec §8.6): an upstream currently cooling down (5xx or
+        // empty-completion) shows the shortest remaining retry — the same state
+        // the router skips it for at dispatch time. A tool-cap penalty is a
+        // distinct, short-lived routing demotion and gets its own label so it
+        // is not mistaken for a health problem.
         if let Some((kind, secs)) = state.cooldown_for(upstream.id) {
-            let label = if kind == "5xx" { "cool" } else { "empty" };
+            let label = match kind.as_str() {
+                "5xx" => "cool",
+                "tool-cap" => "cap",
+                _ => "empty",
+            };
             row.push_str(&format!(" \u{b7}{} {}s", label, secs));
         }
         // Model-performance column (spec §8.6): average latency when recorded,
@@ -1162,6 +1171,7 @@ mod tests {
                 ("groq".to_string(), "5xx".to_string(), Some(45)),
                 ("groq".to_string(), "empty".to_string(), Some(120)),
                 ("cerebras".to_string(), "5xx".to_string(), None),
+                ("google".to_string(), "tool-cap".to_string(), Some(90)),
             ],
             vec![("google".to_string(), 2, 3, Some(60))],
             Vec::new(),
@@ -1170,7 +1180,11 @@ mod tests {
         assert_eq!(dialog.cooldown_for("groq"), Some(("5xx".to_string(), 45)));
         // A cooldown entry with retry None is treated as not active.
         assert_eq!(dialog.cooldown_for("cerebras"), None);
-        assert_eq!(dialog.cooldown_for("google"), None);
+        // A tool-call-cap penalty rides the same snapshot with its own kind.
+        assert_eq!(
+            dialog.cooldown_for("google"),
+            Some(("tool-cap".to_string(), 90))
+        );
         // key_health_for exposes the ring only for key-rotating upstreams.
         assert_eq!(dialog.key_health_for("google"), Some((2, 3)));
         assert_eq!(dialog.key_health_for("groq"), None);

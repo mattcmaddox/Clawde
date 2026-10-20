@@ -267,6 +267,7 @@ impl FreeProvider {
             )),
             tool_dialect: Arc::new(Mutex::new(ToolDialectState::new(n))),
             liveness: Arc::new(Mutex::new(Vec::new())),
+            tool_caps: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -343,6 +344,7 @@ impl FreeProvider {
             capacity: Arc::new(Mutex::new(capacity)),
             tool_dialect: Arc::new(Mutex::new(tool_dialect)),
             liveness: Arc::new(Mutex::new(Vec::new())),
+            tool_caps: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -647,6 +649,21 @@ impl FreeProvider {
             plan.sort_by_key(|(idx, _)| {
                 capacity.rank(*idx, local_quota_for(self.chain[*idx].upstream.id))
             });
+            // Tool-call-cap penalty (short-lived, ordering-only). Applied last so
+            // it is the primary rank: a lane that capped must sit behind every
+            // uncapped lane, whatever its capacity or dialect tier. The stable
+            // sort preserves the earlier rankings inside each tier, and the lane
+            // stays in the plan as a fallback.
+            let tool_capped = self.tool_capped_upstreams();
+            if !tool_capped.is_empty() {
+                plan.sort_by_key(|(idx, _)| {
+                    u8::from(
+                        tool_capped
+                            .iter()
+                            .any(|id| id == self.chain[*idx].upstream.id),
+                    )
+                });
+            }
         }
         plan
     }
@@ -1314,6 +1331,58 @@ impl FreeProvider {
                 .map(|r| (r.upstream_id.clone(), r.model.clone()))
                 .collect(),
         }
+    }
+
+    /// Record that an upstream ended a turn at its own tool-call cap.
+    ///
+    /// Short-lived and ordering-only: later turns of the same run demote the
+    /// lane behind every upstream that has not capped, but keep it available as
+    /// a fallback. Pinned routes ignore the penalty — the user asked for that
+    /// upstream explicitly and the pinned plan already falls through the rest
+    /// of the chain.
+    fn record_tool_cap(&self, upstream_id: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let expires_at = now.saturating_add(crate::providers::free::TOOL_CAP_PENALTY_SECS);
+        let mut store = match self.tool_caps.lock() {
+            Ok(store) => store,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        store.retain(|(_, expires)| *expires > now);
+        if let Some(existing) = store.iter_mut().find(|(id, _)| id == upstream_id) {
+            existing.1 = expires_at;
+            return;
+        }
+        store.push((upstream_id.to_string(), expires_at));
+    }
+
+    /// `(upstream_id, remaining_secs)` for upstreams currently demoted by a
+    /// tool-call cap, pruning expired entries on read so the list is always the
+    /// live penalty set.
+    fn tool_cap_penalties(&self) -> Vec<(String, u64)> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut store = match self.tool_caps.lock() {
+            Ok(store) => store,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        store.retain(|(_, expires)| *expires > now);
+        store
+            .iter()
+            .map(|(id, expires)| (id.clone(), expires.saturating_sub(now)))
+            .collect()
+    }
+
+    /// Upstreams currently demoted for a tool-call cap.
+    fn tool_capped_upstreams(&self) -> Vec<String> {
+        self.tool_cap_penalties()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// Point this provider at the process-wide liveness store so the TUI and
@@ -4000,6 +4069,10 @@ impl LlmProvider for FreeProvider {
         })
     }
 
+    fn note_tool_cap(&self, upstream_id: &str) {
+        self.record_tool_cap(upstream_id);
+    }
+
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let provider_id = self.id.clone();
         let mk = |id: &str, name: &str, ctx: u32| ModelInfo {
@@ -4281,6 +4354,10 @@ impl LlmProvider for FreeProvider {
             }
         }
         out
+    }
+
+    fn upstream_tool_cap_penalties(&self) -> Vec<(String, u64)> {
+        self.tool_cap_penalties()
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -6502,6 +6579,47 @@ mod tests {
         assert_eq!(text_plan[0].0, 1, "text-only routing keeps default order");
     }
 
+    /// A tool-call cap demotes the lane for later turns of the same run without
+    /// dropping it: the free chain must try another provider first, while the
+    /// user's explicit pin still leads its own route.
+    #[test]
+    fn tool_cap_penalty_demotes_the_capped_upstream_for_later_turns() {
+        let provider = FreeProvider::with_routing(
+            vec![entry("lane-b", true), entry("groq", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        let req = dummy_request("free/auto");
+        let baseline = provider.attempt_plan(&Route::Auto, Some(&req));
+        assert_eq!(baseline[0].0, 1, "groq leads before the cap");
+
+        provider.record_tool_cap("groq");
+
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        assert_eq!(plan[0].0, 0, "the capped upstream is demoted");
+        assert_eq!(plan[1].0, 1, "and stays available as a fallback");
+
+        let pinned = provider.attempt_plan(
+            &Route::Pinned {
+                start_idx: 1,
+                pinned_model: "groq/llama-3.3-70b-versatile".to_string(),
+            },
+            Some(&req),
+        );
+        assert_eq!(pinned[0].0, 1, "an explicit pin ignores the penalty");
+
+        // The penalty is a window, not a blacklist: an expired entry is pruned
+        // on read, so the lane returns to its normal rank.
+        {
+            let mut store = provider.tool_caps.lock().unwrap();
+            for (_, expires) in store.iter_mut() {
+                *expires = 0;
+            }
+        }
+        let expired = provider.attempt_plan(&Route::Auto, Some(&req));
+        assert_eq!(expired[0].0, 1, "an expired penalty no longer demotes");
+    }
+
     #[test]
     fn attempt_plan_auto_keeps_unmeasured_upstreams_at_preferred_tail() {
         // No dispatch history for either upstream — groq is in the
@@ -8373,6 +8491,8 @@ mod tests {
             );
         }
 
+        provider.record_tool_cap("groq");
+
         let cooldowns = provider.upstream_cooldowns();
         let kinds: Vec<&str> = cooldowns.iter().map(|(_, k, _)| k.as_str()).collect();
         assert!(
@@ -8384,6 +8504,23 @@ mod tests {
             kinds.contains(&"empty"),
             "empty cooldown must be reported, got {:?}",
             cooldowns
+        );
+        // A tool-call cap is ordering state, not health: it must stay out of
+        // the health list (the footer, `/ctx-viz`, `/stats` and `/compare`
+        // read it) and be reported through its own accessor.
+        assert!(
+            !kinds.contains(&"tool-cap"),
+            "a cap penalty must not be reported as a health cooldown, got {:?}",
+            cooldowns
+        );
+        let cap_secs = provider
+            .upstream_tool_cap_penalties()
+            .into_iter()
+            .find(|(id, _)| id == "groq")
+            .map(|(_, secs)| secs);
+        assert!(
+            cap_secs.is_some_and(|secs| secs > 0),
+            "a tool-cap penalty must be reported with remaining seconds"
         );
         for (_, _, retry) in &cooldowns {
             assert!(retry.is_some(), "active cooldowns must carry retry_secs");

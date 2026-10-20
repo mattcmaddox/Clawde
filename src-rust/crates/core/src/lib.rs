@@ -7985,6 +7985,32 @@ pub mod history {
         Ok(())
     }
 
+    /// Point an existing session record at `model`.
+    ///
+    /// A provider switch inside the query loop (its own tool-call cap, or the
+    /// configured fallback after an output cap) must survive a restart: resume
+    /// restores [`ConversationSession::model`] into the query config, so the
+    /// provider that continued the task is the one that keeps running it.
+    ///
+    /// Returns `Ok(false)` when no record exists yet. The owner (CLI/TUI) saves
+    /// the session on its own schedule; creating one here would race its id,
+    /// timestamps and message list.
+    pub async fn update_session_model(id: &str, model: &str) -> anyhow::Result<bool> {
+        let path = sessions_dir().join(format!("{id}.json"));
+        if !path.exists() {
+            return Ok(false);
+        }
+        let content = tokio::fs::read_to_string(&path).await?;
+        let mut session: ConversationSession = serde_json::from_str(&content)?;
+        if session.model == model {
+            return Ok(true);
+        }
+        session.model = model.to_string();
+        session.updated_at = chrono::Utc::now();
+        save_session(&session).await?;
+        Ok(true)
+    }
+
     /// Load a specific session by ID.
     pub async fn load_session(id: &str) -> anyhow::Result<ConversationSession> {
         let path = sessions_dir().join(format!("{}.json", id));
@@ -8184,6 +8210,73 @@ pub mod history {
                 false
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::ConversationSession;
+        use super::{load_session, save_session, update_session_model};
+
+        /// Restores `$CLAWDE_HOME` on drop so a failed assertion cannot leak the
+        /// scratch home into another test. Only captures the value; the test
+        /// holds the env lock while it mutates.
+        struct SavedHome(Option<std::ffi::OsString>);
+
+        impl SavedHome {
+            fn capture() -> Self {
+                Self(std::env::var_os("CLAWDE_HOME"))
+            }
+        }
+
+        impl Drop for SavedHome {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                    None => std::env::remove_var("CLAWDE_HOME"),
+                }
+            }
+        }
+
+        // Sync test + `block_on` (the pattern the settings tests use): the std
+        // env guard must not be held across an await point, and the crate's
+        // canonical lock is a std mutex.
+        #[test]
+        fn update_session_model_persists_the_switch_for_resume() {
+            // `sessions_dir()` resolves through `config_dir()`, which only the
+            // `$CLAWDE_HOME` override redirects, so pin it at a scratch home:
+            // the real `~/.clawde/sessions` must not see this record.
+            let _lock = crate::paths::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let scratch = tempfile::tempdir().expect("scratch home");
+            let _saved_home = SavedHome::capture();
+            std::env::set_var("CLAWDE_HOME", scratch.path());
+            let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+
+            runtime.block_on(async {
+                let id = format!("update-model-{}", uuid::Uuid::new_v4());
+                let mut session = ConversationSession::new("initial/model".to_string());
+                session.id = id.clone();
+                save_session(&session).await.expect("save session");
+
+                assert!(
+                    update_session_model(&id, "groq/llama-3.3-70b-versatile")
+                        .await
+                        .expect("update model"),
+                    "an existing record must be updated"
+                );
+                let reloaded = load_session(&id).await.expect("reload session");
+                assert_eq!(reloaded.model, "groq/llama-3.3-70b-versatile");
+                assert_eq!(reloaded.messages.len(), session.messages.len());
+
+                assert!(
+                    !update_session_model("no-such-session-record", "x/y")
+                        .await
+                        .expect("missing record"),
+                    "a missing record must not be created"
+                );
+            });
+        }
     }
 }
 

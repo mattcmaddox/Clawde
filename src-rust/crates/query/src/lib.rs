@@ -38,6 +38,7 @@ pub mod session_synopsis;
 pub mod session_title;
 pub mod skill_prefetch;
 pub(crate) mod state_emission;
+pub mod stop_kind;
 pub mod task_state;
 pub(crate) mod thinking_failure;
 pub(crate) mod tool_exec;
@@ -86,6 +87,7 @@ pub use session_memory::{
 pub use skill_prefetch::{
     format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
 };
+pub use stop_kind::StopKind;
 pub use task_state::{
     ComplexityLedger, EvidenceItem, EvidenceSource, EvidenceStatus, FocusState, TaskDecision,
     TaskFailure, TaskState, UserTurnRelation, ValidationVerdict,
@@ -449,6 +451,152 @@ fn free_catalog_pin_redirect(provider_id: &str, auth_store: &clawde_core::AuthSt
     clawde_api::providers::free::first_free_upstream_key(auth_store, provider_id).is_some()
 }
 
+/// Pick where a turn cut by a provider's tool-call cap should resume.
+///
+/// The transcript already carries the task — messages, tool results, files
+/// touched — so the resume only has to name the provider/model that continues
+/// it. An explicit `fallback_model` wins, mirroring the step-budget
+/// continuation. In free mode the cap is per upstream, so the next *keyed*
+/// catalog upstream is pinned instead: the upstream that just capped is
+/// skipped (it will cap again), and a `quick_task_lane` tier is picked only
+/// when nothing else has a key, since those tiers are too small to lead an
+/// agentic resume.
+///
+/// `capped_upstream` is the upstream that actually served the capped turn when
+/// the caller knows it; otherwise the upstream named by a pinned
+/// `upstream/model` string is treated as the one to skip.
+fn cap_resume_switch(
+    current_model: &str,
+    provider_id: &str,
+    capped_upstream: Option<&str>,
+    fallback_model: Option<&str>,
+    auth_store: &clawde_core::AuthStore,
+) -> Option<String> {
+    if let Some(fallback) = fallback_model.filter(|model| *model != current_model) {
+        return Some(fallback.to_string());
+    }
+    let is_free_chain = provider_id == "free"
+        || clawde_api::providers::free::FREE_CATALOG
+            .iter()
+            .any(|upstream| upstream.id == provider_id);
+    if !is_free_chain {
+        return None;
+    }
+    let excluded = capped_upstream.or_else(|| {
+        current_model
+            .split_once('/')
+            .map(|(prefix, _)| prefix)
+            .filter(|prefix| {
+                clawde_api::providers::free::FREE_CATALOG
+                    .iter()
+                    .any(|upstream| upstream.id == *prefix)
+            })
+    });
+    let mut quick_lane: Option<String> = None;
+    for upstream in clawde_api::providers::free::FREE_CATALOG {
+        if Some(upstream.id) == excluded {
+            continue;
+        }
+        if clawde_api::providers::free::first_free_upstream_key(auth_store, upstream.id).is_none() {
+            continue;
+        }
+        let model = format!("{}/{}", upstream.id, upstream.default_model);
+        if model == current_model {
+            continue;
+        }
+        if upstream.quick_task_lane {
+            quick_lane.get_or_insert(model);
+        } else {
+            return Some(model);
+        }
+    }
+    quick_lane
+}
+
+/// Report a provider tool-call cap to the free chain, when this turn ran on it.
+///
+/// Only the composite provider can route around a capped upstream, and only it
+/// overrides [`clawde_api::LlmProvider::note_tool_cap`]; every other provider is
+/// a no-op. The lookup goes through the registry because the dispatch handle is
+/// out of scope by the time the stream is drained.
+fn note_tool_cap_on_free_chain(
+    registry: Option<&clawde_api::ProviderRegistry>,
+    upstream_id: Option<&str>,
+) {
+    let (Some(registry), Some(upstream_id)) = (registry, upstream_id) else {
+        return;
+    };
+    if let Some(free) = registry.get(&clawde_core::ProviderId::new("free")) {
+        free.note_tool_cap(upstream_id);
+    }
+}
+
+/// Announce a cap-driven provider switch through the same event the TUI
+/// already renders for auto-switch decisions, so the status area names both the
+/// reason and the model that continues the task.
+fn announce_cap_switch(
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+    switched_to: Option<&str>,
+    current_model: &str,
+    provider_id: &str,
+    kind: StopKind,
+) {
+    let Some(target) = switched_to else {
+        return;
+    };
+    let Some(tx) = event_tx else {
+        return;
+    };
+    let (target_provider, target_model) = match target.split_once('/') {
+        Some((provider, model)) => (provider.to_string(), model.to_string()),
+        None => (provider_id.to_string(), target.to_string()),
+    };
+    let _ = tx.send(QueryEvent::ModelInfo {
+        original_model: current_model.to_string(),
+        switched_model: target_model,
+        reason: kind.label().to_string(),
+        provider: target_provider,
+        target_model: target.to_string(),
+    });
+}
+
+/// Persist the model that is actually running into the session record.
+///
+/// Resume restores [`clawde_core::history::ConversationSession::model`] into the
+/// query config, so every in-run switch (cap resume, unavailable provider,
+/// output limit, step limit) must land there too — otherwise a restart continues
+/// the task on the model the run started with, which is the one that just
+/// failed. Only the session owner writes: a sub-agent loop does not own the
+/// record its parent will resume, and the record may not exist yet in either
+/// case, in which case there is nothing to update.
+async fn persist_active_model(config: &QueryConfig, session_id: &str, model: &str) {
+    if !config.session_state_owner {
+        return;
+    }
+    match clawde_core::history::update_session_model(session_id, model).await {
+        Ok(_) => {}
+        Err(error) => warn!(
+            error = %error,
+            model = %model,
+            "Could not persist the switched model to the session record"
+        ),
+    }
+}
+
+/// Fold the switch into the resume prompt, which is pushed into `messages` and
+/// therefore persisted with the session transcript. A restarted run then reads
+/// why the model changed and where it resumed — a transient `Status` event is
+/// gone after the frame and cannot serve that.
+fn persist_switch_note(prompt: String, target: Option<&str>, kind: StopKind) -> String {
+    match target {
+        Some(target) => format!(
+            "{prompt}\n\n[Provider switch] This run resumed on {target} after a {}.",
+            kind.label()
+        ),
+        None => prompt,
+    }
+}
+
 /// Choose the provider and model for one-shot background memory work (session
 /// memory extraction).
 ///
@@ -551,6 +699,12 @@ pub enum QueryEvent {
         switched_model: String,
         reason: String,
         provider: String,
+        /// The model string the rest of the run continues on, exactly as the
+        /// loop set it (provider-qualified only when the target was). The
+        /// session owner writes this into the session record: `switched_model`
+        /// and `provider` are the display split, and rebuilding the string from
+        /// them would lose a bare target's shape.
+        target_model: String,
     },
     /// A spec was generated this turn and should be surfaced for review
     /// (spec-driven development, audit spec §10.2). Carries the path to the
@@ -2924,6 +3078,11 @@ async fn run_query_loop_inner(
     // resume the exact task rather than discarding the partial run.
     const MAX_STEP_CONTINUATIONS: u32 = 2;
     let mut max_step_continuations = 0u32;
+    // Bounded resume windows for a turn the provider itself cut short — its
+    // tool-call cap, or an output cap that truncated a tool batch. Draws on the
+    // same ladder budget as the step continuations but counts separately, so a
+    // cap mid-window does not silently shorten the steps the model still has.
+    let mut cap_recoveries = 0u32;
     let mut degradation_done = false;
     // Whether the near-the-limit warning has already been issued for the current
     // step window. Reset whenever the window restarts so each window gets one.
@@ -3104,6 +3263,7 @@ async fn run_query_loop_inner(
                 );
                 effective_model = fallback.clone();
                 used_fallback = true;
+                persist_active_model(config, &tool_ctx.session_id, &fallback).await;
                 sanitize_thinking_from_trajectory(messages);
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(QueryEvent::Status(format!(
@@ -3134,6 +3294,7 @@ async fn run_query_loop_inner(
             last_recovery_error = None;
             // New window, new warning budget.
             budget_warning_issued = false;
+            cap_recoveries = 0;
             goal_turn_start = std::time::Instant::now();
             observability_started_at = std::time::Instant::now();
             turn_started_wall = clawde_core::types::now_rfc3339_ms();
@@ -4638,6 +4799,16 @@ async fn run_query_loop_inner(
                             }
                             // Emit ModelInfo for ALL auto-switch events (Issue 7).
                             if let Some(ref tx) = event_tx {
+                                // The tool-capable model serves the rest of the
+                                // run (and is cached for later turns), so the
+                                // session owner records it as the active model
+                                // too; provider and model are carried as the
+                                // split the TUI displays.
+                                let active_model = if provider_id_str == old_provider {
+                                    model_id_str.clone()
+                                } else {
+                                    format!("{provider_id_str}/{model_id_str}")
+                                };
                                 let _ = tx.send(QueryEvent::ModelInfo {
                                     original_model: old_model.clone(),
                                     switched_model: model_id_str.clone(),
@@ -4647,6 +4818,7 @@ async fn run_query_loop_inner(
                                         "model lacks tool calling capability".to_string()
                                     },
                                     provider: provider_id_str.clone(),
+                                    target_model: active_model,
                                 });
                             }
                             // Emit routing telemetry when --tool-model was overridden (Issue 1c).
@@ -4881,6 +5053,8 @@ async fn run_query_loop_inner(
                                     }
                                     effective_model = fallback.to_string();
                                     used_fallback = true;
+                                    persist_active_model(config, &tool_ctx.session_id, fallback)
+                                        .await;
                                     sanitize_thinking_from_trajectory(messages);
                                     request_retries += 1;
                                     turn -= 1;
@@ -5643,7 +5817,6 @@ async fn run_query_loop_inner(
                             event_tx.as_ref(),
                             &malformed_tool_calls,
                             &mut turn_state,
-                            &mut wrote_files,
                             &mut total_tool_calls,
                         )
                         .await;
@@ -5659,6 +5832,7 @@ async fn run_query_loop_inner(
                             &tool_exec_ctx,
                             &prepared,
                             &mut turn_state,
+                            &mut wrote_files,
                             &mut repeat_detector,
                         )
                         .await;
@@ -5704,6 +5878,86 @@ async fn run_query_loop_inner(
                         }
 
                         continue; // loop for next tool round
+                    }
+
+                    // A provider-side tool-call cap ends the turn mid-task
+                    // without an error of its own, and a `tool_use` stop that
+                    // delivered no calls has the same shape. Classify the stop
+                    // and spend a bounded ladder window resuming, instead of
+                    // reporting a cold end_turn. The assistant turn is already
+                    // in the transcript, so the next request continues from
+                    // it. Tool calls that did arrive were executed above.
+                    {
+                        let stop_kind = crate::stop_kind::classify(&stop_str, 0);
+                        if stop_kind.is_resumable_cap() && cap_recoveries < MAX_STEP_CONTINUATIONS {
+                            if let Some(prompt) = crate::stop_kind::resume_message(stop_kind, &[]) {
+                                cap_recoveries += 1;
+                                // A provider tool-call cap is a routing fact about
+                                // the upstream, not about the task: tell the free
+                                // chain so later turns of this run try another
+                                // lane first (short-lived, ordering-only).
+                                if stop_kind == crate::stop_kind::StopKind::ProviderToolCap {
+                                    note_tool_cap_on_free_chain(
+                                        config.provider_registry.as_deref(),
+                                        actual_upstream_id.as_deref(),
+                                    );
+                                }
+                                let switched = cap_resume_switch(
+                                    &effective_model,
+                                    &provider_id_str,
+                                    actual_upstream_id.as_deref(),
+                                    config.fallback_model.as_deref(),
+                                    &clawde_core::AuthStore::load(),
+                                );
+                                warn!(
+                                    stop_reason = %stop_str,
+                                    kind = ?stop_kind,
+                                    attempt = cap_recoveries,
+                                    limit = MAX_STEP_CONTINUATIONS,
+                                    switch_to = switched.as_deref().unwrap_or("<same provider>"),
+                                    "Provider ended the turn at a tool-call cap — resuming"
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx.send(QueryEvent::Status(format!(
+                                        "Provider tool-call cap ended the turn — resuming on {} ({}/{})…",
+                                        switched.as_deref().unwrap_or("the same provider"),
+                                        cap_recoveries,
+                                        MAX_STEP_CONTINUATIONS
+                                    )));
+                                }
+                                // Sent after the status line so the structured
+                                // switch notice is what stays in the status area:
+                                // it names the from/to models and the cap reason.
+                                announce_cap_switch(
+                                    event_tx.as_ref(),
+                                    switched.as_deref(),
+                                    &effective_model,
+                                    &provider_id_str,
+                                    stop_kind,
+                                );
+                                let prompt =
+                                    persist_switch_note(prompt, switched.as_deref(), stop_kind);
+                                if let Some(target) = switched.as_deref() {
+                                    // The transcript is what carries the task to
+                                    // the new provider; its own reasoning is not
+                                    // the previous model's, so stale thinking
+                                    // blocks are dropped (cascade drift).
+                                    effective_model = target.to_string();
+                                    used_fallback = true;
+                                    sanitize_thinking_from_trajectory(messages);
+                                    // Resume restores the session record's model,
+                                    // so a restart must find the provider that
+                                    // actually continued the task here.
+                                    if config.session_state_owner {
+                                        persist_active_model(config, &tool_ctx.session_id, target)
+                                            .await;
+                                    }
+                                }
+                                messages.push(Message::user(prompt));
+                                repeat_detector.reset();
+                                continue;
+                            }
+                        }
                     }
 
                     // End turn — notify TUI and return.
@@ -5915,6 +6169,7 @@ async fn run_query_loop_inner(
                         }
                         effective_model = fb.clone();
                         used_fallback = true;
+                        persist_active_model(config, &tool_ctx.session_id, fb).await;
                         request_retries += 1;
                         // Trajectory sanitization on provider switch (research:
                         // Zylos 2026 — "cascade drift"). Strip thinking blocks
@@ -6066,6 +6321,88 @@ async fn run_query_loop_inner(
             }
             _ => raw_stop,
         };
+
+        // A provider-side tool-call cap, or an output cap that cut a tool batch
+        // mid-argument, ends the turn mid-task without an error. Classify the
+        // stop and resume through the same bounded ladder the step budget uses
+        // instead of reporting a clean end_turn. A truncated call is answered
+        // here (every tool_use needs a tool_result) but never executed: its
+        // arguments are incomplete by construction.
+        {
+            let partial_calls: Vec<(String, String)> = assistant_msg
+                .get_tool_use_blocks()
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
+                    _ => None,
+                })
+                .collect();
+            let stop_kind = crate::stop_kind::classify(raw_stop, partial_calls.len());
+            if stop_kind.is_resumable_cap() && cap_recoveries < MAX_STEP_CONTINUATIONS {
+                let dropped: Vec<String> =
+                    partial_calls.iter().map(|(_, name)| name.clone()).collect();
+                if let Some(prompt) = crate::stop_kind::resume_message(stop_kind, &dropped) {
+                    cap_recoveries += 1;
+                    let switched = cap_resume_switch(
+                        &effective_model,
+                        "anthropic",
+                        None,
+                        config.fallback_model.as_deref(),
+                        &clawde_core::AuthStore::load(),
+                    );
+                    // Captured before the switch below: the notice names the
+                    // model that was running, not the target again.
+                    let previous_model = effective_model.clone();
+                    if let Some(target) = switched.as_deref() {
+                        // The transcript carries the task; the new model's
+                        // reasoning is not the old one's, so thinking blocks are
+                        // dropped (cascade drift).
+                        effective_model = target.to_string();
+                        used_fallback = true;
+                        sanitize_thinking_from_trajectory(messages);
+                        // Resume restores the session record's model, so a
+                        // restart must find the provider that continued here.
+                        persist_active_model(config, &tool_ctx.session_id, target).await;
+                    }
+                    if stop_kind == crate::stop_kind::StopKind::TruncatedToolBatch {
+                        let (repair, _) = crate::stop_kind::truncated_batch_repair(&partial_calls);
+                        if !repair.is_empty() {
+                            messages.push(Message::user_blocks(repair));
+                        }
+                    }
+                    warn!(
+                        stop_reason = %raw_stop,
+                        kind = ?stop_kind,
+                        attempt = cap_recoveries,
+                        limit = MAX_STEP_CONTINUATIONS,
+                        switch_to = switched.as_deref().unwrap_or("<same provider>"),
+                        "Provider ended the turn at a tool-call cap — resuming"
+                    );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(format!(
+                            "Provider tool-call cap ended the turn — resuming on {} ({}/{})…",
+                            switched.as_deref().unwrap_or("the same provider"),
+                            cap_recoveries,
+                            MAX_STEP_CONTINUATIONS
+                        )));
+                    }
+                    // Sent after the status line so the structured switch notice
+                    // is what stays in the status area: it names the from/to
+                    // models and the cap reason.
+                    announce_cap_switch(
+                        event_tx.as_ref(),
+                        switched.as_deref(),
+                        &previous_model,
+                        "anthropic",
+                        stop_kind,
+                    );
+                    let prompt = persist_switch_note(prompt, switched.as_deref(), stop_kind);
+                    messages.push(Message::user(prompt));
+                    repeat_detector.reset();
+                    continue;
+                }
+            }
+        }
 
         // T1-3: Fire PostModelTurn hooks after the model samples a response.
         // Hooks can inject blocking errors or veto continuation entirely.
@@ -6716,6 +7053,7 @@ async fn run_query_loop_inner(
                             }
                             effective_model = fallback.to_string();
                             used_fallback = true;
+                            persist_active_model(config, &tool_ctx.session_id, fallback).await;
                             sanitize_thinking_from_trajectory(messages);
                             messages.push(Message::user(MAX_TOKENS_RECOVERY_MSG));
                             max_tokens_recovery_count = 0;
@@ -6776,7 +7114,6 @@ async fn run_query_loop_inner(
                         // tool calls (provider-path only, D6).
                         &std::collections::HashSet::new(),
                         &mut turn_state,
-                        &mut wrote_files,
                         &mut total_tool_calls,
                     )
                     .await;
@@ -6792,6 +7129,7 @@ async fn run_query_loop_inner(
                         &tool_exec_ctx,
                         &prepared,
                         &mut turn_state,
+                        &mut wrote_files,
                         &mut repeat_detector,
                     )
                     .await;
@@ -12183,6 +12521,9 @@ mod tests {
         BudgetEaten { reasoning_tokens: u64 },
         /// A normal visible answer.
         Text(String),
+        /// A turn the provider ended at its own tool-call cap: text, no tool
+        /// calls (the cap dropped them), and a non-terminal stop reason.
+        ProviderToolCap,
     }
 
     /// A provider double that replays a scripted sequence of reply shapes, so a
@@ -12250,6 +12591,16 @@ mod tests {
                         usage: Some(UsageInfo::default()),
                     }));
                 }
+                ReplyShape::ProviderToolCap => {
+                    events.push(Ok(StreamEvent::TextDelta {
+                        index: 0,
+                        text: "partial work before the cap".to_string(),
+                    }));
+                    events.push(Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::Other("max_tool_calls".to_string())),
+                        usage: Some(UsageInfo::default()),
+                    }));
+                }
                 ReplyShape::ThinkingOnly { reasoning_tokens }
                 | ReplyShape::BudgetEaten { reasoning_tokens } => {
                     events.push(Ok(StreamEvent::ContentBlockStart {
@@ -12300,7 +12651,31 @@ mod tests {
         shapes: Vec<ReplyShape>,
         max_tokens: u32,
         prompt: &str,
-    ) -> (Vec<clawde_api::ProviderRequest>, QueryOutcome, Vec<String>) {
+        fallback_model: Option<&str>,
+    ) -> (
+        Vec<clawde_api::ProviderRequest>,
+        QueryOutcome,
+        Vec<String>,
+        Vec<QueryEvent>,
+    ) {
+        run_sequence_turn_with_session(shapes, max_tokens, prompt, fallback_model, None).await
+    }
+
+    /// Same loop, but as the session owner for `(session_id, working_dir)`, so
+    /// the run persists a switched model into the session record and its state
+    /// emitter stays inside the caller's scratch project.
+    async fn run_sequence_turn_with_session(
+        shapes: Vec<ReplyShape>,
+        max_tokens: u32,
+        prompt: &str,
+        fallback_model: Option<&str>,
+        session: Option<(&str, &std::path::Path)>,
+    ) -> (
+        Vec<clawde_api::ProviderRequest>,
+        QueryOutcome,
+        Vec<String>,
+        Vec<QueryEvent>,
+    ) {
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let provider: Arc<dyn clawde_api::LlmProvider> = Arc::new(SequenceProvider {
             id: clawde_core::provider_id::ProviderId::new("mockprov"),
@@ -12318,12 +12693,18 @@ mod tests {
         .expect("test client");
         let mut ctx = deny_all_context();
         ctx.config.provider = Some("mockprov".to_string());
+        if let Some((session_id, working_dir)) = session {
+            ctx.session_id = session_id.to_string();
+            ctx.working_dir = working_dir.to_path_buf();
+        }
 
         let config = QueryConfig {
             model: "mock-model".to_string(),
             max_tokens,
             max_turns: 4,
+            fallback_model: fallback_model.map(str::to_string),
             provider_registry: Some(Arc::new(registry)),
+            session_state_owner: session.is_some(),
             ..Default::default()
         };
 
@@ -12346,17 +12727,16 @@ mod tests {
         .await
         .expect("loop must not hang");
 
-        let statuses: Vec<String> = {
-            let mut out = Vec::new();
-            while let Ok(event) = event_rx.try_recv() {
-                if let QueryEvent::Status(s) = event {
-                    out.push(s);
-                }
+        let mut events = Vec::new();
+        let mut statuses = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let QueryEvent::Status(s) = &event {
+                statuses.push(s.clone());
             }
-            out
-        };
+            events.push(event);
+        }
         let requests = requests.lock().unwrap().clone();
-        (requests, outcome, statuses)
+        (requests, outcome, statuses, events)
     }
 
     /// §6.6: a thinking-only terminal turn is retried once (with a nudge) and
@@ -12364,7 +12744,7 @@ mod tests {
     #[tokio::test]
     async fn thinking_only_turn_retries_once_before_the_placeholder() {
         let _g = ENV_LOCK.lock().await;
-        let (requests, outcome, statuses) = run_sequence_turn(
+        let (requests, outcome, statuses, _events) = run_sequence_turn(
             vec![
                 ReplyShape::ThinkingOnly {
                     reasoning_tokens: 50,
@@ -12373,6 +12753,7 @@ mod tests {
             ],
             4_096,
             "explain the design",
+            None,
         )
         .await;
 
@@ -12405,7 +12786,7 @@ mod tests {
     #[tokio::test]
     async fn budget_eaten_turn_retries_with_a_higher_output_budget() {
         let _g = ENV_LOCK.lock().await;
-        let (requests, outcome, statuses) = run_sequence_turn(
+        let (requests, outcome, statuses, _events) = run_sequence_turn(
             vec![
                 ReplyShape::BudgetEaten {
                     reasoning_tokens: 1_900,
@@ -12414,6 +12795,7 @@ mod tests {
             ],
             2_000,
             "explain the design",
+            None,
         )
         .await;
 
@@ -12437,6 +12819,431 @@ mod tests {
             }
             other => panic!("expected EndTurn with the recovered answer, got {other:?}"),
         }
+    }
+
+    /// A provider tool-call cap cuts the turn mid-task with no error of its
+    /// own. It must resume through the ladder (a follow-up request carrying the
+    /// resume prompt) instead of reporting a cold `end_turn`, which is the
+    /// "agent randomly stops" failure mode.
+    #[tokio::test]
+    async fn provider_tool_cap_resumes_the_task() {
+        let _g = ENV_LOCK.lock().await;
+        let (requests, outcome, statuses, _events) = run_sequence_turn(
+            vec![
+                ReplyShape::ProviderToolCap,
+                ReplyShape::Text("finished after the cap".to_string()),
+            ],
+            4_096,
+            "finish the refactor",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            requests.len(),
+            2,
+            "a cap must resume with a second request, got {requests:?} requests"
+        );
+        let second_request: Vec<String> = requests[1]
+            .messages
+            .iter()
+            .map(Message::get_all_text)
+            .collect();
+        assert!(
+            second_request
+                .iter()
+                .any(|text| text.contains("tool-call cap")),
+            "the resume prompt must reach the model, got {second_request:?}"
+        );
+        assert!(
+            statuses.iter().any(|s| s.contains("tool-call cap")),
+            "the resume must be surfaced, got {statuses:?}"
+        );
+        match outcome {
+            QueryOutcome::EndTurn { message, .. } => {
+                assert_eq!(message.get_all_text(), "finished after the cap");
+            }
+            other => panic!("expected EndTurn after the resume, got {other:?}"),
+        }
+    }
+
+    /// The cap ladder is bounded: a provider that caps every turn gets
+    /// `MAX_STEP_CONTINUATIONS` resumes and then a normal end, never an
+    /// unbounded retry loop.
+    #[tokio::test]
+    async fn provider_tool_cap_resumes_are_bounded() {
+        let _g = ENV_LOCK.lock().await;
+        let (requests, _outcome, statuses, _events) = run_sequence_turn(
+            vec![ReplyShape::ProviderToolCap],
+            4_096,
+            "finish the refactor",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            requests.len(),
+            3,
+            "one capped turn plus two bounded resumes, got {requests:?} requests"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| s.contains("tool-call cap"))
+                .count(),
+            2,
+            "both ladder rungs must be reported, got {statuses:?}"
+        );
+    }
+
+    /// A cap resume must move to the configured fallback model and hand it the
+    /// prior transcript, so the task continues instead of restarting on a
+    /// provider that will cap again.
+    #[tokio::test]
+    async fn provider_tool_cap_resume_switches_model_and_keeps_the_transcript() {
+        let _g = ENV_LOCK.lock().await;
+        let (requests, outcome, statuses, events) = run_sequence_turn(
+            vec![
+                ReplyShape::ProviderToolCap,
+                ReplyShape::Text("finished on the fallback".to_string()),
+            ],
+            4_096,
+            "finish the refactor",
+            Some("backup-model"),
+        )
+        .await;
+
+        assert_eq!(requests.len(), 2, "the cap must resume with a request");
+        assert_eq!(
+            requests[1].model, "backup-model",
+            "the resume must run on the switched model"
+        );
+        let second_request: Vec<String> = requests[1]
+            .messages
+            .iter()
+            .map(Message::get_all_text)
+            .collect();
+        assert!(
+            second_request
+                .iter()
+                .any(|text| text.contains("partial work before the cap")),
+            "the new model must receive the capped turn's transcript, got {second_request:?}"
+        );
+        assert!(
+            second_request
+                .iter()
+                .any(|text| text.contains("tool-call cap")),
+            "the resume prompt must reach the switched model, got {second_request:?}"
+        );
+        assert!(
+            statuses.iter().any(|s| s.contains("backup-model")),
+            "the switch must be surfaced, got {statuses:?}"
+        );
+
+        // The TUI renders a model switch from this event: it must carry the
+        // target model and the cap as the reason.
+        let switch = events
+            .iter()
+            .find_map(|event| match event {
+                QueryEvent::ModelInfo {
+                    original_model,
+                    switched_model,
+                    reason,
+                    provider,
+                    target_model,
+                } => Some((
+                    original_model.clone(),
+                    switched_model.clone(),
+                    reason.clone(),
+                    provider.clone(),
+                    target_model.clone(),
+                )),
+                _ => None,
+            })
+            .expect("the cap switch must be announced as a model switch");
+        assert_eq!(switch.0, "mock-model");
+        assert_eq!(switch.1, "backup-model");
+        assert_eq!(switch.2, "provider tool-call cap");
+        assert_eq!(switch.3, "mockprov");
+        assert_eq!(
+            switch.4, "backup-model",
+            "the event must carry the exact model the run continues on"
+        );
+
+        // The switch note is a user message, so it is part of the transcript a
+        // restarted run reloads. Prove the round trip through session storage.
+        let note = requests[1]
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == clawde_core::types::Role::User
+                    && message.get_all_text().contains("[Provider switch]")
+            })
+            .cloned()
+            .expect("the switch note must be in the persisted history");
+        let dir = tempfile::tempdir().expect("temp transcript dir");
+        let path = dir.path().join("session.jsonl");
+        let entry = clawde_core::session_storage::make_user_entry(
+            note,
+            "note-uuid",
+            None,
+            "loop-test",
+            "/workspace",
+        );
+        clawde_core::session_storage::write_transcript_entry(&path, &entry)
+            .await
+            .expect("write transcript entry");
+        let loaded = clawde_core::session_storage::load_transcript(&path)
+            .await
+            .expect("load transcript");
+        let restored = clawde_core::session_storage::messages_from_transcript(&loaded)
+            .iter()
+            .map(Message::get_all_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            restored.contains("[Provider switch]") && restored.contains("backup-model"),
+            "a restarted run must reload the switch note, got: {restored}"
+        );
+
+        match outcome {
+            QueryOutcome::EndTurn { message, .. } => {
+                assert_eq!(message.get_all_text(), "finished on the fallback");
+            }
+            other => panic!("expected EndTurn after the switch, got {other:?}"),
+        }
+    }
+
+    /// A switch inside the loop must reach the session record, because resume
+    /// restores `ConversationSession::model`: the note in the transcript says
+    /// where the run went, the record is what makes the next process run there.
+    #[tokio::test]
+    async fn cap_resume_persists_the_switched_model_to_the_session_record() {
+        let _g = ENV_LOCK.lock().await;
+        let scratch = tempfile::tempdir().expect("scratch home");
+        let saved_home = std::env::var_os("CLAWDE_HOME");
+        std::env::set_var("CLAWDE_HOME", scratch.path());
+
+        let session_id = format!("cap-switch-{}", uuid::Uuid::new_v4());
+        let mut record = clawde_core::history::ConversationSession::new("mock-model".to_string());
+        record.id = session_id.clone();
+        clawde_core::history::save_session(&record)
+            .await
+            .expect("save session record");
+
+        let (_requests, _outcome, _statuses, _events) = run_sequence_turn_with_session(
+            vec![
+                ReplyShape::ProviderToolCap,
+                ReplyShape::Text("finished on the fallback".to_string()),
+            ],
+            4_096,
+            "finish the refactor",
+            Some("backup-model"),
+            Some((&session_id, scratch.path())),
+        )
+        .await;
+
+        let reloaded = clawde_core::history::load_session(&session_id)
+            .await
+            .expect("reload session record");
+        assert_eq!(
+            reloaded.model, "backup-model",
+            "a restart resumes on the model that continued the task"
+        );
+
+        match saved_home {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+    }
+
+    /// Only the session owner writes the record: a sub-agent loop shares its
+    /// parent's session id and must not rewrite the model the parent resumes on.
+    #[tokio::test]
+    async fn persist_active_model_is_written_only_by_the_session_owner() {
+        let _g = ENV_LOCK.lock().await;
+        let scratch = tempfile::tempdir().expect("scratch home");
+        let saved_home = std::env::var_os("CLAWDE_HOME");
+        std::env::set_var("CLAWDE_HOME", scratch.path());
+
+        let session_id = format!("owner-gate-{}", uuid::Uuid::new_v4());
+        let mut record = clawde_core::history::ConversationSession::new("mock-model".to_string());
+        record.id = session_id.clone();
+        clawde_core::history::save_session(&record)
+            .await
+            .expect("save session record");
+
+        persist_active_model(&QueryConfig::default(), &session_id, "sub-agent/model").await;
+        let untouched = clawde_core::history::load_session(&session_id)
+            .await
+            .expect("reload session record");
+        assert_eq!(
+            untouched.model, "mock-model",
+            "a sub-agent loop must not rewrite the parent's model"
+        );
+
+        let owned = QueryConfig {
+            session_state_owner: true,
+            ..Default::default()
+        };
+        persist_active_model(&owned, &session_id, "backup-model").await;
+        let updated = clawde_core::history::load_session(&session_id)
+            .await
+            .expect("reload session record");
+        assert_eq!(updated.model, "backup-model");
+
+        match saved_home {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+    }
+
+    /// Free-mode cap resume picks the next keyed catalog upstream; a capped
+    /// upstream is never re-picked even when it is the only key, and a
+    /// quick-task-lane tier loses to a normal lane later in the catalog.
+    #[tokio::test]
+    async fn cap_resume_switch_picks_the_next_keyed_free_upstream() {
+        let _g = ENV_LOCK.lock().await;
+        let mut store = clawde_core::AuthStore::default();
+        store.set_keys("groq", vec!["gsk_test_key_0001".to_string()]);
+        store.set_keys("zai", vec!["zai_test_key_0001".to_string()]);
+        let mut capped_only = clawde_core::AuthStore::default();
+        capped_only.set_keys("nvidia", vec!["nvapi_test_key_0001".to_string()]);
+
+        // Sweep free-key env vars so the assertions see only the stores above.
+        let saved: Vec<(&'static str, Option<String>)> = clawde_api::providers::free::FREE_CATALOG
+            .iter()
+            .filter_map(|upstream| {
+                clawde_core::config::primary_api_key_env_var_for_provider(upstream.id)
+            })
+            .map(|env| (env, std::env::var(env).ok()))
+            .collect();
+        for (env, _) in &saved {
+            std::env::remove_var(env);
+        }
+        let picked = super::cap_resume_switch("free", "free", Some("nvidia"), None, &store);
+        let capped = super::cap_resume_switch("free", "free", Some("nvidia"), None, &capped_only);
+        for (env, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(env, value),
+                None => std::env::remove_var(env),
+            }
+        }
+
+        let picked = picked.expect("a keyed upstream exists");
+        assert!(
+            picked.starts_with("zai/"),
+            "a normal-lane upstream must outrank the earlier quick-task lane (groq): {picked}"
+        );
+        assert_eq!(
+            capped, None,
+            "the upstream that just capped must not be re-picked"
+        );
+    }
+
+    /// A provider registered as the free chain, used only to observe the loop's
+    /// `note_tool_cap` reporting. Dispatch never reaches it.
+    struct CapRecorderProvider {
+        id: clawde_core::provider_id::ProviderId,
+        capped: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl clawde_api::LlmProvider for CapRecorderProvider {
+        fn id(&self) -> &clawde_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "cap-recorder"
+        }
+        async fn create_message(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
+            unimplemented!("the recorder never dispatches")
+        }
+        async fn create_message_stream(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            clawde_api::ProviderError,
+        > {
+            unimplemented!("the recorder never dispatches")
+        }
+        async fn health_check(
+            &self,
+        ) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderStatus::Healthy)
+        }
+        fn capabilities(&self) -> clawde_api::ProviderCapabilities {
+            clawde_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: clawde_api::SystemPromptStyle::TopLevel,
+            }
+        }
+        fn note_tool_cap(&self, upstream_id: &str) {
+            self.capped.lock().unwrap().push(upstream_id.to_string());
+        }
+    }
+
+    /// The free chain learns about a capped upstream through its registry
+    /// entry, and nothing is reported when the turn did not run on it.
+    #[test]
+    fn tool_cap_is_reported_to_the_registered_free_chain() {
+        let capped = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(Arc::new(CapRecorderProvider {
+            id: clawde_core::provider_id::ProviderId::new("free"),
+            capped: capped.clone(),
+        }));
+
+        super::note_tool_cap_on_free_chain(Some(&registry), Some("groq"));
+        assert_eq!(*capped.lock().unwrap(), vec!["groq".to_string()]);
+
+        super::note_tool_cap_on_free_chain(None, Some("cerebras"));
+        super::note_tool_cap_on_free_chain(Some(&registry), None);
+        assert_eq!(
+            capped.lock().unwrap().len(),
+            1,
+            "no upstream/no registry must not report a cap"
+        );
+    }
+
+    /// An explicit fallback model wins over the free-chain scan, and a provider
+    /// outside the free chain with no fallback has nowhere to switch.
+    #[test]
+    fn cap_resume_switch_honors_an_explicit_fallback() {
+        let store = clawde_core::AuthStore::default();
+        assert_eq!(
+            super::cap_resume_switch(
+                "ollama/qwen2.5-coder",
+                "ollama",
+                None,
+                Some("openai/gpt-4o"),
+                &store,
+            ),
+            Some("openai/gpt-4o".to_string())
+        );
+        assert_eq!(
+            super::cap_resume_switch("ollama/qwen2.5-coder", "ollama", None, None, &store),
+            None,
+            "a non-free provider with no fallback has nowhere to switch"
+        );
     }
 
     /// A minimal Anthropic `POST /v1/messages` SSE mock: serves one scripted
@@ -12482,6 +13289,146 @@ mod tests {
             .iter()
             .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
             .collect()
+    }
+
+    /// Anthropic can stop at `max_tokens` in the middle of a `tool_use` input.
+    /// The partial call must be answered (one `tool_result` per `tool_use`) and
+    /// never executed, and the run must resume instead of returning as if the
+    /// task had ended.
+    #[tokio::test]
+    async fn anthropic_path_repairs_a_truncated_tool_batch_and_resumes() {
+        let _g = ENV_LOCK.lock().await;
+        const START: &str = r#"{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#;
+        let truncated = anthropic_sse_body(&[
+            ("message_start", START),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_trunc","name":"noop_tool","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\": \"a"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":3}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        let answer = anthropic_sse_body(&[
+            ("message_start", START),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"finished after the truncated call"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        let (base, seen) = anthropic_sse_mock(vec![truncated, answer]);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            api_base: base,
+            ..Default::default()
+        })
+        .expect("test client");
+        let mut ctx = deny_all_context();
+        ctx.config.provider = Some("anthropic".to_string());
+        let config = QueryConfig {
+            model: "claude-test".to_string(),
+            max_turns: 4,
+            fallback_model: Some("claude-backup".to_string()),
+            provider_registry: None,
+            ..Default::default()
+        };
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "noop_tool",
+            level: PermissionLevel::ReadOnly,
+            self_gates: false,
+            stateful: false,
+            ran: ran.clone(),
+        })];
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut messages = vec![Message::user("edit the file")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "the truncated turn must resume with a second request"
+        );
+        assert!(
+            !ran.load(AtomicOrdering::SeqCst),
+            "a tool call cut mid-argument must never be executed"
+        );
+        assert!(
+            bodies[1].contains("claude-backup"),
+            "the resume must switch to the configured fallback model: {}",
+            bodies[1]
+        );
+        assert!(
+            bodies[1].contains("toolu_trunc") && bodies[1].contains("Not executed"),
+            "the resume request must answer the truncated call: {}",
+            bodies[1]
+        );
+        assert!(
+            bodies[1].contains("cut off mid tool call"),
+            "the resume prompt must reach the model: {}",
+            bodies[1]
+        );
+        let statuses: Vec<String> = {
+            let mut out = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                if let QueryEvent::Status(s) = event {
+                    out.push(s);
+                }
+            }
+            out
+        };
+        assert!(
+            statuses.iter().any(|s| s.contains("tool-call cap")),
+            "the resume must be surfaced, got {statuses:?}"
+        );
+        match outcome {
+            QueryOutcome::EndTurn { message, .. } => {
+                assert_eq!(message.get_all_text(), "finished after the truncated call");
+            }
+            other => panic!("expected EndTurn after the repaired resume, got {other:?}"),
+        }
     }
 
     /// §6.6 on the Anthropic path (the other terminal path): a thinking-only

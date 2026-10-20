@@ -733,6 +733,22 @@ shape.
 Both halves need `CLAWDE_FREE_BASE_URL_<UPSTREAM>`, which only takes effect in
 debug builds and only for a loopback host.
 
+### Validating the tool-call-cap switch
+
+An upstream that ends a turn at its own tool-call cap is not an error: the turn
+is classified by `crates/query/src/stop_kind.rs`, resumed through the bounded
+ladder, and reported to the free chain through
+`LlmProvider::note_tool_cap`, which demotes that lane for
+`TOOL_CAP_PENALTY_SECS` (ordering only — the lane stays a fallback, and an
+explicit pin ignores the penalty). The Rust tests drive a mock `LlmProvider`,
+so they never see `finish_reason: "max_tool_calls"` decoding, the TUI turn loop,
+or the composite provider's plan. `scripts/probes/tool-cap-switch-probe.sh`
+pins that seam: `tool-cap-switch-mock.py` runs two loopback OpenAI-compatible
+upstreams, one capped once, and the probe drives the real TUI in tmux with a
+scratch `CLAWDE_HOME`. It passes only when the resume lands on the other
+upstream with the capped turn's transcript plus the cap resume prompt, the
+capped upstream is never asked again, and the next prompt skips it too.
+
 ### Health sweep (the startup key probe)
 
 `run_health_poller` (`crates/api/src/health_poller.rs`, spec §6.4) is spawned from

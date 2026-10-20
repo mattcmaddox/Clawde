@@ -203,6 +203,15 @@ pub trait LlmProvider: Send + Sync {
         None
     }
 
+    /// Record that `upstream_id` ended a turn at its own tool-call cap.
+    ///
+    /// A composite provider (the free chain) uses this to demote that upstream
+    /// for a short window, so later turns of the same run try a different lane
+    /// before it. A single-upstream provider has nothing to route around and
+    /// keeps the default no-op: a cap there is a prompt/batch-size fact, not a
+    /// routing fact.
+    fn note_tool_cap(&self, _upstream_id: &str) {}
+
     /// Return key rotation status if this provider supports automatic key
     /// rotation. Returns `(active_count, total_keys, earliest_retry_secs)`:
     /// - `active_count`: number of keys not in cooldown
@@ -253,9 +262,23 @@ pub trait LlmProvider: Send + Sync {
     /// Each entry is `(upstream_id, kind, retry_secs)` where `kind` is
     /// `"empty"` (empty-completion cooldown) or `"5xx"` (server-error /
     /// circuit-breaker cooldown) and `retry_secs` is the seconds remaining
-    /// in the cooldown. The default implementation returns an empty vector
-    /// — only composite providers that multiplex upstreams override this.
+    /// in the cooldown. Health-only on purpose: the footer, `/ctx-viz`,
+    /// `/stats` and `/compare` read this list to answer "is this lane down?",
+    /// so ordering state belongs in [`Self::upstream_tool_cap_penalties`]
+    /// instead. The default implementation returns an empty vector — only
+    /// composite providers that multiplex upstreams override this.
     fn upstream_cooldowns(&self) -> Vec<(String, String, Option<u64>)> {
+        Vec::new()
+    }
+
+    /// Report upstreams currently demoted for ending a turn at their own
+    /// tool-call cap, as `(upstream_id, remaining_secs)`.
+    ///
+    /// This is ordering state, not health: the lane answered normally, it is
+    /// merely tried after every uncapped lane (and a user pin still wins). It
+    /// is reported separately from [`Self::upstream_cooldowns`] so a routing
+    /// demotion can never be rendered as "this provider is down".
+    fn upstream_tool_cap_penalties(&self) -> Vec<(String, u64)> {
         Vec::new()
     }
 

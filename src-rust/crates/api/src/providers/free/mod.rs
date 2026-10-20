@@ -2805,7 +2805,20 @@ pub struct FreeProvider {
     /// Production shares one store via [`Self::share_liveness`] so the TUI can
     /// read it; a freshly constructed provider starts empty.
     liveness: Arc<Mutex<Vec<LivenessRecord>>>,
+    /// Short-lived ordering penalties for upstreams that ended a turn at their
+    /// own tool-call cap: `(upstream_id, expires_at_unix)`. Ordering-only — a
+    /// cap means the request's batch was too big, not that the lane is dead, so
+    /// the upstream is demoted behind every uncapped lane and stays available
+    /// as a fallback. Instance-scoped for the same reason as `liveness`: a
+    /// global would let one test's penalty reorder another test's plan under
+    /// the parallel runner.
+    tool_caps: Arc<Mutex<Vec<(String, u64)>>>,
 }
+
+/// How long an upstream stays demoted after its own tool-call cap. Short on
+/// purpose: the penalty exists so the rest of *this* run tries another lane,
+/// not to blacklist a provider.
+pub const TOOL_CAP_PENALTY_SECS: u64 = 300;
 
 /// How [`FREE_CATALOG`] can serve a user-facing free-mode model string.
 ///

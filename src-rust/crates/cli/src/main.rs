@@ -3442,7 +3442,16 @@ async fn run_headless(
         clawde_core::history::ConversationSession::new(query_config.model.clone())
     });
     persisted_session.id = tool_ctx.session_id.clone();
-    persisted_session.model = query_config.model.clone();
+    // The query loop records an in-run switch (cap resume, unavailable provider,
+    // output limit, step limit) in the session record. That record is the model
+    // this run actually continued on, so `--resume` must keep it; writing
+    // `query_config.model` here would put the model that failed back.
+    let recorded_model = clawde_core::history::load_session(&tool_ctx.session_id)
+        .await
+        .ok()
+        .map(|record| record.model)
+        .filter(|model| !model.is_empty());
+    persisted_session.model = recorded_model.unwrap_or_else(|| query_config.model.clone());
     persisted_session.working_dir = Some(tool_ctx.working_dir.display().to_string());
     persisted_session.messages = final_messages;
     persisted_session.total_cost = cost_tracker.total_cost_usd();
@@ -7177,6 +7186,15 @@ async fn run_interactive(
                 }
             }
             app.handle_query_event(evt);
+            // A switch inside the query loop (cap resume, unavailable provider,
+            // output limit, step limit, tool-capable model) was written to the
+            // session record by the loop itself; this copy is the one the
+            // periodic and per-turn saves write, so it must follow. Synced right
+            // after the event that announced the switch, before the same turn's
+            // end-of-turn save can put the old model back.
+            if let Some(model) = app.switched_session_model.take() {
+                session.model = model;
+            }
         }
 
         // Auto-compact: when context usage hits 99% and no query is running,

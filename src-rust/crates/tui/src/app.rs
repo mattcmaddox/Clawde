@@ -1386,6 +1386,12 @@ pub struct App {
     /// followup completion attribution.
     pub assistant_output_received: bool,
     pub status_message: Option<String>,
+    /// Model the running query switched to, waiting to be copied into the
+    /// session record by the owner loop (`run_interactive`). The query loop
+    /// writes the record itself, but the TUI holds its own `session` and saves
+    /// it periodically; without this the next save would put the configured
+    /// model back and a restart would resume on the one that just failed.
+    pub switched_session_model: Option<String>,
     /// Live free-mode retry indicator: set while the composite provider waits
     /// before re-dispatching to the same upstream (rate-limit backoff), cleared
     /// when the retry goes out. Kept separate from `status_message` because a
@@ -2309,6 +2315,7 @@ impl App {
             paused_thinking_buffer: String::new(),
             assistant_output_received: false,
             status_message: None,
+            switched_session_model: None,
             upstream_retry_notice: None,
             spinner_verb: None,
             should_exit: false,
@@ -4981,16 +4988,28 @@ impl App {
                 })
                 .map(|p| p.upstream_capabilities())
                 .unwrap_or_default();
-            let cooldowns = self
-                .provider_registry
+            let free_provider = self.provider_registry.as_ref().and_then(|reg| {
+                reg.get(&clawde_core::provider_id::ProviderId::new(
+                    clawde_core::provider_id::ProviderId::FREE,
+                ))
+            });
+            let mut cooldowns = free_provider
                 .as_ref()
-                .and_then(|reg| {
-                    reg.get(&clawde_core::provider_id::ProviderId::new(
-                        clawde_core::provider_id::ProviderId::FREE,
-                    ))
-                })
                 .map(|p| p.upstream_cooldowns())
                 .unwrap_or_default();
+            // A tool-call-cap penalty rides the same pane with its own kind so
+            // the reader can see why a preferred lane is ordered lower. It is
+            // kept out of `upstream_cooldowns` (and so out of the footer,
+            // `/ctx-viz`, `/stats` and `/compare`): a cap is a routing
+            // demotion on a healthy lane, not a health cooldown.
+            if let Some(provider) = free_provider {
+                cooldowns.extend(
+                    provider
+                        .upstream_tool_cap_penalties()
+                        .into_iter()
+                        .map(|(id, secs)| (id, "tool-cap".to_string(), Some(secs))),
+                );
+            }
             let key_health = self
                 .provider_registry
                 .as_ref()
@@ -13560,6 +13579,7 @@ impl App {
                 switched_model,
                 reason,
                 provider,
+                target_model,
             } => {
                 tracing::info!(
                     original = %original_model,
@@ -13568,6 +13588,12 @@ impl App {
                     provider = %provider,
                     "model_info: auto-switch occurred"
                 );
+                // Hand the exact continuation string to the owner loop so the
+                // session record follows the switch; the display split
+                // (`provider`/`switched_model`) is not always the same string.
+                if original_model != switched_model {
+                    self.switched_session_model = Some(target_model);
+                }
                 // Surface the auto-switch decision to the user in the status bar.
                 if original_model != switched_model {
                     self.status_message = Some(format!(
@@ -14469,6 +14495,44 @@ mod tests {
             app.upstream_retry_notice.is_none(),
             "a finished turn must not keep a live retry indicator"
         );
+    }
+
+    /// A switch inside the query loop must reach `run_interactive`'s session
+    /// copy; otherwise the TUI's own periodic save writes the configured model
+    /// back over the record and a restart resumes on the failed model.
+    #[test]
+    fn model_info_hands_the_switched_model_to_the_session_owner() {
+        let mut app = make_app();
+        assert!(app.switched_session_model.is_none());
+
+        app.handle_query_event(QueryEvent::ModelInfo {
+            original_model: "mock-model".to_string(),
+            switched_model: "backup-model".to_string(),
+            reason: "provider tool-call cap".to_string(),
+            provider: "mockprov".to_string(),
+            target_model: "backup-model".to_string(),
+        });
+        assert_eq!(
+            app.switched_session_model.as_deref(),
+            Some("backup-model"),
+            "the exact continuation string must be handed over, not a rebuilt one"
+        );
+        // Taken once: the owner loop assigns it to the session and clears it.
+        assert_eq!(
+            app.switched_session_model.take().as_deref(),
+            Some("backup-model")
+        );
+        assert!(app.switched_session_model.is_none());
+
+        // A model notice that names the model already running is not a switch.
+        app.handle_query_event(QueryEvent::ModelInfo {
+            original_model: "mock-model".to_string(),
+            switched_model: "mock-model".to_string(),
+            reason: "no switch".to_string(),
+            provider: "mockprov".to_string(),
+            target_model: "mock-model".to_string(),
+        });
+        assert!(app.switched_session_model.is_none());
     }
 
     #[test]
