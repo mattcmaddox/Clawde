@@ -1441,6 +1441,17 @@ pub struct App {
     pub fast_mode: bool,
     /// Saved model from before entering image mode, restored on exit.
     pub previous_model: Option<String>,
+    /// The vision model image mode switched to. Exit restores `previous_model`
+    /// only while this is still the active model, so a model the user picked
+    /// during image mode is kept.
+    pub image_model: Option<String>,
+    /// Set while image mode is waiting for its first image (or for the prompt to
+    /// be submitted) before swapping in the vision model. Entering the mode
+    /// resolves whether a vision model exists but must not swap on its own, or
+    /// tab-cycling past IMAGE would strand the session on a model the user never
+    /// chose. Cleared when the swap happens, when the user picks a model, and on
+    /// leaving the mode.
+    pub image_switch_pending: bool,
     /// Current agent mode name: "build", "plan", "image".
     pub agent_mode: Option<String>,
     /// Accent color derived from the current agent mode.
@@ -2332,6 +2343,8 @@ impl App {
             effort_level: EffortLevel::Medium,
             fast_mode: false,
             previous_model: None,
+            image_model: None,
+            image_switch_pending: false,
             agent_mode: None,
             agent_mode_changed: false,
             routing_changed: false,
@@ -3269,7 +3282,10 @@ impl App {
         if let Some(ref rx) = self.image_rx {
             match rx.try_recv() {
                 Ok(Some(img)) => {
-                    self.prompt_input.add_image(img.clone());
+                    // Image mode's deferred swap: the first image is what makes
+                    // the vision model necessary, so it happens here rather than
+                    // when the mode was entered.
+                    self.attach_image(img.clone());
                     // Persistent status line with image details.
                     let dims = img
                         .dimensions
@@ -4571,69 +4587,45 @@ impl App {
     /// and tool list accordingly.
     pub fn cycle_agent_mode(&mut self) {
         const MODES: &[&str] = &["build", "plan", "image"];
-        let current = self.agent_mode.as_deref().unwrap_or("build");
+        let current = self
+            .agent_mode
+            .clone()
+            .unwrap_or_else(|| "build".to_string());
         let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
-        let next = MODES[(idx + 1) % MODES.len()];
+        let mut next = MODES[(idx + 1) % MODES.len()];
 
-        // Save / restore model when entering / exiting image mode.
-        if next == "image" && current != "image" {
-            // Entering image mode: save current model for later restore.
+        // Image mode without a vision model would silently strip every image
+        // from the request, so it is skipped rather than entered.
+        let image_model = if next == "image" && current != "image" {
+            self.image_mode_model()
+        } else {
+            None
+        };
+        if next == "image" && current != "image" && image_model.is_none() {
+            self.push_notification(
+                NotificationKind::Warning,
+                "Image mode needs a vision model. Connect one with /connect (e.g. google or github-copilot)."
+                    .to_string(),
+                Some(5),
+            );
+            next = MODES[(idx + 2) % MODES.len()];
+        }
+
+        if image_model.is_some() {
+            // Entering image mode: remember the model to restore, then wait.
+            // The swap itself is deferred to the first image (clipboard, Ctrl+V,
+            // dragged/pasted path) or to submit — see `apply_pending_image_switch`.
+            // Swapping here would strand a user who only tab-cycles through IMAGE
+            // on a model they never asked for.
             self.previous_model = Some(self.model_name.clone());
-            // Free is a composite provider, so its synthetic `free/auto`
-            // entry is not present in the static model registry. Select a
-            // configured vision-capable catalog pin when possible; the query
-            // layer redirects that pin back through FreeProvider, preserving
-            // its vision gate and fallback chain. If the registry already has
-            // an aggregate vision-capable FreeProvider, keep `free/auto` so it
-            // can choose the best configured vision upstream at request time.
-            let selected_vision_model = if self.config.selected_provider_id() == "free" {
-                clawde_api::providers::free::first_configured_vision_model(&self.auth_store)
-                    .or_else(|| {
-                        self.provider_registry
-                            .as_deref()
-                            .and_then(|registry| {
-                                registry.get(&clawde_core::ProviderId::new("free"))
-                            })
-                            .filter(|provider| provider.capabilities().image_input)
-                            .map(|_| "free/auto".to_string())
-                    })
-            } else {
-                self.model_registry
-                    .best_vision_model_for_provider(self.config.selected_provider_id())
-            };
-            if let Some(vis) = selected_vision_model {
-                let display = vis
-                    .strip_prefix(&format!(
-                        "{}/",
-                        self.config.provider.as_deref().unwrap_or("")
-                    ))
-                    .unwrap_or(&vis)
-                    .to_string();
-                self.set_model(vis);
-                self.config.model = Some(display);
-            } else {
-                self.push_notification(
-                    NotificationKind::Warning,
-                    "No vision model found for this provider.".to_string(),
-                    Some(5),
-                );
-            }
+            self.image_model = None;
+            self.image_switch_pending = true;
             // Auto-read clipboard image on a background thread so the TUI
-            // never freezes during the xclip/wl-paste subprocess call.
+            // never freezes during the xclip/wl-paste subprocess call. A hit
+            // attaches an image through `attach_image`, which performs the swap.
             self.spawn_image_read();
-        } else if next != "image" && current == "image" {
-            // Exiting image mode: restore the previous model.
-            if let Some(prev) = self.previous_model.take() {
-                let display = prev
-                    .strip_prefix(&format!(
-                        "{}/",
-                        self.config.provider.as_deref().unwrap_or("")
-                    ))
-                    .unwrap_or(&prev)
-                    .to_string();
-                self.set_model(prev);
-                self.config.model = Some(display);
-            }
+        } else if current == "image" && next != "image" {
+            self.restore_model_after_image_mode();
         }
 
         self.agent_mode = Some(next.to_string());
@@ -4645,6 +4637,115 @@ impl App {
 
         // No status message needed — the color-coded mode badge already
         // tells the user which mode is active.
+    }
+
+    /// The vision-capable model image mode switches to, if one is configured.
+    fn image_mode_model(&self) -> Option<String> {
+        // Free is a composite provider, so its synthetic `free/auto` entry is
+        // not present in the static model registry. Select a configured
+        // vision-capable catalog pin when possible; the query layer redirects
+        // that pin back through FreeProvider, preserving its vision gate and
+        // fallback chain. If the registry already has an aggregate
+        // vision-capable FreeProvider, keep `free/auto` so it can choose the
+        // best configured vision upstream at request time.
+        if self.config.selected_provider_id() == "free" {
+            clawde_api::providers::free::first_configured_vision_model(&self.auth_store).or_else(
+                || {
+                    self.provider_registry
+                        .as_deref()
+                        .and_then(|registry| registry.get(&clawde_core::ProviderId::new("free")))
+                        .filter(|provider| provider.capabilities().image_input)
+                        .map(|_| "free/auto".to_string())
+                },
+            )
+        } else {
+            self.model_registry
+                .best_vision_model_for_provider(self.config.selected_provider_id())
+        }
+    }
+
+    /// Perform image mode's deferred model swap, if it is still waiting for one.
+    ///
+    /// Entering IMAGE only records that a vision model exists; the swap happens
+    /// when something actually needs it — an attached image, or the prompt being
+    /// submitted (a text-only turn in IMAGE mode still counts, since the mode
+    /// says the session is doing image work). Called from every attach path and
+    /// from the CLI submit path, so tab-cycling past IMAGE never changes the
+    /// model.
+    pub fn apply_pending_image_switch(&mut self) {
+        if !self.image_switch_pending || self.agent_mode.as_deref() != Some("image") {
+            return;
+        }
+        // Cleared before `set_model` (which cancels a pending switch by design).
+        self.image_switch_pending = false;
+
+        let Some(vis) = self.image_mode_model() else {
+            // The provider/model selection moved while the mode was waiting, and
+            // nothing vision-capable is left to switch to.
+            self.previous_model = None;
+            self.push_notification(
+                NotificationKind::Warning,
+                "Image mode needs a vision model. Connect one with /connect (e.g. google or github-copilot)."
+                    .to_string(),
+                Some(5),
+            );
+            return;
+        };
+
+        if vis == self.model_name {
+            // Already the mode's pick: no swap, but record ownership so leaving
+            // the mode restores whatever was active before it.
+            self.image_model = Some(vis);
+            return;
+        }
+
+        let display = vis
+            .strip_prefix(&format!(
+                "{}/",
+                self.config.provider.as_deref().unwrap_or("")
+            ))
+            .unwrap_or(&vis)
+            .to_string();
+        self.set_model(vis.clone());
+        self.config.model = Some(display);
+        self.image_model = Some(vis);
+    }
+
+    /// Attach an image to the prompt, performing image mode's deferred switch.
+    ///
+    /// Every attach path (background clipboard read, Ctrl+V, a dropped or
+    /// pasted file path) goes through here so an image can never reach the
+    /// prompt while the session is still on a text-only model.
+    fn attach_image(&mut self, img: crate::image_paste::PastedImage) {
+        self.prompt_input.add_image(img);
+        self.apply_pending_image_switch();
+    }
+
+    /// Leave image mode: restore the model from before it was entered. A model
+    /// the user picked while in image mode is kept instead, and a mode that
+    /// never swapped (no image, no submit) leaves the model untouched.
+    fn restore_model_after_image_mode(&mut self) {
+        self.image_switch_pending = false;
+        let image_model = self.image_model.take();
+        let Some(prev) = self.previous_model.take() else {
+            return;
+        };
+        let Some(image_model) = image_model else {
+            // Never switched: nothing was saved that needs restoring.
+            return;
+        };
+        if image_model != self.model_name {
+            return;
+        }
+        let display = prev
+            .strip_prefix(&format!(
+                "{}/",
+                self.config.provider.as_deref().unwrap_or("")
+            ))
+            .unwrap_or(&prev)
+            .to_string();
+        self.set_model(prev);
+        self.config.model = Some(display);
     }
 
     /// Update the context window size from the model registry for the current model.
@@ -4670,6 +4771,15 @@ impl App {
 
     /// Update the active model name (also updates config + cost tracker).
     pub fn set_model(&mut self, model: String) {
+        // A model chosen while image mode is still waiting for its image is the
+        // user's call: cancel the pending auto-switch instead of overriding the
+        // choice when an image finally arrives. `apply_pending_image_switch`
+        // clears the flag before calling this, so its own swap is not mistaken
+        // for a user pick.
+        if self.image_switch_pending {
+            self.image_switch_pending = false;
+            self.previous_model = None;
+        }
         self.effective_effort = None;
         self.auto_raise_reason = None;
         let old_provider = self.config.selected_provider_id().to_string();
@@ -9561,7 +9671,7 @@ impl App {
             if let Some(img) = read_clipboard_image() {
                 let label = img.label.clone();
                 let dims = img.dimensions;
-                self.prompt_input.add_image(img);
+                self.attach_image(img);
                 let msg = if let Some((w, h)) = dims {
                     format!("Image attached: {} ({}x{})", label, w, h)
                 } else {
@@ -10567,6 +10677,9 @@ impl App {
             self.status_message = Some("Select an agent to activate.".to_string());
             return;
         };
+        if self.agent_mode.as_deref() == Some("image") {
+            self.restore_model_after_image_mode();
+        }
         self.agent_mode = Some(name.clone());
         self.accent_color = accent_for_mode(Some(&name));
         self.agent_mode_changed = true;
@@ -12328,7 +12441,7 @@ impl App {
                     dimensions: None,
                     excluded: false,
                 };
-                self.prompt_input.add_image(img);
+                self.attach_image(img);
                 self.push_notification(
                     crate::notifications::NotificationKind::Info,
                     format!("Image attached: {}", label),
@@ -15116,12 +15229,27 @@ mod tests {
         );
     }
 
+    /// A minimal `PastedImage` for the image-mode tests. The file is never
+    /// read: these tests exercise the model switch, not base64 encoding.
+    fn pasted_image(label: &str) -> crate::image_paste::PastedImage {
+        crate::image_paste::PastedImage {
+            path: std::path::PathBuf::from(format!("/tmp/{label}")),
+            label: label.to_string(),
+            dimensions: Some((16, 16)),
+            excluded: false,
+        }
+    }
+
+    /// Entering IMAGE picks the vision model but does not swap yet: the swap is
+    /// what the first image (or a submit) asks for, so tab-cycling through the
+    /// mode never strands the session on a model the user never chose.
     #[test]
-    fn image_mode_selects_configured_free_vision_model() {
+    fn image_mode_defers_the_vision_switch_until_an_image_arrives() {
         let _home = TestHome::acquire();
         let mut app = make_app();
         app.auth_store
             .set_keys("google", vec!["google-test-key-12345678".to_string()]);
+        let model_before = app.model_name.clone();
 
         // build → plan → image. The configured Google key is the first
         // available vision-capable free upstream in this fixture.
@@ -15129,8 +15257,153 @@ mod tests {
         app.cycle_agent_mode();
 
         assert_eq!(app.agent_mode.as_deref(), Some("image"));
+        assert!(app.image_switch_pending, "the swap waits for its trigger");
+        assert_eq!(app.previous_model.as_deref(), Some(model_before.as_str()));
+        assert_eq!(app.model_name, model_before, "entering IMAGE must not swap");
+        assert!(app.image_model.is_none());
+
+        // Every attach path funnels through `attach_image`: the background
+        // clipboard read, Ctrl+V, and a dropped/pasted file path.
+        app.attach_image(pasted_image("clipboard.png"));
+
+        assert!(!app.image_switch_pending);
         assert_eq!(app.config.model.as_deref(), Some("google/gemini-2.5-flash"));
         assert_eq!(app.config.provider.as_deref(), Some("google"));
+        assert_eq!(app.image_model.as_deref(), Some("google/gemini-2.5-flash"));
+        assert_eq!(app.prompt_input.pending_images.len(), 1);
+    }
+
+    /// A text-only turn in IMAGE mode still switches: the mode says the session
+    /// is doing image work, so the model must be vision-capable before the
+    /// request is built. The CLI calls this from the submit path.
+    #[test]
+    fn submitting_without_an_image_still_switches_to_the_vision_model() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.auth_store
+            .set_keys("google", vec!["google-test-key-12345678".to_string()]);
+        app.cycle_agent_mode();
+        app.cycle_agent_mode();
+        assert!(app.image_switch_pending);
+
+        app.apply_pending_image_switch();
+
+        assert!(!app.image_switch_pending);
+        assert_eq!(app.config.model.as_deref(), Some("google/gemini-2.5-flash"));
+        assert!(app.prompt_input.pending_images.is_empty());
+    }
+
+    /// Tab-cycling past IMAGE is not a request for a vision model, so the model
+    /// must be exactly where it was.
+    #[test]
+    fn tab_cycling_past_image_mode_never_switches_the_model() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.auth_store
+            .set_keys("google", vec!["google-test-key-12345678".to_string()]);
+        let model_before = app.model_name.clone();
+        let provider_before = app.config.provider.clone();
+
+        app.cycle_agent_mode(); // build → plan
+        app.cycle_agent_mode(); // plan → image (waits)
+        app.cycle_agent_mode(); // image → build (nothing was swapped)
+
+        assert_eq!(app.agent_mode.as_deref(), Some("build"));
+        assert_eq!(app.model_name, model_before);
+        assert_eq!(app.config.provider, provider_before);
+        assert!(!app.image_switch_pending);
+        assert!(app.image_model.is_none());
+        assert!(app.previous_model.is_none());
+    }
+
+    /// After a deferred swap, leaving the mode puts the previous model back.
+    #[test]
+    fn leaving_image_mode_after_a_switch_restores_the_previous_model() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.auth_store
+            .set_keys("google", vec!["google-test-key-12345678".to_string()]);
+        let model_before = app.model_name.clone();
+        // Compared through `selected_provider_id`: an unset provider already
+        // means free mode, so the restore is not required to spell it out.
+        let provider_before = app.config.selected_provider_id().to_string();
+
+        app.cycle_agent_mode();
+        app.cycle_agent_mode();
+        app.attach_image(pasted_image("clipboard.png"));
+        assert_eq!(app.config.provider.as_deref(), Some("google"));
+
+        app.cycle_agent_mode(); // image → build
+
+        assert_eq!(app.agent_mode.as_deref(), Some("build"));
+        assert_eq!(app.model_name, model_before);
+        assert_eq!(app.config.selected_provider_id(), provider_before);
+        assert!(app.image_model.is_none());
+        assert!(app.previous_model.is_none());
+    }
+
+    #[test]
+    fn image_mode_is_skipped_when_no_vision_model_is_configured() {
+        // Entering image mode without a vision model would strip every image
+        // from the request, so Tab skips it and the model stays untouched.
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        let model_before = app.model_name.clone();
+
+        app.cycle_agent_mode(); // build → plan
+        app.cycle_agent_mode(); // plan → build (image skipped)
+
+        assert_eq!(app.agent_mode.as_deref(), Some("build"));
+        assert_eq!(app.model_name, model_before);
+        assert!(app.previous_model.is_none());
+        assert!(!app.image_switch_pending);
+    }
+
+    #[test]
+    fn leaving_image_mode_keeps_a_model_chosen_during_image_mode() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.auth_store
+            .set_keys("google", vec!["google-test-key-12345678".to_string()]);
+        app.cycle_agent_mode();
+        app.cycle_agent_mode();
+        assert_eq!(app.agent_mode.as_deref(), Some("image"));
+
+        app.set_model("anthropic/claude-sonnet-4-5".to_string());
+        app.cycle_agent_mode(); // image → build
+
+        assert_eq!(app.agent_mode.as_deref(), Some("build"));
+        assert_eq!(
+            app.model_name, "anthropic/claude-sonnet-4-5",
+            "the exit restore must not overwrite a model the user picked"
+        );
+    }
+
+    #[test]
+    fn leaving_image_mode_through_agent_activation_restores_the_model() {
+        // `/agent <name>` activation is another way out of image mode. It must
+        // restore the pre-image model like Tab does, not leave the vision
+        // model active under a non-image mode.
+        let _home = TestHome::acquire();
+        let project = tempfile::tempdir().unwrap();
+        let mut app = make_app();
+        app.config.project_dir = Some(project.path().to_path_buf());
+        app.auth_store
+            .set_keys("google", vec!["google-test-key-12345678".to_string()]);
+        let model_before = app.model_name.clone();
+        app.cycle_agent_mode();
+        app.cycle_agent_mode();
+        assert_eq!(app.agent_mode.as_deref(), Some("image"));
+        // The mode has to own a model for the exit path to have anything to
+        // restore — an image (or a submit) performs the swap.
+        app.attach_image(pasted_image("clipboard.png"));
+        assert_eq!(app.config.provider.as_deref(), Some("google"));
+
+        app.intercept_slash_command_with_args("agent", "plan");
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert_eq!(app.agent_mode.as_deref(), Some("plan"));
+        assert_eq!(app.model_name, model_before);
     }
 
     #[test]

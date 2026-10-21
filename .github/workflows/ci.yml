@@ -6,6 +6,8 @@ on:
     paths:
       - 'src-rust/**'
       - 'scripts/probes/tui-permissions-smoke.py'
+      - 'scripts/probes/image-mode-probe.sh'
+      - 'scripts/probes/image-mode-mock.py'
       - 'scripts/probes/katban-board-ux-probe.py'
       - 'scripts/probes/katban-docker-card-probe.py'
       - 'scripts/probes/catchat-ux-probe.py'
@@ -21,6 +23,8 @@ on:
     paths:
       - 'src-rust/**'
       - 'scripts/probes/tui-permissions-smoke.py'
+      - 'scripts/probes/image-mode-probe.sh'
+      - 'scripts/probes/image-mode-mock.py'
       - 'scripts/probes/katban-board-ux-probe.py'
       - 'scripts/probes/katban-docker-card-probe.py'
       - 'scripts/probes/catchat-ux-probe.py'
@@ -200,6 +204,22 @@ jobs:
           python3 scripts/probes/tui-permissions-smoke.py \
             --binary src-rust/target/debug/clawde \
             --timeout-secs 20
+
+      # Image-mode probe: a turn sent in IMAGE mode crosses four layers that no
+      # single Rust test drives together — the TUI's Tab cycle (which swaps in a
+      # vision model), the CLI turn loop's `@path` auto-attach, the free
+      # provider's vision gate, and Google's native request shaping into an
+      # `inlineData` part. The probe runs the real binary in tmux against a
+      # loopback Gemini mock (`CLAWDE_FREE_BASE_URL_GOOGLE`, debug builds only,
+      # loopback only) with a scratch CLAWDE_HOME. Seeds that home with the
+      # google free-state caches and silences the two startup calls outside the
+      # free chain (update check, models.dev refresh), so it needs no free-tier
+      # key and makes no network call — the only socket it opens is the mock.
+      # tmux is installed above for the permission probe and used again here.
+      - name: Image-mode probe
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/probes/image-mode-probe.sh src-rust/target/debug/clawde
 
       # Container-tier plumbing (`board runtime docker`). The card phase runs a
       # real free-tier agent, so it stays a dev-machine probe; what CI can prove

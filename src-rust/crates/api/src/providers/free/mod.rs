@@ -2523,11 +2523,14 @@ fn split_cloudflare_key(key: &str) -> Result<(&str, &str), String> {
 /// local mock server stand in for a real upstream so the 5xx /
 /// empty-completion cooldown paths are deterministically testable live.
 ///
-/// Only OpenAI-compatible upstreams honour the override on the chat
-/// dispatch path; `google` and `github-copilot` use native wire
-/// formats and keep their real endpoints. The key-validation / probe
-/// endpoints honour it where applicable (cloudflare's chat probe is
-/// account-scoped and ignores it). Not for production use.
+/// The free chain honours the override for every OpenAI-compatible
+/// upstream and for `google`, whose native wire format gets the base URL
+/// through `GoogleProvider::with_base_url` — it is the only vision-capable
+/// catalog upstream a local mock can stand in for, so the image-mode probe
+/// depends on it. `github-copilot` still uses a native wire format with its
+/// endpoint fixed at the provider. The key-validation / probe endpoints honour
+/// it where applicable (cloudflare's chat probe is account-scoped and ignores
+/// it). Not for production use.
 pub fn free_upstream_base_url_override(upstream_id: &str) -> Option<String> {
     // These overrides are intended for local mock servers. Release builds
     // ignore them unless an operator explicitly opts in, preventing an

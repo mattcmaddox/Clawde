@@ -79,10 +79,16 @@ A "preset" can therefore bind a set of these knobs without engine changes.
 ### 2.3 Existing mode cycling (verified)
 
 The TUI cycles **three modes** with **Tab**: `build`, `plan`, `image`
-(`crates/tui/src/app.rs:3362`, `const MODES: &[&str] = &["build", "plan",
-"image"]`), with image mode saving/restoring the model. There is also a
-"fast mode" toggle (test: `test_fast_slash_command_toggles_fast_mode`). The
-user's "build/plan/image" report is confirmed by code — not just a report.
+(`App::cycle_agent_mode`, `const MODES: &[&str] = &["build", "plan",
+"image"]`). Image mode saves the model on entry but swaps in a vision model
+**lazily** — on the first attached image (clipboard read, Ctrl+V, or a
+dropped/pasted file path) or at submit, through
+`App::apply_pending_image_switch` — so tab-cycling through IMAGE never changes
+the model, and a mode the user only passed through restores nothing. Leaving
+the mode after a swap restores the saved model unless the user picked one in
+the meantime. There is also a "fast mode" toggle (test:
+`test_fast_slash_command_toggles_fast_mode`). The user's "build/plan/image"
+report is confirmed by code — not just a report.
 
 ### 2.4 Snapshot / undo machinery (already built — key finding)
 
@@ -633,7 +639,8 @@ Post-interview audit of this spec against the codebase found and fixed:
    `system_prompt.rs:630` + the default `AskUserQuestionTool` + TUI dialog;
    the feature modulates existing guidance.
 4. **Image mode is real** (§2.3) — `MODES = ["build", "plan", "image"]`
-   in `tui/app.rs:3362`; the spec now says "verified" not "user reports."
+   in `App::cycle_agent_mode`; the spec now says "verified" not "user
+   reports."
 5. **Feature E gaps** (§4.5) — added `/undo [n]` multi-prompt undo
    (user's "last two tasks" was unimplementable otherwise), mandatory
    confirmation listing grouped turns, transcript-cleanup semantics, and

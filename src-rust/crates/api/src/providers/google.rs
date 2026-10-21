@@ -59,6 +59,15 @@ impl GoogleProvider {
         }
     }
 
+    /// Override the API base URL. Used by the dev-only
+    /// `CLAWDE_FREE_BASE_URL_GOOGLE` hook (`free_upstream_base_url_override`),
+    /// which lets a local mock stand in for the one free-catalog upstream that
+    /// can receive images, so the image path is testable with a real socket.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------

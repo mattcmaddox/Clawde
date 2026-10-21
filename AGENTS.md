@@ -749,6 +749,46 @@ scratch `CLAWDE_HOME`. It passes only when the resume lands on the other
 upstream with the capped turn's transcript plus the cap resume prompt, the
 capped upstream is never asked again, and the next prompt skips it too.
 
+### Validating image mode end to end
+
+A turn sent in IMAGE mode crosses four layers that no single Rust test drives
+together: `App::cycle_agent_mode` swaps in a vision model, the CLI turn loop
+assembles an `@path` reference into an image block, the free provider's vision
+gate (`FreeProvider::entry_fits_request`) only routes an image-bearing request
+to a `vision` upstream, and Google's request shaping turns it into an
+`inlineData` part.
+`scripts/probes/image-mode-probe.sh` pins that seam against the real binary: it
+runs the TUI in tmux, presses Tab twice (BUILD → PLAN → IMAGE), types
+`@<png> …`, and asserts against `scripts/probes/image-mode-mock.py` that exactly
+one streamed request arrived, on the image-mode vision model, carrying one
+`inlineData` part whose SHA-256 equals the fixture on disk. CI runs it on the
+Linux leg, right after the TUI permission smoke probe (same tmux-installed
+step), and the workflow's `paths` filter covers both probe files.
+
+Image mode's model swap is deliberately lazy, and the probe asserts it:
+entering IMAGE records the model to restore and resolves whether a vision model
+exists, but the swap itself happens in `App::apply_pending_image_switch` — from
+every attach path (background clipboard read, Ctrl+V, a dropped or pasted path)
+and from the CLI submit path, so a text-only turn still switches while
+tab-cycling through the mode never does. Leaving the mode restores the saved
+model unless the user picked one in the meantime, and a mode that never swapped
+restores nothing.
+
+Google is the only vision-capable catalog upstream a mock can stand in for
+(`github-copilot` fixes its endpoint inside the provider), so
+`GoogleProvider::with_base_url` takes the dev-only, debug-only, loopback-only
+`CLAWDE_FREE_BASE_URL_GOOGLE` hook through `google_provider` in
+`crates/api/src/registry.rs`. Its scratch home pre-seeds the google free-state
+caches and silences the two startup calls that live outside the free chain (an
+empty `update_check.txt` answers the GitHub check, `CLAWDE_DISABLE_MODELS_FETCH`
+skips the models.dev refresh), so `strace -f -e trace=connect` sees only the
+loopback mock. It also fails if the file-injection dialog fires: a PNG is not
+UTF-8, so `parse_at_refs` files it as `Binary`, and the dialog's "inject
+anyways" only relaxes the size limit — leaving images in the oversized list
+re-raised the same dialog and the turn never started. Image references are
+therefore dropped from that list before the dialog check, since the auto-attach
+scan has already handled them.
+
 ### Health sweep (the startup key probe)
 
 `run_health_poller` (`crates/api/src/health_poller.rs`, spec §6.4) is spawned from

@@ -93,6 +93,23 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
     }
 }
 
+/// Build the Google provider the free chain dispatches through.
+///
+/// Google is the only free-catalog vision upstream reachable from a mock: the
+/// native wire format keeps its endpoint fixed unless the dev-only
+/// `CLAWDE_FREE_BASE_URL_GOOGLE` hook retargets it, which is what
+/// `scripts/probes/image-mode-probe.sh` relies on to prove an image-mode turn
+/// really carries its image block. Both chain-construction sites go through
+/// here so a multi-key and a single-key google entry can never disagree about
+/// the endpoint.
+fn google_provider(key: String) -> GoogleProvider {
+    let mut provider = GoogleProvider::new(key);
+    if let Some(base) = crate::providers::free::free_upstream_base_url_override("google") {
+        provider = provider.with_base_url(base);
+    }
+    provider
+}
+
 /// Construct the per-key provider for a free-catalog upstream.
 ///
 /// This is the factory a [`KeyRotatingProvider`] calls once per request, so an
@@ -103,7 +120,7 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
 /// asserts that across the whole catalog.
 fn build_multi_key_provider(upstream_id: &str, key: String) -> Option<Arc<dyn LlmProvider>> {
     match upstream_id {
-        "google" => Some(Arc::new(GoogleProvider::new(key)) as Arc<dyn LlmProvider>),
+        "google" => Some(Arc::new(google_provider(key)) as Arc<dyn LlmProvider>),
         "cloudflare" => {
             let mut provider = crate::providers::openai_compat_providers::cloudflare_with_key(&key);
             if let Some(base) =
@@ -237,7 +254,7 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         };
 
         let provider: Option<Arc<dyn LlmProvider>> = match upstream.id {
-            "google" => Some(Arc::new(GoogleProvider::new(key))),
+            "google" => Some(Arc::new(google_provider(key))),
             "cloudflare" => {
                 let mut p = crate::providers::openai_compat_providers::cloudflare_with_key(&key);
                 if let Some(base) =
@@ -1439,6 +1456,56 @@ mod tests {
         assert!(
             msg.contains("127.0.0.1:1"),
             "request must go to the overridden base URL, error was: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn build_free_provider_honors_env_base_url_override_for_google() {
+        // Google speaks a native wire format, so the override only reaches it
+        // through `google_provider`. That hook is what lets a local mock stand
+        // in for the one vision-capable free upstream (the image-mode probe),
+        // and a chain that silently kept the real endpoint would be a probe
+        // that never touches its mock — or a request that ships a user's
+        // screenshot to Google without a key.
+        use crate::provider_types::ProviderRequest;
+        use clawde_core::types::Message;
+
+        let (mut store, _home) = crate::test_support::test_auth_store();
+        store.set(
+            "google",
+            clawde_core::StoredCredential::ApiKey {
+                key: "AIza-fake-key-1234567890".to_string(),
+            },
+        );
+        let _guard = crate::test_support::EnvVarGuard::set(
+            "CLAWDE_FREE_BASE_URL_GOOGLE",
+            "http://127.0.0.1:1",
+        );
+
+        let provider = build_free_provider(&config_with_only_upstream("google"))
+            .expect("a seeded google key should build the free chain");
+
+        let req = ProviderRequest {
+            model: "free/auto".to_string(),
+            messages: vec![Message::user("hi")],
+            system_prompt: None,
+            tools: Vec::new(),
+            max_tokens: 8,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: None,
+            effort_level: None,
+            provider_options: serde_json::Value::Null,
+            strict_route: false,
+        };
+        let err = provider.create_message(req).await.unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("127.0.0.1:1"),
+            "google's dispatch must use the overridden base URL, error was: {}",
             msg
         );
     }

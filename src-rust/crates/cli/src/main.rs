@@ -6006,6 +6006,18 @@ async fn run_interactive(
                             .await;
                         }
 
+                        // IMAGE mode resolves its vision model when entered but
+                        // performs the swap lazily: on the first attached image,
+                        // or here. A text-only turn in the mode still switches —
+                        // the mode says the session is doing image work — and a
+                        // user who only tab-cycled through IMAGE never reaches
+                        // this code, so their model is left alone.
+                        // `qcfg.model` is built from `cmd_ctx.config` below, so
+                        // the swap has to land before that.
+                        app.apply_pending_image_switch();
+                        cmd_ctx.config = app.config.clone();
+                        tool_ctx.config = app.config.clone();
+
                         // Regular user message (with optional image attachments + file injection)
                         let mut pending_imgs = app.prompt_input.clear_images();
 
@@ -6086,9 +6098,19 @@ async fn run_interactive(
                                 });
                             }
 
-                            // Images are attached via pending_imgs, not text-injected.
+                            // Images are attached via pending_imgs, not text-injected,
+                            // and they are not text at all: a PNG fails
+                            // `read_to_string`, so `parse_at_refs` files it under
+                            // `AtFileIssue::Binary`, and leaving it in `oversized`
+                            // raises the file-injection dialog for a reference that
+                            // was never going to be injected — then raises it again
+                            // after "inject anyways", because that option only
+                            // relaxes the size limit. Drop image refs before the
+                            // dialog check so `@screenshot.png` sends its image block
+                            // (see the auto-attach scan above) instead of looping.
                             within_limit
                                 .retain(|f| !clawde_tui::image_paste::is_image_path(&f.path));
+                            oversized.retain(|f| !clawde_tui::image_paste::is_image_path(&f.path));
 
                             if !oversized.is_empty() {
                                 // Show either the directory warning or the file warning, never both.
