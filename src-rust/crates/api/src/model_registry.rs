@@ -14,7 +14,7 @@
 // **No more hardcoded per-provider model lists.**  All metadata —
 // modalities, pricing, release date, capability flags, npm SDK package —
 // lives in the bundled JSON and is updated by re-running
-// `script/sync-models.{ps1,sh}`.
+// `src-rust/scripts/sync-models.sh` (or the `.ps1` twin).
 //
 // All network and parse failures are non-fatal: the bundled snapshot is
 // always available as a fallback.
@@ -35,8 +35,14 @@ use crate::provider::ModelInfo;
 
 /// The bundled models.dev snapshot, baked into the binary at compile time.
 ///
-/// Refresh it locally with `bun run script/sync-models.ts` (TS) or
-/// `pwsh script/sync-models.ps1` (PS).  CI also refreshes weekly.
+/// Refresh it with `src-rust/scripts/sync-models.sh` (or
+/// `src-rust/scripts/sync-models.ps1`).  Nothing refreshes it automatically:
+/// there is no CI job for it and the sync script is the only writer, so the
+/// file ages until someone runs it (the copy committed 2026-08 kept June's
+/// catalog while models.dev had moved on by two months' worth of providers).
+/// A running install still sees current data through the on-disk cache
+/// (`load_cache` overlays `~/.cache/clawde/models.json`, refreshed hourly) —
+/// the bundled copy is what an offline or first-run process parses.
 const BUNDLED_SNAPSHOT: &[u8] = include_bytes!("../assets/models-snapshot.json");
 
 // ---------------------------------------------------------------------------
@@ -708,6 +714,7 @@ fn transform_api(api: md::ApiJson) -> ParsedSnapshot {
                     max_output_tokens: max_output,
                     release_date: m.release_date.clone(),
                     status: m.status.map(|s| format!("{s:?}").to_lowercase()),
+                    vision: mod_in.contains(&Modality::Image),
                 },
                 family: m.family,
                 status: m.status.unwrap_or_default(),
@@ -1524,6 +1531,11 @@ impl ModelRegistry {
                     max_output_tokens: upstream.max_tokens_cap.unwrap_or(8_192),
                     release_date: None,
                     status: None,
+                    // The catalog flag describes the DEFAULT model, which is
+                    // what this synthetic entry stands for. An upstream that can
+                    // only do images on a secondary model says so through
+                    // `vision_model_for`, not here.
+                    vision: upstream.vision,
                 },
                 family: None,
                 status: ModelStatus::Active,
@@ -1595,10 +1607,13 @@ fn apply_overrides_to_entries(
                     entry.status = model_status_from_str(st);
                     entry.info.status = Some(st.clone());
                 }
+                if let Some(vision) = ov.vision {
+                    apply_vision_capability(entry, vision);
+                }
             }
             None => {
                 // Materialise a synthetic entry for an id the catalog lacks.
-                let entry = ModelEntry {
+                let mut entry = ModelEntry {
                     info: ModelInfo {
                         id: ModelId::new(model),
                         provider_id: ProviderId::new(provider),
@@ -1607,6 +1622,7 @@ fn apply_overrides_to_entries(
                         max_output_tokens: ov.max_output_tokens.unwrap_or(0),
                         release_date: ov.release_date.clone(),
                         status: ov.status.clone(),
+                        vision: ov.vision.unwrap_or(false),
                     },
                     family: None,
                     status: ov
@@ -1636,9 +1652,29 @@ fn apply_overrides_to_entries(
                     options: HashMap::new(),
                     headers: HashMap::new(),
                 };
+                if let Some(vision) = ov.vision {
+                    apply_vision_capability(&mut entry, vision);
+                }
                 entries.insert(registry_key, entry);
             }
         }
+    }
+}
+
+/// Apply a user's explicit image-capability statement to a registry row.
+///
+/// Capability lives in `modalities_input` — [`ModelEntry::vision`] reads that
+/// vector, not a flag — so an override has to edit it: `true` marks an id the
+/// catalog does not know (a local alias, a self-hosted endpoint) as
+/// image-capable, and `false` demotes a catalog row the user knows rejects
+/// images. Image mode and the attach-time warning both read the resulting row.
+fn apply_vision_capability(entry: &mut ModelEntry, vision: bool) {
+    entry.info.vision = vision;
+    let has_image = entry.modalities_input.contains(&Modality::Image);
+    match (vision, has_image) {
+        (true, false) => entry.modalities_input.push(Modality::Image),
+        (false, true) => entry.modalities_input.retain(|m| *m != Modality::Image),
+        _ => {}
     }
 }
 

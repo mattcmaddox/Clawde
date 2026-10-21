@@ -544,6 +544,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+enter", "select", KeyContext::KeysDialog),
         ("backspace", "backspace", KeyContext::KeysDialog),
         ("delete", "delete", KeyContext::KeysDialog),
+        ("ctrl+f", "importCredentials", KeyContext::KeysDialog),
         // ========== /models PROVIDER MENU ==========
         // No text entry, so navigation is unconditional. Space flips the
         // cursor provider on/off; enter selects the Auto/pinned target.

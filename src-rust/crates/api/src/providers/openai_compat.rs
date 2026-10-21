@@ -1051,7 +1051,7 @@ impl OpenAiCompatProvider {
         let mut models: Vec<(ModelInfo, bool, u64)> = Vec::with_capacity(model_names.len());
 
         for name in &model_names {
-            let (context_window, max_output, is_coder, param_size) =
+            let (context_window, max_output, is_coder, param_size, vision) =
                 self.fetch_ollama_model_info(&show_url_base, name).await;
 
             models.push((
@@ -1061,6 +1061,11 @@ impl OpenAiCompatProvider {
                     name: Self::ollama_display_name(name),
                     context_window,
                     max_output_tokens: max_output,
+                    // The only vision signal a local runtime publishes:
+                    // `/api/show` reports capabilities per tag, so image mode
+                    // can find a pulled `llava`/`llama3.2-vision` without any
+                    // hand-written override.
+                    vision,
                     ..Default::default()
                 },
                 is_coder,
@@ -1078,15 +1083,17 @@ impl OpenAiCompatProvider {
     }
 
     /// Call `/api/show` for a single model to extract its actual context
-    /// window, parameter count, and whether it's coding-oriented.
+    /// window, parameter count, whether it's coding-oriented, and whether it
+    /// accepts image input.
     ///
-    /// Returns `(context_window, max_output_tokens, is_coder, param_size_bytes)`.
+    /// Returns
+    /// `(context_window, max_output_tokens, is_coder, param_size_bytes, vision)`.
     /// Falls back to sensible defaults if the request fails.
     async fn fetch_ollama_model_info(
         &self,
         show_url: &str,
         model_name: &str,
-    ) -> (u32, u32, bool, u64) {
+    ) -> (u32, u32, bool, u64, bool) {
         let default_ctx = 4_096u32;
         let default_out = 2_048u32;
         let lower = model_name.to_lowercase();
@@ -1100,12 +1107,12 @@ impl OpenAiCompatProvider {
         let body = serde_json::json!({ "name": model_name });
         let resp = match self.http_client.post(show_url).json(&body).send().await {
             Ok(r) if r.status().is_success() => r,
-            _ => return (default_ctx, default_out, is_coder_by_name, 0),
+            _ => return (default_ctx, default_out, is_coder_by_name, 0, false),
         };
 
         let json: Value = match resp.json().await {
             Ok(j) => j,
-            Err(_) => return (default_ctx, default_out, is_coder_by_name, 0),
+            Err(_) => return (default_ctx, default_out, is_coder_by_name, 0, false),
         };
 
         // Extract parameter size from model_info.
@@ -1128,7 +1135,22 @@ impl OpenAiCompatProvider {
             .unwrap_or("");
         let is_coder = is_coder_by_name || family.contains("code") || family.contains("coder");
 
-        (num_ctx, max_output, is_coder, param_size)
+        let vision = Self::ollama_reports_vision(&json);
+
+        (num_ctx, max_output, is_coder, param_size, vision)
+    }
+
+    /// Whether an Ollama `/api/show` body advertises image input.
+    ///
+    /// Ollama reports per-tag capabilities (`"capabilities": ["completion",
+    /// "vision"]`) — the only place a local runtime states that a model can
+    /// take images, since models.dev has no ollama rows at all. A body without
+    /// the array is treated as text-only: guessing from the model name would
+    /// mark `llava`-alikes correctly but is not a promise the runtime made.
+    fn ollama_reports_vision(json: &Value) -> bool {
+        json.get("capabilities")
+            .and_then(|caps| caps.as_array())
+            .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some("vision")))
     }
 
     /// Extract `num_ctx` (context window) from the `/api/show` response.
@@ -1566,6 +1588,19 @@ mod tests {
     use super::*;
     use crate::provider_types::SystemPrompt;
     use serde_json::json;
+
+    #[test]
+    fn ollama_show_capabilities_mark_vision_models() {
+        let vision = serde_json::json!({ "capabilities": ["completion", "vision"] });
+        let text_only = serde_json::json!({ "capabilities": ["completion"] });
+
+        assert!(OpenAiCompatProvider::ollama_reports_vision(&vision));
+        assert!(!OpenAiCompatProvider::ollama_reports_vision(&text_only));
+        // No capabilities array at all: nothing was promised, so text-only.
+        assert!(!OpenAiCompatProvider::ollama_reports_vision(
+            &serde_json::json!({ "model_info": {} })
+        ));
+    }
 
     #[test]
     fn reasoning_roundtrip_injects_reasoning_content_on_tool_calls() {

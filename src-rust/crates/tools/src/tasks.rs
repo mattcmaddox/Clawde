@@ -4,7 +4,7 @@
 // Tasks have id, subject, description, status, owner, blocks/blocked-by dependencies,
 // and optional output.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{PermissionLevel, Tool, ToolContext, ToolErrorCode, ToolResult};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -156,7 +156,12 @@ impl Tool for TaskCreateTool {
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
         let params: TaskCreateInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Invalid input: {}", e),
+                )
+            }
         };
 
         let mut task = Task::new(&params.subject, &params.description);
@@ -213,7 +218,12 @@ impl Tool for TaskGetTool {
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
         let params: TaskGetInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Invalid input: {}", e),
+                )
+            }
         };
 
         match TASK_STORE.get(&params.task_id) {
@@ -295,12 +305,22 @@ impl Tool for TaskUpdateTool {
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
         let params: TaskUpdateInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Invalid input: {}", e),
+                )
+            }
         };
 
         let mut task = match TASK_STORE.get_mut(&params.task_id) {
             Some(t) => t,
-            None => return ToolResult::error(format!("Task '{}' not found", params.task_id)),
+            None => {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Task '{}' not found", params.task_id),
+                )
+            }
         };
 
         let mut updated_fields: Vec<&str> = vec![];
@@ -321,7 +341,12 @@ impl Tool for TaskUpdateTool {
                 "deleted" => TaskStatus::Deleted,
                 "running" => TaskStatus::Running,
                 "failed" => TaskStatus::Failed,
-                other => return ToolResult::error(format!("Unknown status: {}", other)),
+                other => {
+                    return ToolResult::error_with_code(
+                        ToolErrorCode::InvalidInput,
+                        format!("Unknown status: {}", other),
+                    )
+                }
             };
             updated_fields.push("status");
         }
@@ -466,16 +491,24 @@ impl Tool for TaskStopTool {
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
         let params: TaskStopInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Invalid input: {}", e),
+                )
+            }
         };
 
         match TASK_STORE.get_mut(&params.task_id) {
             Some(mut task) => {
                 if task.status != TaskStatus::Running && task.status != TaskStatus::InProgress {
-                    return ToolResult::error(format!(
-                        "Task '{}' is not running (status: {})",
-                        params.task_id, task.status
-                    ));
+                    return ToolResult::error_with_code(
+                        ToolErrorCode::InvalidInput,
+                        format!(
+                            "Task '{}' is not running (status: {})",
+                            params.task_id, task.status
+                        ),
+                    );
                 }
                 task.status = TaskStatus::Completed;
                 task.updated_at = chrono::Utc::now();
@@ -487,7 +520,10 @@ impl Tool for TaskStopTool {
                     .unwrap_or_default(),
                 )
             }
-            None => ToolResult::error(format!("Task '{}' not found", params.task_id)),
+            None => ToolResult::error_with_code(
+                ToolErrorCode::InvalidInput,
+                format!("Task '{}' not found", params.task_id),
+            ),
         }
     }
 }
@@ -535,7 +571,12 @@ impl Tool for TaskOutputTool {
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
         let params: TaskOutputInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Invalid input: {}", e),
+                )
+            }
         };
 
         match TASK_STORE.get(&params.task_id) {
@@ -559,7 +600,10 @@ impl Tool for TaskOutputTool {
                     .unwrap_or_default(),
                 )
             }
-            None => ToolResult::error(format!("Task '{}' not found", params.task_id)),
+            None => ToolResult::error_with_code(
+                ToolErrorCode::InvalidInput,
+                format!("Task '{}' not found", params.task_id),
+            ),
         }
     }
 }
@@ -736,6 +780,7 @@ mod tests {
                 .execute(json!({ "task_id": "missing", "subject": "x" }), &ctx())
                 .await;
             assert!(res.is_error);
+            assert_eq!(res.error_code, Some(ToolErrorCode::InvalidInput));
             assert!(res.content.contains("not found"), "{}", res.content);
         })
         .await;
@@ -877,6 +922,7 @@ mod tests {
                 .execute(json!({ "subject": "no description" }), &ctx())
                 .await;
             assert!(res.is_error);
+            assert_eq!(res.error_code, Some(ToolErrorCode::InvalidInput));
             assert!(res.content.contains("Invalid input"), "{}", res.content);
         })
         .await;

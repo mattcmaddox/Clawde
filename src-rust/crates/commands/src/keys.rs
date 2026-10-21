@@ -13,6 +13,7 @@
 
 use super::*;
 use async_trait::async_trait;
+use clawde_core::format_utils::format_retry_wait;
 use clawde_core::key_ring::KeyRing;
 use clawde_core::AuthStore;
 use clawde_tools::web_search;
@@ -540,31 +541,6 @@ impl SlashCommand for KeysCommand {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Show key store status.
-/// Format a duration in seconds to a human-readable string.
-/// Examples: 42s, 5m 23s, 2h 15m, 1d 3h, 11h 59m 55s
-fn format_duration(total_secs: u64) -> String {
-    let days = total_secs / 86400;
-    let hours = (total_secs % 86400) / 3600;
-    let minutes = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-
-    let mut parts = Vec::new();
-    if days > 0 {
-        parts.push(format!("{}d", days));
-    }
-    if hours > 0 {
-        parts.push(format!("{}h", hours));
-    }
-    if minutes > 0 {
-        parts.push(format!("{}m", minutes));
-    }
-    if secs > 0 || parts.is_empty() {
-        parts.push(format!("{}s", secs));
-    }
-    parts.join(" ")
-}
-
 /// Render the free-mode upstream model-performance section (spec §8.6) for
 /// `/keys health`: per-upstream dispatch success rate, average latency, and
 /// per-task success rates (the same data as the /routing edit dashboard, in
@@ -824,7 +800,7 @@ fn cmd_health(
                             "    [{}] {}  EXHAUSTED ({} remaining{scope} — {})",
                             i + 1,
                             preview,
-                            format_duration(remaining),
+                            format_retry_wait(remaining),
                             error_info,
                         )
                     }
@@ -857,7 +833,7 @@ fn cmd_health(
                     lines.push(format!(
                         "  {}  EXHAUSTED ({} remaining — {})",
                         preview,
-                        format_duration(remaining),
+                        format_retry_wait(remaining),
                         error_info,
                     ));
                 }
@@ -894,7 +870,7 @@ fn cmd_health(
                         "    [{}] {}  EXHAUSTED ({} remaining)",
                         i + 1,
                         preview,
-                        format_duration(remaining),
+                        format_retry_wait(remaining),
                     ));
                 } else {
                     lines.push(format!("    [{}] {}  ACTIVE", i + 1, preview));
@@ -938,7 +914,7 @@ fn cmd_health(
                             "  {} · {}  COOLED (retry in {})",
                             provider,
                             upstream,
-                            format_duration(*secs),
+                            format_retry_wait(*secs),
                         ),
                         None => format!(
                             "  {} · {}  {} consecutive empties",

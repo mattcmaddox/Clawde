@@ -17,6 +17,7 @@ regexes = [
   # Test fixtures in auth-store / key-ring / provider tests.
   '''zen-key-12345678''',
   '''sk-ok-12345678''',
+  '''sk-other-123456789''',
   '''my-secret-key''',
   '''test-groq-key-1234567890''',
   '''nv-legacy-12345678''',

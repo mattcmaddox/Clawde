@@ -345,6 +345,13 @@ struct Cli {
     #[arg(long = "prefill")]
     prefill: Option<String>,
 
+    /// Attach an image to the prompt (repeatable). Headless runs have no prompt
+    /// box, so this is the only way to send a screenshot to the model in
+    /// `--print` mode. Accepts PNG/JPEG/WebP/GIF plus BMP/TIFF, which are
+    /// re-encoded to PNG before the request.
+    #[arg(long = "image", value_name = "PATH", action = ArgAction::Append)]
+    image: Vec<std::path::PathBuf>,
+
     /// Effort level for extended thinking (low, medium, high, max)
     #[arg(long = "effort", value_name = "LEVEL")]
     effort: Option<String>,
@@ -2854,6 +2861,100 @@ async fn load_headless_resume_session(
         .with_context(|| format!("could not load headless resume session '{resume_id}'"))
 }
 
+/// Attach `--image` inputs to the prompt a headless run starts from.
+///
+/// The images go on the LAST user message — the prompt this run adds, since a
+/// resumed or absorbed history is prepended ahead of it — keeping the prompt
+/// text first so the provider sees `[text, image, image, …]`. Returns how many
+/// images were attached.
+fn attach_images_to_prompt(
+    messages: &mut [clawde_core::types::Message],
+    sources: Vec<clawde_core::types::ImageSource>,
+) -> usize {
+    if sources.is_empty() {
+        return 0;
+    }
+    let Some(position) = messages
+        .iter()
+        .rposition(|m| m.role == clawde_core::types::Role::User)
+    else {
+        return 0;
+    };
+    let count = sources.len();
+    let mut blocks: Vec<clawde_core::types::ContentBlock> = match &messages[position].content {
+        clawde_core::types::MessageContent::Text(text) => {
+            vec![clawde_core::types::ContentBlock::Text { text: text.clone() }]
+        }
+        clawde_core::types::MessageContent::Blocks(blocks) => blocks.clone(),
+    };
+    blocks.extend(
+        sources
+            .into_iter()
+            .map(|source| clawde_core::types::ContentBlock::Image { source }),
+    );
+    messages[position].content = clawde_core::types::MessageContent::Blocks(blocks);
+    count
+}
+
+#[cfg(test)]
+mod headless_image_tests {
+    use super::attach_images_to_prompt;
+    use clawde_core::types::{ContentBlock, ImageSource, Message, MessageContent, Role};
+
+    fn source(data: &str) -> ImageSource {
+        ImageSource {
+            source_type: "base64".to_string(),
+            media_type: Some("image/png".to_string()),
+            data: Some(data.to_string()),
+            url: None,
+        }
+    }
+
+    fn images_of(msg: &Message) -> usize {
+        match &msg.content {
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                .count(),
+            MessageContent::Text(_) => 0,
+        }
+    }
+
+    #[test]
+    fn images_attach_to_the_last_user_prompt_after_history() {
+        // Resumed/absorbed history is prepended, so the prompt this run adds is
+        // the LAST user message — attaching to the first one would bolt the
+        // screenshot onto an old turn the model already answered.
+        let mut messages = vec![
+            Message::user("old question"),
+            Message::assistant("old answer"),
+            Message::user("what is in this screenshot?"),
+        ];
+
+        let attached = attach_images_to_prompt(&mut messages, vec![source("AAA"), source("BBB")]);
+
+        assert_eq!(attached, 2);
+        assert_eq!(images_of(&messages[0]), 0);
+        assert_eq!(images_of(&messages[2]), 2);
+        // The prompt text stays first so providers see [text, image, image].
+        let MessageContent::Blocks(blocks) = &messages[2].content else {
+            panic!("prompt should carry blocks");
+        };
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text } if text == "what is in this screenshot?")
+        );
+        assert_eq!(messages[2].role, Role::User);
+    }
+
+    #[test]
+    fn empty_image_list_leaves_the_prompt_as_plain_text() {
+        let mut messages = vec![Message::user("hi")];
+
+        assert_eq!(attach_images_to_prompt(&mut messages, Vec::new()), 0);
+        assert!(matches!(messages[0].content, MessageContent::Text(_)));
+    }
+}
+
 async fn run_headless(
     cli: &Cli,
     verbose: bool,
@@ -3000,6 +3101,26 @@ async fn run_headless(
     if messages.is_empty() {
         eprintln!("Error: No messages provided.");
         std::process::exit(1);
+    }
+
+    // `--image` attaches to the prompt THIS run adds, not to absorbed or resumed
+    // history: a headless run has no prompt box, so this flag is the only image
+    // input path it has. Unreadable paths are reported rather than silently
+    // dropped — a missing file would otherwise look like the model ignoring the
+    // image.
+    let mut image_sources: Vec<clawde_core::types::ImageSource> = Vec::new();
+    for path in &cli.image {
+        match clawde_tui::image_paste::image_source_from_file(path) {
+            Some(source) => image_sources.push(source),
+            None => eprintln!("Warning: cannot read image '{}' — skipping", path.display()),
+        }
+    }
+    let attached_images = attach_images_to_prompt(&mut messages, image_sources);
+    if attached_images > 0 {
+        tracing::info!(
+            images = attached_images,
+            "headless: attached --image inputs"
+        );
     }
 
     // Headless slash-command execution: when the single-shot prompt IS a
@@ -4517,11 +4638,23 @@ async fn run_interactive(
 
     // Set agent mode from the --agent flag (carried on query_config).
     if let Some(ref agent_name) = base_query_config.agent_name {
-        app.agent_mode = Some(agent_name.clone());
-        // Sync the mode accent: App::new defaults to the build accent, so a
-        // session launched with --agent plan/image would otherwise show the
-        // build color until the first explicit mode switch.
-        app.accent_color = clawde_tui::app::accent_for_mode(Some(agent_name));
+        if agent_name == "image" {
+            // `--agent image` is the same entry as Tab and `/agent image`:
+            // resolve the vision model, remember what to restore, and read the
+            // clipboard. Setting `agent_mode` directly skipped all of that, so
+            // a session launched this way never swapped in a vision model and
+            // had nothing to restore on exit.
+            if !app.enter_image_mode() {
+                app.agent_mode = Some("build".to_string());
+                app.accent_color = clawde_tui::app::accent_for_mode(Some("build"));
+            }
+        } else {
+            app.agent_mode = Some(agent_name.clone());
+            // Sync the mode accent: App::new defaults to the build accent, so a
+            // session launched with --agent plan/image would otherwise show the
+            // build color until the first explicit mode switch.
+            app.accent_color = clawde_tui::app::accent_for_mode(Some(agent_name));
+        }
     }
 
     // Mirror TS BypassPermissionsModeDialog.tsx startup gate
@@ -6638,6 +6771,9 @@ async fn run_interactive(
                             for ch in data.chars() {
                                 app.custom_provider_dialog.insert_char(ch);
                             }
+                        } else if app.credential_import.visible {
+                            // Paste a file path into the import popup (first line only).
+                            app.credential_import.paste(&data);
                         } else if app.keys_dialog.visible {
                             // Paste into the /keys popup's active row new-key
                             // buffer, trimmed to a single token. The
@@ -7742,6 +7878,10 @@ async fn run_interactive(
                     let (tx, rx) = tokio::sync::mpsc::channel(1);
                     app.model_fetch_rx = Some(rx);
                     app.model_picker.loading_models = true;
+                    // Shared with the fetch task so the parsed capability flags
+                    // (Ollama's per-tag `vision`) reach image mode, which runs
+                    // on the main thread and cannot await a discovery call.
+                    let discovered_cache = app.discovered_models.clone();
                     tokio::spawn(async move {
                         // Effective context window for a discovered model:
                         // the user override wins, else the discovered value.
@@ -7759,6 +7899,7 @@ async fn run_interactive(
                         };
                         match provider.discover_models().await {
                             Ok(models) => {
+                                *discovered_cache.lock() = models.clone();
                                 let entries: Vec<clawde_tui::model_picker::ModelEntry> =
                                     if is_anthropic && !models.is_empty() {
                                         let by_id: std::collections::HashMap<

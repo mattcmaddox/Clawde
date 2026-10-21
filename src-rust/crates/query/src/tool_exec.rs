@@ -107,19 +107,18 @@ pub(crate) struct ToolExecCtx<'a> {
 
 /// Phase 1: sequential pre-hook pass over the turn's tool calls.
 ///
-/// For each call: emit `ToolStart`, mark writes, record the no-progress
-/// signature, run PreToolUse hooks (config then plugins — a veto blocks
-/// execution), and fall back to the malformed-args error for calls whose
-/// streamed JSON failed to parse (`malformed` is empty for stream handlers
-/// that do not detect them, e.g. the Anthropic path — D6). Also advances the
-/// goal re-anchor counter so the milestone moves on both request paths.
+/// For each call: emit `ToolStart`, record the no-progress signature, run
+/// PreToolUse hooks (config then plugins — a veto blocks execution), and fall
+/// back to the malformed-args error for calls whose streamed JSON failed to
+/// parse (`malformed` is empty for stream handlers that do not detect them,
+/// e.g. the Anthropic path — D6). Also advances the goal re-anchor counter so
+/// the milestone moves on both request paths.
 pub(crate) async fn prepare_tool_batch(
     tool_calls: &[(String, String, Value)],
     tool_ctx: &ToolContext,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
     malformed: &std::collections::HashSet<String>,
     state: &mut TurnToolState,
-    wrote_files: &mut bool,
     total_tool_calls: &mut u32,
 ) -> Vec<PreparedTool> {
     let mut prepared = Vec::with_capacity(tool_calls.len());
@@ -131,7 +130,6 @@ pub(crate) async fn prepare_tool_batch(
                 input_json: tool_input.to_string(),
             });
         }
-        *wrote_files |= is_write_tool(tool_name);
         state.signatures.push(format!(
             "{}:{}",
             tool_name,
@@ -218,6 +216,7 @@ pub(crate) async fn execute_tool_batch(
     ctx: &ToolExecCtx<'_>,
     prepared: &[PreparedTool],
     state: &mut TurnToolState,
+    wrote_files: &mut bool,
     repeat_detector: &mut RepeatCallDetector,
 ) -> (Vec<clawde_core::types::ContentBlock>, bool) {
     let exec_futures: Vec<_> = prepared
@@ -248,6 +247,9 @@ pub(crate) async fn execute_tool_batch(
         Vec::with_capacity(prepared.len());
     for (p, result) in prepared.iter().zip(exec_results) {
         state.observe(&p.name, &result);
+        if !result.is_error && is_write_tool(&p.name) {
+            *wrote_files = true;
+        }
 
         if !batch_cancelled {
             let hooks = &ctx.tool_ctx.config.hooks;
@@ -311,9 +313,26 @@ pub(crate) async fn execute_tool_batch(
             }
             content.push_str(&format!("\n[SYSTEM NOTICE: {reminder}]"));
         }
+        // A tool that captured or rendered an image (screenshot, chart, MCP
+        // image result) returns it as image blocks next to the text. Every
+        // provider's tool_result encoder already understands `Blocks`; sending
+        // the bytes as text made the model unable to see the image at all.
+        let content = if result.images.is_empty() {
+            clawde_core::types::ToolResultContent::Text(content)
+        } else {
+            let mut blocks = vec![clawde_core::types::ContentBlock::Text { text: content }];
+            blocks.extend(
+                result
+                    .images
+                    .iter()
+                    .cloned()
+                    .map(|source| clawde_core::types::ContentBlock::Image { source }),
+            );
+            clawde_core::types::ToolResultContent::Blocks(blocks)
+        };
         result_blocks.push(clawde_core::types::ContentBlock::ToolResult {
             tool_use_id: p.id.clone(),
-            content: clawde_core::types::ToolResultContent::Text(content),
+            content,
             // Canonical wire form: omit is_error on success.
             is_error: if result.is_error { Some(true) } else { None },
         });
@@ -506,17 +525,20 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let exec_ctx = exec_ctx(&tools, &tool_ctx, &tx);
         let mut state = TurnToolState::default();
+        let mut wrote_files = false;
         let mut detector = RepeatCallDetector::new();
 
         let (blocks, cancelled) = execute_tool_batch(
             &exec_ctx,
             &[prepared("t1", "ok_tool", None)],
             &mut state,
+            &mut wrote_files,
             &mut detector,
         )
         .await;
 
         assert!(!cancelled);
+        assert!(!wrote_files);
         assert_eq!(blocks.len(), 1);
         let ContentBlock::ToolResult {
             tool_use_id,
@@ -543,6 +565,56 @@ mod tests {
         assert!(saw_tool_end, "ToolEnd event missing");
     }
 
+    /// A tool that produces an image (screenshot, chart render, MCP image
+    /// content) must reach the model as an image block next to its text. Sent
+    /// as text, the model cannot see it at all.
+    #[tokio::test]
+    async fn image_results_become_image_blocks_next_to_the_text() {
+        let image = clawde_core::types::ImageSource {
+            source_type: "base64".to_string(),
+            media_type: Some("image/jpeg".to_string()),
+            data: Some("AAAA".to_string()),
+            url: None,
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeTool {
+            name: "screenshot",
+            result: ToolResult::success("captured").with_images(vec![image]),
+        })];
+        let tool_ctx = test_ctx();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let exec_ctx = exec_ctx(&tools, &tool_ctx, &tx);
+        let mut state = TurnToolState::default();
+        let mut wrote_files = false;
+        let mut detector = RepeatCallDetector::new();
+
+        let (blocks, cancelled) = execute_tool_batch(
+            &exec_ctx,
+            &[prepared("t1", "screenshot", None)],
+            &mut state,
+            &mut wrote_files,
+            &mut detector,
+        )
+        .await;
+
+        assert!(!cancelled);
+        let ContentBlock::ToolResult { content, .. } = &blocks[0] else {
+            panic!("expected a ToolResult block");
+        };
+        let clawde_core::types::ToolResultContent::Blocks(inner) = content else {
+            panic!("an image result must use blocks, got {content:?}");
+        };
+        assert!(matches!(
+            &inner[0],
+            ContentBlock::Text { text } if text == "captured"
+        ));
+        assert!(matches!(
+            &inner[1],
+            ContentBlock::Image { source }
+                if source.media_type.as_deref() == Some("image/jpeg")
+        ));
+        assert_eq!(inner.len(), 2);
+    }
+
     #[tokio::test]
     async fn unchanged_results_surface_notices_without_duplicate_replies() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeTool {
@@ -553,6 +625,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let exec_ctx = exec_ctx(&tools, &tool_ctx, &tx);
         let mut state = TurnToolState::default();
+        let mut wrote_files = false;
         let mut detector = RepeatCallDetector::new();
 
         for count in 1..=4 {
@@ -561,6 +634,7 @@ mod tests {
                 &exec_ctx,
                 &[prepared(&id, "ok_tool", None)],
                 &mut state,
+                &mut wrote_files,
                 &mut detector,
             )
             .await;
@@ -602,24 +676,27 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let exec_ctx = exec_ctx(&tools, &tool_ctx, &tx);
         let mut state = TurnToolState::default();
+        let mut wrote_files = false;
         let mut detector = RepeatCallDetector::new();
 
         let (blocks, cancelled) = execute_tool_batch(
             &exec_ctx,
             &[prepared(
                 "t1",
-                "ok_tool",
+                "Edit",
                 Some(ToolResult::error_with_code(
                     ToolErrorCode::PermissionDenied,
                     "Blocked by hook: nope",
                 )),
             )],
             &mut state,
+            &mut wrote_files,
             &mut detector,
         )
         .await;
 
         assert!(!cancelled);
+        assert!(!wrote_files, "blocked write tool must not mark wrote_files");
         assert_eq!(blocks.len(), 1);
         let ContentBlock::ToolResult { is_error, .. } = &blocks[0] else {
             panic!("expected a ToolResult block");
@@ -654,7 +731,6 @@ mod tests {
         tool_ctx.config.hooks = hooks;
 
         let mut state = TurnToolState::default();
-        let mut wrote_files = false;
         let mut total_tool_calls = 0;
         // "m1" is BOTH blocked by the hook AND malformed — the hook veto must
         // win; "ok" is a plain call that would execute.
@@ -677,13 +753,11 @@ mod tests {
             None,
             &malformed,
             &mut state,
-            &mut wrote_files,
             &mut total_tool_calls,
         )
         .await;
 
         assert_eq!(prepared.len(), 2);
-        assert!(wrote_files, "Edit must mark wrote_files");
         assert_eq!(
             total_tool_calls, 2,
             "blocked calls still advance the re-anchor counter"
@@ -706,7 +780,6 @@ mod tests {
     async fn prepare_tool_batch_malformed_call_gets_invalid_input() {
         let tool_ctx = test_ctx(); // no hooks configured
         let mut state = TurnToolState::default();
-        let mut wrote_files = false;
         let mut total_tool_calls = 0;
         let malformed: std::collections::HashSet<String> = ["m1".to_string()].into_iter().collect();
         let prepared = prepare_tool_batch(
@@ -719,7 +792,6 @@ mod tests {
             None,
             &malformed,
             &mut state,
-            &mut wrote_files,
             &mut total_tool_calls,
         )
         .await;
@@ -770,12 +842,14 @@ mod tests {
             event_tx: Some(&tx),
         };
         let mut state = TurnToolState::default();
+        let mut wrote_files = false;
         let mut detector = RepeatCallDetector::new();
 
         let (blocks, batch_cancelled) = execute_tool_batch(
             &exec_ctx,
             &[prepared("t1", "hanging_tool", None)],
             &mut state,
+            &mut wrote_files,
             &mut detector,
         )
         .await;

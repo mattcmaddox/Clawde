@@ -110,6 +110,8 @@ pub mod cat_chat;
 pub mod compare_dialog;
 /// Context window and rate-limit visualization overlay (/context).
 pub mod context_viz;
+/// `/keys` popup — j/k-navigable key manager with CRUD.
+pub mod credential_import_dialog;
 /// Modal dialog for entering custom provider URL + API key.
 pub mod custom_provider_dialog;
 /// Desktop app upsell startup dialog (shown at startup on macOS/Windows x64).
@@ -157,7 +159,6 @@ pub mod katban_controls;
 pub mod key_editor;
 /// Masked text input overlay for entering API keys.
 pub mod key_input_dialog;
-/// `/keys` popup — j/k-navigable key manager with CRUD.
 pub mod keys_dialog;
 /// Inline image rendering via the Kitty graphics protocol (with text fallback).
 pub mod kitty_image;

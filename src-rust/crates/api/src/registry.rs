@@ -133,7 +133,18 @@ fn build_multi_key_provider(upstream_id: &str, key: String) -> Option<Arc<dyn Ll
         "github-copilot" => Some(Arc::new(CopilotProvider::new(key)) as Arc<dyn LlmProvider>),
         id => {
             let provider = crate::providers::openai_compat_providers::provider_for_id(id)?;
+            // `multi_key_factory_available` calls this with an empty probe key
+            // to ask which ids have a factory; reading OpenCode's credential
+            // store for that would be I/O at construction.
+            let org_id = if id == "opencode-zen" && !key.is_empty() {
+                clawde_core::AuthStore::opencode_org_id()
+            } else {
+                None
+            };
             let mut provider = provider.with_api_key(key);
+            if let Some(org) = org_id {
+                provider = provider.with_header("x-org-id", org);
+            }
             if let Some(base) = crate::providers::free::free_upstream_base_url_override(id) {
                 provider = provider.with_base_url(base);
             }
@@ -266,7 +277,18 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
             }
             "github-copilot" => Some(Arc::new(CopilotProvider::new(key)) as Arc<dyn LlmProvider>),
             id => crate::providers::openai_compat_providers::provider_for_id(id).map(|p| {
+                // An organization-scoped OpenCode Console account is only
+                // authorized when the request names the org; a personal one
+                // has no org and needs no header.
+                let org_id = if id == "opencode-zen" {
+                    clawde_core::AuthStore::opencode_org_id()
+                } else {
+                    None
+                };
                 let mut p = p.with_api_key(key);
+                if let Some(org) = org_id {
+                    p = p.with_header("x-org-id", org);
+                }
                 if let Some(base) = crate::providers::free::free_upstream_base_url_override(id) {
                     p = p.with_base_url(base);
                 }

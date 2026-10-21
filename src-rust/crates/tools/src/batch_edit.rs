@@ -5,7 +5,7 @@
 // fails after some files have already been written, the tool attempts to
 // restore those files from in-memory backups.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{PermissionLevel, Tool, ToolContext, ToolErrorCode, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -88,11 +88,19 @@ impl Tool for BatchEditTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: BatchEditInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Invalid input: {}", e),
+                )
+            }
         };
 
         if params.edits.is_empty() {
-            return ToolResult::error("edits array must not be empty".to_string());
+            return ToolResult::error_with_code(
+                ToolErrorCode::InvalidInput,
+                "edits array must not be empty".to_string(),
+            );
         }
 
         // Permission check (one check covers the whole batch).
@@ -100,7 +108,7 @@ impl Tool for BatchEditTool {
         if let Err(e) =
             ctx.check_permission_for_tool(self, &format!("BatchEdit: {}", description), false)
         {
-            return ToolResult::error(e.to_string());
+            return ToolResult::error_with_code(ToolErrorCode::PermissionDenied, e.to_string());
         }
 
         // ----------------------------------------------------------------
@@ -183,11 +191,14 @@ impl Tool for BatchEditTool {
         }
 
         if !pre_check_errors.is_empty() {
-            return ToolResult::error(format!(
-                "BatchEdit aborted — {} validation error(s):\n{}",
-                pre_check_errors.len(),
-                pre_check_errors.join("\n")
-            ));
+            return ToolResult::error_with_code(
+                ToolErrorCode::InvalidInput,
+                format!(
+                    "BatchEdit aborted — {} validation error(s):\n{}",
+                    pre_check_errors.len(),
+                    pre_check_errors.join("\n")
+                ),
+            );
         }
 
         let edit_count = prepared.len();
@@ -374,6 +385,7 @@ mod tests {
             )
             .await;
         assert!(res.is_error, "ambiguous edit must abort: {}", res.content);
+        assert_eq!(res.error_code, Some(ToolErrorCode::InvalidInput));
         assert!(
             res.content.contains("line 2, 4"),
             "aborted batch should name the matching lines, got: {}",

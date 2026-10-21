@@ -60,10 +60,14 @@ impl Tool for McpToolWrapper {
         match self.manager.call_tool_binding(&self.binding, args).await {
             Ok(result) => {
                 let text = clawde_mcp::mcp_result_to_string(&result);
+                let images = mcp_result_images(&result);
                 if result.is_error {
                     ToolResult::error_with_code(ToolErrorCode::ExecutionFailed, text)
                 } else {
-                    ToolResult::success(text)
+                    // MCP image content (screenshots, rendered charts, page
+                    // captures) reaches the model as image blocks; a text
+                    // preview of base64 is not something a model can look at.
+                    ToolResult::success(text).with_images(images)
                 }
             }
             Err(error) => ToolResult::error_with_code(
@@ -72,6 +76,26 @@ impl Tool for McpToolWrapper {
             ),
         }
     }
+}
+
+/// Image content blocks from an MCP tool result, ready to attach to the
+/// model-facing result.
+fn mcp_result_images(result: &clawde_mcp::CallToolResult) -> Vec<clawde_core::types::ImageSource> {
+    result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            clawde_mcp::McpContent::Image { data, mime_type } => {
+                Some(clawde_core::types::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: Some(mime_type.clone()),
+                    data: Some(data.clone()),
+                    url: None,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Build wrappers for all tools exposed by a connected MCP manager.
@@ -134,5 +158,31 @@ mod tests {
             manager: Arc::new(clawde_mcp::McpManager::new()),
         };
         assert!(wrapper.self_gates());
+    }
+
+    /// Image content from an MCP server (a screenshot tool, a rendered chart)
+    /// becomes a real image block: the text preview of base64 that the string
+    /// form carries is unreadable to the model.
+    #[test]
+    fn mcp_image_content_becomes_an_image_source() {
+        let result = clawde_mcp::CallToolResult {
+            content: vec![
+                clawde_mcp::McpContent::Text {
+                    text: "captured the window".to_string(),
+                },
+                clawde_mcp::McpContent::Image {
+                    data: "AAAA".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            ],
+            is_error: false,
+        };
+
+        let images = super::mcp_result_images(&result);
+
+        assert_eq!(images.len(), 1, "only image content becomes an image");
+        assert_eq!(images[0].source_type, "base64");
+        assert_eq!(images[0].media_type.as_deref(), Some("image/png"));
+        assert_eq!(images[0].data.as_deref(), Some("AAAA"));
     }
 }

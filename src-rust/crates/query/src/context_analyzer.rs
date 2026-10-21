@@ -114,6 +114,9 @@ fn content_tokens(content: &MessageContent) -> u64 {
                             .sum(),
                     }
                 }
+                ContentBlock::Image { .. } => {
+                    clawde_core::message_utils::IMAGE_TOKEN_EQUIVALENT_CHARS as u64
+                }
                 _ => 10,
             })
             .sum(),

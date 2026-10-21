@@ -129,6 +129,42 @@ pub struct AuthStore {
     loaded_file_hash: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
+/// A credential resolved from OpenCode's own store.
+///
+/// OpenCode 2 keeps credentials in `~/.local/share/opencode/opencode.db`
+/// (`credential.value`, a tagged union of `key`, `oauth` and `external`)
+/// instead of the flat `auth.json` map older releases wrote. Both shapes are
+/// read here so a migrated machine and one that never migrated resolve the
+/// same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeCredential {
+    /// What goes in `Authorization: Bearer` — an API key or an OAuth access
+    /// token; the provider sends either the same way.
+    pub token: String,
+    /// Console organization, sent as `x-org-id` by an organization-scoped
+    /// account. Absent for a personal one.
+    pub org_id: Option<String>,
+}
+
+/// One decoded `credential.value` row from OpenCode's v2 store.
+#[derive(Debug)]
+enum OpencodeStoredValue {
+    Key {
+        key: String,
+        org_id: Option<String>,
+    },
+    OAuth {
+        method_id: String,
+        access: String,
+        refresh: String,
+        /// Absolute expiry in epoch milliseconds, as OpenCode writes it
+        /// (`Date.now() + expires_in * 1000`).
+        expires_ms: Option<i64>,
+        server: String,
+        metadata: serde_json::Map<String, serde_json::Value>,
+    },
+}
+
 /// Result of [`AuthStore::salvage_auth_store`]: the recoverable maps plus a
 /// human-readable reason for every dropped entry.
 struct SalvageResult {
@@ -324,61 +360,383 @@ impl AuthStore {
         crate::config::Settings::config_dir().join("auth.json")
     }
 
-    /// Read the current OpenCode CLI API key without modifying either auth
-    /// store. OpenCode writes a flat map at `~/.local/share/opencode/auth.json`
-    /// with records such as `{ "type": "api", "key": "..." }` keyed by the
-    /// provider ID. The current Zen ID is `opencode`; the two Clawde IDs are
-    /// accepted as compatibility aliases because OpenCode has changed naming
-    /// across releases.
+    /// The active OpenCode credential, without modifying Clawde's auth store.
     ///
-    /// This deliberately does not accept the generic `{ "providers": ...,
-    /// "apiKey": ... }` shape: importing arbitrary provider entries could send
-    /// an OpenAI or Anthropic key to Zen by mistake. File and parse failures are
-    /// silent and fail closed; credential values are never logged.
-    pub fn opencode_cli_api_key() -> Option<String> {
+    /// Order of sources:
+    ///
+    /// 1. OpenCode 2's `credential` table (`opencode.db`), rows marked active
+    ///    first and newest first — this is where both new-style API keys and
+    ///    Console OAuth sessions live.
+    /// 2. The legacy flat `~/.local/share/opencode/auth.json` map, whose
+    ///    records are `{ "type": "api", "key": "..." }` keyed by provider ID.
+    ///    The old parser deliberately does not accept the generic
+    ///    `{ "providers": ..., "apiKey": ... }` shape: importing arbitrary
+    ///    provider entries could send an OpenAI or Anthropic key to Zen.
+    ///
+    /// An OAuth row whose access token has expired (or is about to) is
+    /// refreshed through the Console token endpoint and the rotated record is
+    /// written back to `opencode.db`, so OpenCode and Clawde keep sharing one
+    /// session instead of invalidating each other's refresh token. File, parse
+    /// and refresh failures fail closed; credential values are never logged.
+    pub fn opencode_credential() -> Option<OpencodeCredential> {
+        // A cargo test harness must not resolve the developer's real OpenCode
+        // login: a machine with a live Console session would otherwise hand
+        // tests a token for "no OpenCode key configured" cases, and a refresh
+        // would even rotate that session. The DB readers stay testable because
+        // the tests call them with an explicit path.
+        if crate::config::Settings::running_under_cargo_test() {
+            return None;
+        }
         let dir = dirs::data_local_dir()?.join("opencode");
+        if let Some(credential) = Self::opencode_db_credential(&dir.join("opencode.db")) {
+            return Some(credential);
+        }
         let raw = std::fs::read_to_string(dir.join("auth.json")).ok();
         raw.as_deref()
             .and_then(Self::parse_opencode_cli_api_key)
-            .or_else(|| Self::opencode_db_api_key(&dir.join("opencode.db")))
+            .map(|token| OpencodeCredential {
+                token,
+                org_id: None,
+            })
     }
 
-    /// Read the newest OpenCode API key from the v2 credential table in
-    /// `opencode.db`. Rows are `credential(integration_id, value JSON)` where
-    /// `value` is a tagged union: `{"type":"key","key":...}` or an OAuth
-    /// record. Only `key` rows under the `opencode` integration are used.
-    /// The database is opened read-only; any failure fails closed to `None`.
-    fn opencode_db_api_key(path: &Path) -> Option<String> {
-        if !path.is_file() {
+    /// The bearer token for OpenCode, from [`Self::opencode_credential`].
+    pub fn opencode_cli_api_key() -> Option<String> {
+        Self::opencode_credential().map(|credential| credential.token)
+    }
+
+    /// Console organization id for the active OpenCode credential.
+    ///
+    /// Read separately from the token so a provider can attach `x-org-id`
+    /// without re-resolving (and possibly re-refreshing) the credential.
+    pub fn opencode_org_id() -> Option<String> {
+        // Same isolation as `opencode_credential`: a test harness must not read
+        // the developer's OpenCode database, or a free-chain build under test
+        // would carry a real organization header.
+        if crate::config::Settings::running_under_cargo_test() {
             return None;
         }
-        let conn =
+        let path = dirs::data_local_dir()?.join("opencode").join("opencode.db");
+        Self::opencode_db_rows(&path)
+            .into_iter()
+            .find_map(|(_, raw)| {
+                let stored = Self::parse_opencode_stored_value(&raw)?;
+                match stored {
+                    OpencodeStoredValue::Key { org_id, .. } => org_id,
+                    OpencodeStoredValue::OAuth { metadata, .. } => metadata
+                        .get("orgID")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                }
+            })
+    }
+
+    /// Every `credential` row for OpenCode's integration, in selection order.
+    ///
+    /// OpenCode's own queries order by `active` ascending, `time_created`
+    /// ascending, `id` — the *last* row is the selected one. Selecting the
+    /// first row here means ordering descending, which keeps the same choice
+    /// without depending on a reverse scan.
+    fn opencode_db_rows(path: &Path) -> Vec<(String, String)> {
+        if !path.is_file() {
+            return Vec::new();
+        }
+        let Ok(conn) =
             rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .ok()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT value FROM credential \
-                 WHERE integration_id = 'opencode' ORDER BY time_created DESC",
-            )
-            .ok()?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
-        let mut found = None;
-        for raw in rows.flatten() {
-            if let Some(key) = Self::parse_opencode_db_value(&raw) {
-                found = Some(key);
-                break;
+        else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, value FROM credential WHERE integration_id = 'opencode' \
+             ORDER BY active DESC, time_created DESC, id DESC",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
+    }
+
+    fn opencode_db_credential(path: &Path) -> Option<OpencodeCredential> {
+        for (row_id, raw) in Self::opencode_db_rows(path) {
+            let Some(stored) = Self::parse_opencode_stored_value(&raw) else {
+                continue;
+            };
+            match stored {
+                OpencodeStoredValue::Key { key, org_id } => {
+                    return Some(OpencodeCredential { token: key, org_id });
+                }
+                OpencodeStoredValue::OAuth {
+                    method_id,
+                    access,
+                    refresh,
+                    expires_ms,
+                    server,
+                    metadata,
+                } => {
+                    if !Self::opencode_token_is_stale(expires_ms, Self::now_ms()) {
+                        let org_id = metadata
+                            .get("orgID")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        return Some(OpencodeCredential {
+                            token: access,
+                            org_id,
+                        });
+                    }
+                    if let Some(credential) = Self::refresh_opencode_oauth(
+                        path, &row_id, &method_id, &refresh, &server, metadata,
+                    ) {
+                        return Some(credential);
+                    }
+                    // This row cannot be used; a later row still might.
+                }
             }
         }
-        found
+        None
     }
 
-    fn parse_opencode_db_value(raw: &str) -> Option<String> {
-        let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("key") {
+    /// Whether a stored access token must be refreshed before use.
+    ///
+    /// A token that expires while a request is in flight is indistinguishable
+    /// from an invalid one, so the skew refreshes slightly early. A row with no
+    /// `expires` predates the field and is refreshed too.
+    fn opencode_token_is_stale(expires_ms: Option<i64>, now_ms: i64) -> bool {
+        const SKEW_MS: i64 = 60_000;
+        match expires_ms {
+            Some(expires) => expires.saturating_sub(SKEW_MS) <= now_ms,
+            None => true,
+        }
+    }
+
+    /// Exchange a Console refresh token for a new session.
+    ///
+    /// Mirrors OpenCode's own `refresh`: `POST {server}/auth/device/token` with
+    /// `grant_type=refresh_token`, the stored refresh token and the CLI client
+    /// id. The response rotates both tokens, so the new record is written back
+    /// to `opencode.db` — otherwise OpenCode's copy would keep a refresh token
+    /// the server has already retired.
+    fn refresh_opencode_oauth(
+        path: &Path,
+        row_id: &str,
+        method_id: &str,
+        refresh: &str,
+        server: &str,
+        mut metadata: serde_json::Map<String, serde_json::Value>,
+    ) -> Option<OpencodeCredential> {
+        const CLIENT_ID: &str = "opencode-cli";
+        let endpoint = format!("{}/auth/device/token", server.trim_end_matches('/'));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+        let response = client
+            .post(&endpoint)
+            .json(&serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": CLIENT_ID,
+            }))
+            .send()
+            .ok()?;
+        if !response.status().is_success() {
+            // A 400 `invalid_grant` means the session was revoked and only a
+            // new device login recovers; every other status is transient. Both
+            // fail closed here, and neither logs the token.
+            tracing::warn!(
+                status = response.status().as_u16(),
+                "OpenCode Console token refresh failed"
+            );
             return None;
         }
-        let key = value.get("key")?.as_str()?.trim();
-        (key.len() >= 8).then(|| key.to_string())
+        let body: serde_json::Value = response.json().ok()?;
+        let access = body
+            .get("access_token")
+            .and_then(serde_json::Value::as_str)?
+            .trim();
+        if access.len() < 8 {
+            return None;
+        }
+        let rotated = body
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+            .unwrap_or(refresh);
+        let expires_in = body
+            .get("expires_in")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(3600);
+        let expires_ms = Self::now_ms().saturating_add((expires_in as i64).saturating_mul(1000));
+        let org_id = match body.get("org_id").and_then(serde_json::Value::as_str) {
+            Some(org) => {
+                metadata.insert(
+                    "orgID".to_string(),
+                    serde_json::Value::String(org.to_string()),
+                );
+                Some(org.to_string())
+            }
+            None => metadata
+                .get("orgID")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        };
+        let value = serde_json::json!({
+            "type": "oauth",
+            "methodID": method_id,
+            "access": access,
+            "refresh": rotated,
+            "expires": expires_ms,
+            "metadata": metadata,
+        });
+        if !Self::persist_opencode_credential(path, row_id, &value) {
+            // The rotation already happened upstream, so discarding the new
+            // token would leave both processes signed out. Keep using it, but
+            // say that OpenCode's copy is now the stale one.
+            tracing::warn!(
+                "refreshed OpenCode credential could not be written back to opencode.db"
+            );
+        }
+        Some(OpencodeCredential {
+            token: access.to_string(),
+            org_id,
+        })
+    }
+
+    /// Write a rotated credential back into OpenCode's database.
+    ///
+    /// Opened read-write only for this one statement, with a short busy timeout
+    /// because OpenCode holds the database while it runs. Returns whether the
+    /// row was updated; a failure is reported by the caller, never fatal.
+    fn persist_opencode_credential(path: &Path, row_id: &str, value: &serde_json::Value) -> bool {
+        let Ok(conn) = rusqlite::Connection::open(path) else {
+            return false;
+        };
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(2_000));
+        conn.execute(
+            "UPDATE credential SET value = ?1, time_updated = ?2 WHERE id = ?3",
+            rusqlite::params![value.to_string(), Self::now_ms(), row_id],
+        )
+        .map(|updated| updated == 1)
+        .unwrap_or(false)
+    }
+
+    fn now_ms() -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    /// Decode one `credential.value` JSON blob.
+    ///
+    /// `external` rows point at a credential managed outside the store, so
+    /// there is nothing to send and they are skipped. A `key` row from before
+    /// v2.1 also carries a legacy `configuration` object, which is irrelevant
+    /// to the token.
+    fn parse_opencode_stored_value(raw: &str) -> Option<OpencodeStoredValue> {
+        const DEFAULT_SERVER: &str = "https://opencode.ai/console";
+        let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+        let metadata = value
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let org_id = metadata
+            .get("orgID")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        match value.get("type").and_then(serde_json::Value::as_str)? {
+            "key" => {
+                let key = value.get("key").and_then(serde_json::Value::as_str)?.trim();
+                (key.len() >= 8).then(|| OpencodeStoredValue::Key {
+                    key: key.to_string(),
+                    org_id,
+                })
+            }
+            "oauth" => {
+                let access = value
+                    .get("access")
+                    .and_then(serde_json::Value::as_str)?
+                    .trim();
+                let refresh = value
+                    .get("refresh")
+                    .and_then(serde_json::Value::as_str)?
+                    .trim();
+                if access.len() < 8 || refresh.is_empty() {
+                    return None;
+                }
+                let method_id = value
+                    .get("methodID")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("device")
+                    .to_string();
+                let expires_ms = value.get("expires").and_then(serde_json::Value::as_i64);
+                // Credentials saved before August 2026 point at the retired
+                // `console.opencode.ai` host, which maps path-for-path onto the
+                // default server (OpenCode rewrites it the same way).
+                let server = metadata
+                    .get("server")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(DEFAULT_SERVER)
+                    .replace("https://console.opencode.ai", DEFAULT_SERVER);
+                Some(OpencodeStoredValue::OAuth {
+                    method_id,
+                    access: access.to_string(),
+                    refresh: refresh.to_string(),
+                    expires_ms,
+                    server,
+                    metadata,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Read an OpenCode API key from a user-chosen credential file. The format
+    /// is auto-detected: an OpenCode `auth.json` record, a `.env` line
+    /// (`OPENCODE_API_KEY=...`, optionally `export`ed and quoted), or plain text
+    /// whose first non-comment line is the key. Legacy `sk-` keys are rejected
+    /// because OpenCode returns 401 for them. Errors name the file, never the
+    /// key contents.
+    pub fn read_opencode_credential_file(path: &Path) -> Result<String, String> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+        Self::parse_opencode_credential_text(&raw).ok_or_else(|| {
+            format!(
+                "No usable OpenCode key found in {} (expected an auth.json record, \
+                 OPENCODE_API_KEY=..., or a line holding an oc_sk_ key; legacy sk- keys \
+                 are expired).",
+                path.display()
+            )
+        })
+    }
+
+    fn parse_opencode_credential_text(raw: &str) -> Option<String> {
+        if let Some(key) = Self::parse_opencode_cli_api_key(raw) {
+            return Self::accept_opencode_key(key);
+        }
+        raw.lines().map(str::trim).find_map(|line| {
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let value = match line.strip_prefix("export ") {
+                Some(rest) => rest.trim_start(),
+                None => line,
+            };
+            let candidate = match value.split_once('=') {
+                Some((name, rhs)) if name.trim() == "OPENCODE_API_KEY" => {
+                    rhs.trim().trim_matches(|c| c == '"' || c == '\'')
+                }
+                Some(_) => return None,
+                None => value,
+            };
+            Self::accept_opencode_key(candidate.to_string())
+        })
+    }
+
+    fn accept_opencode_key(key: String) -> Option<String> {
+        let key = key.trim().to_string();
+        (key.len() >= 8 && !key.starts_with("sk-")).then_some(key)
     }
 
     fn parse_opencode_cli_api_key(raw: &str) -> Option<String> {
@@ -1022,20 +1380,105 @@ mod tests {
     }
 
     #[test]
-    fn opencode_db_value_accepts_key_rows_and_rejects_oauth() {
+    fn credential_file_autodetects_json_env_and_plain_text() {
+        let json = r#"{"opencode":{"type":"api","key":"oc_sk_json_000000000000"}}"#;
         assert_eq!(
-            AuthStore::parse_opencode_db_value(
-                r#"{"type":"key","key":"oc_sk_8ee113ce433c_secretvalue"}"#
-            )
-            .as_deref(),
-            Some("oc_sk_8ee113ce433c_secretvalue")
+            AuthStore::parse_opencode_credential_text(json).as_deref(),
+            Some("oc_sk_json_000000000000")
         );
+        let env = "# comment\nexport OPENCODE_API_KEY=\"oc_sk_env_000000000000\"\n";
         assert_eq!(
-            AuthStore::parse_opencode_db_value(
-                r#"{"type":"oauth","refresh":"r","access":"a","expires":0}"#
-            ),
+            AuthStore::parse_opencode_credential_text(env).as_deref(),
+            Some("oc_sk_env_000000000000")
+        );
+        let plain = "\n# note\noc_sk_plain_000000000000\n";
+        assert_eq!(
+            AuthStore::parse_opencode_credential_text(plain).as_deref(),
+            Some("oc_sk_plain_000000000000")
+        );
+    }
+
+    #[test]
+    fn credential_file_rejects_legacy_and_unrelated_content() {
+        assert_eq!(
+            AuthStore::parse_opencode_credential_text("sk-legacykey1234567890"),
             None
         );
+        assert_eq!(
+            AuthStore::parse_opencode_credential_text("OPENAI_API_KEY=sk-other-123456789"),
+            None
+        );
+        assert_eq!(AuthStore::parse_opencode_credential_text("short"), None);
+    }
+
+    #[test]
+    fn opencode_stored_value_accepts_key_and_oauth_rows() {
+        let key = AuthStore::parse_opencode_stored_value(
+            r#"{"type":"key","key":"oc_sk_8ee113ce433c_secretvalue"}"#,
+        );
+        assert!(matches!(
+            key,
+            Some(super::OpencodeStoredValue::Key { ref key, org_id: None })
+                if key == "oc_sk_8ee113ce433c_secretvalue"
+        ));
+
+        // The v2.1 OAuth shape: `access`/`refresh`/`expires` (epoch ms), not
+        // the `access_token`/`refresh_token` names the token endpoint returns.
+        let oauth = AuthStore::parse_opencode_stored_value(
+            r#"{"type":"oauth","methodID":"device","access":"session-token-1234",
+                "refresh":"refresh-token-1234","expires":1760000000000,
+                "metadata":{"server":"https://console.opencode.ai","orgID":"org_1"}}"#,
+        );
+        match oauth {
+            Some(super::OpencodeStoredValue::OAuth {
+                method_id,
+                access,
+                refresh,
+                expires_ms,
+                server,
+                metadata,
+            }) => {
+                assert_eq!(method_id, "device");
+                assert_eq!(access, "session-token-1234");
+                assert_eq!(refresh, "refresh-token-1234");
+                assert_eq!(expires_ms, Some(1_760_000_000_000));
+                // The retired console host maps onto the current one.
+                assert_eq!(server, "https://opencode.ai/console");
+                assert_eq!(
+                    metadata.get("orgID").and_then(|v| v.as_str()),
+                    Some("org_1")
+                );
+            }
+            other => panic!("expected an OAuth row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opencode_stored_value_skips_external_and_short_secrets() {
+        // `external` points at a credential managed outside the store: there is
+        // no bearer token to send.
+        assert!(
+            AuthStore::parse_opencode_stored_value(r#"{"type":"external","methodID":"aws"}"#)
+                .is_none()
+        );
+        assert!(
+            AuthStore::parse_opencode_stored_value(r#"{"type":"key","key":"short"}"#).is_none()
+        );
+        assert!(AuthStore::parse_opencode_stored_value(r#"{"type":"oauth"}"#).is_none());
+        assert!(AuthStore::parse_opencode_stored_value("not json").is_none());
+    }
+
+    #[test]
+    fn opencode_token_staleness_refreshes_early_and_treats_missing_expiry_as_stale() {
+        let now = 1_760_000_000_000;
+        assert!(!AuthStore::opencode_token_is_stale(
+            Some(now + 3_600_000),
+            now
+        ));
+        // Inside the skew window: refresh before the request can outlive it.
+        assert!(AuthStore::opencode_token_is_stale(Some(now + 30_000), now));
+        assert!(AuthStore::opencode_token_is_stale(Some(now - 1), now));
+        assert!(AuthStore::opencode_token_is_stale(None, now));
     }
 
     #[test]
@@ -1063,9 +1506,200 @@ mod tests {
         .expect("seed temp db");
         drop(conn);
 
-        let found = AuthStore::opencode_db_api_key(&path);
+        let found = AuthStore::opencode_db_credential(&path);
         let _ = std::fs::remove_file(&path);
-        assert_eq!(found.as_deref(), Some("oc_sk_new_111111111111"));
+        assert_eq!(
+            found.map(|credential| credential.token).as_deref(),
+            Some("oc_sk_new_111111111111")
+        );
+    }
+
+    /// A live OAuth row is used as-is; the refresh path is only for a token
+    /// that has already expired, which a test must not trigger over the
+    /// network.
+    #[test]
+    fn opencode_db_reader_uses_a_live_oauth_session_and_its_org() {
+        let path = std::env::temp_dir().join(format!(
+            "clawde-opencode-db-oauth-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let expires = AuthStore::now_ms() + 3_600_000;
+        let conn = rusqlite::Connection::open(&path).expect("open temp db");
+        conn.execute_batch(
+            "CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL,
+               value TEXT NOT NULL, connector_id TEXT, method_id TEXT, active INTEGER,
+               time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);",
+        )
+        .expect("create temp table");
+        conn.execute(
+            "INSERT INTO credential VALUES ('signed-in','opencode','default',?1,NULL,'device',1,2,2)",
+            [format!(
+                r#"{{"type":"oauth","methodID":"device","access":"session-token-1234",
+                     "refresh":"refresh-token-1234","expires":{expires},
+                     "metadata":{{"orgID":"org_1"}}}}"#
+            )],
+        )
+        .expect("seed oauth row");
+        drop(conn);
+
+        let found = AuthStore::opencode_db_credential(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            found,
+            Some(super::OpencodeCredential {
+                token: "session-token-1234".to_string(),
+                org_id: Some("org_1".to_string()),
+            })
+        );
+    }
+
+    /// The refresh seam, against a loopback token endpoint: an expired OAuth
+    /// row is exchanged for a new session using the exact request OpenCode
+    /// sends (`grant_type=refresh_token`, the stored refresh token, the CLI
+    /// client id), and the rotated record is written back so OpenCode does not
+    /// keep a retired refresh token.
+    #[test]
+    fn expired_oauth_row_is_refreshed_and_written_back() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("listener address").port();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept one request");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while let Ok(read) = stream.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let Some(head_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let content_len = text[..head_end]
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= head_end + 4 + content_len {
+                    break;
+                }
+            }
+            let _ = request_tx.send(String::from_utf8_lossy(&buf).to_string());
+            let body = r#"{"access_token":"fresh-access-token","refresh_token":"rotated-refresh-token","expires_in":3600,"org_id":"org_2"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "clawde-opencode-db-refresh-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let conn = rusqlite::Connection::open(&path).expect("open temp db");
+        conn.execute_batch(
+            "CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL,
+               value TEXT NOT NULL, connector_id TEXT, method_id TEXT, active INTEGER,
+               time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);",
+        )
+        .expect("create temp table");
+        conn.execute(
+            "INSERT INTO credential VALUES ('signed-in','opencode','default',?1,NULL,'device',1,1,1)",
+            [format!(
+                r#"{{"type":"oauth","methodID":"device","access":"stale-access-token",
+                     "refresh":"stale-refresh-token","expires":1,
+                     "metadata":{{"server":"http://127.0.0.1:{port}"}}}}"#
+            )],
+        )
+        .expect("seed expired oauth row");
+        drop(conn);
+
+        let credential = AuthStore::opencode_db_credential(&path);
+        let request = request_rx.recv_timeout(std::time::Duration::from_secs(10));
+        server.join().expect("server thread");
+
+        assert_eq!(
+            credential,
+            Some(super::OpencodeCredential {
+                token: "fresh-access-token".to_string(),
+                org_id: Some("org_2".to_string()),
+            })
+        );
+        let request = request.expect("the refresh endpoint received a request");
+        assert!(
+            request.contains("POST /auth/device/token "),
+            "unexpected request line: {request}"
+        );
+        assert!(
+            request.contains(r#""grant_type":"refresh_token""#),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""refresh_token":"stale-refresh-token""#),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""client_id":"opencode-cli""#),
+            "{request}"
+        );
+
+        // The rotated pair must land back in OpenCode's row.
+        let conn = rusqlite::Connection::open(&path).expect("reopen temp db");
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM credential WHERE id = 'signed-in'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row still exists");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let stored: serde_json::Value = serde_json::from_str(&stored).expect("valid JSON");
+        assert_eq!(
+            stored.get("access").and_then(|v| v.as_str()),
+            Some("fresh-access-token")
+        );
+        assert_eq!(
+            stored.get("refresh").and_then(|v| v.as_str()),
+            Some("rotated-refresh-token")
+        );
+        assert_eq!(stored.get("type").and_then(|v| v.as_str()), Some("oauth"));
+        assert_eq!(
+            stored.get("methodID").and_then(|v| v.as_str()),
+            Some("device")
+        );
+        let expires = stored
+            .get("expires")
+            .and_then(|v| v.as_i64())
+            .expect("expiry written");
+        assert!(
+            expires > AuthStore::now_ms(),
+            "expiry must be in the future"
+        );
+        assert_eq!(
+            stored
+                .get("metadata")
+                .and_then(|m| m.get("orgID"))
+                .and_then(|v| v.as_str()),
+            Some("org_2")
+        );
     }
 
     #[test]

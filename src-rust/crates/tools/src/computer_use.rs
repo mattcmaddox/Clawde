@@ -494,13 +494,21 @@ fn take_screenshot() -> ToolResult {
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes);
 
+    // The screenshot goes back as an image block, not as a data URL inside the
+    // text: a model cannot see a base64 string, and embedding it in the
+    // transcript cost ~1.3 MB per capture for nothing.
     ToolResult::success(format!(
-        "Screenshot captured ({}x{} → JPEG, {} bytes base64).\ndata:image/jpeg;base64,{}",
+        "Screenshot captured ({}x{} → JPEG, {} bytes base64). The image is attached.",
         orig_w,
         orig_h,
-        b64.len(),
-        b64
+        b64.len()
     ))
+    .with_images(vec![clawde_core::types::ImageSource {
+        source_type: "base64".to_string(),
+        media_type: Some("image/jpeg".to_string()),
+        data: Some(b64),
+        url: None,
+    }])
 }
 
 // ---------------------------------------------------------------------------

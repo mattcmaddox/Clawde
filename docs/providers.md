@@ -109,6 +109,35 @@ and in what order:
 OpenCode Zen reads the `opencode-go` key slots as a fallback in all three
 resolvers.
 
+### OpenCode credentials (OpenCode 2 / Console)
+
+OpenCode 2 keeps credentials in `~/.local/share/opencode/opencode.db` (the
+`credential` table, `integration_id = 'opencode'`) instead of the flat
+`auth.json` map older releases wrote. `AuthStore::opencode_credential` reads
+the database first and falls back to `auth.json`, decoding the tagged
+`credential.value` union:
+
+- `{"type":"key","key":"..."}` — an API key.
+- `{"type":"oauth","access":...,"refresh":...,"expires":<epoch ms>}` — a
+  Console session. A live access token is used as-is; one that is expired (or
+  within 60 s of expiring) is exchanged at `POST {server}/auth/device/token`
+  with `grant_type=refresh_token` and `client_id=opencode-cli`, and the rotated
+  record is written back to `opencode.db`. Writing it back matters: the
+  endpoint rotates the refresh token, so a refresh Clawde kept to itself would
+  leave OpenCode holding a retired one.
+- `{"type":"external",...}` — a credential managed outside the store, so
+  there is nothing to send and the row is skipped.
+
+Rows are selected active-first then newest-first, matching OpenCode's own
+query. Either kind of credential is sent as `Authorization: Bearer`; when it
+carries `metadata.orgID`, the request also gets `x-org-id`, because an
+organization-scoped Console account is only authorized with it. A refresh that
+fails (revoked session, network error) fails closed with a warning and never
+logs the token.
+
+Keys pasted with `/connect` or `clawde /keys` take precedence: they live in
+`~/.clawde/auth.json` and the resolvers read those slots before this fallback.
+
 Health probes distinguish invalid credentials from transient provider trouble:
 401/403-style failures mark a key unhealthy, while 429, 5xx, connection, and
 empty-response failures are shown as transient and do not evict the key. Health
@@ -1127,6 +1156,7 @@ object), keyed by the fully-qualified `"provider/model"` id:
 | `name` | string | Human-readable display name shown in the model picker |
 | `releaseDate` | string | ISO 8601 date; drives newest-first ordering in the picker |
 | `status` | string | Lifecycle status (`active`, `beta`, `alpha`, `deprecated`) |
+| `vision` | boolean | Whether the model accepts image input. Marks a local tag or self-hosted alias as image-capable so IMAGE mode can switch to it; `false` demotes a catalog entry that rejects images. |
 
 Field names accept both camelCase (`contextWindow`) and snake_case
 (`context_window`). The key **must** contain a `/` — a bare model id is ignored,
@@ -1136,3 +1166,22 @@ When the keyed model exists in the catalog, the override patches it in place.
 When it does not (a self-hosted alias), Clawde materialises a synthetic entry
 so the corrected values flow everywhere the metadata is read: the `/model`
 picker, the token-usage warnings, and the auto-compact thresholds.
+
+`vision` is how a local runtime gets IMAGE mode. Ollama publishes
+`capabilities: ["vision"]` per tag and Clawde reads it during model discovery,
+but a tag that has never been discovered — or a `custom-openai` endpoint, which
+publishes no capability data at all — needs the override:
+
+```json
+{
+  "modelOverrides": {
+    "ollama/llama3.2-vision:11b": { "vision": true },
+    "custom-openai/my-vlm": { "vision": true }
+  }
+}
+```
+
+With it, Tab reaches IMAGE mode and the mode keeps that model (it is already
+the vision pick). Without it and without a discovery answer, the mode falls
+back to the provider's own capability claim, and attaching an image to a model
+Clawde knows is text-only raises a warning instead of a failed turn.

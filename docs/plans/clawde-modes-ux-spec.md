@@ -86,7 +86,9 @@ dropped/pasted file path) or at submit, through
 `App::apply_pending_image_switch` — so tab-cycling through IMAGE never changes
 the model, and a mode the user only passed through restores nothing. Leaving
 the mode after a swap restores the saved model unless the user picked one in
-the meantime. There is also a "fast mode" toggle (test:
+the meantime. Tab, `--agent image` and `/agent image` all enter through
+`App::enter_image_mode`, and the badge reads `IMAGE · WAITING` until the swap
+happens. There is also a "fast mode" toggle (test:
 `test_fast_slash_command_toggles_fast_mode`). The user's "build/plan/image"
 report is confirmed by code — not just a report.
 

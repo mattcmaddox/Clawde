@@ -253,6 +253,13 @@ impl ToolErrorCode {
 pub struct ToolResult {
     /// Content to send back to the model as the tool result.
     pub content: String,
+    /// Images the tool produced, sent to the model as real image blocks.
+    ///
+    /// A tool that captures or renders an image — a screenshot, a chart, an
+    /// MCP image result — cannot express it in `content`: base64 in a text
+    /// block is unreadable to the model and bloats the transcript. The dispatch
+    /// layer turns each entry into a `ContentBlock::Image` next to the text.
+    pub images: Vec<clawde_core::types::ImageSource>,
     /// Whether this invocation was an error.
     pub is_error: bool,
     /// Optional stable category for an error result.
@@ -265,6 +272,7 @@ impl ToolResult {
     pub fn success(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            images: Vec::new(),
             is_error: false,
             error_code: None,
             metadata: None,
@@ -274,6 +282,7 @@ impl ToolResult {
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            images: Vec::new(),
             is_error: true,
             error_code: None,
             metadata: None,
@@ -283,6 +292,7 @@ impl ToolResult {
     pub fn error_with_code(code: ToolErrorCode, content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            images: Vec::new(),
             is_error: true,
             error_code: Some(code),
             metadata: None,
@@ -291,6 +301,13 @@ impl ToolResult {
 
     pub fn with_metadata(mut self, meta: Value) -> Self {
         self.metadata = Some(meta);
+        self
+    }
+
+    /// Attach images the tool produced, so the model receives them as image
+    /// blocks rather than as text it cannot see.
+    pub fn with_images(mut self, images: Vec<clawde_core::types::ImageSource>) -> Self {
+        self.images = images;
         self
     }
 }

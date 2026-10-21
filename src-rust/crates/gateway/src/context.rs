@@ -398,6 +398,9 @@ fn estimate_block_chars(block: &ContentBlock) -> usize {
         },
         ContentBlock::Thinking { thinking, .. } => thinking.len(),
         ContentBlock::RedactedThinking { data } => data.len(),
+        // Keep the gateway's context budget in step with the query loop's
+        // estimator: an image costs real tokens even though it is not text.
+        ContentBlock::Image { .. } => clawde_core::message_utils::IMAGE_TOKEN_EQUIVALENT_CHARS,
         _ => 200,
     }
 }

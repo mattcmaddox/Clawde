@@ -4916,6 +4916,28 @@ async fn run_query_loop_inner(
                                                     .to_string(),
                                             };
                                         }
+                                        // A tool can return images too (screenshot,
+                                        // chart, MCP image content). They sit
+                                        // inside the tool_result block, so the
+                                        // top-level arms above never see them —
+                                        // and a text-only model rejects the whole
+                                        // tool_result instead of degrading.
+                                        clawde_core::types::ContentBlock::ToolResult {
+                                            content: clawde_core::types::ToolResultContent::Blocks(inner),
+                                            ..
+                                        } if !caps.image_input => {
+                                            for part in inner.iter_mut() {
+                                                if matches!(
+                                                    part,
+                                                    clawde_core::types::ContentBlock::Image { .. }
+                                                ) {
+                                                    *part = clawde_core::types::ContentBlock::Text {
+                                                        text: "[Image not supported by this model]"
+                                                            .to_string(),
+                                                    };
+                                                }
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }

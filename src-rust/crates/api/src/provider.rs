@@ -47,6 +47,18 @@ pub struct ModelInfo {
     /// Lifecycle status string (`"active"`, `"beta"`, …), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+
+    /// Whether the model accepts image input.
+    ///
+    /// `false` is the conservative default: only a source that actually says
+    /// so sets it. Ollama answers this per tag in `/api/show`'s `capabilities`
+    /// array, which is the one local runtime that publishes the fact — models.dev
+    /// has no rows for `ollama`, `llamacpp` or a user's own OpenAI-compatible
+    /// endpoint. Image mode resolves its vision model from the registry first
+    /// and falls back to live-discovered models, so a pulled `llava` tag is
+    /// usable without a hand-written `modelOverrides` entry.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 impl Default for ModelInfo {
@@ -62,6 +74,7 @@ impl Default for ModelInfo {
             max_output_tokens: 0,
             release_date: None,
             status: None,
+            vision: false,
         }
     }
 }

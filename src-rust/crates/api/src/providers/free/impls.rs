@@ -665,7 +665,55 @@ impl FreeProvider {
                 });
             }
         }
-        plan
+        // Image substitution comes last: every ranking above keys on the
+        // upstream's own model names (capped models, pins), so swapping the
+        // wire model earlier would make those lookups miss.
+        plan.into_iter()
+            .filter_map(|(idx, model)| {
+                Self::substitute_vision_model(&self.chain, idx, model, has_images)
+            })
+            .collect()
+    }
+
+    /// Switch a text-only upstream's default model to its vision model when the
+    /// request carries an image.
+    ///
+    /// An explicit pin is left alone: if the user asked for
+    /// `groq/some-other-model`, sending a different model would silently ignore
+    /// them — and the capability gate has already dropped the upstream when the
+    /// pinned model cannot take images.
+    ///
+    /// The upstream's `fallback_models` rows are dropped for an image turn. They
+    /// are the alternates for a text-only default, so on an armed upstream they
+    /// can only answer an image with a 400; keeping them would spend a
+    /// guaranteed-rejected round-trip before the chain moved on. `None` means
+    /// "this row cannot serve the request".
+    fn substitute_vision_model(
+        chain: &[FreeEntry],
+        idx: usize,
+        model: String,
+        has_images: bool,
+    ) -> Option<(usize, String)> {
+        let Some(entry) = chain.get(idx) else {
+            return Some((idx, model));
+        };
+        if !has_images {
+            return Some((idx, model));
+        }
+        let Some(vision) = crate::providers::free::vision_model_for(entry.upstream.id) else {
+            return Some((idx, model));
+        };
+        let default = entry
+            .effective_model
+            .as_deref()
+            .unwrap_or(entry.upstream.default_model);
+        if model == default {
+            return Some((idx, vision.to_string()));
+        }
+        if entry.upstream.fallback_models.contains(&model.as_str()) {
+            return None;
+        }
+        Some((idx, model))
     }
 
     fn is_disabled_upstream(&self, idx: usize) -> bool {
@@ -716,7 +764,7 @@ impl FreeProvider {
         let Some(entry) = self.chain.get(idx) else {
             return true;
         };
-        if has_images && !entry.upstream.vision {
+        if has_images && !entry.upstream.supports_images() {
             return false;
         }
         if has_tools && !entry.upstream.tool_calling {
@@ -771,7 +819,9 @@ impl FreeProvider {
             .filter(|idx| !self.is_disabled_upstream(*idx))
             .collect();
         if Self::request_has_images(request)
-            && !available.iter().any(|idx| self.chain[*idx].upstream.vision)
+            && !available
+                .iter()
+                .any(|idx| self.chain[*idx].upstream.supports_images())
         {
             return Some(
                 "no enabled upstream supports image input — add a vision-capable provider via /connect (e.g. google or github-copilot)"
@@ -4329,7 +4379,7 @@ impl LlmProvider for FreeProvider {
             .map(|entry| {
                 (
                     entry.upstream.id.to_string(),
-                    entry.upstream.vision,
+                    entry.upstream.supports_images(),
                     entry.upstream.context_window,
                 )
             })
@@ -4366,7 +4416,10 @@ impl LlmProvider for FreeProvider {
         // entries (see `entry_fits_request`), so the composite advertises
         // vision iff at least one configured upstream can serve it.
         let tool_calling = self.chain.iter().any(|entry| entry.upstream.tool_calling);
-        let image_input = self.chain.iter().any(|entry| entry.upstream.vision);
+        let image_input = self
+            .chain
+            .iter()
+            .any(|entry| entry.upstream.supports_images());
         let thinking = self.chain.iter().any(|entry| entry.upstream.thinking);
 
         ProviderCapabilities {
@@ -8060,6 +8113,73 @@ mod tests {
     }
 
     #[test]
+    fn image_request_substitutes_the_upstream_vision_model() {
+        // Groq's free tier is rate-limited rather than model-gated, but its
+        // DEFAULT model is text-only. The gate admits the upstream (it hosts a
+        // vision model on the same key) and the plan must dispatch that model
+        // for an image turn — leaving the default would send the image to a
+        // model that rejects it.
+        let chain = vec![entry("groq", true)];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let vision = crate::providers::free::vision_model_for("groq").expect("groq vision model");
+
+        let image_plan = provider.attempt_plan(&Route::Auto, Some(&image_request("free/auto")));
+        assert_eq!(image_plan, vec![(0, vision.to_string())]);
+
+        let text_plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
+        assert!(
+            text_plan.iter().all(|(_, model)| model != vision),
+            "a text turn keeps the upstream default, got {text_plan:?}"
+        );
+    }
+
+    #[test]
+    fn every_vision_arm_substitutes_and_drops_text_fallbacks() {
+        // nvidia is the case with teeth: its arm id carries a slash
+        // (`google/gemma-4-31b-it`) and the entry declares a text-only fallback
+        // (`openai/gpt-oss-20b`). An image turn must dispatch the arm and must
+        // NOT also queue the fallback, which could only answer with a 400.
+        for id in ["groq", "nvidia", "zai", "openrouter"] {
+            let provider = FreeProvider::with_routing(
+                vec![entry(id, true)],
+                RoutingConfig {
+                    strategy: RoutingStrategy::Sequential,
+                    ..Default::default()
+                },
+                false,
+            );
+            let vision = crate::providers::free::vision_model_for(id)
+                .unwrap_or_else(|| panic!("{id} has a vision arm"));
+
+            let image_plan = provider.attempt_plan(&Route::Auto, Some(&image_request("free/auto")));
+            assert_eq!(
+                image_plan,
+                vec![(0, vision.to_string())],
+                "{id}: image turn must dispatch exactly the vision arm"
+            );
+
+            let text_plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
+            assert!(
+                text_plan
+                    .iter()
+                    .any(|(_, model)| model == provider.model_for_entry(0)),
+                "{id}: text turn keeps the upstream default"
+            );
+            assert!(
+                text_plan.iter().all(|(_, model)| model != vision),
+                "{id}: text turn must not use the vision arm, got {text_plan:?}"
+            );
+        }
+    }
+
+    #[test]
     fn capability_gate_drops_small_context_upstreams_for_large_request() {
         // github-copilot documents a 16K serving context — a request that
         // estimates above 16K tokens must skip it and go to the 128K upstream
@@ -8192,7 +8312,12 @@ mod tests {
         // Image request + only text-only upstreams → the plan is empty and
         // the error must explain the capability gap instead of blaming
         // cooldown (which would be actively misleading).
-        let chain = vec![entry("lane-b", true), entry("nvidia", true)];
+        //
+        // Both ids must stay free of a `vision_model_for` arm (cerebras
+        // declares `vision: false` and has none); nvidia was the second entry
+        // here until it gained a vision arm, which made the image request
+        // succeed and turned this assertion into a false failure.
+        let chain = vec![entry("lane-b", true), entry("cerebras", true)];
         let provider = FreeProvider::with_routing(
             chain,
             RoutingConfig {

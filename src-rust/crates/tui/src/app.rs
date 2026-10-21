@@ -1676,6 +1676,7 @@ pub struct App {
     pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
     /// `/keys` popup — j/k-navigable CRUD over stored API keys.
     pub keys_dialog: crate::keys_dialog::KeysDialogState,
+    pub credential_import: crate::credential_import_dialog::CredentialImportState,
     /// Custom provider dialog for URL + API key input.
     pub custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState,
     /// Ollama config dialog for host URL + model picker.
@@ -1821,6 +1822,18 @@ pub struct App {
     /// popup (every currently-free model per provider, not just the chain's
     /// effective pick).
     pub free_model_lists: Vec<(String, String, Vec<String>)>,
+    /// Models the live `/model` picker discovered for non-free providers, with
+    /// their capability flags.
+    ///
+    /// The registry (models.dev) has no rows for `ollama`, `llamacpp` or a
+    /// user's own OpenAI-compatible endpoint, so it cannot answer "is this
+    /// model vision-capable?". Live discovery can: Ollama reports
+    /// `capabilities: ["completion", "vision"]` per tag in `/api/show`, and
+    /// the CLI's picker fetch stores the parsed list here. Image mode and the
+    /// attach-time warning read it before falling back to the provider's own
+    /// capability claim. Shared with the discovery task, which runs off the
+    /// main thread.
+    pub discovered_models: std::sync::Arc<parking_lot::Mutex<Vec<clawde_api::ModelInfo>>>,
     /// Ollama connectivity mode — Auto (participates in free-model
     /// fallback) or Isolated (manual selection only).
     pub ollama_mode: clawde_core::OllamaMode,
@@ -2446,6 +2459,7 @@ impl App {
             spec_review: crate::spec_review::SpecReviewState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
             keys_dialog: crate::keys_dialog::KeysDialogState::new(),
+            credential_import: crate::credential_import_dialog::CredentialImportState::new(),
             custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState::new(),
             ollama_config_dialog: crate::ollama_config_dialog::OllamaConfigDialogState::new(),
             ollama_ping_pending: false,
@@ -2508,6 +2522,7 @@ impl App {
             key_ring_data_fn: None,
             free_model_defaults: Vec::new(),
             free_model_lists: Vec::new(),
+            discovered_models: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             ollama_mode: clawde_core::OllamaMode::default(),
             ollama_loaded_models: Vec::new(),
             ollama_vram: clawde_core::config::OllamaVramStatus::default(),
@@ -3261,6 +3276,42 @@ impl App {
         // key that was just deleted (footer `dead` marker).
         self.refresh_free_provider();
         total
+    }
+
+    /// Import an OpenCode key from the path typed into the import popup, store
+    /// it under `opencode-zen`, and reopen `/keys` to show it. Problems stay in
+    /// the popup; the key text is never echoed.
+    fn import_credential_file(&mut self) {
+        let Some(path) = self.credential_import.resolved_path() else {
+            self.credential_import.error = Some("Type or paste a file path first.".to_string());
+            return;
+        };
+        let key = match clawde_core::AuthStore::read_opencode_credential_file(&path) {
+            Ok(key) => key,
+            Err(err) => {
+                self.credential_import.error = Some(err);
+                return;
+            }
+        };
+        self.auth_store.reload();
+        let mut keys: Vec<String> = self
+            .auth_store
+            .keys_for("opencode-zen")
+            .map(<[String]>::to_vec)
+            .unwrap_or_default();
+        if keys.contains(&key) {
+            self.credential_import.error = Some("That key is already stored.".to_string());
+            return;
+        }
+        keys.push(key);
+        let total = self.apply_key_edits(&[("opencode-zen", keys)], &[]);
+        self.credential_import.close();
+        self.open_keys_dialog();
+        self.status_message = Some(format!(
+            "\u{2713} Imported OpenCode key from {} ({} stored)",
+            path.display(),
+            total
+        ));
     }
 
     /// Persist the `/keys` dialog's edited key map to the auth store, rebuild
@@ -4592,51 +4643,80 @@ impl App {
             .clone()
             .unwrap_or_else(|| "build".to_string());
         let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
-        let mut next = MODES[(idx + 1) % MODES.len()];
+        let next = MODES[(idx + 1) % MODES.len()];
 
-        // Image mode without a vision model would silently strip every image
-        // from the request, so it is skipped rather than entered.
-        let image_model = if next == "image" && current != "image" {
-            self.image_mode_model()
-        } else {
-            None
-        };
-        if next == "image" && current != "image" && image_model.is_none() {
-            self.push_notification(
-                NotificationKind::Warning,
-                "Image mode needs a vision model. Connect one with /connect (e.g. google or github-copilot)."
-                    .to_string(),
-                Some(5),
-            );
-            next = MODES[(idx + 2) % MODES.len()];
+        if next == "image" {
+            // Image mode without a vision model would silently strip every
+            // image from the request, so it is skipped rather than entered.
+            // `enter_image_mode` owns the whole entry contract (remember the
+            // model, resolve the vision model, read the clipboard), so Tab and
+            // `--agent image` / `/agent image` cannot drift apart.
+            if self.enter_image_mode() {
+                return;
+            }
+            self.apply_agent_mode(MODES[(idx + 2) % MODES.len()]);
+            return;
         }
 
-        if image_model.is_some() {
-            // Entering image mode: remember the model to restore, then wait.
-            // The swap itself is deferred to the first image (clipboard, Ctrl+V,
-            // dragged/pasted path) or to submit — see `apply_pending_image_switch`.
-            // Swapping here would strand a user who only tab-cycles through IMAGE
-            // on a model they never asked for.
-            self.previous_model = Some(self.model_name.clone());
-            self.image_model = None;
-            self.image_switch_pending = true;
-            // Auto-read clipboard image on a background thread so the TUI
-            // never freezes during the xclip/wl-paste subprocess call. A hit
-            // attaches an image through `attach_image`, which performs the swap.
-            self.spawn_image_read();
-        } else if current == "image" && next != "image" {
+        if current == "image" {
             self.restore_model_after_image_mode();
         }
+        self.apply_agent_mode(next);
+    }
 
+    /// Install a mode name: badge, accent, plan flag, and the change flag the
+    /// CLI loop watches. The mode's own entry/exit side effects are handled by
+    /// the caller (`enter_image_mode` / `restore_model_after_image_mode`).
+    fn apply_agent_mode(&mut self, next: &str) {
         self.agent_mode = Some(next.to_string());
         self.agent_mode_changed = true;
         self.accent_color = accent_for_mode(Some(next));
 
-        // Sync plan_mode flag for legacy code paths.
-        self.plan_mode = next == "plan";
+        // The plan flag mirrors both the plan agent and an active `/plan`
+        // (permission mode Plan), so leaving the plan agent keeps `/plan` on.
+        self.plan_mode = next == "plan"
+            || matches!(
+                self.config.permission_mode,
+                clawde_core::config::PermissionMode::Plan
+            );
+    }
 
-        // No status message needed — the color-coded mode badge already
-        // tells the user which mode is active.
+    /// Enter image mode, whatever the caller is — Tab, `--agent image`, or
+    /// `/agent image`.
+    ///
+    /// Resolves whether a vision model exists, remembers the model to restore,
+    /// and kicks off the clipboard read, but deliberately does **not** swap the
+    /// model yet: the swap belongs to the first image (any attach path) or to
+    /// submit, through [`Self::apply_pending_image_switch`]. Entering the mode
+    /// through a path that never does image work must leave the model alone.
+    ///
+    /// Returns `false` with a warning when no vision model exists, so the
+    /// caller can fall back to another mode instead of pretending to be in a
+    /// mode that would strip every attachment.
+    pub fn enter_image_mode(&mut self) -> bool {
+        if self.agent_mode.as_deref() == Some("image") {
+            // Already there (e.g. `--agent image` re-asserted): keep the
+            // pending swap and the clipboard read that are already armed.
+            return true;
+        }
+        if self.image_mode_model().is_none() {
+            self.push_notification(
+                NotificationKind::Warning,
+                "Image mode needs a vision model. Connect one with /connect (e.g. google or github-copilot), or pick a vision model with /model."
+                    .to_string(),
+                Some(5),
+            );
+            return false;
+        }
+        self.previous_model = Some(self.model_name.clone());
+        self.image_model = None;
+        self.image_switch_pending = true;
+        // Auto-read clipboard image on a background thread so the TUI never
+        // freezes during the xclip/wl-paste subprocess call. A hit attaches an
+        // image through `attach_image`, which performs the swap.
+        self.spawn_image_read();
+        self.apply_agent_mode("image");
+        true
     }
 
     /// The vision-capable model image mode switches to, if one is configured.
@@ -4648,20 +4728,104 @@ impl App {
         // fallback chain. If the registry already has an aggregate
         // vision-capable FreeProvider, keep `free/auto` so it can choose the
         // best configured vision upstream at request time.
-        if self.config.selected_provider_id() == "free" {
-            clawde_api::providers::free::first_configured_vision_model(&self.auth_store).or_else(
-                || {
+        let provider = self.config.selected_provider_id().to_string();
+        if provider == "free" {
+            return clawde_api::providers::free::first_configured_vision_model(&self.auth_store)
+                .or_else(|| {
                     self.provider_registry
                         .as_deref()
                         .and_then(|registry| registry.get(&clawde_core::ProviderId::new("free")))
                         .filter(|provider| provider.capabilities().image_input)
                         .map(|_| "free/auto".to_string())
-                },
-            )
-        } else {
-            self.model_registry
-                .best_vision_model_for_provider(self.config.selected_provider_id())
+                });
         }
+        // A `modelOverrides` entry is an explicit statement from the person
+        // running the model, and `apply_model_overrides` materialises it into
+        // the registry — so it wins over every catalog guess. Keeping the
+        // CURRENT model when it is the one marked vision-capable is deliberate:
+        // image mode must not move a user off a model they chose on purpose.
+        if self.config.vision_override(&provider, &self.model_name) == Some(true) {
+            return Some(self.model_name.clone());
+        }
+        if let Some(best) = self
+            .model_registry
+            .best_vision_model_for_provider(&provider)
+        {
+            return Some(best);
+        }
+        // The registry has no row for this provider (local runtime, custom
+        // endpoint). Live discovery is the only thing that can answer — Ollama
+        // reports `capabilities: ["vision"]` per tag in `/api/show`.
+        self.discovered_vision_model(&provider)
+    }
+
+    /// The best live-discovered vision model for `provider`, if discovery
+    /// reported one.
+    ///
+    /// Discovery is per-session state filled by the `/model` picker's fetch (the
+    /// only place the app talks to a provider's model endpoint), so this is
+    /// empty until the user has opened the picker once. Largest context window
+    /// wins, then the id breaks ties, so two vision tags cannot make image mode
+    /// flap between models.
+    fn discovered_vision_model(&self, provider: &str) -> Option<String> {
+        let models = self.discovered_models.lock();
+        models
+            .iter()
+            .filter(|m| m.vision && &*m.provider_id == provider)
+            .max_by(|a, b| {
+                a.context_window
+                    .cmp(&b.context_window)
+                    .then_with(|| (*b.id).cmp(&*a.id))
+            })
+            .map(|m| m.id.to_string())
+    }
+
+    /// Whether the active model can accept image input, as far as this session
+    /// can tell.
+    ///
+    /// Sources, most explicit first: a `modelOverrides` entry, the free chain's
+    /// catalog flags (the router only sends an image-bearing request to a vision
+    /// upstream), the models.dev registry for this exact model, live discovery,
+    /// and finally the provider's own capability claim — the same signal the
+    /// query loop uses to strip an image it cannot send. `false` means "do not
+    /// promise this works"; an unknown model on a provider that claims image
+    /// input answers `true` rather than refusing a request that may be fine.
+    pub fn model_supports_images(&self) -> bool {
+        let provider = self.config.selected_provider_id().to_string();
+        if let Some(explicit) = self.config.vision_override(&provider, &self.model_name) {
+            return explicit;
+        }
+        if provider == "free" {
+            return clawde_api::providers::free::first_configured_vision_model(&self.auth_store)
+                .is_some()
+                || self
+                    .provider_registry
+                    .as_deref()
+                    .and_then(|registry| registry.get(&clawde_core::ProviderId::new("free")))
+                    .is_some_and(|provider| provider.capabilities().image_input);
+        }
+        let bare = self
+            .model_name
+            .strip_prefix(&format!("{provider}/"))
+            .unwrap_or(&self.model_name)
+            .to_string();
+        if let Some(entry) = self.model_registry.get(&provider, &bare) {
+            return entry.vision();
+        }
+        {
+            let models = self.discovered_models.lock();
+            if let Some(seen) = models
+                .iter()
+                .find(|m| *m.provider_id == provider && &*m.id == bare.as_str())
+            {
+                return seen.vision;
+            }
+        }
+        self.provider_registry
+            .as_deref()
+            .and_then(|registry| registry.get(&clawde_core::ProviderId::new(&provider)))
+            .map(|provider| provider.capabilities().image_input)
+            .unwrap_or(true)
     }
 
     /// Perform image mode's deferred model swap, if it is still waiting for one.
@@ -4717,6 +4881,18 @@ impl App {
     /// pasted file path) goes through here so an image can never reach the
     /// prompt while the session is still on a text-only model.
     fn attach_image(&mut self, img: crate::image_paste::PastedImage) {
+        // Outside IMAGE mode nothing swaps the model, so an image may be headed
+        // for a text-only model that will reject the request. Say so at attach
+        // time instead of letting the turn fail with the provider's 400.
+        if self.agent_mode.as_deref() != Some("image") && !self.model_supports_images() {
+            self.push_notification(
+                NotificationKind::Warning,
+                "This model can't read images. Tab to IMAGE mode to switch, or mark it in \
+                 modelOverrides: {\"<provider>/<model>\": {\"vision\": true}}."
+                    .to_string(),
+                Some(6),
+            );
+        }
         self.prompt_input.add_image(img);
         self.apply_pending_image_switch();
     }
@@ -4972,6 +5148,20 @@ impl App {
         // to that agent's detail screen. Headless mode still runs the slash
         // command, which prints the same fields.
         if cmd == "agent" {
+            // `image` is a mode, not a registry agent (the registry holds
+            // build/plan/explore), so it cannot be selected in the popup — that
+            // path reported "Unknown agent 'image'". Run the mode's real entry
+            // instead, the same one Tab and `--agent image` use, so all three
+            // paths resolve the vision model, arm the deferred swap, and read
+            // the clipboard.
+            if args.trim() == "image" {
+                if self.enter_image_mode() {
+                    self.status_message = Some(
+                        "Image mode: paste an image, drop a file, or type @path.png".to_string(),
+                    );
+                }
+                return true;
+            }
             self.close_secondary_views();
             self.open_agents_menu();
             let name = args.trim();
@@ -7754,6 +7944,28 @@ impl App {
             return false;
         }
 
+        // Credential import popup (opened from `/keys`): path entry only.
+        if self.credential_import.visible {
+            match key.code {
+                KeyCode::Esc => self.credential_import.close(),
+                KeyCode::Enter => self.import_credential_file(),
+                KeyCode::Backspace => self.credential_import.backspace(),
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let paste = crate::image_paste::read_primary_text()
+                        .or_else(crate::image_paste::read_clipboard_text);
+                    if let Some(text) = paste {
+                        self.credential_import.paste(&text);
+                    }
+                }
+                KeyCode::Char(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
+                    self.credential_import.insert_char(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         // `/keys` management dialog — j/k-navigable CRUD over stored keys.
         if self.keys_dialog.visible {
             // Delete-confirmation popup captures all keys while open.
@@ -10227,6 +10439,10 @@ impl App {
         };
         let is_char = matches!(key.code, KeyCode::Char(_));
         match action.as_str() {
+            "importCredentials" => {
+                self.credential_import.open();
+                true
+            }
             "cancel" => {
                 // Esc cascade: hide the expanded key list → drop typed text → close.
                 if !self.keys_dialog.unreveal_active() && !self.keys_dialog.clear_pending() {
@@ -10680,9 +10896,20 @@ impl App {
         if self.agent_mode.as_deref() == Some("image") {
             self.restore_model_after_image_mode();
         }
-        self.agent_mode = Some(name.clone());
-        self.accent_color = accent_for_mode(Some(&name));
-        self.agent_mode_changed = true;
+        if name == "image" {
+            // `/agent image` is the same entry as Tab and `--agent image`:
+            // resolve the vision model, remember what to restore, read the
+            // clipboard. A mode that cannot get a vision model is refused here
+            // rather than activated with the old model still in place.
+            if !self.enter_image_mode() {
+                self.agents_menu.close();
+                return;
+            }
+            self.agents_menu.close();
+            self.status_message = Some("Agent @image active.".to_string());
+            return;
+        }
+        self.apply_agent_mode(&name);
         self.agents_menu.close();
         self.status_message = Some(format!("Agent @{name} active."));
     }
@@ -15342,6 +15569,178 @@ mod tests {
         assert!(app.previous_model.is_none());
     }
 
+    /// `/agent image` reaches the same entry as Tab and `--agent image`: the
+    /// mode resolves its vision model, arms the deferred swap, and remembers
+    /// what to restore. (The agents registry holds build/plan/explore, so the
+    /// popup path used to answer "Unknown agent 'image'" instead.)
+    #[test]
+    fn slash_agent_image_enters_the_mode_through_the_shared_entry() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.auth_store
+            .set_keys("google", vec!["google-test-key-12345678".to_string()]);
+        let model_before = app.model_name.clone();
+
+        assert!(app.intercept_slash_command_with_args("agent", "image"));
+
+        assert_eq!(app.agent_mode.as_deref(), Some("image"));
+        assert!(app.image_switch_pending);
+        assert_eq!(app.previous_model.as_deref(), Some(model_before.as_str()));
+        assert_eq!(app.model_name, model_before, "the swap waits for an image");
+        assert!(app.agents_menu.definitions.is_empty() || !app.agents_menu.visible);
+    }
+
+    /// A mode that cannot reach a vision model must not be entered, whichever
+    /// entry path asked for it — otherwise every attachment is silently dropped
+    /// by the request-time capability gate.
+    #[test]
+    fn slash_agent_image_is_refused_without_a_vision_model() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        let model_before = app.model_name.clone();
+
+        assert!(app.intercept_slash_command_with_args("agent", "image"));
+
+        assert_ne!(app.agent_mode.as_deref(), Some("image"));
+        assert!(!app.image_switch_pending);
+        assert!(app.previous_model.is_none());
+        assert_eq!(app.model_name, model_before);
+    }
+
+    /// A `modelOverrides` entry is the only way to describe a model the
+    /// registry does not list — a local runtime tag, a self-hosted endpoint.
+    /// It has to make image mode work end to end: the model is marked
+    /// vision-capable, the mode enters, and the swap keeps the marked model
+    /// instead of hunting for a registry flagship that does not exist.
+    #[test]
+    fn vision_override_makes_a_local_model_usable_in_image_mode() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.config.provider = Some("ollama".to_string());
+        app.config.model = Some("llava:latest".to_string());
+        app.model_name = "ollama/llava:latest".to_string();
+        app.config.model_overrides.insert(
+            "ollama/llava:latest".to_string(),
+            clawde_core::config::ModelOverride {
+                vision: Some(true),
+                ..Default::default()
+            },
+        );
+        app.model_registry
+            .apply_model_overrides(&app.config.model_overrides);
+
+        assert!(
+            app.model_supports_images(),
+            "the override is an explicit statement that this tag takes images"
+        );
+        assert_eq!(
+            app.image_mode_model().as_deref(),
+            Some("ollama/llava:latest"),
+            "image mode keeps the model the user marked"
+        );
+        assert!(app.enter_image_mode());
+
+        app.apply_pending_image_switch();
+        assert_eq!(app.model_name, "ollama/llava:latest");
+        assert_eq!(app.image_model.as_deref(), Some("ollama/llava:latest"));
+    }
+
+    /// Live discovery is the only vision signal for a provider models.dev has
+    /// no rows for: Ollama reports `capabilities: ["vision"]` per tag, and the
+    /// `/model` fetch caches the parsed list.
+    #[test]
+    fn discovered_models_supply_the_vision_model_for_a_local_provider() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.config.provider = Some("llamacpp".to_string());
+        app.config.model = Some("qwen3-coder".to_string());
+        app.model_name = "llamacpp/qwen3-coder".to_string();
+
+        // Before discovery the provider's own claim is the only signal (an
+        // OpenAI-compatible endpoint says it accepts images), so an unknown tag
+        // is not declared incapable.
+        assert!(app.model_supports_images());
+        assert!(
+            app.image_mode_model().is_none(),
+            "nothing discovered yet, nothing to switch to"
+        );
+
+        *app.discovered_models.lock() = vec![
+            clawde_api::ModelInfo {
+                id: clawde_core::ModelId::new("qwen3-coder"),
+                provider_id: clawde_core::ProviderId::new("llamacpp"),
+                vision: false,
+                ..Default::default()
+            },
+            clawde_api::ModelInfo {
+                id: clawde_core::ModelId::new("llava-13b"),
+                provider_id: clawde_core::ProviderId::new("llamacpp"),
+                vision: true,
+                context_window: 8_192,
+                ..Default::default()
+            },
+        ];
+
+        // Discovery says the active tag is text-only, so the attach-time
+        // warning is now accurate rather than pessimistically silent.
+        assert!(!app.model_supports_images());
+        assert_eq!(app.image_mode_model().as_deref(), Some("llava-13b"));
+        assert!(app.enter_image_mode());
+        app.apply_pending_image_switch();
+        assert_eq!(app.model_name, "llava-13b");
+    }
+
+    /// Attaching an image outside IMAGE mode to a model that cannot read it has
+    /// to be flagged at attach time — the alternative is a turn that fails on
+    /// the provider's 400 with no hint about what to do.
+    #[test]
+    fn attaching_to_a_text_only_model_warns_instead_of_failing_silently() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.config.provider = Some("openai".to_string());
+        app.config.model = Some("o1-mini".to_string());
+        app.model_name = "openai/o1-mini".to_string();
+        assert!(!app.model_supports_images());
+
+        app.attach_image(pasted_image("clipboard.png"));
+
+        assert_eq!(app.prompt_input.pending_images.len(), 1);
+        assert!(
+            app.notifications
+                .notifications
+                .iter()
+                .any(|n| n.kind == NotificationKind::Warning
+                    && n.message.contains("can't read images")),
+            "expected an attach-time warning, got {:?}",
+            app.notifications
+                .notifications
+                .iter()
+                .map(|n| n.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A vision-capable model must not trigger the warning.
+    #[test]
+    fn attaching_to_a_vision_model_does_not_warn() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.config.provider = Some("openai".to_string());
+        app.config.model = Some("gpt-4o".to_string());
+        app.model_name = "openai/gpt-4o".to_string();
+
+        assert!(app.model_supports_images());
+        app.attach_image(pasted_image("clipboard.png"));
+
+        assert!(
+            !app.notifications
+                .notifications
+                .iter()
+                .any(|n| n.message.contains("can't read images")),
+            "a vision model must not warn about images"
+        );
+    }
+
     #[test]
     fn image_mode_is_skipped_when_no_vision_model_is_configured() {
         // Entering image mode without a vision model would strip every image
@@ -15404,6 +15803,30 @@ mod tests {
 
         assert_eq!(app.agent_mode.as_deref(), Some("plan"));
         assert_eq!(app.model_name, model_before);
+    }
+
+    #[test]
+    fn leaving_the_plan_agent_keeps_plan_mode_while_plan_permission_is_on() {
+        // `/plan` (permission mode Plan) and the plan agent share the plan
+        // flag. Tab must not turn `/plan` off by leaving the plan agent.
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.config.permission_mode = clawde_core::config::PermissionMode::Plan;
+        app.plan_mode = true;
+        app.agent_mode = Some("build".to_string());
+
+        app.cycle_agent_mode(); // build → plan
+        assert!(app.plan_mode);
+        app.cycle_agent_mode(); // plan → build
+        assert!(app.plan_mode, "/plan is still on");
+
+        app.config.permission_mode = clawde_core::config::PermissionMode::Default;
+        app.cycle_agent_mode(); // build → plan
+        app.cycle_agent_mode(); // plan → build
+        assert!(
+            !app.plan_mode,
+            "plan flag follows the agent when /plan is off"
+        );
     }
 
     #[test]

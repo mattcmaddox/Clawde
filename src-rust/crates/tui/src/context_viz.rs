@@ -314,7 +314,10 @@ pub fn render_context_viz(
                 Some((active, total, retry)) => {
                     let retry_part = if *active == 0 && *total > 0 {
                         match retry {
-                            Some(r) => format!(", retry {}s", r),
+                            Some(r) => format!(
+                                ", retry {}",
+                                clawde_core::format_utils::format_retry_wait(*r)
+                            ),
                             None => String::new(),
                         }
                     } else {
@@ -495,7 +498,9 @@ pub fn render_context_viz(
             let req_color = pct_color(row.requests_pct);
 
             let retry_text = match row.retry_secs {
-                Some(s) if row.active == 0 && row.total > 0 => format!("{}s", s),
+                Some(s) if row.active == 0 && row.total > 0 => {
+                    clawde_core::format_utils::format_retry_wait(s)
+                }
                 _ => "\u{2014}".to_string(),
             };
 

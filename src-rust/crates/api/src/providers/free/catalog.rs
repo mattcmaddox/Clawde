@@ -137,6 +137,16 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         id: "github-copilot",
         title: "GitHub Copilot",
         key_url: "github.com/settings/tokens",
+        // Unresolved as of 2026-10-21: models.dev no longer lists any
+        // `gpt-4o` for Copilot (its current rows start at the gpt-5/6 and
+        // claude-4.5+ families), while this pin comes from Clawde's own
+        // Copilot-Free probe (see `CopilotProvider::hardcoded_models`,
+        // 2026-08-02). Copilot's list is account-scoped and
+        // `CopilotProvider::discover_models` filters `policy.state ==
+        // "disabled"`, which models.dev cannot see, so the two sources are not
+        // directly comparable. Do not swap this id for a models.dev row on
+        // guesswork: re-probe `/models` with a Copilot Free token and pick from
+        // the entries that are not disabled there.
         default_model: "gpt-4o-2024-11-20",
         model_family: "gpt-4o",
         note: "GPT-4o (16K ctx) — free OAuth via /connect",
@@ -292,8 +302,18 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         // balance as long as the request carries `X-CLIENT-TYPE: cline-sdk`
         // (sent in production). Each has its own daily cap, so a cap on one
         // leaves the others usable.
-        default_model: "cline-free/deepseek-v4.1-flash",
-        model_family: "deepseek-v4.1-flash",
+        //
+        // Re-checked 2026-10-21 with 1-token chat probes against the live
+        // endpoint: `cline-free/longcat-2.0` (the free-array head that day) and
+        // the previous `cline-free/deepseek-v4.1-flash` both answer 404
+        // `model not found`, `cline-free/nemotron-3.5-super-vl` and
+        // `nvidia/nemotron-3.5-lightning-free` answer 500 `empty response
+        // content`, and the unprefixed `deepseek/deepseek-v4-flash` is a paid
+        // id (402 insufficient_credits). `cline-free/minimax-m3.1-flash` and
+        // `cline-free/solar-mini4` are the two that actually answered. The
+        // pool rotates, so re-probe before trusting any id here.
+        default_model: "cline-free/minimax-m3.1-flash",
+        model_family: "minimax-m3.1-flash",
         note: "live free-model API — per-model daily caps, auto-discovers at startup",
         tool_calling: true,
         vision: false,
@@ -366,6 +386,115 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
 /// Look up a catalog entry by its `id`.
 pub fn catalog_entry(id: &str) -> Option<&'static FreeUpstream> {
     FREE_CATALOG.iter().find(|e| e.id == id)
+}
+
+impl FreeUpstream {
+    /// Whether this upstream can serve an image-bearing request.
+    ///
+    /// True when the default model takes images, or when a sibling model on the
+    /// same key does ([`vision_model_for`]). The catalog's `vision` flag alone
+    /// is a statement about the *default* model, so an upstream whose free tier
+    /// also hosts a vision model is not written off by it.
+    pub fn supports_images(&self) -> bool {
+        self.vision || vision_model_for(self.id).is_some()
+    }
+}
+
+/// The vision model a free upstream switches to for an image-bearing request.
+///
+/// Only for upstreams whose **default** model is text-only but whose free tier
+/// also lists a vision model: `entry_fits_request` admits them on
+/// [`FreeUpstream::supports_images`], and `attempt_plan` swaps the wire model
+/// for this one at dispatch. Keeping the mapping here (rather than in an
+/// extra catalog field) leaves `FREE_CATALOG` a faithful description of each
+/// upstream's default and puts the exception in one place, next to the note
+/// that justifies it.
+///
+/// Groq's free tier is rate-limited rather than model-gated, and models.dev
+/// lists `qwen/qwen3.8-27b` for it as an image-input chat model. The previous
+/// pick, `meta-llama/llama-4-scout-17b-16e-instruct`, disappeared from Groq's
+/// catalog (its live model list no longer carries the Llama family at all), so
+/// an image turn was admitted here and then rejected by the upstream. A 1-token
+/// chat probe on 2026-10-21 returned 200 for it (and for the default), so the
+/// id is callable on Groq's free tier; a first attempt that answered 403
+/// `error code: 1010` for every model was Cloudflare rejecting the client, not
+/// the model.
+///
+/// The other arms cover upstreams whose free tier hosts a vision model next to
+/// a text-only default. `nvidia` and `zai` were confirmed with live chat
+/// probes (the nvidia one with an actual image), `openrouter` from models.dev's
+/// cost-0 rows. There is deliberately no `cline` arm: Cline's free pool rotates
+/// and none of its currently callable models is verified as vision-capable.
+pub fn vision_model_for(upstream_id: &str) -> Option<&'static str> {
+    match upstream_id {
+        "groq" => Some("qwen/qwen3.8-27b"),
+        // Re-checked 2026-10-21: a 1-token chat probe returns 200, so the id
+        // is served even though this endpoint's `/models` list does not
+        // enumerate it. `glm-5.3-flash` (the one vision row `/models` does
+        // list) answers 429 "Insufficient balance".
+        "zai" => Some("glm-4.6v-flash"),
+        // Verified 2026-10-21 with an image request: answers the colour in a
+        // 64x64 PNG. `google/gemma-4-31b-it` timed out twice and
+        // `meta/llama-3.2-11b-vision-instruct` timed out, so the omni model is
+        // the arm that actually serves images on the free endpoint.
+        "nvidia" => Some("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"),
+        "openrouter" => Some("minimax/minimax-m3.1-flash:free"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod vision_model_tests {
+    use super::*;
+
+    #[test]
+    fn vision_model_is_a_real_groq_model_not_the_default() {
+        // The substitution must point at a different model than the default,
+        // otherwise the gate would admit an image request and dispatch it to
+        // the text-only model anyway.
+        let groq = catalog_entry("groq").expect("groq is in the catalog");
+        let vision = vision_model_for("groq").expect("groq has a vision model");
+        assert!(!groq.vision, "the default model is text-only");
+        assert_ne!(vision, groq.default_model);
+        assert!(groq.supports_images());
+    }
+
+    #[test]
+    fn every_vision_arm_names_a_model_other_than_the_default() {
+        // Each id here was verified against the upstream or models.dev — a
+        // retired id would be admitted by the capability gate and then rejected
+        // at dispatch, which is what the old Groq arm did after Groq dropped the
+        // Llama family. `cline` is absent on purpose: its pool rotates, so a
+        // static arm cannot stay true.
+        for (id, expected) in [
+            ("groq", "qwen/qwen3.8-27b"),
+            ("nvidia", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"),
+            ("zai", "glm-4.6v-flash"),
+            ("openrouter", "minimax/minimax-m3.1-flash:free"),
+        ] {
+            let upstream = catalog_entry(id).expect("upstream is in the catalog");
+            assert_eq!(vision_model_for(id), Some(expected), "{id} arm");
+            assert!(!upstream.vision, "{id}'s default stays text-only");
+            assert_ne!(upstream.default_model, expected, "{id} arm is the default");
+            assert!(upstream.supports_images(), "{id} must admit image turns");
+        }
+    }
+
+    #[test]
+    fn upstreams_without_a_vision_model_keep_the_catalog_flag() {
+        for upstream in FREE_CATALOG {
+            assert_eq!(
+                upstream.supports_images(),
+                upstream.vision || vision_model_for(upstream.id).is_some(),
+                "{} disagrees with its vision declaration",
+                upstream.id
+            );
+        }
+        // A text-only upstream must stay text-only.
+        assert!(!catalog_entry("cerebras")
+            .expect("cerebras")
+            .supports_images());
+    }
 }
 
 /// Static storage for the most recently built FreeProvider's model defaults.

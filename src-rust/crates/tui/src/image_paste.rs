@@ -593,7 +593,7 @@ pub fn image_source_from_file(path: &Path) -> Option<clawde_core::types::ImageSo
     if data.is_empty() {
         return None;
     }
-    let media_type = sniff_media_type(&data).to_string();
+    let (data, media_type) = normalise_image(data)?;
     let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
     Some(clawde_core::types::ImageSource {
         source_type: "base64".to_string(),
@@ -601,6 +601,91 @@ pub fn image_source_from_file(path: &Path) -> Option<clawde_core::types::ImageSo
         data: Some(data),
         url: None,
     })
+}
+
+/// Largest raw image payload sent to a provider, in bytes.
+///
+/// Anthropic refuses an image once its base64 payload passes 5 MB; OpenAI and
+/// Google are in the same league. 3.75 MB of raw bytes expands to exactly 5 MB
+/// under base64, so this is the largest payload that is safe everywhere.
+pub const MAX_IMAGE_BYTES: usize = 3_750_000;
+
+/// Longest edge sent to a provider, in pixels.
+///
+/// Anthropic rejects anything above 8000 px on either axis; a 4K screenshot is
+/// 3840 px wide, so this only ever trips on panoramas and huge retina captures.
+pub const MAX_IMAGE_EDGE: u32 = 8_000;
+
+/// Media types every provider accepts verbatim.
+///
+/// `image/bmp` and `image/tiff` are deliberately absent: they are common on
+/// disk and offered by some clipboards, but Anthropic, OpenAI and Google all
+/// reject them, so they must be re-encoded rather than forwarded.
+const PASSTHROUGH_MEDIA_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// Make an image safe to send: pass through a provider-supported encoding that
+/// is already small enough, and re-encode (downscaling if needed) otherwise.
+///
+/// Without this an `@scan.bmp`, a 12 MB retina screenshot, or a clipboard image
+/// in TIFF goes to the provider as-is and the turn fails with a 400 that names
+/// nothing the user can act on. Returns `None` when the bytes cannot be decoded
+/// — a corrupt file should not become a request that is guaranteed to fail.
+fn normalise_image(data: Vec<u8>) -> Option<(Vec<u8>, String)> {
+    let media_type = sniff_media_type(&data).to_string();
+    let oversized = data.len() > MAX_IMAGE_BYTES;
+    let dimensions = image_dimensions_from_bytes(&data);
+    let too_wide = dimensions.is_some_and(|(w, h)| w > MAX_IMAGE_EDGE || h > MAX_IMAGE_EDGE);
+    if PASSTHROUGH_MEDIA_TYPES.contains(&media_type.as_str()) && !oversized && !too_wide {
+        return Some((data, media_type));
+    }
+
+    let mut img = image::load_from_memory(&data).ok()?;
+    if too_wide {
+        let (w, h) = (img.width(), img.height());
+        let scale = MAX_IMAGE_EDGE as f32 / w.max(h) as f32;
+        let target = (
+            (w as f32 * scale).round().max(1.0) as u32,
+            (h as f32 * scale).round().max(1.0) as u32,
+        );
+        img = img.resize(target.0, target.1, image::imageops::FilterType::Lanczos3);
+    }
+
+    // PNG first: it is lossless, which matters for screenshots and diagrams.
+    let mut png = Vec::new();
+    if img
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .is_ok()
+        && png.len() <= MAX_IMAGE_BYTES
+    {
+        return Some((png, "image/png".to_string()));
+    }
+
+    // A photographic PNG can still be too large. JPEG at high quality is the
+    // fallback every provider accepts; `image` only writes RGB8/RGBA8 as JPEG,
+    // so convert first (a screenshot decodes as RGBA).
+    let mut jpeg = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut jpeg);
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 85);
+    img.to_rgb8()
+        .write_with_encoder(encoder)
+        .ok()
+        .filter(|_| jpeg.len() <= MAX_IMAGE_BYTES)
+        .map(|_| (jpeg, "image/jpeg".to_string()))
+}
+
+/// Dimensions from raw bytes, for formats we can parse without decoding.
+fn image_dimensions_from_bytes(data: &[u8]) -> Option<(u32, u32)> {
+    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) && data.len() >= 24 {
+        let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+        let h = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+        return Some((w, h));
+    }
+    if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
+        return jpeg_dimensions(data);
+    }
+    image::load_from_memory(data)
+        .ok()
+        .map(|img| (img.width(), img.height()))
 }
 
 /// Check whether a file path points to a supported image format.
@@ -794,6 +879,49 @@ mod tests {
     #[test]
     fn image_source_from_file_missing_returns_none() {
         assert!(image_source_from_file(Path::new("/nonexistent/x.png")).is_none());
+    }
+
+    fn decode_source(src: &clawde_core::types::ImageSource) -> Vec<u8> {
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            src.data.as_deref().expect("base64 payload"),
+        )
+        .expect("valid base64")
+    }
+
+    /// A format providers reject must be converted, not forwarded: `@scan.bmp`
+    /// used to be attached as `image/bmp` and fail the whole turn on a 400.
+    #[test]
+    fn bmp_is_reencoded_to_a_provider_supported_format() {
+        let tmp = make_temp_image("bmp").unwrap();
+        image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]))
+            .save(&tmp)
+            .expect("write bmp");
+        assert_eq!(
+            sniff_media_type(&std::fs::read(&tmp).expect("read bmp")),
+            "image/bmp"
+        );
+
+        let src = image_source_from_file(&tmp).expect("bmp normalises");
+        assert_eq!(src.media_type.as_deref(), Some("image/png"));
+        assert_eq!(sniff_media_type(&decode_source(&src)), "image/png");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Providers cap the longest edge (Anthropic: 8000 px). A wider image is
+    /// downscaled rather than sent into a guaranteed rejection.
+    #[test]
+    fn an_over_long_edge_is_downscaled_before_it_is_sent() {
+        let tmp = make_temp_image("png").unwrap();
+        image::RgbImage::from_pixel(MAX_IMAGE_EDGE + 1, 2, image::Rgb([0, 0, 0]))
+            .save(&tmp)
+            .expect("write png");
+
+        let src = image_source_from_file(&tmp).expect("png normalises");
+        let decoded = image::load_from_memory(&decode_source(&src)).expect("decodable");
+        assert_eq!(decoded.width(), MAX_IMAGE_EDGE);
+        assert_eq!(src.media_type.as_deref(), Some("image/png"));
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

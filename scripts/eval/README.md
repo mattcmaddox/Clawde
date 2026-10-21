@@ -44,7 +44,7 @@ python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/catalog-order -
 # run (deterministic assertions stay the gate; judge score is advisory). Pin the
 # judge to a strong upstream for stable scores:
 python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/fallback-behavior \
-    --judge --judge-model free/groq/meta-llama/llama-4-scout-17b-16e-instruct
+    --judge --judge-model free/groq/openai/gpt-oss-120b
 
 # Drift A/B: does <task_context> reduce drift? Runs each scenario twice per
 # repeat (control `--no-task-context` vs treatment), scores every finished

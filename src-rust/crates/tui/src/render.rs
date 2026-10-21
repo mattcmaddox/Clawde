@@ -59,7 +59,7 @@ use crate::transcript_turn::{build_transcript_turns, TranscriptTurn};
 use crate::virtual_list::{VirtualItem, VirtualList};
 use crate::voice_mode_notice::render_voice_mode_notice;
 use clawde_core::constants::APP_VERSION;
-use clawde_core::format_utils::format_duration_ms;
+use clawde_core::format_utils::format_retry_wait;
 use clawde_core::types::Role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -861,7 +861,13 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     display_dir,
-                    Style::default().fg(Color::DarkGray),
+                    // Dark yellow, not the dim grey used for hints: the path is
+                    // a location you read at a glance (it answers "which
+                    // checkout am I in?"), so it has to stand out from the
+                    // footer's grey without competing with the prompt. The
+                    // exact tone is the Solarized yellow already defined in
+                    // `theme_colors::ColorPalette::solarized().warning`.
+                    Style::default().fg(Color::Rgb(181, 137, 0)),
                 ))),
                 cwd_area,
             );
@@ -1143,6 +1149,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             frame,
             &app.keys_dialog,
             app.prompt_input.vim_enabled,
+            size,
+        );
+        crate::credential_import_dialog::render_credential_import(
+            frame,
+            &app.credential_import,
             size,
         );
     }
@@ -3322,9 +3333,18 @@ fn render_input(
                 }
                 // idx == 0: keep the abstract "auto" / "free" labels
             }
+            // Image mode resolves its vision model on entry but swaps only
+            // when something needs it, so the badge has to say which state the
+            // mode is in: `image · waiting` means the model still has not
+            // changed, and a text-only model may still be active.
+            let mode_label = if agent_mode == "image" && app.image_switch_pending {
+                " IMAGE · WAITING ".to_string()
+            } else {
+                format!(" {} ", agent_mode.to_uppercase())
+            };
             let mut spans = vec![
                 Span::styled(
-                    format!(" {} ", agent_mode.to_uppercase()),
+                    mode_label,
                     Style::default()
                         .fg(Color::Black)
                         .bg(pink)
@@ -3583,15 +3603,11 @@ fn should_render_status_row(app: &App) -> bool {
         })
         .unwrap_or(false);
 
-    // Check if any provider has exhausted API keys — keep the status row
-    // visible so the user sees the key exhaustion indicator even while idle.
-    let has_exhausted_keys = app.provider_registry.as_ref().is_some_and(|reg| {
-        reg.key_ring_summaries()
-            .iter()
-            .any(|(_, active, total, _)| *active < *total)
-    });
-
-    // Also keep the row visible while any upstream is in empty-completion
+    // Note: exhausted API keys are NOT a reason to keep this row — the key
+    // health label now lives in the bottom footer row, and an idle row here
+    // would be blank apart from its separator.
+    //
+    // Keep the row visible while any upstream is in empty-completion
     // cooldown (spec §6.3) so the user sees which upstreams are cooled down
     // for repeated empty completions.
     let has_empty_cooldowns = app.provider_registry.as_ref().is_some_and(|reg| {
@@ -3604,14 +3620,13 @@ fn should_render_status_row(app: &App) -> bool {
     // intentionally NOT a reason to keep the status row on — it stays set until
     // the next submit, so gating on it pinned the idle spinner glyph on screen
     // permanently after the first turn. The row now shows only while actually
-    // active (voice, streaming, or an idle status message). Free-mode routing
-    // and key health are shown in the prompt config row (Row 2) instead.
+    // active (voice, streaming, or an idle status message). Free-mode key
+    // health is shown in the bottom footer row instead.
     app.voice_recording
         || app.is_verifying
         || app.is_compacting
         || (!app.is_streaming && app.status_message.is_some())
         || (app.is_streaming && interesting_stream_status)
-        || has_exhausted_keys
         || has_empty_cooldowns
         // A free-mode retry wait is the one moment the user most needs to know
         // what is happening (rate-limit backoff, 20-120s), so it keeps the row
@@ -3736,49 +3751,15 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    // Append key-ring status when any keys are exhausted. Only shown
-    // when the active provider is "free" — standalone providers surface
-    // their exhaustion through their own error paths, and free-catalog
-    // upstream status is noise on non-free providers (e.g. ollama).
+    // Empty-completion cooldowns. Free key-ring health (`free:n/N · k fb`)
+    // lives in the bottom footer row instead: it is a standing fact about the
+    // chain, not an activity, and this row only exists while something is
+    // happening.
     if let Some(ref registry) = app.provider_registry {
         // The effective provider — free mode is the default, so a fresh config
         // (provider unset) must still be treated as free here, otherwise the
-        // exhausted-key indicator would never render.
+        // cooldown indicator would never render.
         let active_provider = app.config.selected_provider_id();
-        let summaries = registry.key_ring_summaries();
-        let has_exhausted = summaries
-            .iter()
-            .any(|(_, active, total, _)| *active < *total);
-        if has_exhausted && !spans.is_empty() && active_provider == "free" {
-            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-            for (provider, active, total, retry_secs) in &summaries {
-                if *active < *total {
-                    let color = if *active == 0 {
-                        Color::Red
-                    } else {
-                        Color::Yellow
-                    };
-                    let retry_label =
-                        retry_secs.map(|s| format!("retry in {}", format_duration_ms(s * 1000)));
-                    let mut label = match retry_label {
-                        Some(r) => format!("{}:{}/{} ({})", provider, active, total, r),
-                        None => format!("{}:{}/{}", provider, active, total),
-                    };
-                    // Fallback-models count for the free provider: how many
-                    // configured upstreams carry a secondary model (e.g.
-                    // nvidia 70B -> 8B). Surfaced so users know the chain
-                    // can self-recover on a slow primary.
-                    if provider == "free" {
-                        let fb = free_fallback_upstream_count(&app.free_model_defaults);
-                        if fb > 0 {
-                            label.push_str(&format!(" \u{00b7} {} fb", fb));
-                        }
-                    }
-                    spans.push(Span::styled(label, Style::default().fg(color)));
-                    spans.push(Span::raw(" "));
-                }
-            }
-        }
 
         // Empty-completion cooldowns (spec §6.3): show which upstreams are
         // cooled down for repeated empty completions, with the remaining
@@ -3800,7 +3781,7 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
                             "{}:{} empty-cooldown (retry in {})",
                             provider,
                             upstream,
-                            format_duration_ms(secs * 1000)
+                            format_retry_wait(*secs)
                         );
                         spans.push(Span::styled(label, Style::default().fg(Color::Yellow)));
                         spans.push(Span::raw(" "));
@@ -3942,6 +3923,141 @@ fn free_fallback_upstream_count(defaults: &[(String, String, String)]) -> usize 
                 .any(|u| u.id == upstream_id && !u.fallback_models.is_empty())
         })
         .count()
+}
+
+/// One provider's key-ring label, e.g. `free:2/3`.
+///
+/// The retry countdown appears only once nothing is selectable. While any key
+/// is still available, another key's cooldown is not something the user is
+/// waiting on, and pairing it with a partial count (`free:1/2 (retry in 59s)`)
+/// reads as a countdown on the whole chain rather than on the one benched key.
+fn key_ring_summary_label(
+    provider: &str,
+    active: usize,
+    total: usize,
+    retry: Option<u64>,
+) -> String {
+    match retry {
+        Some(secs) if active == 0 => format!(
+            "{}:{}/{} (retry in {})",
+            provider,
+            active,
+            total,
+            format_retry_wait(secs)
+        ),
+        _ => format!("{}:{}/{}", provider, active, total),
+    }
+}
+
+/// Footer key-health labels for the free chain, e.g. `free:14/16 · 1 fb`.
+///
+/// Only benched rings appear — `summaries` comes from
+/// `ProviderRegistry::key_ring_summaries()`, and a fully healthy chain has
+/// nothing to report. `defaults` is the configured upstream list
+/// (`App::free_model_defaults`), used to count how many upstreams carry a
+/// secondary model so the chain can self-recover on a slow primary.
+///
+/// `chain_down` suppresses the labels entirely: the aggregate badge already
+/// states that nothing can serve, and repeating the same counts beside it
+/// reads as two separate problems.
+fn free_key_health_labels(
+    summaries: &[(String, usize, usize, Option<u64>)],
+    defaults: &[(String, String, String)],
+    chain_down: bool,
+) -> Vec<(String, Color)> {
+    if chain_down {
+        return Vec::new();
+    }
+    summaries
+        .iter()
+        .filter(|(_, active, total, _)| active < total)
+        .map(|(provider, active, total, retry_secs)| {
+            let color = if *active == 0 {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
+            let mut label = key_ring_summary_label(provider, *active, *total, *retry_secs);
+            if provider == "free" {
+                let fb = free_fallback_upstream_count(defaults);
+                if fb > 0 {
+                    label.push_str(&format!(" \u{00b7} {} fb", fb));
+                }
+            }
+            (label, color)
+        })
+        .collect()
+}
+
+/// The two shapes the "whole free chain is down" badge can take.
+///
+/// They count different things, so the label names the unit: the badge uses the
+/// same slot as the `free:n/N` key indicator, and printing upstream counts
+/// there read as "all keys working" while every upstream was cooled.
+enum FreeDowntime {
+    /// Every key in the free key rings is exhausted.
+    Keys { total: usize, retry: Option<u64> },
+    /// Every configured upstream is in a 5xx / empty cooldown.
+    Upstreams {
+        cooled: usize,
+        chain: usize,
+        retry: Option<u64>,
+    },
+}
+
+impl FreeDowntime {
+    fn label(&self) -> String {
+        let (body, retry) = match self {
+            Self::Keys { total, retry } => (format!("free:0/{total} keys"), *retry),
+            Self::Upstreams {
+                cooled,
+                chain,
+                retry,
+            } => (format!("free:{cooled}/{chain} upstreams cooled"), *retry),
+        };
+        match retry {
+            Some(secs) => format!(" {body} (retry in {}) ", format_retry_wait(secs)),
+            None => format!(" {body} "),
+        }
+    }
+}
+
+/// Distinct cooled upstreams, from `upstream_cooldowns` rows that may repeat
+/// an upstream once per kind (`5xx` + `empty`).
+fn distinct_cooled_upstreams(entries: &[(String, String, Option<u64>)]) -> Vec<&str> {
+    let mut ids: Vec<&str> = entries
+        .iter()
+        .filter(|(_, _, retry)| retry.is_some())
+        .map(|(id, _, _)| id.as_str())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Distinct cooled upstreams and the earliest retry.
+fn cooled_upstreams(entries: &[(String, String, Option<u64>)]) -> (usize, Option<u64>) {
+    let retry = entries.iter().filter_map(|(_, _, retry)| *retry).min();
+    (distinct_cooled_upstreams(entries).len(), retry)
+}
+
+/// True when every chain upstream is known-down: its key ring has no usable
+/// key, or it is in a 5xx / empty cooldown.
+///
+/// An upstream that is in neither list may still serve — a single-key upstream
+/// has no ring to report through — so the chain is not "all down" and a retry
+/// countdown would overstate the wait.
+fn free_chain_known_down(
+    chain: &[(String, String, String)],
+    health: &[(String, usize, usize)],
+    cooled: &[&str],
+) -> bool {
+    chain.iter().all(|(upstream_id, _, _)| {
+        cooled.iter().any(|id| id == upstream_id)
+            || health
+                .iter()
+                .any(|(id, active, total)| id == upstream_id && *total > 0 && *active == 0)
+    })
 }
 // Keybinding hints footer
 // -----------------------------------------------------------------------
@@ -4217,7 +4333,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         // Health sweep indicator — red warning marker when the last background
         // probe found dead keys. Hidden when everything is healthy, and only
         // relevant when the active provider is the free composite.
-        if app.config.provider.as_deref() == Some("free") {
+        //
+        // Gate on `selected_provider_id` like the key-ring indicator above: a
+        // fresh config leaves `provider` unset, and hard-coding `Some("free")`
+        // here meant the default free-mode session never showed the marker the
+        // sweep had just produced.
+        if app.config.selected_provider_id() == "free" {
             if let Some(sweep) = app.last_health_sweep.as_ref() {
                 if sweep.unhealthy > 0 {
                     spans.push(Span::raw("  "));
@@ -4255,54 +4376,102 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         // Free-mode aggregate indicator — compact and unobtrusive, shown only
-        // when the whole free chain is down: every key in the free key rings
-        // is exhausted, or every configured upstream is in a 5xx/empty
-        // cooldown. Mirrors the ollama indicator's placement.
-        {
-            let free_aggregate: Option<(usize, usize, Option<u64>)> =
+        // when nothing in the free chain can serve: every upstream is either
+        // out of usable keys or in a 5xx/empty cooldown. Mirrors the ollama
+        // indicator's placement. The key health label further down stays quiet
+        // when this is `Some`: the badge already prints the same counts, plus
+        // the countdown that only makes sense once nothing can serve.
+        let free_downtime = {
+            let free_aggregate: Option<FreeDowntime> =
                 app.provider_registry.as_ref().and_then(|reg| {
                     let provider = reg.get(&clawde_core::ProviderId::new("free"))?;
                     let chain_len = app.free_model_defaults.len();
                     if chain_len == 0 {
                         return None;
                     }
-                    // Key-ring exhaustion (multi-key upstreams): all keys down.
-                    if let Some((active, total, retry)) = provider.key_ring_status() {
-                        if total > 0 && active == 0 {
-                            return Some((active, total, retry));
-                        }
-                    }
-                    // All-upstreams-cooled case: every chain entry is in a
-                    // 5xx / empty cooldown.
-                    let (cooled_count, cooled_retry) = reg
-                        .upstream_cooldown_summaries()
+                    // Per-upstream key health, `(id, active, total)`. Upstreams
+                    // with a single key have no ring and are absent.
+                    let health: Vec<(String, usize, usize)> = reg
+                        .upstream_key_health_summaries()
                         .into_iter()
                         .find(|(pid, _)| pid == "free")
                         .map(|(_, entries)| {
-                            let retry = entries.iter().filter_map(|(_, _, r)| *r).min();
-                            (entries.len(), retry)
+                            entries
+                                .into_iter()
+                                .map(|(id, active, total, _)| (id, active, total))
+                                .collect()
                         })
-                        .unwrap_or((0, None));
+                        .unwrap_or_default();
+                    let cooldown_rows = reg
+                        .upstream_cooldown_summaries()
+                        .into_iter()
+                        .find(|(pid, _)| pid == "free")
+                        .map(|(_, entries)| entries)
+                        .unwrap_or_default();
+                    let cooled = distinct_cooled_upstreams(&cooldown_rows);
+                    // A retry countdown only makes sense when every chain entry
+                    // is known-down. A ring whose keys are all benched says
+                    // nothing about a single-key upstream next to it, so the
+                    // per-key state alone is not enough to call the chain down.
+                    if !free_chain_known_down(&app.free_model_defaults, &health, &cooled) {
+                        return None;
+                    }
+                    // Key-ring exhaustion (multi-key upstreams): all keys down.
+                    if let Some((active, total, retry)) = provider.key_ring_status() {
+                        if total > 0 && active == 0 {
+                            return Some(FreeDowntime::Keys { total, retry });
+                        }
+                    }
+                    // All-upstreams-cooled case: every chain entry is in a
+                    // 5xx / empty cooldown. Counted by distinct upstream —
+                    // `upstream_cooldowns` emits one row per (upstream, kind),
+                    // so raw row counts let a single upstream in both a 5xx and
+                    // an empty cooldown saturate a two-upstream chain.
+                    let (cooled_count, cooled_retry) = cooled_upstreams(&cooldown_rows);
                     if cooled_count > 0 && cooled_count >= chain_len {
-                        Some((cooled_count, chain_len, cooled_retry))
+                        Some(FreeDowntime::Upstreams {
+                            cooled: cooled_count,
+                            chain: chain_len,
+                            retry: cooled_retry,
+                        })
                     } else {
                         None
                     }
                 });
-            if let Some((active, total, retry)) = free_aggregate {
-                let retry_label = retry
-                    .map(|s| format!("retry in {}", format_duration_ms(s * 1000)))
-                    .unwrap_or_default();
-                let label = if retry_label.is_empty() {
-                    format!(" free:{}/{} ", active, total)
-                } else {
-                    format!(" free:{}/{} ({}) ", active, total, retry_label)
-                };
+            if let Some(ref downtime) = free_aggregate {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
-                    label,
+                    downtime.label(),
                     Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
                 ));
+            }
+            free_aggregate
+        };
+
+        // Free key-ring health, moved here from the transient status row:
+        // `free:14/16 · 1 fb` is how many free keys are still usable, plus how
+        // many configured upstreams carry a secondary model (e.g. nvidia 70B ->
+        // 8B) so the chain can self-recover on a slow primary. It is a standing
+        // fact about the chain rather than an activity, so it belongs on the row
+        // that is always on screen; the status row only exists while a turn is
+        // running, which is why the count used to vanish mid-run.
+        if app.config.selected_provider_id() == "free" {
+            let health = app
+                .provider_registry
+                .as_ref()
+                .map(|registry| {
+                    free_key_health_labels(
+                        &registry.key_ring_summaries(),
+                        &app.free_model_defaults,
+                        free_downtime.is_some(),
+                    )
+                })
+                .unwrap_or_default();
+            for (label, color) in health {
+                if !spans.is_empty() {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(label, Style::default().fg(color)));
             }
         }
 
@@ -5574,6 +5743,69 @@ mod free_mode_progress_tests {
         );
     }
 
+    /// The key-ring label carries a retry countdown only once nothing is
+    /// selectable. A partial bench shows the count alone: the countdown belongs
+    /// to the one benched key, and `free:1/2 (retry in 59s)` read as a
+    /// countdown on the whole chain.
+    #[test]
+    fn key_ring_label_shows_a_retry_only_when_every_key_is_out() {
+        assert_eq!(key_ring_summary_label("free", 1, 2, Some(59)), "free:1/2");
+        assert_eq!(
+            key_ring_summary_label("free", 0, 2, Some(59)),
+            "free:0/2 (retry in 59.0s)"
+        );
+        assert_eq!(key_ring_summary_label("free", 0, 2, None), "free:0/2");
+    }
+
+    /// Configured upstreams that carry a catalog fallback model — the `N fb`
+    /// half of the footer label only counts these.
+    fn defaults_with_fallbacks() -> Vec<(String, String, String)> {
+        clawde_api::FREE_CATALOG
+            .iter()
+            .filter(|u| !u.fallback_models.is_empty())
+            .map(|u| (u.id.to_string(), u.default_model.to_string(), String::new()))
+            .collect()
+    }
+
+    /// The free key-health label lives on the bottom footer row, so it reports a
+    /// partially benched ring, states the countdown only when nothing is left,
+    /// and steps aside for the aggregate badge once the whole chain is down.
+    #[test]
+    fn free_key_health_label_reports_only_a_bench_and_defers_when_chain_is_down() {
+        let defaults = defaults_with_fallbacks();
+        let expect_fb = format!(" \u{00b7} {} fb", defaults.len());
+        assert!(!defaults.is_empty(), "catalog must carry a fallback model");
+
+        assert_eq!(
+            free_key_health_labels(&[("free".into(), 14, 16, None)], &defaults, false),
+            vec![(format!("free:14/16{expect_fb}"), Color::Yellow)],
+            "a partial bench keeps the count and adds the fallback tally"
+        );
+        assert_eq!(
+            free_key_health_labels(&[("free".into(), 0, 2, Some(59))], &defaults, false),
+            vec![(format!("free:0/2 (retry in 59.0s){expect_fb}"), Color::Red)],
+            "a fully benched ring is red and carries the countdown"
+        );
+        assert_eq!(
+            free_key_health_labels(&[("free".into(), 0, 2, Some(300))], &defaults, false),
+            vec![(format!("free:0/2 (retry in 5m){expect_fb}"), Color::Red)],
+            "a wait of a minute or more prints whole minutes, no seconds"
+        );
+        assert!(
+            free_key_health_labels(&[("free".into(), 14, 16, None)], &defaults, true).is_empty(),
+            "the aggregate badge owns the counts once the chain is down"
+        );
+        assert!(
+            free_key_health_labels(&[("free".into(), 16, 16, None)], &defaults, false).is_empty(),
+            "a healthy chain has nothing to report"
+        );
+        assert_eq!(
+            free_key_health_labels(&[("other".into(), 1, 2, None)], &defaults, false),
+            vec![("other:1/2".to_string(), Color::Yellow)],
+            "the fallback tally is a free-chain fact, not a per-provider one"
+        );
+    }
+
     #[test]
     fn a_long_turn_error_wraps_instead_of_running_off_the_pane() {
         let text = "free-mode upstreams exhausted: nvidia [rate_limited], poolside \
@@ -6191,6 +6423,29 @@ mod status_row_badge_tests {
             "'PLAN' mode badge should appear in the prompt row when plan_mode=true. Output: {:?}",
             out
         );
+    }
+
+    /// While image mode is waiting for an image, the model has not changed yet.
+    /// The badge has to say so, or the user reads `IMAGE` and assumes a vision
+    /// model is already active.
+    #[test]
+    fn image_mode_badge_reports_the_pending_swap() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.agent_mode = Some("image".to_string());
+        app.image_switch_pending = true;
+
+        let out = render_screen(&app);
+        assert!(
+            out.contains("IMAGE · WAITING"),
+            "a pending image-mode swap must be visible. Output: {:?}",
+            out
+        );
+
+        // Once the swap happens the badge goes back to the plain mode name.
+        app.image_switch_pending = false;
+        let out = render_screen(&app);
+        assert!(out.contains("IMAGE"));
+        assert!(out.contains("IMAGE ") && !out.contains("IMAGE · WAITING"));
     }
 
     #[test]
@@ -7082,6 +7337,128 @@ mod ollama_indicator_tests {
             !render_screen(&app).contains("dead"),
             "cleared sweep must hide the dead marker"
         );
+    }
+
+    /// The default free-mode config leaves `provider` unset, and
+    /// `selected_provider_id` — which the key-ring indicator already reads —
+    /// resolves that to "free". Gating the dead marker on the raw field alone
+    /// hid it for exactly the default setup.
+    #[test]
+    fn dead_key_marker_shows_when_the_provider_is_unset() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        assert_eq!(app.config.provider, None, "precondition: unset provider");
+        app.status_message = Some("test".to_string());
+        app.last_health_sweep = Some(clawde_api::health_poller::ProbeOutcome {
+            checked: 3,
+            unhealthy: 2,
+            results: Vec::new(),
+        });
+
+        let out = render_screen(&app);
+        assert!(
+            out.contains("2 dead"),
+            "an unset provider is still free mode: {out:?}"
+        );
+    }
+
+    /// The two all-down badge cases count different things, so the label must
+    /// say which — the old shared `free:{active}/{total}` slot printed upstream
+    /// counts where the reader expects key counts.
+    #[test]
+    fn free_downtime_badge_names_the_unit_it_counts() {
+        assert_eq!(
+            FreeDowntime::Keys {
+                total: 4,
+                retry: None
+            }
+            .label()
+            .trim(),
+            "free:0/4 keys"
+        );
+        assert_eq!(
+            FreeDowntime::Upstreams {
+                cooled: 2,
+                chain: 3,
+                retry: Some(45)
+            }
+            .label()
+            .trim(),
+            "free:2/3 upstreams cooled (retry in 45.0s)",
+            "the upstream case must not read like a key count"
+        );
+    }
+
+    /// `upstream_cooldowns` emits one row per (upstream, kind), so a single
+    /// upstream in both a 5xx and an empty cooldown counted twice and could
+    /// saturate a two-upstream chain on its own.
+    #[test]
+    fn cooled_upstreams_counts_each_upstream_once() {
+        let entries = vec![
+            ("a".to_string(), "5xx".to_string(), Some(30)),
+            ("a".to_string(), "empty".to_string(), Some(60)),
+            ("b".to_string(), "5xx".to_string(), Some(20)),
+        ];
+        assert_eq!(cooled_upstreams(&entries), (2, Some(20)));
+
+        // One upstream, two kinds: still one cooled upstream, not two.
+        let single = vec![
+            ("a".to_string(), "5xx".to_string(), Some(30)),
+            ("a".to_string(), "empty".to_string(), Some(60)),
+        ];
+        assert_eq!(cooled_upstreams(&single), (1, Some(30)));
+    }
+
+    /// The badge may only claim the chain is down when every upstream is known
+    /// down. A single-key upstream has no ring to report through, so "every
+    /// ring key is benched" does not cover it and a retry countdown there would
+    /// overstate the wait.
+    #[test]
+    fn free_chain_is_down_only_when_every_upstream_is_known_down() {
+        fn chain(ids: &[&str]) -> Vec<(String, String, String)> {
+            ids.iter()
+                .map(|id| (id.to_string(), id.to_string(), "model".to_string()))
+                .collect()
+        }
+        fn health(rows: &[(&str, usize, usize)]) -> Vec<(String, usize, usize)> {
+            rows.iter()
+                .map(|(id, active, total)| (id.to_string(), *active, *total))
+                .collect()
+        }
+
+        let both_cooled = chain(&["groq", "nvidia"]);
+        assert!(free_chain_known_down(
+            &both_cooled,
+            &health(&[]),
+            &["groq", "nvidia"]
+        ));
+
+        let both_empty = chain(&["groq", "nvidia"]);
+        assert!(free_chain_known_down(
+            &both_empty,
+            &health(&[("groq", 0, 2), ("nvidia", 0, 3)]),
+            &[]
+        ));
+
+        // One ring empty, the other still holds a key.
+        assert!(!free_chain_known_down(
+            &chain(&["groq", "nvidia"]),
+            &health(&[("groq", 0, 2), ("nvidia", 1, 1)]),
+            &[]
+        ));
+
+        // A single-key upstream (no ring, no cooldown) may still serve.
+        assert!(!free_chain_known_down(
+            &chain(&["groq", "cerebras"]),
+            &health(&[("groq", 0, 2)]),
+            &[]
+        ));
+
+        // A cooled upstream needs no ring entry.
+        assert!(free_chain_known_down(
+            &chain(&["groq", "cerebras"]),
+            &health(&[("groq", 0, 2)]),
+            &["cerebras"]
+        ));
     }
 
     /// An Ollama session: `provider` is what `selected_provider_id` reads.

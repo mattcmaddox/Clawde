@@ -229,7 +229,11 @@ fn estimate_block_chars(block: &ContentBlock) -> usize {
         },
         ContentBlock::Thinking { thinking, .. } => thinking.len(),
         ContentBlock::RedactedThinking { data } => data.len(),
-        _ => 200, // default for images/documents
+        // Images are not text, but they are not free either: an image-heavy
+        // turn must be able to trigger compaction. Documents stay at the small
+        // default (their text is usually summarised separately).
+        ContentBlock::Image { .. } => clawde_core::message_utils::IMAGE_TOKEN_EQUIVALENT_CHARS,
+        _ => 200, // default for documents and unknown blocks
     }
 }
 
@@ -1464,17 +1468,34 @@ pub fn calculate_messages_to_keep_index(
     keep_from
 }
 
-/// Remove image blocks from a message list before compacting.
+/// How many of the newest messages keep their image blocks through compaction.
+///
+/// Follow-up work on an attachment ("now click the button in that screenshot")
+/// is almost always the next turn or two. Stripping every image made those
+/// turns impossible after a compact, and a user cannot re-attach an image the
+/// model already saw because it no longer exists for them either. Older images
+/// are still stripped — they dominate the token budget and a text summary does
+/// not need them.
+const KEEP_RECENT_IMAGES: usize = 2;
+
+/// Remove image blocks from all but the newest messages before compacting.
 ///
 /// Image tokens are expensive and carry no information that a text summary
-/// needs.  Mirrors the TypeScript `stripImages` helper used inside
-/// `reactiveCompact.ts`.
+/// needs, so everything older than [`KEEP_RECENT_IMAGES`] messages is stripped
+/// (a message that held only images collapses to a placeholder so the
+/// conversation stays parseable). The newest messages keep theirs: the model
+/// must still be able to answer a question about the screenshot just attached.
 fn strip_images(messages: Vec<clawde_core::types::Message>) -> Vec<clawde_core::types::Message> {
     use clawde_core::types::{ContentBlock, MessageContent};
 
+    let keep_from = messages.len().saturating_sub(KEEP_RECENT_IMAGES);
     messages
         .into_iter()
-        .map(|mut msg| {
+        .enumerate()
+        .map(|(idx, mut msg)| {
+            if idx >= keep_from {
+                return msg;
+            }
             if let MessageContent::Blocks(ref mut blocks) = msg.content {
                 blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
                 // If stripping left only an empty block list, collapse to a
@@ -1968,6 +1989,61 @@ mod tests {
     /// `n` bytes of filler text (≈ `n/4 * 4/3` tokens under the chars/4 estimate).
     fn filler(n: usize) -> String {
         "x".repeat(n)
+    }
+
+    /// A user message carrying `text` plus one image block.
+    fn user_with_image(text: &str) -> Message {
+        Message::user_blocks(vec![
+            ContentBlock::Text {
+                text: text.to_string(),
+            },
+            ContentBlock::Image {
+                source: clawde_core::types::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: Some("image/png".to_string()),
+                    data: Some("AAAA".to_string()),
+                    url: None,
+                },
+            },
+        ])
+    }
+
+    fn image_count(msg: &Message) -> usize {
+        match &msg.content {
+            clawde_core::types::MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                .count(),
+            clawde_core::types::MessageContent::Text(_) => 0,
+        }
+    }
+
+    /// The newest messages keep their images: a follow-up about the screenshot
+    /// just attached must still work after a compact. Everything older loses
+    /// them, because they dominate the token budget and the summary does not
+    /// need them.
+    #[test]
+    fn compaction_keeps_the_newest_images_and_strips_older_ones() {
+        let messages = vec![
+            user_with_image("first screenshot"),
+            make_assistant("I see a toolbar."),
+            user_with_image("now the second screenshot"),
+        ];
+
+        let stripped = strip_images(messages);
+
+        assert_eq!(image_count(&stripped[0]), 0, "old image stripped");
+        assert_eq!(image_count(&stripped[2]), 1, "newest image kept");
+        // The stripped message keeps its text instead of losing the turn.
+        match &stripped[0].content {
+            clawde_core::types::MessageContent::Blocks(blocks) => assert!(
+                blocks.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text } if text == "first screenshot")
+                ),
+                "the prompt text must survive an image strip"
+            ),
+            other => panic!("expected blocks, got {other:?}"),
+        }
     }
 
     /// An assistant message carrying a single `tool_use` block.

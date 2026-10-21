@@ -1,6 +1,6 @@
 {
   "source": "src-rust/crates/api/src/providers/free/catalog.rs",
-  "source_sha256": "32f2cd793d759649244794a70048f81cfc704ba14b78f1db4624a5877df483e9",
+  "source_sha256": "a5374cca753d9730e631421514c1ef4d6b7d9a2c2bc7d93c6e8a7318c69c15be",
   "upstreams": [
     {
       "id": "github-copilot",
@@ -40,12 +40,12 @@
     {
       "id": "cline",
       "title": "Cline",
-      "default_model": "cline-free/deepseek-v4.1-flash"
+      "default_model": "cline-free/minimax-m3.1-flash"
     },
     {
       "id": "opencode-zen",
       "title": "OpenCode Zen",
-      "default_model": "deepseek-v4-flash-free"
+      "default_model": "deepseek-v4.1-flash-free"
     },
     {
       "id": "zai",

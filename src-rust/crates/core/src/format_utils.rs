@@ -29,6 +29,38 @@ pub fn format_duration_ms(ms: u64) -> String {
     }
 }
 
+/// Format a retry wait (cooldown remaining) as a human-readable string.
+///
+/// Seconds are shown only while the wait is short enough to act on — under a
+/// minute. Past that the countdown drops them entirely: `5m 0s` and `2m 43s`
+/// claim a precision nobody waits on, and the seconds digit is the only part
+/// that changes between polls.
+///
+/// Examples: `48.0s`, `1m`, `5m`, `1h 5m`, `1d 2h`.
+pub fn format_retry_wait(secs: u64) -> String {
+    if secs < 60 {
+        format_duration_ms(secs * 1_000)
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        let hours = secs / 3_600;
+        let minutes = (secs % 3_600) / 60;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        }
+    } else {
+        let days = secs / 86_400;
+        let hours = (secs % 86_400) / 3_600;
+        if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d {hours}h")
+        }
+    }
+}
+
 /// Format a token count compactly: 1234 → "1.2K", 1234567 → "1.2M"
 pub fn format_tokens(count: u64) -> String {
     if count >= 1_000_000 {
@@ -109,6 +141,21 @@ mod tests {
         assert_eq!(format_duration_ms(500), "500ms");
         assert_eq!(format_duration_ms(5000), "5.0s");
         assert_eq!(format_duration_ms(90_000), "1m 30s");
+    }
+
+    /// A retry wait shows seconds only under a minute; above that the seconds
+    /// component is dropped, never rounded into a "0s" tail.
+    #[test]
+    fn retry_wait_drops_seconds_from_a_minute_up() {
+        assert_eq!(format_retry_wait(0), "0ms");
+        assert_eq!(format_retry_wait(48), "48.0s");
+        assert_eq!(format_retry_wait(59), "59.0s");
+        assert_eq!(format_retry_wait(60), "1m");
+        assert_eq!(format_retry_wait(90), "1m");
+        assert_eq!(format_retry_wait(300), "5m");
+        assert_eq!(format_retry_wait(3_600), "1h");
+        assert_eq!(format_retry_wait(3_900), "1h 5m");
+        assert_eq!(format_retry_wait(90_000), "1d 1h");
     }
 
     #[test]

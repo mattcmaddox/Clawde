@@ -1,7 +1,7 @@
 // FileEdit tool: exact string replacement with old/new strings (like sed but
 // deterministic).  Mirrors the TypeScript Edit tool behaviour.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{PermissionLevel, Tool, ToolContext, ToolErrorCode, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -68,16 +68,27 @@ impl Tool for FileEditTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: FileEditInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Invalid input: {}", e),
+                )
+            }
         };
 
         // Validate old != new
         if params.old_string == params.new_string {
-            return ToolResult::error("old_string and new_string must be different".to_string());
+            return ToolResult::error_with_code(
+                ToolErrorCode::InvalidInput,
+                "old_string and new_string must be different".to_string(),
+            );
         }
 
         if params.old_string.is_empty() {
-            return ToolResult::error("old_string must not be empty".to_string());
+            return ToolResult::error_with_code(
+                ToolErrorCode::InvalidInput,
+                "old_string must not be empty".to_string(),
+            );
         }
 
         let path = ctx.resolve_path(&params.file_path);
@@ -90,14 +101,17 @@ impl Tool for FileEditTool {
             path.clone(),
             false,
         ) {
-            return ToolResult::error(e.to_string());
+            return ToolResult::error_with_code(ToolErrorCode::PermissionDenied, e.to_string());
         }
 
         // Read current content
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => {
-                return ToolResult::error(format!("Failed to read file {}: {}", path.display(), e));
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Failed to read file {}: {}", path.display(), e),
+                );
             }
         };
 
@@ -114,22 +128,28 @@ impl Tool for FileEditTool {
         let count = normalized.matches(&old_string).count();
 
         if count == 0 {
-            return ToolResult::error(format!(
-                "old_string not found in {}. Make sure the string matches exactly, \
-                 including whitespace and indentation.",
-                path.display()
-            ));
+            return ToolResult::error_with_code(
+                ToolErrorCode::InvalidInput,
+                format!(
+                    "old_string not found in {}. Make sure the string matches exactly, \
+                     including whitespace and indentation.",
+                    path.display()
+                ),
+            );
         }
 
         if count > 1 && !params.replace_all {
             let sites = crate::match_sites_clause(&normalized, &old_string);
-            return ToolResult::error(format!(
-                "old_string appears {} times in {}{sites}. Either provide a larger \
-                 string with more surrounding context to make it unique, or set replace_all \
-                 to true to replace every occurrence.",
-                count,
-                path.display()
-            ));
+            return ToolResult::error_with_code(
+                ToolErrorCode::InvalidInput,
+                format!(
+                    "old_string appears {} times in {}{sites}. Either provide a larger \
+                     string with more surrounding context to make it unique, or set replace_all \
+                     to true to replace every occurrence.",
+                    count,
+                    path.display()
+                ),
+            );
         }
 
         // Perform the replacement on the ORIGINAL bytes, preserving every
@@ -298,6 +318,7 @@ mod tests {
             )
             .await;
         assert!(res.is_error, "expected error for missing old_string");
+        assert_eq!(res.error_code, Some(ToolErrorCode::InvalidInput));
         assert!(res.content.contains("not found"));
     }
 
@@ -319,6 +340,7 @@ mod tests {
             )
             .await;
         assert!(res.is_error, "expected error for duplicate old_string");
+        assert_eq!(res.error_code, Some(ToolErrorCode::InvalidInput));
         assert!(res.content.contains("appears"));
         // The report must locate the matches — that is what lets the model fix
         // the ambiguity in one step instead of re-reading and guessing.
@@ -347,6 +369,7 @@ mod tests {
             )
             .await;
         assert!(res.is_error, "expected error for identical strings");
+        assert_eq!(res.error_code, Some(ToolErrorCode::InvalidInput));
     }
 
     #[tokio::test]
@@ -367,6 +390,7 @@ mod tests {
             )
             .await;
         assert!(res.is_error, "expected error for empty old_string");
+        assert_eq!(res.error_code, Some(ToolErrorCode::InvalidInput));
     }
 
     #[tokio::test]
@@ -377,6 +401,7 @@ mod tests {
             .execute(json!({"file_path": "some/path"}), &ctx)
             .await;
         assert!(res.is_error, "expected error for missing fields");
+        assert_eq!(res.error_code, Some(ToolErrorCode::InvalidInput));
         assert!(res.content.contains("Invalid input"));
     }
 }

@@ -59,8 +59,8 @@ use catalog::CLOUDFLARE_PROBE_MODEL;
 
 pub use catalog::{
     catalog_entry, store_free_last_route, store_free_model_defaults, store_free_model_lists,
-    take_free_last_route, take_free_model_defaults, take_free_model_lists, FreeLastRoute,
-    FreeModelListEntry, FreeUpstream, LocalQuota, LocalQuotaWindow, FREE_CATALOG,
+    take_free_last_route, take_free_model_defaults, take_free_model_lists, vision_model_for,
+    FreeLastRoute, FreeModelListEntry, FreeUpstream, LocalQuota, LocalQuotaWindow, FREE_CATALOG,
 };
 pub use discovery::{
     discovery_for, fetch_cline_free_model, fetch_cline_free_models,
@@ -89,16 +89,23 @@ pub use task_classifier::{classify_request, classify_text, task_preference_ids, 
 pub fn first_configured_vision_model(auth_store: &clawde_core::AuthStore) -> Option<String> {
     let effective_models = take_free_model_defaults();
     FREE_CATALOG.iter().find_map(|upstream| {
-        if !upstream.vision
+        if !upstream.supports_images()
             || crate::providers::free::first_free_upstream_key(auth_store, upstream.id).is_none()
         {
             return None;
         }
-        let model = effective_models
-            .iter()
-            .find(|(id, _, _)| id == upstream.id)
-            .map(|(_, _, model)| model.as_str())
-            .unwrap_or(upstream.default_model);
+        // An upstream whose default is text-only pins its vision model; one
+        // whose default takes images keeps the live-discovered default, so the
+        // pin is always a model that can actually serve the image.
+        let model = vision_model_for(upstream.id)
+            .map(str::to_string)
+            .or_else(|| {
+                effective_models
+                    .iter()
+                    .find(|(id, _, _)| id == upstream.id)
+                    .map(|(_, _, model)| model.clone())
+            })
+            .unwrap_or_else(|| upstream.default_model.to_string());
         Some(format!("{}/{}", upstream.id, model))
     })
 }
@@ -3088,8 +3095,45 @@ mod cache_tests {
     fn first_configured_vision_model_skips_non_vision_upstreams() {
         let _home = TestHome::new();
         let mut auth = AuthStore::default();
-        auth.set_keys("groq", vec!["groq-test-key-12345678".to_string()]);
+        // Cerebras has no vision model on its free tier: a key alone must not
+        // make image mode think it has one.
+        auth.set_keys("cerebras", vec!["cerebras-test-key-12345678".to_string()]);
         assert_eq!(first_configured_vision_model(&auth), None);
+    }
+
+    /// An upstream whose DEFAULT model is text-only but whose free tier also
+    /// hosts a vision model still resolves: the pin names the vision model, not
+    /// the text-only default, so image mode does not skip a lane it can use.
+    #[test]
+    fn first_configured_vision_model_pins_the_vision_model_of_a_text_default_upstream() {
+        let _home = TestHome::new();
+        let mut auth = AuthStore::default();
+        auth.set_keys("groq", vec!["groq-test-key-12345678".to_string()]);
+
+        let pin = first_configured_vision_model(&auth).expect("groq resolves");
+        assert_eq!(
+            pin,
+            format!(
+                "groq/{}",
+                vision_model_for("groq").expect("groq has a vision model")
+            )
+        );
+    }
+
+    /// A vision arm whose own id is namespaced still yields a usable pin: the
+    /// upstream id is the first segment and the rest is the wire model, which
+    /// is how `classify_pin` splits `nvidia/google/gemma-4-31b-it`. Image mode
+    /// must therefore name the arm verbatim rather than the text-only default.
+    #[test]
+    fn first_configured_vision_model_pins_a_namespaced_vision_arm() {
+        let _home = TestHome::new();
+        let mut auth = AuthStore::default();
+        auth.set_keys("nvidia", vec!["nvidia-test-key-12345678".to_string()]);
+
+        assert_eq!(
+            first_configured_vision_model(&auth).as_deref(),
+            Some("nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
+        );
     }
 
     /// Verbose upstream error messages are capped before persistence so

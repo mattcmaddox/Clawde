@@ -2191,6 +2191,21 @@ pub mod config {
         /// Lifecycle status string (`"active"`, `"beta"`, …).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub status: Option<String>,
+        /// Whether the model accepts image input.
+        ///
+        /// The only way to state a capability for a model models.dev does not
+        /// list — a local runtime alias, a self-hosted OpenAI-compatible
+        /// endpoint, a freshly pulled Ollama vision model. Image mode refuses to
+        /// enter without a vision model, and the attach-time warning reads the
+        /// same answer, so without this a local user with a working `llava`/
+        /// `llama3.2-vision` tag is told they have no vision model at all.
+        #[serde(
+            default,
+            rename = "vision",
+            alias = "imageInput",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub vision: Option<bool>,
     }
 
     impl ModelOverride {
@@ -2201,6 +2216,7 @@ pub mod config {
                 && self.name.is_none()
                 && self.release_date.is_none()
                 && self.status.is_none()
+                && self.vision.is_none()
         }
     }
 
@@ -3296,6 +3312,23 @@ pub mod config {
                 .unwrap_or("free")
         }
 
+        /// The user's explicit image-input answer for `"provider/model"`.
+        ///
+        /// `modelOverrides` is the one place a capability can be stated for a
+        /// model the registry does not list (a local alias, a self-hosted
+        /// endpoint). Both the image-mode model pick and the attach-time
+        /// warning consult this before any catalog guess, because the person
+        /// running a local vision model knows something models.dev does not.
+        pub fn vision_override(&self, provider_id: &str, model: &str) -> Option<bool> {
+            let model = model
+                .strip_prefix(&format!("{provider_id}/"))
+                .unwrap_or(model);
+            self.model_overrides
+                .get(&format!("{provider_id}/{model}"))
+                .or_else(|| self.model_overrides.get(model))
+                .and_then(|ov| ov.vision)
+        }
+
         /// Resolve the effective model, falling back to a provider-appropriate default.
         ///
         /// When a non-Anthropic provider is active and no model is explicitly set,
@@ -3693,7 +3726,7 @@ pub mod config {
         /// sits in `<target>/<profile>/` — so that path segment is the signal
         /// that works for every crate. Cached: the executable cannot change
         /// mid-process.
-        fn running_under_cargo_test() -> bool {
+        pub(crate) fn running_under_cargo_test() -> bool {
             static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *CACHE.get_or_init(|| {
                 std::env::current_exe()

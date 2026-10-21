@@ -673,6 +673,22 @@ Model discovery fetches use `first_upstream_key()` (`free/discovery.rs`), which
 is keys-first (ring order) with a credential fallback — any valid key works for
 fetching a model list.
 
+**OpenCode's own store** is the last fallback for the two OpenCode ids, through
+`AuthStore::opencode_credential` (`crates/core/src/auth_store.rs`). It reads
+`~/.local/share/opencode/opencode.db` (`credential`, `integration_id =
+'opencode'`) before the legacy flat `auth.json`, decodes the tagged union
+(`key`, `oauth`, `external`), and refreshes an expired `oauth` row at
+`POST {server}/auth/device/token` (`grant_type=refresh_token`,
+`client_id=opencode-cli`) — writing the rotated record back so OpenCode and
+Clawde never hold different refresh tokens. Rows are selected active-first,
+then newest. `AuthStore::opencode_org_id` feeds `x-org-id`, which an
+organization-scoped Console account needs; `build_free_provider` and
+`build_multi_key_provider` attach it for `opencode-zen` (skipping the empty
+probe key `multi_key_factory_available` passes, so construction stays I/O-free).
+`expired_oauth_row_is_refreshed_and_written_back` drives the whole seam against
+a loopback token endpoint — keep it that way rather than testing a live
+Console session.
+
 ### Key Algorithms
 
 1. **`build_free_provider()`** (registry.rs) — Iterates `FREE_CATALOG` in
@@ -752,7 +768,7 @@ capped upstream is never asked again, and the next prompt skips it too.
 ### Validating image mode end to end
 
 A turn sent in IMAGE mode crosses four layers that no single Rust test drives
-together: `App::cycle_agent_mode` swaps in a vision model, the CLI turn loop
+together: `App::enter_image_mode` swaps in a vision model, the CLI turn loop
 assembles an `@path` reference into an image block, the free provider's vision
 gate (`FreeProvider::entry_fits_request`) only routes an image-bearing request
 to a `vision` upstream, and Google's request shaping turns it into an
@@ -772,11 +788,67 @@ every attach path (background clipboard read, Ctrl+V, a dropped or pasted path)
 and from the CLI submit path, so a text-only turn still switches while
 tab-cycling through the mode never does. Leaving the mode restores the saved
 model unless the user picked one in the meantime, and a mode that never swapped
-restores nothing.
+restores nothing. While the swap is pending the badge reads `IMAGE · WAITING`,
+so "the model has not changed yet" is visible rather than inferred.
 
-Google is the only vision-capable catalog upstream a mock can stand in for
-(`github-copilot` fixes its endpoint inside the provider), so
-`GoogleProvider::with_base_url` takes the dev-only, debug-only, loopback-only
+Every entry path funnels through `App::enter_image_mode`: Tab
+(`cycle_agent_mode`), `--agent image`, and `/agent image`. It is the only place
+that resolves the vision model, arms the swap and starts the clipboard read, so
+a path that sets `agent_mode` directly (as `--agent` used to) cannot leave the
+mode half-entered; it returns `false` when no vision model resolves and the
+caller falls back to another mode. `/agent image` is special-cased in
+`intercept_slash_command_with_args` because `image` is a mode, not a registry
+agent — the popup path only knows build/plan/explore.
+
+**Where the vision model comes from**, most explicit first: a
+`modelOverrides` entry with `"vision": true` (via
+`apply_overrides_to_entries`, which materialises it into the registry), the
+models.dev registry (`best_vision_model_for_provider`), live-discovered models
+(`App::discovered_models`, filled by the `/model` picker's fetch — Ollama
+reports `capabilities: ["vision"]` per tag, parsed by
+`OpenAiCompatProvider::ollama_reports_vision`), and finally the provider's own
+`image_input` claim. `App::model_supports_images` answers the same question for
+the attach-time warning, so a screenshot attached in BUILD mode to a text-only
+model warns before the turn instead of failing on the provider's 400. The free
+chain is separate: `FreeUpstream::supports_images` is true when either the
+default model or `vision_model_for(upstream)` takes images, and `attempt_plan`
+swaps in that model for an image turn, dropping the upstream's text-only
+`fallback_models` rows (they could only answer an image with a 400). Four
+upstreams keep a text-only default and answer images through that arm (`groq`,
+`nvidia`, `zai`, `openrouter`), so an arm id has to be a model the upstream
+still serves — a retired id admits the image turn and then 404s, which is how
+the old `groq` arm (`meta-llama/llama-4-scout-17b-16e-instruct`) died once Groq
+dropped the Llama family. Verify an arm with a real request before changing it
+(the nvidia one was confirmed with an image request, zai with a 1-token chat);
+a `/models` listing is not enough, and for Cline it is actively misleading —
+ids in its `free` array still answer 404/500. `every_vision_arm_names_a_model_other_than_the_default`
+in `catalog.rs` locks the current ids.
+
+Headless runs have no prompt box, so `--image <PATH>` (repeatable) is their
+only image input: `attach_images_to_prompt` appends the decoded images to the
+last user message. Images are normalised on the way in
+(`image_paste::normalise_image`): BMP/TIFF are re-encoded to PNG, anything over
+3.75 MB or 8000 px is downscaled (PNG, JPEG fallback), because providers reject
+the raw form and the error names nothing the user can act on.
+
+Tool output can carry images too: `ToolResult.images` becomes
+`ToolResultContent::Blocks` in `tool_exec`, which is how the computer-use
+screenshot and MCP image content reach the model — as a text blob they were
+unreadable. Compaction keeps the newest `KEEP_RECENT_IMAGES` messages' images
+(`compact::strip_images`) so a follow-up about the attached screenshot still
+works, and the token estimators charge an image
+`IMAGE_TOKEN_EQUIVALENT_CHARS` instead of a handful of characters.
+
+Six catalog upstreams accept images: `github-copilot` and `google` by their
+`vision` flag, and `groq`, `nvidia`, `zai` and `openrouter` through
+`vision_model_for` (a text-only default, so `attempt_plan` swaps the wire
+model). The probe stands in for Google, which is the only one whose request
+shaping is its own module: `github-copilot` fixes its endpoint inside the
+provider, so a loopback mock cannot reach it, and the `vision_model_for`
+substitution rides the OpenAI-compatible transport that
+`crates/api/src/providers/free/impls.rs` covers with a mock `LlmProvider` — the
+probe does not exercise it on the wire. `GoogleProvider::with_base_url`
+therefore takes the dev-only, debug-only, loopback-only
 `CLAWDE_FREE_BASE_URL_GOOGLE` hook through `google_provider` in
 `crates/api/src/registry.rs`. Its scratch home pre-seeds the google free-state
 caches and silences the two startup calls that live outside the free chain (an

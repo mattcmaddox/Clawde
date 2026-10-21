@@ -14,11 +14,53 @@ pub fn estimate_tokens(text: &str) -> u64 {
     (text.len() as f64 / 4.0).ceil() as u64
 }
 
+/// Character-equivalent weight of one image in the token estimators.
+///
+/// The estimators convert chars → tokens as `chars / 4` (plus a `* 4 / 3`
+/// safety padding in the compaction paths), so 3 300 chars ≈ 1 100 tokens.
+/// That matches a typical screenshot closely enough for a context meter
+/// (Anthropic bills `w*h/750` ≈ 1.2k for 1280×800, Gemini ≈ 258 per tile,
+/// OpenAI ≈ 85 + 170 per tile). Without it an image counted as a handful of
+/// characters, so an image-heavy turn looked like it had barely used the
+/// window — and the compaction trigger never fired for it.
+pub const IMAGE_TOKEN_EQUIVALENT_CHARS: usize = 3_300;
+
+/// Tokens an image is estimated to cost, using the same chars / 4 convention
+/// as [`estimate_tokens`].
+pub fn image_token_equivalent() -> u64 {
+    (IMAGE_TOKEN_EQUIVALENT_CHARS / 4) as u64
+}
+
+/// Total images carried by one message, including images inside tool results
+/// (a screenshot tool returns its capture that way).
+fn image_count(msg: &Message) -> u64 {
+    let blocks = match &msg.content {
+        MessageContent::Blocks(blocks) => blocks,
+        MessageContent::Text(_) => return 0,
+    };
+    blocks
+        .iter()
+        .map(|b| match b {
+            ContentBlock::Image { .. } => 1,
+            ContentBlock::ToolResult {
+                content: crate::types::ToolResultContent::Blocks(inner),
+                ..
+            } => inner
+                .iter()
+                .filter(|part| matches!(part, ContentBlock::Image { .. }))
+                .count() as u64,
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Estimate total tokens for a slice of messages.
 pub fn estimate_messages_tokens(messages: &[Message]) -> u64 {
     messages
         .iter()
-        .map(|m| estimate_tokens(&get_message_text(m)) + 4)
+        .map(|m| {
+            estimate_tokens(&get_message_text(m)) + image_count(m) * image_token_equivalent() + 4
+        })
         .sum()
 }
 
