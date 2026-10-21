@@ -43,7 +43,7 @@ CASES = {
         {"X-CLIENT-TYPE": "cline-sdk"},
         "first",
     ),
-    "opencode-zen": ("https://api.opencode.ai/v1", "deepseek-v4-flash-free", {}, "first"),
+    "opencode-zen": ("https://opencode.ai/inference/openai/v1", "deepseek-v4.1-flash-free", {}, "first"),
     "zai": ("https://open.bigmodel.cn/api/paas/v4", "glm-4.7-flash", {}, "first"),
     "openrouter": ("https://openrouter.ai/api/v1", "openrouter/free", {}, "first"),
     "cloudflare": ("", CLOUDFLARE_PROBE_MODEL, {}, "composite"),

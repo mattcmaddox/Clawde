@@ -336,9 +336,49 @@ impl AuthStore {
     /// an OpenAI or Anthropic key to Zen by mistake. File and parse failures are
     /// silent and fail closed; credential values are never logged.
     pub fn opencode_cli_api_key() -> Option<String> {
-        let path = dirs::data_local_dir()?.join("opencode").join("auth.json");
-        let raw = std::fs::read_to_string(path).ok()?;
-        Self::parse_opencode_cli_api_key(&raw)
+        let dir = dirs::data_local_dir()?.join("opencode");
+        let raw = std::fs::read_to_string(dir.join("auth.json")).ok();
+        raw.as_deref()
+            .and_then(Self::parse_opencode_cli_api_key)
+            .or_else(|| Self::opencode_db_api_key(&dir.join("opencode.db")))
+    }
+
+    /// Read the newest OpenCode API key from the v2 credential table in
+    /// `opencode.db`. Rows are `credential(integration_id, value JSON)` where
+    /// `value` is a tagged union: `{"type":"key","key":...}` or an OAuth
+    /// record. Only `key` rows under the `opencode` integration are used.
+    /// The database is opened read-only; any failure fails closed to `None`.
+    fn opencode_db_api_key(path: &Path) -> Option<String> {
+        if !path.is_file() {
+            return None;
+        }
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .ok()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT value FROM credential \
+                 WHERE integration_id = 'opencode' ORDER BY time_created DESC",
+            )
+            .ok()?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
+        let mut found = None;
+        for raw in rows.flatten() {
+            if let Some(key) = Self::parse_opencode_db_value(&raw) {
+                found = Some(key);
+                break;
+            }
+        }
+        found
+    }
+
+    fn parse_opencode_db_value(raw: &str) -> Option<String> {
+        let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("key") {
+            return None;
+        }
+        let key = value.get("key")?.as_str()?.trim();
+        (key.len() >= 8).then(|| key.to_string())
     }
 
     fn parse_opencode_cli_api_key(raw: &str) -> Option<String> {
@@ -979,6 +1019,53 @@ mod tests {
 
         let oauth = r#"{"opencode":{"type":"oauth","access":"token-12345678"}}"#;
         assert_eq!(AuthStore::parse_opencode_cli_api_key(oauth), None);
+    }
+
+    #[test]
+    fn opencode_db_value_accepts_key_rows_and_rejects_oauth() {
+        assert_eq!(
+            AuthStore::parse_opencode_db_value(
+                r#"{"type":"key","key":"oc_sk_8ee113ce433c_secretvalue"}"#
+            )
+            .as_deref(),
+            Some("oc_sk_8ee113ce433c_secretvalue")
+        );
+        assert_eq!(
+            AuthStore::parse_opencode_db_value(
+                r#"{"type":"oauth","refresh":"r","access":"a","expires":0}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_db_reader_returns_newest_opencode_key_row() {
+        let path = std::env::temp_dir().join(format!(
+            "clawde-opencode-db-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let conn = rusqlite::Connection::open(&path).expect("open temp db");
+        conn.execute_batch(
+            "CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL,
+               value TEXT NOT NULL, connector_id TEXT, method_id TEXT, active INTEGER,
+               time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+             INSERT INTO credential VALUES ('a','opencode','default',
+               '{\"type\":\"key\",\"key\":\"oc_sk_old_000000000000\"}',NULL,NULL,1,1,1);
+             INSERT INTO credential VALUES ('b','opencode','default',
+               '{\"type\":\"key\",\"key\":\"oc_sk_new_111111111111\"}',NULL,NULL,1,2,2);
+             INSERT INTO credential VALUES ('c','openai','default',
+               '{\"type\":\"key\",\"key\":\"sk-other-provider-key\"}',NULL,NULL,1,3,3);",
+        )
+        .expect("seed temp db");
+        drop(conn);
+
+        let found = AuthStore::opencode_db_api_key(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(found.as_deref(), Some("oc_sk_new_111111111111"));
     }
 
     #[test]

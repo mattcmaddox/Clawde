@@ -500,7 +500,7 @@ pub fn opencode_zen() -> OpenAiCompatProvider {
     OpenAiCompatProvider::new(
         ProviderId::OPENCODE_ZEN,
         "OpenCode Zen",
-        "https://opencode.ai/zen/v1",
+        "https://opencode.ai/inference/openai/v1",
     )
     .with_api_key(key)
     .with_quirks(ProviderQuirks {

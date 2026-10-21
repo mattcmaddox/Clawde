@@ -74,6 +74,25 @@ fn validate_cloudflare_key(key: &str) -> Result<String, String> {
     Ok(trimmed)
 }
 
+/// Validate an OpenCode Zen key.
+///
+/// OpenCode replaced its legacy `sk-...` Zen keys with Console API keys shaped
+/// `oc_sk_<id>_<secret>`. The legacy keys now return HTTP 401 (expired), so
+/// storing one only poisons the rotation pool. Reject them with a pointer to
+/// the Console instead of storing a dead credential.
+fn validate_opencode_zen_key(key: &str) -> Result<String, String> {
+    let trimmed = key.trim().to_string();
+    if trimmed.starts_with("sk-") {
+        return Err(
+            "That is a legacy OpenCode Zen key (sk-...). It has expired.\n\
+             Create a new key in the OpenCode Console (opencode.ai/auth) —\n\
+             keys look like oc_sk_<id>_<secret>."
+                .to_string(),
+        );
+    }
+    Ok(trimmed)
+}
+
 /// Cloudflare account IDs are 32-character lowercase hex strings
 /// (e.g. `1a2b3c4d5e6f7890abcdef1234567890`). Used only to catch clearly
 /// swapped composite pastes — permissive by design, never a hard requirement.
@@ -371,6 +390,16 @@ impl SlashCommand for KeysCommand {
                         }
                     }
                 }
+                if provider == "opencode-zen" {
+                    for k in &valid {
+                        if let Err(err) = validate_opencode_zen_key(k) {
+                            return CommandResult::Error(format!(
+                                "Invalid OpenCode Zen key '{}':\n{}",
+                                k, err
+                            ));
+                        }
+                    }
+                }
                 store.set_keys(provider, valid.clone());
                 let dropped_note = if dropped.is_empty() {
                     String::new()
@@ -417,6 +446,11 @@ impl SlashCommand for KeysCommand {
                 // the composite shape explicitly.
                 if provider == "cloudflare" {
                     if let Err(err) = validate_cloudflare_key(&valid[0]) {
+                        return CommandResult::Error(err);
+                    }
+                }
+                if provider == "opencode-zen" {
+                    if let Err(err) = validate_opencode_zen_key(&valid[0]) {
                         return CommandResult::Error(err);
                     }
                 }
@@ -1808,6 +1842,12 @@ pub(crate) mod tests {
             autonomy: None,
             transient_prev_config: None,
         }
+    }
+
+    #[test]
+    fn opencode_zen_key_accepts_console_keys_and_rejects_legacy() {
+        assert!(validate_opencode_zen_key("oc_sk_8ee1a2b3c4d5_secretvalue123").is_ok());
+        assert!(validate_opencode_zen_key("sk-legacykey1234567890").is_err());
     }
 
     #[test]

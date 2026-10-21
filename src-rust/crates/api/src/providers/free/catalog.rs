@@ -311,7 +311,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         key_url: "opencode.ai/auth",
         // Zen's free pool is dynamic. This is only the offline fallback;
         // live discovery selects the current `*-free` model from `/models`.
-        default_model: "deepseek-v4-flash-free",
+        default_model: "deepseek-v4.1-flash-free",
         model_family: "opencode-zen-free",
         note: "dynamic Zen free pool — current `*-free` model via /models",
         tool_calling: true,

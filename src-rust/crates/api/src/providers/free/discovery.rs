@@ -91,7 +91,7 @@ pub fn discovery_for(upstream_id: &str) -> FreeModelDiscovery {
         },
         "google" => FreeModelDiscovery::GeminiModels,
         "opencode-zen" => FreeModelDiscovery::OpenCodeZenFreeModels {
-            base_url: "https://opencode.ai/zen/v1",
+            base_url: "https://opencode.ai/inference/v1",
         },
         "zai" => FreeModelDiscovery::OpenAiModelList {
             base_url: "https://api.z.ai/api/coding/paas/v4",
