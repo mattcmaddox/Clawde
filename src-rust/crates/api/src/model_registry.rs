@@ -383,8 +383,8 @@ pub struct ModelEntry {
 
     // ---- SDK overrides ----------------------------------------------------
     /// Override for the provider-level npm SDK / API URL on a per-model basis
-    /// (e.g. when a "minimax-m2.7" hosted on opencode-go uses the Anthropic
-    /// SDK rather than the openai-compatible one).
+    /// (e.g. when a "minimax-m2.7" hosted on OpenCode uses the Anthropic SDK
+    /// rather than the openai-compatible one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_override: Option<ProviderOverride>,
     /// Per-mode dispatch alternatives (rarely populated).
@@ -636,10 +636,20 @@ fn normalize_provider_api(provider_id: &str, api: Option<String>) -> Option<Stri
     api
 }
 
+/// Provider ids models.dev still publishes but Clawde does not support. Their
+/// models must never enter the registry: the picker would offer ids that no
+/// registered provider can dispatch.
+fn is_retired_provider_id(id: &str) -> bool {
+    matches!(id, "opencode-go")
+}
+
 fn transform_api(api: md::ApiJson) -> ParsedSnapshot {
     let mut out = ParsedSnapshot::default();
 
     for (raw_provider_id, p) in api.into_iter() {
+        if is_retired_provider_id(&raw_provider_id) {
+            continue;
+        }
         let provider_id = remap_provider_id(&raw_provider_id).to_string();
         let pid = ProviderId::new(provider_id.clone());
 
@@ -2083,6 +2093,24 @@ mod tests {
             "best model for groq should be llama-3.3-70b-versatile, got: {}",
             best
         );
+    }
+
+    #[test]
+    fn retired_opencode_go_is_dropped_from_the_snapshot() {
+        // models.dev still publishes an `opencode-go` provider. Clawde no
+        // longer registers it, so its models must not enter the registry where
+        // the picker would offer an id nothing can dispatch.
+        let json = r#"{"opencode-go":{"id":"opencode-go","name":"OpenCode Go","env":[],"models":{"kimi-k2.5":{"id":"kimi-k2.5","name":"Kimi K2.5","cost":{"input":0,"output":0},"limit":{"context":8192,"output":4096}}}},"opencode-zen":{"id":"opencode-zen","name":"OpenCode Zen","env":[],"models":{}}}"#;
+        let parsed = parse_snapshot_str(json).expect("parse must succeed");
+        assert!(!parsed.providers.contains_key("opencode-go"));
+        assert!(
+            !parsed
+                .models
+                .keys()
+                .any(|key| key.starts_with("opencode-go/")),
+            "no opencode-go model may survive the snapshot transform"
+        );
+        assert!(parsed.providers.contains_key("opencode-zen"));
     }
 
     #[test]

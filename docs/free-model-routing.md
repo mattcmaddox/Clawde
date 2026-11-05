@@ -648,7 +648,7 @@ upstream using the real key, base url and headers, and reports the status. A
 | google | 200 | OK |
 | groq | 200 | OK |
 | cline | 429 | OK — the `cline-free/` + `X-CLIENT-TYPE` fix works |
-| opencode-zen | 200 | OK |
+| opencode-zen | 200 | OK (at the time of this audit; Console now serves `-free` models only to the OpenCode client, so Zen left the free catalog) |
 | zai | 429 | OK (rate-limited = exists) |
 | cloudflare | 200 | OK |
 | openrouter | — | no key configured, not checked |

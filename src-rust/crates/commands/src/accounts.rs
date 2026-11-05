@@ -271,60 +271,6 @@ impl SlashCommand for LogoutCommand {
     }
 }
 
-// ---- /accounts ------------------------------------------------------------
-
-pub struct AccountsCommand;
-
-#[async_trait]
-impl SlashCommand for AccountsCommand {
-    fn name(&self) -> &str {
-        "accounts"
-    }
-    fn aliases(&self) -> Vec<&str> {
-        vec!["account"]
-    }
-    fn description(&self) -> &str {
-        "List stored Anthropic and Codex accounts"
-    }
-    fn help(&self) -> &str {
-        "Usage: /accounts\n\n\
-         Lists every stored Anthropic and Codex account along with the\n\
-         currently active one (marked with `*`). Use /switch to change\n\
-         accounts, /login to add a new one, /logout to remove one."
-    }
-
-    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let registry = clawde_core::accounts::AccountRegistry::load();
-        let mut out = String::new();
-        for (provider, label) in [
-            (clawde_core::accounts::PROVIDER_ANTHROPIC, "Anthropic"),
-            (clawde_core::accounts::PROVIDER_CODEX, "Codex"),
-        ] {
-            let profiles = registry.list(provider);
-            let active = registry.active(provider);
-            if profiles.is_empty() {
-                out.push_str(&format!("{}: (no accounts stored)\n", label));
-                continue;
-            }
-            out.push_str(&format!("{}:\n", label));
-            for p in profiles {
-                let marker = if active == Some(&p.id) { "*" } else { " " };
-                let email = p.email.as_deref().unwrap_or("");
-                let tier = p
-                    .subscription_tier
-                    .as_deref()
-                    .map(|t| format!(" [{}]", t))
-                    .unwrap_or_default();
-                out.push_str(&format!("  {} {}{}  {}\n", marker, p.id, tier, email));
-            }
-        }
-        if out.is_empty() {
-            out.push_str("No accounts stored. Use /login to add one.");
-        }
-        CommandResult::Message(out.trim_end().to_string())
-    }
-}
-
 // ---- /switch --------------------------------------------------------------
 
 pub struct SwitchCommand;
@@ -515,6 +461,7 @@ mod tests {
                     pm.insert(clawde_core::accounts::PROVIDER_CODEX.to_string(), codex);
                     pm
                 },
+                admin_users: None,
             };
             registry.save().unwrap();
 

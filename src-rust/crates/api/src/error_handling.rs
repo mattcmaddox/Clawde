@@ -123,6 +123,23 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
                         message,
                     };
                 }
+                // OpenCode's free tier admits only the OpenCode client — the
+                // gateway decides from the request itself, not from the key —
+                // so any other harness sees `FreeTierError` on every `-free`
+                // model. That is an entitlement fact about the model, not a bad
+                // key and not a malformed request: classify it as
+                // InvalidRequest so the free chain falls through to the next
+                // upstream without benching the key, and name the fix.
+                "freetiererror" | "free_tier_restricted" => {
+                    return ProviderError::InvalidRequest {
+                        provider: provider.clone(),
+                        message: format!(
+                            "{message} — OpenCode free models are served only to the \
+                             OpenCode client. Add a Console key (oc_sk_…) with credits and use a \
+                             paid model, or let another free upstream serve this turn."
+                        ),
+                    };
+                }
                 "invalid_prompt" | "invalid_request_error" => {
                     return ProviderError::InvalidRequest {
                         provider: provider.clone(),
@@ -418,6 +435,25 @@ mod tests {
         let pid = ProviderId::new("openai");
         let err = parse_error_response(429, "rate limited", &pid);
         assert!(matches!(err, ProviderError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn test_parse_opencode_free_tier_error_is_not_an_auth_failure() {
+        // A `FreeTierError` arrives with HTTP 403 but is about the client, not
+        // the key: benching the key would report a valid Console credential as
+        // dead, and the free chain must still fall through to another upstream.
+        let pid = ProviderId::new("opencode-zen");
+        let err = parse_error_response(
+            403,
+            r#"{"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used from within OpenCode."}}"#,
+            &pid,
+        );
+        assert!(
+            matches!(&err, ProviderError::InvalidRequest { provider, message }
+                if *provider == pid && message.contains("Console key")),
+            "OpenCode FreeTierError must be an InvalidRequest with actionable guidance: {:?}",
+            err
+        );
     }
 
     #[test]

@@ -70,7 +70,6 @@ impl ProviderId {
     pub const NOVITA: &'static str = "novita";
     pub const MINIMAX: &'static str = "minimax";
     pub const CODEX: &'static str = "codex";
-    pub const OPENCODE_GO: &'static str = "opencode-go";
     pub const OPENCODE_ZEN: &'static str = "opencode-zen";
     pub const SYNTHETIC: &'static str = "synthetic";
     pub const ROUTING: &'static str = "routing";
@@ -166,7 +165,6 @@ impl ProviderId {
                 | Self::NOVITA
                 | Self::MINIMAX
                 | Self::CROF
-                | Self::OPENCODE_GO
                 | Self::OPENCODE_ZEN
                 | Self::CLINE
                 // Legacy aliases that predate canonical constants
@@ -253,6 +251,15 @@ mod tests {
         assert!(ProviderId::is_known_provider_id(ProviderId::LM_STUDIO));
         assert!(ProviderId::is_known_provider_id(ProviderId::DEEPSEEK));
         assert!(ProviderId::is_known_provider_id(ProviderId::CLINE));
+    }
+
+    #[test]
+    fn opencode_go_is_not_a_known_provider_id() {
+        // OpenCode Go support was removed (its subscription terms do not allow
+        // third-party clients); a stale `opencode-go/<model>` string must not
+        // be parsed as a provider prefix.
+        assert!(!ProviderId::is_known_provider_id("opencode-go"));
+        assert!(ProviderId::is_known_provider_id(ProviderId::OPENCODE_ZEN));
     }
 
     #[test]

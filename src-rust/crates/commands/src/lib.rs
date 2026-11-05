@@ -557,6 +557,218 @@ pub struct ThinkingCommand;
 pub struct AutoCompactCommand;
 pub struct TaskCommand;
 pub struct FollowupsCommand;
+
+/// Admin user account management command.
+pub struct AccountsCommand;
+
+#[async_trait]
+impl SlashCommand for AccountsCommand {
+    fn name(&self) -> &str {
+        "accounts"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["account"]
+    }
+    fn description(&self) -> &str {
+        "Manage admin and user accounts (create, list, delete, update passwords)"
+    }
+    fn help(&self) -> &str {
+        "Usage: /accounts <subcommand> [options]\n\
+         \n\
+         Subcommands:\n\
+         /accounts create <USERNAME> --password <PASSWORD>  — create a new user account\n\
+         /accounts list                                    — list all user accounts (without passwords)\n\
+         /accounts get <USERNAME>                         — get details for a specific user\n\
+         /accounts delete <USERNAME>                      — delete a user account\n\
+         /accounts passwd <USERNAME> --password <NEW>     — update a user's password\n\n\
+         You must be authenticated as the admin to use these commands.\n\n\
+         Example:\n\
+         /accounts create alice --password \"secret123\"\n\
+         /accounts list\n\
+         /accounts passwd alice --password \"newsecret\""
+    }
+
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let mut out = Vec::new();
+        let args: Vec<&str> = partial.split_whitespace().collect();
+        match args.as_slice() {
+            [] | ["create"] => {
+                out.push(ArgCompletion {
+                    value: "USERNAME".to_string(),
+                    available: true,
+                    description: "Username for the new account".to_string(),
+                });
+            }
+            ["create", ref username] => {
+                out.push(ArgCompletion {
+                    value: format!("--password {}", username),
+                    available: false,
+                    description: String::new(),
+                });
+            }
+            ["list"] => {}
+            ["get", ref username] => {
+                out.push(ArgCompletion {
+                    value: username.to_string(),
+                    available: true,
+                    description: "Get user details".to_string(),
+                });
+            }
+            ["delete", ref username] => {
+                out.push(ArgCompletion {
+                    value: username.to_string(),
+                    available: true,
+                    description: "Delete user".to_string(),
+                });
+            }
+            ["passwd", ref username] => {
+                out.push(ArgCompletion {
+                    value: format!("--password {}", username),
+                    available: false,
+                    description: String::new(),
+                });
+            }
+            _ => {}
+        }
+        out
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        if !clawde_core::accounts::AccountRegistry::is_admin_authenticated() {
+            return CommandResult::Error(
+                "Admin authentication required. Set CLAWDE_ADMIN_TOKEN to use /accounts."
+                    .to_string(),
+            );
+        }
+
+        let args: Vec<&str> = args.split_whitespace().collect();
+        let cmd = if args.is_empty() { "list" } else { args[0] };
+
+        match cmd {
+            "create" => {
+                // Parse: /accounts create <USERNAME> --password <PASSWORD>
+                let mut iter = args.iter();
+                let _create = iter.next();
+                let username_opt = iter.next();
+                let username = username_opt.copied().unwrap_or("");
+                let password_opt =
+                    iter.find(|&s| s.starts_with("--password=") || s.starts_with("--password "));
+                let password = if let Some(pw) = password_opt {
+                    pw.strip_prefix("--password=")
+                        .unwrap_or(pw.strip_prefix("--password ").unwrap_or(""))
+                        .to_string()
+                } else {
+                    "".to_string()
+                };
+
+                if username.is_empty() {
+                    return CommandResult::Error("Username is required".to_string());
+                }
+                if password.is_empty() {
+                    return CommandResult::Error("Password is required".to_string());
+                }
+
+                // Create the admin user; the password is hashed before storage.
+                let mut registry = clawde_core::accounts::AccountRegistry::load();
+                let result = registry.create_admin_user(username, &password);
+                match result {
+                    Ok(_) => CommandResult::Message(format!(
+                        "User account '{}' created successfully (admin only).",
+                        username
+                    )),
+                    Err(e) => CommandResult::Error(format!("Failed to create user: {}", e)),
+                }
+            }
+            "list" => {
+                // List all admin users
+                let registry = clawde_core::accounts::AccountRegistry::load();
+                let users = registry.list_admin_users();
+                if users.is_empty() {
+                    CommandResult::Message("No user accounts found.".to_string())
+                } else {
+                    let mut msg = String::from("User accounts:\n");
+                    for user in &users {
+                        msg.push_str(&format!(
+                            "  - {} (created: {})\n",
+                            user.username, user.created_at
+                        ));
+                    }
+                    CommandResult::Message(msg)
+                }
+            }
+            "get" => {
+                let args2: Vec<&str> = args[1..].to_vec();
+                let username = if args2.is_empty() { "" } else { args2[0] };
+
+                if username.is_empty() {
+                    return CommandResult::Error("Username is required".to_string());
+                }
+
+                let registry = clawde_core::accounts::AccountRegistry::load();
+                if let Some(user) = registry.get_admin_user_by_username(username) {
+                    CommandResult::Message(format!(
+                        "User: {}\nCreated: {}\n",
+                        user.username, user.created_at
+                    ))
+                } else {
+                    CommandResult::Error(format!("User '{}' not found", username))
+                }
+            }
+            "delete" => {
+                let args2: Vec<&str> = args[1..].to_vec();
+                let username = if args2.is_empty() { "" } else { args2[0] };
+
+                if username.is_empty() {
+                    return CommandResult::Error("Username is required".to_string());
+                }
+
+                let mut registry = clawde_core::accounts::AccountRegistry::load();
+                let result = registry.delete_admin_user(username);
+                match result {
+                    Ok(_) => {
+                        CommandResult::Message(format!("User account '{}' deleted.", username))
+                    }
+                    Err(e) => CommandResult::Error(format!("Failed to delete user: {}", e)),
+                }
+            }
+            "passwd" => {
+                // Parse: /accounts passwd <USERNAME> --password <NEW>
+                let args2: Vec<&str> = args[1..].to_vec();
+                let username = if args2.is_empty() { "" } else { args2[0] };
+
+                let new_password: String = args2
+                    .iter()
+                    .find(|&s| s.starts_with("--password=") || s.starts_with("--password "))
+                    .map(|s| {
+                        s.strip_prefix("--password=")
+                            .unwrap_or(s.strip_prefix("--password ").unwrap_or(""))
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+
+                if username.is_empty() {
+                    return CommandResult::Error("Username is required".to_string());
+                }
+                if new_password.is_empty() {
+                    return CommandResult::Error("New password is required".to_string());
+                }
+
+                let mut registry = clawde_core::accounts::AccountRegistry::load();
+                let result = registry.update_admin_user_password(username, &new_password);
+                match result {
+                    Ok(_) => {
+                        CommandResult::Message(format!("Password updated for user '{}'.", username))
+                    }
+                    Err(e) => CommandResult::Error(format!("Failed to update password: {}", e)),
+                }
+            }
+            _ => CommandResult::Error(format!(
+                "Unknown subcommand: {}. Use /accounts list for available commands.",
+                cmd
+            )),
+        }
+    }
+}
 // New commands
 // Batch-1 new commands
 // New commands: teleport, btw, ctx-viz, sandbox-toggle
@@ -2013,7 +2225,7 @@ impl SlashCommand for ChatCommand {
         let mut out = Vec::new();
         let args: Vec<&str> = partial.split_whitespace().collect();
         match args.as_slice() {
-            [] | ["status"] => {
+            [] => {
                 for (value, description) in [
                     ("status", "Links, devices, exposure, lockouts"),
                     ("links", "List guest links"),
@@ -4104,11 +4316,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_accounts_command_returns_message() {
-        let mut ctx = make_ctx();
-        let cmd = find_command("accounts").unwrap();
-        let result = cmd.execute("", &mut ctx).await;
-        // Should return a Message regardless of registry contents.
-        assert!(matches!(result, CommandResult::Message(_)));
+        with_chat_temp_home(|| {
+            Box::pin(async {
+                let mut ctx = make_ctx();
+                let cmd = find_command("accounts").unwrap();
+                let unauth = cmd.execute("", &mut ctx).await;
+                assert!(matches!(unauth, CommandResult::Error(_)));
+
+                std::fs::write(
+                    clawde_core::accounts::AccountRegistry::admin_session_path(),
+                    "test-session-token",
+                )
+                .unwrap();
+                let result = cmd.execute("", &mut ctx).await;
+                // Should return a Message regardless of registry contents when authenticated.
+                assert!(matches!(result, CommandResult::Message(_)));
+            })
+        })
+        .await;
     }
 
     #[tokio::test]

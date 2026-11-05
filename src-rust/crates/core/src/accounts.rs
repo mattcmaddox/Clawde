@@ -2,6 +2,7 @@
 //!
 //! Stores named profiles per provider (anthropic, codex) on disk so users can
 //! switch between Pro/Max/work/personal accounts without re-logging-in.
+//! Also supports an admin account model with regular user accounts.
 //!
 //! Design borrows from two prior arts:
 //!
@@ -26,8 +27,15 @@
 //! The registry holds metadata (label, email, account-id, timestamps, active
 //! pointer per provider). The per-account credential files keep their existing
 //! schemas so the rest of the codebase doesn't change shape.
+//!
+//! Admin model:
+//!   The registry includes a special "admin" provider that holds user accounts.
+//!   User accounts are stored under `users.<id>` with fields: username, password_hash,
+//!   created_at, and optional metadata. The admin can create, list, modify, and delete
+//!   user accounts through CLI (/accounts) and TUI interfaces.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -73,6 +81,27 @@ impl AccountProfile {
     }
 }
 
+/// A user account under the admin.
+///
+/// Passwords are never stored in cleartext: `password_hash` holds
+/// `salt(16) || sha256(salt || password)(32)`. See [`hash_password`] and
+/// [`verify_password`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdminUser {
+    /// Unique identifier for this user account.
+    pub id: String,
+    /// Display username (unique).
+    pub username: String,
+    /// Hashed password: 16-byte random salt followed by a 32-byte SHA-256
+    /// digest of `salt || password`. Never cleartext.
+    pub password_hash: Vec<u8>,
+    /// ISO-8601 timestamp when the account was created.
+    pub created_at: String,
+    /// Optional metadata (role, permissions, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<BTreeMap<String, String>>,
+}
+
 /// Per-provider section of the registry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderAccounts {
@@ -87,12 +116,16 @@ pub struct ProviderAccounts {
 /// On-disk shape of `~/.clawde/accounts.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccountRegistry {
-    /// Schema version (current: 1).
+    /// Schema version (current: 2 — added admin/user support).
     #[serde(default = "default_version")]
     pub version: u32,
     /// One entry per credential provider.
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderAccounts>,
+    /// Admin users stored under the special "admin" provider.
+    /// Structure: users.<id> = { username, password_hash, created_at, metadata }
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_users: Option<BTreeMap<String, AdminUser>>,
 }
 
 fn default_version() -> u32 {
@@ -211,6 +244,150 @@ impl AccountRegistry {
         }
         self.save()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Admin user management
+// ---------------------------------------------------------------------------
+
+impl AccountRegistry {
+    /// Path to `~/.clawde/admin_session` (or the `CLAWDE_HOME` override).
+    pub fn admin_session_path() -> PathBuf {
+        clawde_dir().join("admin_session")
+    }
+
+    /// True when an admin session is active. The gate is the
+    /// `CLAWDE_ADMIN_TOKEN` environment variable being set and non-empty, or a
+    /// non-empty `~/.clawde/admin_session` file. Every `/accounts` subcommand
+    /// requires this before it may run.
+    pub fn is_admin_authenticated() -> bool {
+        if std::env::var("CLAWDE_ADMIN_TOKEN")
+            .ok()
+            .is_some_and(|token| !token.is_empty())
+        {
+            return true;
+        }
+        std::fs::read_to_string(Self::admin_session_path())
+            .ok()
+            .is_some_and(|content| !content.trim().is_empty())
+    }
+
+    /// List all admin users, sorted by username.
+    pub fn list_admin_users(&self) -> Vec<AdminUser> {
+        let mut users: Vec<AdminUser> = self
+            .admin_users
+            .as_ref()
+            .map(|map| map.values().cloned().collect())
+            .unwrap_or_default();
+        users.sort_by(|a, b| a.username.cmp(&b.username));
+        users
+    }
+
+    /// Look up a user by username.
+    pub fn get_admin_user_by_username(&self, username: &str) -> Option<AdminUser> {
+        self.admin_users
+            .as_ref()
+            .and_then(|map| map.values().find(|user| user.username == username))
+            .cloned()
+    }
+
+    /// Create a new user account. The password is salted and hashed before
+    /// storage; it is never written to disk in cleartext.
+    pub fn create_admin_user(&mut self, username: &str, password: &str) -> anyhow::Result<()> {
+        if username.is_empty() {
+            anyhow::bail!("Username is required");
+        }
+        if password.is_empty() {
+            anyhow::bail!("Password is required");
+        }
+        if self.get_admin_user_by_username(username).is_some() {
+            anyhow::bail!("User '{}' already exists", username);
+        }
+        let user = AdminUser {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: username.to_string(),
+            password_hash: hash_password(password),
+            created_at: now_iso(),
+            metadata: None,
+        };
+        self.admin_users
+            .get_or_insert_with(BTreeMap::new)
+            .insert(user.id.clone(), user);
+        self.save()
+    }
+
+    /// Delete a user account by username.
+    pub fn delete_admin_user(&mut self, username: &str) -> anyhow::Result<()> {
+        let users = self
+            .admin_users
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("No user accounts stored"))?;
+        let id = users
+            .iter()
+            .find(|(_, user)| user.username == username)
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| anyhow::anyhow!("User '{}' not found", username))?;
+        users.remove(&id);
+        if users.is_empty() {
+            self.admin_users = None;
+        }
+        self.save()
+    }
+
+    /// Update a user's password by username. The new password is salted and
+    /// hashed before storage.
+    pub fn update_admin_user_password(
+        &mut self,
+        username: &str,
+        new_password: &str,
+    ) -> anyhow::Result<()> {
+        if new_password.is_empty() {
+            anyhow::bail!("New password is required");
+        }
+        let user_id = self
+            .admin_users
+            .as_ref()
+            .and_then(|map| {
+                map.values()
+                    .find(|user| user.username == username)
+                    .map(|user| user.id.clone())
+            })
+            .ok_or_else(|| anyhow::anyhow!("User '{}' not found", username))?;
+        let user = self
+            .admin_users
+            .as_mut()
+            .and_then(|map| map.get_mut(&user_id))
+            .ok_or_else(|| anyhow::anyhow!("User '{}' not found", username))?;
+        user.password_hash = hash_password(new_password);
+        self.save()
+    }
+}
+
+/// Hash a password into `salt(16) || sha256(salt || password)(32)`. The salt
+/// is drawn from the OS RNG via `getrandom`.
+fn hash_password(password: &str) -> Vec<u8> {
+    let mut salt = [0u8; 16];
+    getrandom::getrandom(&mut salt).expect("getrandom is seeded by the operating system");
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(password.as_bytes());
+    let digest = hasher.finalize().to_vec();
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&digest);
+    out
+}
+
+/// Verify a cleartext password against a stored `hash_password` value.
+pub fn verify_password(password: &str, stored: &[u8]) -> bool {
+    if stored.len() != 48 {
+        return false;
+    }
+    let (salt, digest) = stored.split_at(16);
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(password.as_bytes());
+    hasher.finalize().as_slice() == digest
 }
 
 /// Slugify an arbitrary string into a safe profile id. Lowercases, replaces
@@ -565,5 +742,123 @@ mod tests {
             0o700,
             "codex account dir must be owner-only"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin user accounts: create / list / get / delete / password update.
+    // All redirect CLAWDE_HOME to a temp dir, so no real user state is touched.
+    // -----------------------------------------------------------------------
+
+    /// Redirect CLAWDE_HOME to a temp dir for the duration of `f`, holding the
+    /// crate-wide env lock so sibling env-mutating tests cannot race us.
+    fn with_scratch_home<F>(f: F)
+    where
+        F: FnOnce(),
+    {
+        let _lock = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", dir.path());
+        f();
+        std::env::remove_var("CLAWDE_HOME");
+        drop(dir);
+    }
+
+    #[test]
+    fn admin_create_and_list_user() {
+        with_scratch_home(|| {
+            let mut reg = AccountRegistry::default();
+            reg.create_admin_user("alice", "secret123").unwrap();
+            let users = reg.list_admin_users();
+            assert_eq!(users.len(), 1);
+            assert_eq!(users[0].username, "alice");
+            assert!(!users[0].password_hash.is_empty());
+        });
+    }
+
+    #[test]
+    fn admin_create_duplicate_user_is_rejected() {
+        with_scratch_home(|| {
+            let mut reg = AccountRegistry::default();
+            reg.create_admin_user("alice", "secret123").unwrap();
+            let err = reg.create_admin_user("alice", "other").unwrap_err();
+            assert!(err.to_string().contains("already exists"));
+        });
+    }
+
+    #[test]
+    fn admin_get_user_by_username() {
+        with_scratch_home(|| {
+            let mut reg = AccountRegistry::default();
+            reg.create_admin_user("alice", "secret123").unwrap();
+            let user = reg.get_admin_user_by_username("alice").unwrap();
+            assert_eq!(user.username, "alice");
+            assert!(reg.get_admin_user_by_username("nope").is_none());
+        });
+    }
+
+    #[test]
+    fn admin_delete_user() {
+        with_scratch_home(|| {
+            let mut reg = AccountRegistry::default();
+            reg.create_admin_user("alice", "secret123").unwrap();
+            reg.create_admin_user("bob", "secret123").unwrap();
+            reg.delete_admin_user("alice").unwrap();
+            let users = reg.list_admin_users();
+            assert_eq!(users.len(), 1);
+            assert_eq!(users[0].username, "bob");
+            assert!(reg.delete_admin_user("missing").is_err());
+        });
+    }
+
+    #[test]
+    fn admin_update_password_changes_hash() {
+        with_scratch_home(|| {
+            let mut reg = AccountRegistry::default();
+            reg.create_admin_user("alice", "oldpass").unwrap();
+            let before = reg
+                .get_admin_user_by_username("alice")
+                .unwrap()
+                .password_hash
+                .clone();
+            assert!(verify_password("oldpass", &before));
+            assert!(!verify_password("newpass", &before));
+
+            reg.update_admin_user_password("alice", "newpass").unwrap();
+            let after = reg
+                .get_admin_user_by_username("alice")
+                .unwrap()
+                .password_hash
+                .clone();
+            assert_ne!(before, after);
+            assert!(verify_password("newpass", &after));
+            assert!(!verify_password("oldpass", &after));
+
+            assert!(reg.update_admin_user_password("missing", "x").is_err());
+        });
+    }
+
+    #[test]
+    fn admin_password_hash_is_not_cleartext() {
+        let hash = hash_password("hunter2");
+        assert_eq!(hash.len(), 48);
+        // Two hashes of the same password differ (random salt).
+        assert_ne!(hash_password("hunter2"), hash_password("hunter2"));
+        assert!(verify_password("hunter2", &hash));
+        assert!(!verify_password("wrong", &hash));
+        assert!(!verify_password("hunter2", &[0u8; 31]));
+    }
+
+    #[test]
+    fn admin_auth_reflects_env_token() {
+        let _lock = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!AccountRegistry::is_admin_authenticated());
+        std::env::set_var("CLAWDE_ADMIN_TOKEN", "s3cr3t");
+        assert!(AccountRegistry::is_admin_authenticated());
+        std::env::remove_var("CLAWDE_ADMIN_TOKEN");
+        assert!(!AccountRegistry::is_admin_authenticated());
     }
 }

@@ -194,8 +194,8 @@ fn detect_env_var_key(upstream_id: &str) -> Option<String> {
     std::env::var(env_var).ok().filter(|v| !v.is_empty())
 }
 /// All stored keys for a free-catalog upstream: single-key / OAuth
-/// credentials plus rotation keys, deduplicated, with OpenCode Zen sharing
-/// the OpenCode Go slots. Display-oriented — seeds `/keys`' per-key health
+/// credentials plus rotation keys, deduplicated. Display-oriented — seeds
+/// `/keys`' per-key health
 /// dots (the health poller keeps its own ring-aligned probe list via
 /// `resolve_free_upstream_keys`).
 fn free_upstream_stored_keys(auth: &clawde_core::AuthStore, upstream_id: &str) -> Vec<String> {
@@ -286,21 +286,14 @@ fn provider_picker_items() -> Vec<SelectItem> {
             category: "Free".into(),
             badge: Some("FREE".into()),
         },
+        // ── Popular Paid Providers ──
         SelectItem {
             id: "opencode-zen".into(),
             title: "OpenCode Zen".into(),
-            description: "Free models + paid · Nemotron · MiniMax · DeepSeek".into(),
-            category: "Free".into(),
-            badge: Some("FREE".into()),
-        },
-        SelectItem {
-            id: "opencode-go".into(),
-            title: "OpenCode Go".into(),
-            description: "Flat-rate · Kimi · DeepSeek · GLM · MiniMax".into(),
-            category: "Free".into(),
+            description: "Paid Console models · Claude · DeepSeek · MiniMax".into(),
+            category: "Paid".into(),
             badge: None,
         },
-        // ── Popular Paid Providers ──
         SelectItem {
             id: "anthropic".into(),
             title: "Anthropic".into(),
@@ -3653,16 +3646,14 @@ impl App {
     }
 
     /// Whether a provider id can affect the free-mode fallback chain — i.e.
-    /// it is a catalog upstream, the composite "free" provider itself, an
-    /// OpenCode Zen/Go alias, or Ollama (when in Auto mode). Used to skip
+    /// it is a catalog upstream, the composite "free" provider itself, the
+    /// OpenCode Zen alias, or Ollama (when in Auto mode). Used to skip
     /// pointless free-chain rebuilds when connecting unrelated providers.
     fn provider_affects_free_chain(&self, provider_id: &str) -> bool {
-        matches!(
-            provider_id,
-            "free" | "opencode-zen" | "opencode-go" | "ollama"
-        ) || clawde_api::providers::free::FREE_CATALOG
-            .iter()
-            .any(|u| u.id == provider_id)
+        matches!(provider_id, "free" | "opencode-zen" | "ollama")
+            || clawde_api::providers::free::FREE_CATALOG
+                .iter()
+                .any(|u| u.id == provider_id)
     }
 
     fn persist_custom_provider_base_url(&self, base_url: &str) {
@@ -4107,13 +4098,11 @@ impl App {
     }
 
     fn infer_provider_from_model(model: &str) -> Option<String> {
-        // Free-mode synthetic IDs always route back through the "free"
-        // composite provider so the Zen → OpenRouter fallback kicks in.
-        if model == "free/auto"
-            || model.starts_with("free/")
-            || model.starts_with("zen/")
-            || model.starts_with("opencode-zen/")
-        {
+        // Free-mode synthetic IDs and the legacy `zen/` alias route back
+        // through the "free" composite provider. A paid
+        // `opencode-zen/<model>` id names its own provider: folding it into
+        // free mode would resolve the pin to `free/auto` and never reach Zen.
+        if model == "free/auto" || model.starts_with("free/") || model.starts_with("zen/") {
             return Some("free".to_string());
         }
         if let Some((provider, _)) = model.split_once('/') {
@@ -18528,6 +18517,22 @@ mod tests {
             app.model_picker.task_sort,
             crate::model_picker::FreeTask::Reasoning,
             "switching within free must keep the task sort"
+        );
+    }
+
+    #[test]
+    fn paid_opencode_zen_model_keeps_its_provider() {
+        // A paid Zen model must not be folded into free mode: the free chain
+        // has no Zen entry, so `free/auto` would silently route elsewhere and
+        // the Zen key would never be used.
+        assert_eq!(
+            App::infer_provider_from_model("opencode-zen/claude-sonnet-4-6").as_deref(),
+            Some("opencode-zen")
+        );
+        assert_eq!(
+            App::infer_provider_from_model("zen/big-pickle").as_deref(),
+            Some("free"),
+            "the legacy zen/ alias still routes through the free composite"
         );
     }
 

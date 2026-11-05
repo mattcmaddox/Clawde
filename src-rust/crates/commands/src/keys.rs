@@ -152,7 +152,6 @@ fn known_provider_ids() -> Vec<&'static str> {
         P::NOVITA,
         P::MINIMAX,
         P::CODEX,
-        P::OPENCODE_GO,
         P::OPENCODE_ZEN,
         P::NEURALWATT,
         P::CLINE,

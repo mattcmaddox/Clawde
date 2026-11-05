@@ -2087,19 +2087,15 @@ impl UpstreamKeyProbe {
     }
 }
 
-/// Resolve the key list for a free upstream, handling the OpenCode Zen/Go
-/// alias (both slots share the same key).  Used by the health poller and
-/// `build_free_provider` in registry.rs.
 /// Resolve the rotation keys for a free-catalog upstream, in ring order.
 ///
 /// This is the **single source of truth** for the key list a
 /// [`KeyRotatingProvider`] ring is built from, so it must stay **exactly
 /// aligned** with [`crate::registry`]'s ring construction: stored `keys`
 /// slots are preferred (with environment/OpenCode CLI fallback for Zen when
-/// no slot exists), the OpenCode Zen/Go shared slots are collapsed to a single
-/// slot (Zen first, Go as fallback), and each key is trimmed with placeholders
-/// shorter than 8 chars dropped — the same filtering the registry applies
-/// before wrapping a pool in a ring.
+/// no slot exists), and each key is trimmed with placeholders shorter than
+/// 8 chars dropped — the same filtering the registry applies before wrapping
+/// a pool in a ring.
 ///
 /// The health poller probes this exact list by index and forwards `key_idx`
 /// into the rings, so a key's position here is its ring slot. Any divergence
@@ -2120,18 +2116,7 @@ pub fn resolve_free_upstream_keys(
             .filter(|key| key.len() >= 8)
             .collect::<Vec<_>>()
     };
-    // Zen and Go intentionally share one ring: prefer the canonical Zen slot,
-    // but fall back to the Go alias when the Zen slot is absent or invalid.
-    let filtered = if upstream_id == "opencode-zen" {
-        let zen = clean(auth_store.keys_for("opencode-zen"));
-        if zen.is_empty() {
-            clean(auth_store.keys_for("opencode-go"))
-        } else {
-            zen
-        }
-    } else {
-        clean(auth_store.keys_for(upstream_id))
-    };
+    let filtered = clean(auth_store.keys_for(upstream_id));
     if !filtered.is_empty() {
         return Some(filtered);
     }
@@ -2186,8 +2171,7 @@ pub fn cooling_free_upstreams() -> std::collections::HashSet<String> {
 }
 
 /// All stored keys for a free-catalog upstream, including single-key / OAuth
-/// credentials (e.g. github-copilot), deduplicated, with OpenCode Zen sharing
-/// the OpenCode Go slots.
+/// credentials (e.g. github-copilot), deduplicated.
 ///
 /// Display-oriented: seeds `/keys`' per-key health dots.
 /// Not ring-aligned — the health poller must keep using
@@ -2202,31 +2186,24 @@ pub fn all_stored_free_upstream_keys(
             out.push(key);
         }
     };
-    let slots: Vec<&str> = if upstream_id == "opencode-zen" {
-        vec!["opencode-zen", "opencode-go"]
-    } else {
-        vec![upstream_id]
-    };
-    for slot in slots {
-        // This helper is display/migration-oriented, not a dispatch resolver:
-        // surface a legacy API credential so `/connect` and diagnostics can
-        // show it while the production chain still requires `keys`.
-        if let Some(clawde_core::StoredCredential::ApiKey { key }) =
-            auth_store.credentials.get(slot)
-        {
-            let key = key.trim();
-            if !key.is_empty() {
-                push(key.to_string());
-            }
-        } else if let Some(key) = auth_store.api_key_for(slot) {
-            // Preserve OAuth-backed display credentials such as Copilot while
-            // keeping free API credentials out of api_key_for's dispatch path.
-            push(key);
+    // This helper is display/migration-oriented, not a dispatch resolver:
+    // surface a legacy API credential so `/connect` and diagnostics can
+    // show it while the production chain still requires `keys`.
+    if let Some(clawde_core::StoredCredential::ApiKey { key }) =
+        auth_store.credentials.get(upstream_id)
+    {
+        let key = key.trim();
+        if !key.is_empty() {
+            push(key.to_string());
         }
-        if let Some(keys) = auth_store.keys_for(slot) {
-            for key in keys {
-                push(key.clone());
-            }
+    } else if let Some(key) = auth_store.api_key_for(upstream_id) {
+        // Preserve OAuth-backed display credentials such as Copilot while
+        // keeping free API credentials out of api_key_for's dispatch path.
+        push(key);
+    }
+    if let Some(keys) = auth_store.keys_for(upstream_id) {
+        for key in keys {
+            push(key.clone());
         }
     }
     out
@@ -2260,8 +2237,9 @@ pub fn fast_free_model(auth_store: &clawde_core::AuthStore) -> String {
 /// GitHub Copilot's OAuth credential or the provider's environment variable;
 /// free API credentials must first be migrated into the canonical `keys` map.
 ///
-/// OpenCode Zen shares the OpenCode Go slots. `build_free_provider` uses
-/// this for the non-rotating single-key path.
+/// OpenCode Zen also falls back to `OPENCODE_API_KEY` and OpenCode's own
+/// credential. `build_free_provider` uses this for the non-rotating
+/// single-key path.
 pub fn first_free_upstream_key(
     auth_store: &clawde_core::AuthStore,
     upstream_id: &str,
@@ -2280,17 +2258,11 @@ pub fn first_free_upstream_key(
     if upstream_id == "github-copilot" {
         return auth_store.api_key_for(upstream_id);
     }
-    let key = if matches!(upstream_id, "opencode-zen" | "opencode-go") {
+    let key = if upstream_id == "opencode-zen" {
         auth_store
             .keys_for("opencode-zen")
             .and_then(|keys| keys.iter().find(|key| key.trim().len() >= 8))
             .cloned()
-            .or_else(|| {
-                auth_store
-                    .keys_for("opencode-go")
-                    .and_then(|keys| keys.iter().find(|key| key.trim().len() >= 8))
-                    .cloned()
-            })
             .or_else(|| std::env::var("OPENCODE_API_KEY").ok())
             .or_else(clawde_core::AuthStore::opencode_cli_api_key)
     } else {
@@ -2985,11 +2957,13 @@ mod free_pin_resolution {
         }
     }
 
-    /// The legacy `zen/` alias and its canonical spelling both stay pinned.
+    /// OpenCode Zen is a Console harness provider, not a free upstream, so the
+    /// legacy `zen/` alias and its canonical spelling name no free route: the
+    /// label falls back to `free/auto`, exactly what the router does with them.
     #[test]
-    fn legacy_zen_pins_still_resolve() {
+    fn legacy_zen_pins_are_no_longer_free_routes() {
         for pin in ["zen/llama-3.3-70b", "opencode-zen/llama-3.3-70b"] {
-            assert_eq!(resolve_free_model(pin), pin);
+            assert_eq!(resolve_free_model(pin), "free/auto");
         }
     }
 

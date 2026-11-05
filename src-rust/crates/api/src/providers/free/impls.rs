@@ -3506,9 +3506,8 @@ impl Stream for RetryingFreeStream {
 /// calls early-return after one small store read, so cost is bounded to the
 /// first success per upstream.
 ///
-/// No-op once the upstream has any stored ring keys or a stored credential
-/// (mirroring the opencode-zen ↔ opencode-go slot alias used by the
-/// resolvers). Also no-ops for non-env providers (e.g. ollama) and
+/// No-op once the upstream has any stored ring keys or a stored credential.
+/// Also no-ops for non-env providers (e.g. ollama) and
 /// sub-8-char placeholders. Best-effort: failures only log. On a corrupt
 /// store the first save also triggers the `auth.json.corrupt-<ts>` backup, so
 /// this doubles as an automatic heal of an unreadable store.
@@ -3522,11 +3521,6 @@ fn persist_env_key_if_unstored(upstream_id: &str) {
     // destination for a free key.
     if store.migrate_free_credential_to_keys(upstream_id) {
         store.save();
-        return;
-    }
-    // opencode-zen shares the opencode-go slots (see resolve_free_upstream_keys).
-    if upstream_id == "opencode-zen" && store.keys_for("opencode-go").is_some_and(|k| !k.is_empty())
-    {
         return;
     }
     if store.get(upstream_id).is_some() {
@@ -6013,20 +6007,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_zen_prefix_routes_to_opencode_zen() {
-        let provider =
-            FreeProvider::new(vec![entry("opencode-zen", true), entry("openrouter", true)]);
-        let route = provider.resolve_route("zen/big-pickle");
-        match route {
-            Route::Pinned {
-                start_idx,
-                pinned_model,
-            } => {
-                assert_eq!(start_idx, 0);
-                assert_eq!(pinned_model, "big-pickle");
-            }
-            other => panic!("expected pinned, got {:?}", other),
-        }
+    fn legacy_zen_prefix_is_not_a_free_route() {
+        // Zen left the free catalog when Console restricted free models to the
+        // OpenCode client. The legacy `zen/` alias therefore routes through the
+        // chain (`Auto`) instead of pinning an upstream the chain no longer has.
+        let provider = FreeProvider::new(vec![entry("openrouter", true)]);
+        assert!(
+            matches!(provider.resolve_route("zen/big-pickle"), Route::Auto),
+            "the retired zen alias must fall back to chain routing"
+        );
     }
 
     #[test]
@@ -9829,8 +9818,7 @@ fn fetch_gemini_models_parses_gemini_response() {
 ///   * credentials (`api_key_for`) are NOT included — rings are built from
 ///     the multi-key store only;
 ///   * whitespace-trimmed and >=8 chars (placeholder / test-artifact
-///     filter applied at ring build time too);
-///   * OpenCode Zen reads the `opencode-go` slots as a fallback.
+///     filter applied at ring build time too).
 #[test]
 fn resolve_free_upstream_keys_is_ring_aligned() {
     let (mut store, _home) = crate::test_support::test_auth_store();
@@ -9878,22 +9866,6 @@ fn resolve_free_upstream_keys_ignores_credentials() {
         all_stored_free_upstream_keys(&store, "openrouter"),
         vec!["or-credential-key-0123456789".to_string()],
         "display-oriented union still surfaces the credential"
-    );
-}
-
-#[test]
-fn resolve_free_upstream_keys_opencode_zen_shares_go_slots() {
-    let (mut store, _home) = crate::test_support::test_auth_store();
-    store.keys.insert(
-        "opencode-go".to_string(),
-        vec!["zen-shared-key-00000000000000".into()],
-    );
-
-    // Zen has no slots of its own — the ring must be built from the Go
-    // slots so poller key_idx stays aligned with the actual ring.
-    assert_eq!(
-        resolve_free_upstream_keys(&store, "opencode-zen"),
-        Some(vec!["zen-shared-key-00000000000000".to_string()])
     );
 }
 
@@ -10038,19 +10010,6 @@ fn first_free_upstream_key_trims_and_drops_placeholders() {
     assert_eq!(first_free_upstream_key(&store, "groq"), None);
 }
 
-#[test]
-fn first_free_upstream_key_opencode_zen_shares_go_slots() {
-    let (mut store, _home) = crate::test_support::test_auth_store();
-    store.keys.insert(
-        "opencode-go".to_string(),
-        vec!["zen-shared-key-00000000000000".into()],
-    );
-    assert_eq!(
-        first_free_upstream_key(&store, "opencode-zen").as_deref(),
-        Some("zen-shared-key-00000000000000")
-    );
-}
-
 /// Load the synthetic multi-upstream fixture (`tests/fixtures/auth.json`)
 /// through the real `AuthStore::load()` path by pointing CLAWDE_HOME at a
 /// temp dir containing a copy of it.
@@ -10140,8 +10099,8 @@ fn first_successful_dispatch_persists_env_key() {
 #[test]
 /// Bidirectional catalog drift test: every provider in FREE_CATALOG
 fn free_catalog_and_core_predicate_agree_bidirectionally() {
-    // All providers recognized by core's is_free_upstream, excluding the
-    // intentional alias opencode-go (shared key slot with opencode-zen).
+    // All providers recognized by core's is_free_upstream. OpenCode Zen is a
+    // Console harness provider, not a free upstream (see FreeUpstream docs).
     let core_free = [
         "github-copilot",
         "cline",
@@ -10152,8 +10111,6 @@ fn free_catalog_and_core_predicate_agree_bidirectionally() {
         "groq",
         "google",
         "cloudflare",
-        "opencode-zen",
-        // opencode-go omitted: intentional alias, not a catalog entry
         "zai",
     ];
 
@@ -10174,14 +10131,18 @@ fn free_catalog_and_core_predicate_agree_bidirectionally() {
         );
     }
 
-    // The intentional alias must be recognized but must NOT be a catalog entry.
+    // OpenCode Zen is a Console harness provider: it must not be treated as a
+    // free upstream and must not appear in the free catalog. Its free models
+    // are served only to the OpenCode client, so a free route there can never
+    // succeed.
+    let id = "opencode-zen";
     assert!(
-        clawde_core::AuthStore::is_free_upstream("opencode-go"),
-        "opencode-go must be recognized as free upstream"
+        !clawde_core::AuthStore::is_free_upstream(id),
+        "{id} must not be recognized as a free upstream"
     );
     assert!(
-        !FREE_CATALOG.iter().any(|e| e.id == "opencode-go"),
-        "opencode-go must NOT be a separate catalog entry (alias for opencode-zen)"
+        !FREE_CATALOG.iter().any(|e| e.id == id),
+        "{id} must not be a free catalog entry"
     );
 }
 

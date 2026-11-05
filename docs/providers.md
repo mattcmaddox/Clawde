@@ -106,8 +106,9 @@ and in what order:
 - **`all_stored_free_upstream_keys`** — display only: credentials + rotation
   keys merged and deduplicated for the `/keys` popup's per-key health dots.
 
-OpenCode Zen reads the `opencode-go` key slots as a fallback in all three
-resolvers.
+OpenCode Zen is not a free upstream (see the Console harness section below),
+so none of the three resolvers reach it for the free chain; the Zen env/CLI
+fallback that survives in `free/mod.rs` is now inert.
 
 ### OpenCode credentials (OpenCode 2 / Console)
 
@@ -137,6 +138,39 @@ logs the token.
 
 Keys pasted with `/connect` or `clawde /keys` take precedence: they live in
 `~/.clawde/auth.json` and the resolvers read those slots before this fallback.
+
+### OpenCode Console (Zen) as a harness
+
+Clawde speaks Console's documented harness contract (the same one Claude Code,
+Codex and Pi use), so a Console key is a first-class provider rather than a
+free-chain upstream:
+
+- Base URL: `https://opencode.ai/inference/openai/v1` (pay-as-you-go).
+- Auth: `Authorization: Bearer oc_sk_…`, from `OPENCODE_API_KEY` or the
+  `opencode-zen` entry in `~/.clawde/auth.json`.
+- Session routing: every request carries `x-opencode-session: ses_…`
+  (`opencode_session_id()`). Console uses it to route a conversation and reuse
+  its prompt cache. The id is stable for the life of the process, one per
+  Clawde run.
+- Models: `opencode-zen/<model>`, e.g. `opencode-zen/claude-sonnet-4-6`.
+
+OpenCode Go (the flat-rate subscription gateway) is not supported: its
+subscription terms do not allow use through a third-party client, so Clawde no
+longer registers or routes it. Existing `opencode-go` keys in
+`~/.clawde/auth.json` are left untouched but inert: nothing registers the
+provider, no request routes to it, and the health poller never probes it. An
+`opencode-go` key is not used as a Zen fallback either — Zen reads only its own
+slot, `OPENCODE_API_KEY`, or OpenCode's own credential.
+
+To drop a stale slot, run `/keys remove opencode-go <index>` (indices are
+1-based, as shown by `/keys list`) or edit `auth.json` directly.
+
+**The free tier is not available to Clawde.** Console admits the `-free` models
+only to the OpenCode client and decides that from the request itself, so every
+free model answers `403 FreeTierError` here. Clawde maps that to an
+`InvalidRequest` that names the fix instead of benching the key; the free chain
+falls through to the next upstream. Use a Console key with credits on a paid
+model, or another free upstream.
 
 Health probes distinguish invalid credentials from transient provider trouble:
 401/403-style failures mark a key unhealthy, while 429, 5xx, connection, and
@@ -256,8 +290,9 @@ override uses it verbatim; tasks without one keep their built-in defaults:
 ```
 
 Upstream ids must match the free catalog (e.g. `groq`, `cerebras`,
-`google`, `openrouter`, `zai`, `opencode-zen`, `cloudflare`,
-`nvidia`, `cline`, `poolside`).
+`google`, `openrouter`, `zai`, `cloudflare`, `nvidia`, `cline`, `poolside`).
+OpenCode Zen is not a free upstream — its free models are OpenCode-only; see
+the Console harness section above.
 
 ### Router behaviour (audit spec Phase 2)
 

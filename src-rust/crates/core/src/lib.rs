@@ -8324,8 +8324,7 @@ pub mod cost {
     ///
     /// These overlap with providers that appear in `api_key_env_vars_for_provider`.
     /// When adding a provider to one, check whether it also belongs in the other.
-    /// Keep in sync with `AuthStore::is_free_upstream` (opencode-go is the
-    /// shared-key alias, not a catalog entry).
+    /// Keep in sync with `AuthStore::is_free_upstream`.
     const FREE_UPSTREAM_IDS: &[&str] = &[
         "github-copilot",
         "poolside",
@@ -8335,8 +8334,6 @@ pub mod cost {
         "cloudflare",
         "groq",
         "cline",
-        "opencode-zen",
-        "opencode-go",
         "zai",
         "openrouter",
     ];
@@ -10570,7 +10567,14 @@ mod tests {
         );
         assert_eq!(
             cost::ModelPricing::for_model("opencode-zen/minimax-m2.5-free"),
-            cost::ModelPricing::FREE
+            cost::ModelPricing::FREE,
+            "the `-free` suffix keeps a zero-cost Zen model free"
+        );
+        // Paid Zen models are billed through Console, so they must not inherit
+        // the free-upstream zero price (Zen is not a free catalog upstream).
+        assert_eq!(
+            cost::ModelPricing::for_model("opencode-zen/claude-sonnet-4-6"),
+            cost::ModelPricing::SONNET
         );
         assert_eq!(
             cost::ModelPricing::for_model("zai/glm-4.6"),

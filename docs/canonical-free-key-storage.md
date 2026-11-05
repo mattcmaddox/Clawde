@@ -16,8 +16,7 @@ All free API keys **must** be stored in the `keys` map of `auth.json`:
 {
   "keys": {
     "groq": ["gsk-abc123..."],
-    "nvidia": ["nvapi-xyz789..."],
-    "opencode-zen": ["zen-key-123...", "zen-key-456..."]
+    "nvidia": ["nvapi-xyz789..."]
   },
   "credentials": {
     "github-copilot": { "OAuthToken": { ... } }
@@ -102,8 +101,6 @@ ensures no regressions.
 | cloudflare | Composite key (ACCOUNT_ID:TOKEN) |
 | groq | API key |
 | cline | API key |
-| opencode-zen | API key (shared with opencode-go) |
-| opencode-go | Alias for opencode-zen, not a catalog entry |
 | zai | API key |
 | openrouter | API key |
 

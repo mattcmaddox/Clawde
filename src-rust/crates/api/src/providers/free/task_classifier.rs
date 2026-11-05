@@ -178,39 +178,19 @@ pub fn task_preference_ids(task: TaskType) -> &'static [&'static str] {
     match task {
         // Strong coders first (OpenRouter's DeepSeek, Cerebras' coding
         // specialist, Hugging Face's 70B), then the fast generalists.
-        TaskType::CodeGeneration => &[
-            "openrouter",
-            "cerebras",
-            "poolside",
-            "groq",
-            "cline",
-            "opencode-zen",
-        ],
+        TaskType::CodeGeneration => &["openrouter", "cerebras", "poolside", "groq", "cline"],
         // Fast, instruction-following models for iterating on existing code.
-        TaskType::CodeEdit => &[
-            "groq",
-            "cerebras",
-            "cloudflare",
-            "opencode-zen",
-            "poolside",
-            "nvidia",
-        ],
+        TaskType::CodeEdit => &["groq", "cerebras", "cloudflare", "poolside", "nvidia"],
         // Strong reasoning first (Gemini), then the 70B-class fast models.
         TaskType::Reasoning => &["google", "groq", "nvidia", "openrouter", "zai"],
         // Design-before-implementation: comprehensive, structured output.
         TaskType::Planning => &["google", "groq", "openrouter", "cline", "zai"],
         // Fastest, cheapest tokens — a check needs speed, not depth.
-        TaskType::Verification => &["groq", "cloudflare", "opencode-zen", "zai", "cerebras"],
+        TaskType::Verification => &["groq", "cloudflare", "zai", "cerebras"],
         // Cheapest available — a typo fix shouldn't burn a strong model.
-        TaskType::SimpleEdit => &["zai", "opencode-zen", "nvidia"],
+        TaskType::SimpleEdit => &["zai", "nvidia"],
         // Tool-calling only: any capable upstream, fast ones first.
-        TaskType::Search => &[
-            "cloudflare",
-            "groq",
-            "opencode-zen",
-            "openrouter",
-            "cerebras",
-        ],
+        TaskType::Search => &["cloudflare", "groq", "openrouter", "cerebras"],
     }
 }
 

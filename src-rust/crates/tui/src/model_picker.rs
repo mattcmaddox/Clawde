@@ -2190,6 +2190,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retired_opencode_go_has_no_models_in_the_picker() {
+        // models.dev still lists an `opencode-go` provider; the snapshot
+        // transform drops it, so the picker falls back to the single `default`
+        // placeholder instead of offering ids nothing can dispatch.
+        let registry = clawde_api::ModelRegistry::new();
+        let models = models_for_provider_from_registry("opencode-go", &registry);
+        assert_eq!(models.len(), 1, "expected the placeholder only: {models:?}");
+        assert_eq!(models[0].id, "default");
+    }
+
     // The picker list for a catalog-backed provider must be exactly the
     // read-only registry projection (release_date DESC, then id) — no provider
     // return value is allowed to become the displayed list. This is what makes

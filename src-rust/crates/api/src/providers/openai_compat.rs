@@ -206,6 +206,12 @@ impl OpenAiCompatProvider {
     /// checks and native model discovery would keep targeting the original
     /// (localhost) host even though chat completions go to the overridden
     /// server.
+    /// The endpoint every request is sent to (already including any path
+    /// prefix). Read-only: retargeting goes through [`Self::with_base_url`].
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         if self.quirks.ollama_native_host.is_some() {

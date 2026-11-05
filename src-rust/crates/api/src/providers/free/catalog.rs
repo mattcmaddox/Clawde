@@ -325,25 +325,10 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         usage: "auto-pick · 8K",
         quick_task_lane: false,
     },
-    FreeUpstream {
-        id: "opencode-zen",
-        title: "OpenCode Zen",
-        key_url: "opencode.ai/auth",
-        // Zen's free pool is dynamic. This is only the offline fallback;
-        // live discovery selects the current `*-free` model from `/models`.
-        default_model: "deepseek-v4.1-flash-free",
-        model_family: "opencode-zen-free",
-        note: "dynamic Zen free pool — current `*-free` model via /models",
-        tool_calling: true,
-        vision: false,
-        thinking: true,
-        max_tokens_cap: Some(8_192),
-        context_window: 128_000,
-        fallback_models: &[],
-        specialty: "general purpose",
-        usage: "2 keys · 8K",
-        quick_task_lane: false,
-    },
+    // OpenCode Zen is intentionally absent: Console admits its free (`-free`)
+    // models only to the OpenCode client, so every dispatch from here answered
+    // `FreeTierError`. It is a Console harness provider with a paid `oc_sk_`
+    // key; see `providers/openai_compat_providers.rs`.
     FreeUpstream {
         id: "zai",
         title: "Z.AI",

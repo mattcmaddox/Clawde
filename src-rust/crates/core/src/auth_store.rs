@@ -176,9 +176,12 @@ struct SalvageResult {
 impl AuthStore {
     /// Return whether a provider is part of Clawde's composite free catalog.
     /// Kept in core so every credential-writing surface can enforce the same
-    /// destination without depending on the API crate. `opencode-go` is the
-    /// compatibility alias for the shared OpenCode Zen/Go key slot; it is not
-    /// a separate catalog entry.
+    /// destination without depending on the API crate.
+    ///
+    /// OpenCode Zen is deliberately **not** here: Console serves its models
+    /// from a paid Console key, and the free (`-free`) models admit only the
+    /// OpenCode client. Treating it as a free upstream routed a valid Console
+    /// key into a chain that could never answer.
     pub fn is_free_upstream(provider_id: &str) -> bool {
         matches!(
             provider_id,
@@ -191,8 +194,6 @@ impl AuthStore {
                 | "groq"
                 | "google"
                 | "cloudflare"
-                | "opencode-zen"
-                | "opencode-go"
                 | "zai"
         )
     }
@@ -741,7 +742,7 @@ impl AuthStore {
 
     fn parse_opencode_cli_api_key(raw: &str) -> Option<String> {
         let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
-        for provider_id in ["opencode", "opencode-zen", "opencode-go"] {
+        for provider_id in ["opencode", "opencode-zen"] {
             let Some(record) = value
                 .get(provider_id)
                 .and_then(serde_json::Value::as_object)
@@ -1039,29 +1040,17 @@ impl AuthStore {
     /// key string is re-added later. Best-effort: a missing state file or an
     /// I/O failure is a no-op.
     ///
-    /// The live set is the provider's own slot list. OpenCode Zen/Go share one
-    /// ring, so the sibling alias is included for either id — pruning a shared
-    /// ring against only one slot would drop the other's live keys.
+    /// The live set is the provider's own slot list.
     fn prune_key_ring_state(provider_id: &str, live_keys: &[String]) {
         let path = crate::key_ring::KeyRing::default_state_path(provider_id);
         crate::key_ring::prune_snapshot_file(&path, live_keys);
     }
 
-    /// Keys that should remain in `provider_id`'s ring after a mutation,
-    /// including the OpenCode Zen/Go sibling slot for the shared ring.
+    /// Keys that should remain in `provider_id`'s ring after a mutation.
     fn remaining_ring_keys(&self, provider_id: &str) -> Vec<String> {
-        let mut live: Vec<String> = self
-            .keys_for(provider_id)
-            .map(|keys| keys.to_vec())
-            .unwrap_or_default();
-        if matches!(provider_id, "opencode-zen" | "opencode-go") {
-            for sibling in ["opencode-zen", "opencode-go"] {
-                if let Some(keys) = self.keys_for(sibling) {
-                    live.extend(keys.iter().cloned());
-                }
-            }
-        }
-        live
+        self.keys_for(provider_id)
+            .map(<[String]>::to_vec)
+            .unwrap_or_default()
     }
 
     /// Remove only a legacy API-key credential while preserving any canonical
@@ -1248,7 +1237,7 @@ impl AuthStore {
             "azure" => "AZURE_API_KEY",
             "nvidia" => "NVIDIA_API_KEY",
             "zai" => "ZAI_API_KEY",
-            "opencode-zen" | "opencode-go" => "OPENCODE_API_KEY",
+            "opencode-zen" => "OPENCODE_API_KEY",
             "crof" => "CROF_API_KEY",
             "poolside" => "POOLSIDE_API_KEY",
             // qwen adapter reads DASHSCOPE_API_KEY (Alibaba's DashScope is the
@@ -1288,7 +1277,7 @@ impl AuthStore {
                 return Some(key.trim().to_string());
             }
         }
-        if matches!(provider_id, "opencode-zen" | "opencode-go") {
+        if provider_id == "opencode-zen" {
             return Self::opencode_cli_api_key();
         }
         None

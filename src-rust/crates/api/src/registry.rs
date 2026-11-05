@@ -69,7 +69,21 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
     }
 
     if let Some(provider) = p::provider_for_id(provider_id) {
-        return Some(Arc::new(provider.with_api_key(key)));
+        // An organization-scoped OpenCode Console account is only authorized
+        // with `x-org-id`; attach it here so every registration path (auth
+        // store slots, config, runtime switch) sends it. The empty probe key
+        // used for factory availability skips the lookup, keeping that
+        // construction I/O-free.
+        let org_id = if provider_id == "opencode-zen" && !key.is_empty() {
+            clawde_core::AuthStore::opencode_org_id()
+        } else {
+            None
+        };
+        let mut provider = provider.with_api_key(key);
+        if let Some(org) = org_id {
+            provider = provider.with_header("x-org-id", org);
+        }
+        return Some(Arc::new(provider));
     }
 
     match provider_id {
@@ -207,7 +221,7 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         // --- multi-key path (2+ keys → wrap in KeyRotatingProvider) ---
         // Uses the ring-aligned resolver so the ring's key order and slot
         // indices are exactly the list the health poller probes (it forwards
-        // key_idx into these rings). OpenCode Zen/Go slot sharing and the
+        // key_idx into these rings). The OpenCode Zen fallbacks and the
         // >=8-char placeholder filter live in that one helper.
         let multi_keys: Option<Vec<String>> =
             crate::providers::free::resolve_free_upstream_keys(&auth_store, upstream.id)
@@ -258,7 +272,7 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
 
         // --- single-key path ---
         // Same validation as the multi-key resolver (trim + >=8 placeholder
-        // guard, OpenCode Zen/Go slot sharing) via first_free_upstream_key.
+        // guard, OpenCode Zen fallbacks) via first_free_upstream_key.
         let Some(key) = crate::providers::free::first_free_upstream_key(&auth_store, upstream.id)
         else {
             continue;
@@ -562,6 +576,10 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
             .filter(|k| k.len() >= 8)
             .collect();
         if real_keys.len() > 1 {
+            // A stored slot can name a provider Clawde no longer supports
+            // (`opencode-go`); skip it rather than panicking inside the ring
+            // factory on the first request.
+            provider_from_key(provider_id, String::new())?;
             let pid_owned = provider_id.to_string();
             let rotating = KeyRotatingProvider::new_with_persistence(
                 pid_owned.clone(),
@@ -940,6 +958,13 @@ impl ProviderRegistry {
             };
 
             if keys.len() > 1 {
+                // A stored slot can name a provider Clawde no longer supports
+                // (`opencode-go`). `provider_from_key` answers `None` for it, and
+                // the ring factory below would panic on first dispatch, so skip
+                // the entry rather than wrapping it.
+                if provider_from_key(provider_id, String::new()).is_none() {
+                    continue;
+                }
                 let keys_vec: Vec<String> = keys.to_vec();
                 let pid_owned = provider_id.clone();
                 let rotating = KeyRotatingProvider::new_with_persistence(
@@ -1258,11 +1283,20 @@ impl ProviderRegistry {
         {
             self.register(Arc::new(p::fireworks()));
         }
+        // OpenCode Console key (`oc_sk_…`) for the Zen pay-as-you-go gateway.
+        // OpenCode Go is not registered: its subscription terms do not permit
+        // use through a third-party client.
         if std::env::var("OPENCODE_API_KEY")
             .map(|v| !v.is_empty())
             .unwrap_or(false)
         {
-            self.register(Arc::new(p::opencode_go()));
+            let mut zen = p::opencode_zen();
+            // An organization-scoped Console account is only authorized with
+            // the org id; a personal one has no org and needs no header.
+            if let Some(org) = clawde_core::AuthStore::opencode_org_id() {
+                zen = zen.with_header("x-org-id", org);
+            }
+            self.register(Arc::new(zen));
         }
         if std::env::var("CLINE_API_KEY")
             .map(|v| !v.is_empty())
@@ -1296,6 +1330,26 @@ impl Default for ProviderRegistry {
 mod tests {
     use super::*;
     use clawde_core::config::{Config, ProviderConfig};
+
+    #[test]
+    fn stale_opencode_go_keys_neither_register_nor_panic() {
+        // A user who configured OpenCode Go before its removal keeps those
+        // slots in auth.json. The multi-key path must skip the provider rather
+        // than panic inside the ring factory on the first dispatch.
+        let mut store = clawde_core::AuthStore::default();
+        store.keys.insert(
+            "opencode-go".to_string(),
+            vec![
+                "oc_sk_aaaaaaaaaaaaaaaa".to_string(),
+                "oc_sk_bbbbbbbbbbbbbbbb".to_string(),
+            ],
+        );
+        let mut registry = ProviderRegistry::new();
+        registry.register_key_store_providers(&store);
+
+        assert!(registry.get(&ProviderId::new("opencode-go")).is_none());
+        assert!(registry.provider_ids().is_empty());
+    }
 
     /// Build a [`Config`] whose free-provider routing options carry the given
     /// strategy JSON, mirroring what `providers.free.options.routing` looks

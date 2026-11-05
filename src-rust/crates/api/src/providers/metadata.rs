@@ -197,11 +197,6 @@ pub const ALL_PROVIDERS: &[ProviderMetadata] = &[
         key_url: "opencode.ai/auth",
     },
     ProviderMetadata {
-        id: "opencode-go",
-        env_var: "OPENCODE_API_KEY",
-        key_url: "opencode.ai/auth",
-    },
-    ProviderMetadata {
         id: "openrouter",
         env_var: "OPENROUTER_API_KEY",
         key_url: "openrouter.ai/keys",

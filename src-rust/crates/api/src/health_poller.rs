@@ -617,7 +617,8 @@ mod tests {
     fn poller_probe_list_aligns_with_registry_ring_keys() {
         // Craft a store exercising every resolver rule:
         //   - groq: 3 slots, one <8 placeholder that must be dropped -> ring of 2
-        //   - opencode-zen: no own slots, falls back to opencode-go slots
+        //   - opencode-zen: a Console key that must NOT become a free probe
+        //     (Zen is a Console harness provider, not a free upstream)
         //   - cline: 1 valid key + 1 placeholder -> single-key chain entry
         let (mut store, _home) = crate::test_support::test_auth_store();
         store.keys.insert(
@@ -629,7 +630,7 @@ mod tests {
             ],
         );
         store.keys.insert(
-            "opencode-go".to_string(),
+            "opencode-zen".to_string(),
             vec!["zen-shared-key-00000000000000".to_string()],
         );
         store.keys.insert(
@@ -648,8 +649,8 @@ mod tests {
             "groq must be probed (2 usable keys)"
         );
         assert!(
-            targets.contains(&"opencode-zen".to_string()),
-            "opencode-zen must be probed via opencode-go slot fallback"
+            !targets.iter().any(|id| id.starts_with("opencode-")),
+            "OpenCode Console providers must not be in the free probe list"
         );
         assert!(
             targets.contains(&"cline".to_string()),
@@ -673,14 +674,6 @@ mod tests {
         );
         // key_idx 0 and 1 in the probe map to ring slots 0 and 1.
         assert_eq!(groq_probe.len(), 2, "ring holds exactly the probed keys");
-
-        let zen_probe = resolve_keys(&store, "opencode-zen").expect("zen keys");
-        let zen_ring = resolve_free_upstream_keys(&store, "opencode-zen").expect("zen ring");
-        assert_eq!(
-            zen_probe, zen_ring,
-            "opencode-zen probe must equal ring built from opencode-go slots"
-        );
-        assert_eq!(zen_probe, vec!["zen-shared-key-00000000000000".to_string()]);
 
         // A single usable key still yields exactly one probe entry (single-key
         // chain path uses first_free_upstream_key, but the poller probes the

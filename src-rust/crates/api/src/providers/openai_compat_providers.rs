@@ -45,7 +45,6 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "upstage" => Some(upstage()),
         "stepfun" => Some(stepfun()),
         "fireworks" => Some(fireworks()),
-        "opencode-go" => Some(opencode_go()),
         "opencode-zen" => Some(opencode_zen()),
         "synthetic" => Some(synthetic()),
         "routing" => Some(routing()),
@@ -471,26 +470,35 @@ pub fn fireworks() -> OpenAiCompatProvider {
     .with_api_key(key)
 }
 
-/// OpenCode Go — flat-rate subscription endpoint hosted by opencode.ai.
-/// OpenAI-compatible chat completions surface; same key works for the Zen
-/// metered tier, hence the shared `OPENCODE_API_KEY` env var.
-pub fn opencode_go() -> OpenAiCompatProvider {
-    let key = std::env::var("OPENCODE_API_KEY").unwrap_or_default();
-    OpenAiCompatProvider::new(
-        ProviderId::OPENCODE_GO,
-        "OpenCode Go",
-        "https://opencode.ai/zen/go/v1",
-    )
-    .with_api_key(key)
-    .with_quirks(ProviderQuirks {
-        include_usage_in_stream: true,
-        ..Default::default()
+/// `x-opencode-session` value for OpenCode Console gateway requests.
+///
+/// Console docs (Harnesses → Sessions) require a stable `ses_…` id on every
+/// request so a conversation is routed consistently and its prompt cache is
+/// reused. One id per process satisfies the routing contract (the gateway only
+/// needs the value to be stable), so it is generated once and reused. The shape matches the id OpenCode mints
+/// (`ses_` + 12 hex + 14 base62) so gateway-side validation accepts it.
+pub fn opencode_session_id() -> &'static str {
+    static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SESSION.get_or_init(|| {
+        const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let mut rng = rand::thread_rng();
+        let mut id = String::with_capacity(4 + 12 + 14);
+        id.push_str("ses_");
+        for _ in 0..6 {
+            id.push_str(&format!("{:02x}", rand::Rng::gen::<u8>(&mut rng)));
+        }
+        for _ in 0..14 {
+            let idx = rand::Rng::gen_range(&mut rng, 0..BASE62.len());
+            id.push(BASE62[idx] as char);
+        }
+        id
     })
 }
 
 /// OpenCode Zen — pay-as-you-go metered endpoint hosted by opencode.ai.
-/// Exposes the free pool (DeepSeek V4 Flash, MiniMax M2.5 Free, Nemotron,
-/// etc.) alongside paid models.  Same `OPENCODE_API_KEY` as OpenCode Go.
+/// The `-free` model ids answer only for the OpenCode client (`FreeTierError`
+/// everywhere else), so a Console key with credits on a paid model is the
+/// usable path. One `OPENCODE_API_KEY` serves the provider.
 ///
 /// Several Zen free models run thinking mode and reject multi-turn tool-call
 /// requests that drop the previous turn's `reasoning_content`, so the provider
@@ -503,6 +511,7 @@ pub fn opencode_zen() -> OpenAiCompatProvider {
         "https://opencode.ai/inference/openai/v1",
     )
     .with_api_key(key)
+    .with_header("x-opencode-session", opencode_session_id())
     .with_quirks(ProviderQuirks {
         include_usage_in_stream: true,
         reasoning_field: Some("reasoning_content".to_string()),
@@ -724,6 +733,50 @@ mod tests {
         assert!(
             p.quirks.requires_reasoning_roundtrip,
             "expected opencode-zen to require the reasoning roundtrip"
+        );
+    }
+
+    #[test]
+    fn opencode_zen_sends_the_console_session_header() {
+        // Console (Harnesses → Sessions) routes a conversation and reuses its
+        // prompt cache from `x-opencode-session`. The header must carry the
+        // same id the factory exposes.
+        let provider = opencode_zen();
+        assert!(
+            provider.has_header("x-opencode-session", opencode_session_id()),
+            "OpenCode Zen requests must carry the Console session header"
+        );
+    }
+
+    #[test]
+    fn opencode_go_has_no_factory() {
+        // Go was removed; only Zen may resolve from a Console key.
+        assert!(provider_for_id("opencode-go").is_none());
+        assert!(provider_for_id("opencode-zen").is_some());
+    }
+
+    #[test]
+    fn opencode_zen_factory_uses_the_documented_base_url() {
+        // `/zen` is the retired legacy host and answers only for old clients.
+        assert_eq!(
+            opencode_zen().base_url(),
+            "https://opencode.ai/inference/openai/v1"
+        );
+    }
+
+    #[test]
+    fn opencode_session_id_has_the_client_shape_and_is_stable() {
+        let id = opencode_session_id();
+        assert_eq!(id, opencode_session_id(), "session id must be stable");
+        assert_eq!(id.len(), 4 + 12 + 14, "unexpected session id length: {id}");
+        assert!(id.starts_with("ses_"), "unexpected session id prefix: {id}");
+        assert!(
+            id[4..16].chars().all(|c| c.is_ascii_hexdigit()),
+            "session id must start with 12 hex chars: {id}"
+        );
+        assert!(
+            id[16..].chars().all(|c| c.is_ascii_alphanumeric()),
+            "session id suffix must be base62: {id}"
         );
     }
 

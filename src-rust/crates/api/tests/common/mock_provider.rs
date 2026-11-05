@@ -56,6 +56,18 @@ pub struct RequestRecord {
     pub method: String,
     pub path: String,
     pub body: String,
+    /// Request headers exactly as sent, name in its original case.
+    pub headers: Vec<(String, String)>,
+}
+
+impl RequestRecord {
+    /// First header whose name matches `name` case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 /// A scripted, single-accept-loop HTTP mock bound to an ephemeral loopback port.
@@ -148,6 +160,7 @@ fn read_request(stream: &mut TcpStream) -> Option<RequestRecord> {
     let mut method = String::new();
     let mut path = String::new();
     let mut content_length = 0usize;
+    let mut headers: Vec<(String, String)> = Vec::new();
     for (index, line) in header_text.split("\r\n").enumerate() {
         if index == 0 {
             let mut parts = line.split_whitespace();
@@ -155,9 +168,13 @@ fn read_request(stream: &mut TcpStream) -> Option<RequestRecord> {
             path = parts.next().unwrap_or("").to_string();
             continue;
         }
-        let lower = line.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            content_length = rest.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse().unwrap_or(0);
+            }
+            headers.push((name.to_string(), value.to_string()));
         }
     }
 
@@ -174,6 +191,7 @@ fn read_request(stream: &mut TcpStream) -> Option<RequestRecord> {
         method,
         path,
         body: String::from_utf8_lossy(&body).into_owned(),
+        headers,
     })
 }
 

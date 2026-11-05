@@ -625,9 +625,8 @@ Level 1: FreeProvider (across providers) — order is FREE_CATALOG order
   ├── upstream[5]:  Cloudflare Workers AI
   ├── upstream[6]:  Groq
   ├── upstream[7]:  Cline
-  ├── upstream[8]:  OpenCode Zen
-  ├── upstream[9]:  Z.AI
-  └── upstream[10]: OpenRouter
+  ├── upstream[8]:  Z.AI
+  └── upstream[9]:  OpenRouter
 
 Level 2: KeyRotatingProvider (within each upstream, 2+ keys)
   └── key[0], key[1], key[2], ...  (round-robins on exhaustion)
@@ -656,14 +655,13 @@ so the registry, health poller, and TUI dialog can never disagree:
 
 1. **`resolve_free_upstream_keys()`** (`free/mod.rs`) — **ring-aligned**: keys
    from the multi-key store only (no credentials), whitespace-trimmed, >=8-char
-   placeholder guard, OpenCode Zen reading the `opencode-go` slots as fallback.
-   Used by BOTH `build_free_provider`'s multi-key path AND the health poller's
+   placeholder guard. Used by BOTH `build_free_provider`'s multi-key path AND the health poller's
    `resolve_keys` wrapper, so the `key_idx` the poller forwards into
    `mark_key_healthy` / `mark_key_exhausted` lines up exactly with the
    `KeyRotatingProvider` ring slots.
 2. **`first_free_upstream_key()`** (`free/mod.rs`) — the single-key chain path:
    first valid ring slot, else stored credential (incl. OAuth), else env var,
-   with the same trim + >=8 guard and Zen/Go alias. A placeholder in slot 0
+   with the same trim + >=8 guard. A placeholder in slot 0
    does not shadow a valid slot-1 key.
 3. **`all_stored_free_upstream_keys()`** (`free/mod.rs`) — **display-oriented**:
    merges credentials + rotation keys, deduped, for `/keys`' per-key health
@@ -683,8 +681,12 @@ fetching a model list.
 Clawde never hold different refresh tokens. Rows are selected active-first,
 then newest. `AuthStore::opencode_org_id` feeds `x-org-id`, which an
 organization-scoped Console account needs; `build_free_provider` and
-`build_multi_key_provider` attach it for `opencode-zen` (skipping the empty
-probe key `multi_key_factory_available` passes, so construction stays I/O-free).
+the per-key factory in `build_multi_key_provider` attach it for `opencode-zen`
+(skipping the empty probe key `multi_key_factory_available` passes, so
+construction stays I/O-free). OpenCode Zen is a Console harness provider, not
+a free upstream, so the free chain no longer reaches that factory. OpenCode Go
+is not supported at all (its subscription terms do not allow third-party
+clients).
 `expired_oauth_row_is_refreshed_and_written_back` drives the whole seam against
 a loopback token endpoint — keep it that way rather than testing a live
 Console session.
@@ -696,7 +698,7 @@ Console session.
    2+ keys → `KeyRotatingProvider`, else if 1 usable key (via
    `first_free_upstream_key`) → single provider, else skip.
 
-2. **`resolve_route()`** (free/impls.rs) — Maps model ID to Route. `"free"`/`"auto"`/`"free/auto"`/`""` → Auto (try all in order). `"groq/model"` → Pinned (try pinned first, then rest). Legacy `"zen/"` → normalized to `"opencode-zen/"`. OpenRouter special: `"openrouter/free"` restores full model ID. The string matching is `classify_pin` (free/mod.rs) and `resolve_route` adds only what needs a chain (the index to pin first, the canonical wire model for a bare tail), so the label side cannot drift from the routing side: `resolve_free_model` — which the footer label, the session's stored model and cost pricing all resolve through (`free_mode_effective_model`, api/model_registry.rs) — answers a pin the catalog no longer has (a retired upstream) with `free/auto`, exactly what the router does with it.
+2. **`resolve_route()`** (free/impls.rs) — Maps model ID to Route. `"free"`/`"auto"`/`"free/auto"`/`""` → Auto (try all in order). `"groq/model"` → Pinned (try pinned first, then rest). Legacy `"zen/"` still normalizes to `"opencode-zen/"`, but Zen left the catalog, so such a pin resolves to `free/auto` like any other retired upstream. OpenRouter special: `"openrouter/free"` restores full model ID. The string matching is `classify_pin` (free/mod.rs) and `resolve_route` adds only what needs a chain (the index to pin first, the canonical wire model for a bare tail), so the label side cannot drift from the routing side: `resolve_free_model` — which the footer label, the session's stored model and cost pricing all resolve through (`free_mode_effective_model`, api/model_registry.rs) — answers a pin the catalog no longer has (a retired upstream) with `free/auto`, exactly what the router does with it.
 
 3. **`attempt_plan()`** (free/impls.rs) — Builds ordered `[(idx, model)]` list. Auto = all upstreams with their `default_model`. Pinned = pinned first, then all others in catalog order with defaults.
 
@@ -939,7 +941,11 @@ Synthetic only — never calls upstream `discover_models()`. Produces one `free/
   uses the chat probe (the `/ai/v1/models` endpoint returns 405 for GET)
 - Groq: free tier is fast but token-capped (100-200K TPD on strong models,
   12K TPM) — a quick-task lane, not a daily driver
-- OpenCode Zen/Go key sharing: checks both auth store slots
+- OpenCode Zen is not in this catalog: Console serves its free models only to
+  the OpenCode client. It is registered as a paid Console provider
+  (`OPENCODE_API_KEY`, `x-opencode-session`); see `docs/providers.md`. OpenCode
+  Go is not supported (its subscription terms do not allow third-party
+  clients).
 - Silent skip for unconfigured upstreams (no error)
 - Catalog order = fallback priority (GitHub Copilot first). Retired upstreams
   are removed, not commented out: GitHub Models (2026-07-30), Hugging Face,
